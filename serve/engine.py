@@ -44,6 +44,8 @@ WASTE_E_OOM = -4
 WASTE_E_ARG = -5
 WASTE_E_UNSUPPORTED = -6
 WASTE_E_CANCELLED = -7
+WASTE_E_BUSY = -8
+WASTE_E_MEMORY = -9
 
 # waste.h's waste_cache_policy. There is no third: a "pinned" policy was
 # listed there and never implemented, so it selected LFRU like everything
@@ -86,7 +88,9 @@ class Cfg(C.Structure):
                 ("use_direct_io", C.c_int),
                 ("vision", C.c_int),
                 ("verify_records", C.c_int),
-                ("usage_path", C.c_char_p)]
+                ("usage_path", C.c_char_p),
+                ("allow_concurrent_open", C.c_int),
+                ("trace_path", C.c_char_p)]
 
 
 class GenParams(C.Structure):
@@ -271,6 +275,13 @@ def _bind(lib) -> None:
     lib.waste_get_stats.argtypes = [C.c_void_p, C.POINTER(Stats)]
     lib.waste_physical_ram.restype = C.c_uint64
     lib.waste_physical_ram.argtypes = []
+    lib.waste_available_ram.restype = C.c_uint64
+    lib.waste_available_ram.argtypes = []
+    lib.waste_cgroup_available_ram.restype = C.c_uint64
+    lib.waste_cgroup_available_ram.argtypes = []
+    lib.waste_set_cpu_affinity.restype = C.c_int
+    lib.waste_set_cpu_affinity.argtypes = [C.c_char_p, C.POINTER(C.c_char),
+                                           C.c_size_t]
 
 
 def version() -> str:
@@ -283,6 +294,24 @@ def build_info() -> str:
 
 def physical_ram() -> int:
     return int(_lib().waste_physical_ram())
+
+
+def available_ram() -> int:
+    return int(_lib().waste_available_ram())
+
+
+def cgroup_available_ram() -> int:
+    return int(_lib().waste_cgroup_available_ram())
+
+
+def set_cpu_affinity(spec: str) -> str:
+    if not isinstance(spec, str) or not spec:
+        raise ValueError("CPU set must be a non-empty string")
+    out = C.create_string_buffer(256)
+    st = _lib().waste_set_cpu_affinity(spec.encode(), out, len(out))
+    if st != WASTE_OK:
+        raise EngineError("CPU set", st, spec)
+    return out.value.decode()
 
 
 def _bounded_int(name: str, value: int, lo: int, hi: int) -> int:
@@ -368,7 +397,9 @@ class Engine:
                  direct_io: bool = True,
                  vision: bool = False,
                  verify_records: bool = False,
-                 usage_path: Optional[str] = None):
+                 usage_path: Optional[str] = None,
+                 allow_concurrent_open: bool = False,
+                 trace_path: Optional[str] = None):
         ram_budget_bytes = _bounded_int(
             "ram_budget_bytes", ram_budget_bytes, 0, (1 << 64) - 1)
         ctx_tokens = _bounded_int("ctx_tokens", ctx_tokens, 0, (1 << 32) - 1)
@@ -392,6 +423,9 @@ class Engine:
         # and a temporary would be freed before waste_open reads it.
         self._usage = usage_path.encode() if usage_path else None
         cfg.usage_path = self._usage
+        cfg.allow_concurrent_open = 1 if allow_concurrent_open else 0
+        self._trace_path = trace_path.encode() if trace_path else None
+        cfg.trace_path = self._trace_path
 
         st = self.lib.waste_open(self.model_path.encode(), C.byref(cfg),
                                  C.byref(self._ctx))

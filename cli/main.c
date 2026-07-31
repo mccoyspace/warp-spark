@@ -112,11 +112,11 @@ typedef struct {
     uint64_t budget;
     uint32_t ctx, max_tokens;
     float temperature, top_p;
-    int top_k, threads, quiet, learn, json, no_echo;
+    int top_k, threads, quiet, learn, json, no_echo, allow_concurrent;
     int media_inlined;              /* the media block is already in the
                                        prompt string, inside the user turn */
     uint64_t seed;
-    const char *file, *stop, *system;
+    const char *file, *stop, *system, *cpu_set, *trace_path;
     const char *image[WASTE_MAX_IMAGES_CLI];
     int n_image;
     int raw;
@@ -131,6 +131,7 @@ static void opts_init(opts *o)
     o->ctx = 4096;
     o->max_tokens = 128;
     o->top_p = 1.0f;
+    o->cpu_set = getenv("WASTE_CPU_SET");
 }
 
 /* Options and positionals in any order.
@@ -150,7 +151,8 @@ static int parse_opts(int argc, char **argv, int from, opts *o)
             !strcmp(a, "--temp") || !strcmp(a, "--top-p") || !strcmp(a, "--top-k") ||
             !strcmp(a, "--seed") || !strcmp(a, "--threads") ||
             !strcmp(a, "--file") || !strcmp(a, "--stop") ||
-            !strcmp(a, "--system") || !strcmp(a, "--image")) {
+            !strcmp(a, "--system") || !strcmp(a, "--image") ||
+            !strcmp(a, "--cpu-set") || !strcmp(a, "--trace-layers")) {
             need = 1;
             /* `--temp --budget 8G` used to make "--budget" the temperature
              * and then complain about 8G. A value that looks like an option
@@ -175,6 +177,8 @@ static int parse_opts(int argc, char **argv, int from, opts *o)
         else if (!strcmp(a, "--file")) o->file = v;
         else if (!strcmp(a, "--stop")) o->stop = v;
         else if (!strcmp(a, "--system")) o->system = v;
+        else if (!strcmp(a, "--cpu-set")) o->cpu_set = v;
+        else if (!strcmp(a, "--trace-layers")) o->trace_path = v;
         else if (!strcmp(a, "--image")) {
             if (o->n_image >= WASTE_MAX_IMAGES_CLI) {
                 fprintf(stderr, "at most %d images\n", WASTE_MAX_IMAGES_CLI);
@@ -187,6 +191,7 @@ static int parse_opts(int argc, char **argv, int from, opts *o)
         else if (!strcmp(a, "--json")) o->json = 1;
         else if (!strcmp(a, "--raw")) o->raw = 1;
         else if (!strcmp(a, "--verify")) o->verify = 1;
+        else if (!strcmp(a, "--allow-concurrent-open")) o->allow_concurrent = 1;
         else if (!strcmp(a, "-")) {                /* explicit stdin */
             if (o->n_pos >= MAX_POS) { fprintf(stderr, "too many arguments\n"); return -1; }
             o->pos[o->n_pos++] = "-";
@@ -257,6 +262,14 @@ static char *read_prompt(const opts *o)
 
 static waste_status open_model(const char *path, const opts *o, waste_ctx **ctx)
 {
+    if (o->cpu_set && *o->cpu_set) {
+        char resolved[256];
+        const waste_status st = waste_set_cpu_affinity(o->cpu_set, resolved,
+                                                       sizeof resolved);
+        if (st != WASTE_OK) return st;
+        if (!o->quiet)
+            fprintf(stderr, "waste: CPU set %s\n", resolved);
+    }
     waste_cfg cfg;
     waste_cfg_init(&cfg);
     cfg.ram_budget_bytes = o->budget;
@@ -269,6 +282,8 @@ static waste_status open_model(const char *path, const opts *o, waste_ctx **ctx)
      * Kimi-Linear. Worth it for a container that was copied or downloaded
      * and has not been read since. */
     cfg.verify_records = o->verify;
+    cfg.allow_concurrent_open = o->allow_concurrent;
+    cfg.trace_path = o->trace_path;
     return waste_open(path, &cfg, ctx);
 }
 
@@ -1189,6 +1204,7 @@ int main(int argc, char **argv)
                "given as - or simply piped in.\n\n"
                "options: --budget 8G  --ctx N  -n N  --temp F  --top-p F\n"
                "         --top-k N  --seed N  --threads N  --stop STR\n"
+               "         --cpu-set performance|LIST  --trace-layers PATH\n"
                "         --file F  --json  -q  --learn  --verify\n"
          "  --stop  ends generation when the text appears\n"
          "  --json  machine-readable output for eval, tokenize, plan,\n"
@@ -1196,6 +1212,9 @@ int main(int argc, char **argv)
          "  --learn records which experts the run used, so the next open\n"
          "  starts with a warm cache instead of an empty one\n"
          "  --threads sets the compute pool; 0 (default) is one per core\n"
+         "  --cpu-set performance selects the fastest Linux core class\n"
+         "  --allow-concurrent-open permits another process to load MODEL\n"
+         "  --trace-layers writes decode-layer timing and cache JSON Lines\n"
          "  --verify checks each expert record's checksum as it is read,\n"
          "  for a container you have not read since copying it. Costs ~5%%\n"
          "  on Kimi-Linear, ~1%% on K3; off otherwise\n",

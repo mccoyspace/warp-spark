@@ -13,6 +13,7 @@
 
 #include <limits.h>
 #include <math.h>
+#include <errno.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -21,12 +22,20 @@
 #include <sys/sysctl.h>
 #endif
 #include <time.h>
+#include <pthread.h>
+#if !defined(_WIN32)
+#include <fcntl.h>
+#include <sys/file.h>
+#include <sys/stat.h>
+#endif
 
 #include "json.h"
 #include "model.h"
 #include "platform.h"
 #include "tokenizer.h"
 #include "waste_backend.h"
+
+typedef struct waste_lock_entry waste_lock_entry;
 
 struct waste_ctx {
     waste_model m;
@@ -40,6 +49,7 @@ struct waste_ctx {
     char quant[64];          /* composed at open, reported by get_info */
     char detail[128];        /* which record failed, for waste_error_detail */
     waste_stats stats;
+    waste_lock_entry *model_lock;
 
     /* Queued image embeddings, concatenated: img_each[] is how many rows
      * each queued image contributed, which is what expand needs to know
@@ -49,6 +59,85 @@ struct waste_ctx {
     size_t   img_each[WASTE_MAX_IMAGES];
     int      img_n;
 };
+
+#if !defined(_WIN32)
+struct waste_lock_entry {
+    dev_t dev;
+    ino_t ino;
+    int fd, refs;
+    waste_lock_entry *next;
+};
+
+static pthread_mutex_t model_lock_mu = PTHREAD_MUTEX_INITIALIZER;
+static waste_lock_entry *model_locks;
+
+/* One OS lock per container and process, reference-counted so the library's
+ * documented same-process multi-context use remains valid. Other processes
+ * fail before any model-sized allocation occurs. */
+static waste_lock_entry *model_lock_acquire(const char *path, int allow,
+                                            waste_status *status)
+{
+    *status = WASTE_OK;
+    const char *e = getenv("WASTE_ALLOW_CONCURRENT");
+    if (allow || (e && *e && *e != '0')) return NULL;
+    const int fd = open(path, O_RDONLY | O_CLOEXEC);
+    if (fd < 0) { *status = WASTE_E_IO; return NULL; }
+    struct stat st;
+    if (fstat(fd, &st)) { close(fd); *status = WASTE_E_IO; return NULL; }
+
+    pthread_mutex_lock(&model_lock_mu);
+    for (waste_lock_entry *p = model_locks; p; p = p->next) {
+        if (p->dev == st.st_dev && p->ino == st.st_ino) {
+            p->refs++;
+            pthread_mutex_unlock(&model_lock_mu);
+            close(fd);
+            return p;
+        }
+    }
+    if (flock(fd, LOCK_EX | LOCK_NB)) {
+        const int busy = errno == EWOULDBLOCK || errno == EAGAIN;
+        pthread_mutex_unlock(&model_lock_mu);
+        close(fd);
+        *status = busy ? WASTE_E_BUSY : WASTE_E_IO;
+        return NULL;
+    }
+    waste_lock_entry *p = (waste_lock_entry *)calloc(1, sizeof *p);
+    if (!p) {
+        flock(fd, LOCK_UN);
+        pthread_mutex_unlock(&model_lock_mu);
+        close(fd);
+        *status = WASTE_E_OOM;
+        return NULL;
+    }
+    p->dev = st.st_dev; p->ino = st.st_ino; p->fd = fd; p->refs = 1;
+    p->next = model_locks; model_locks = p;
+    pthread_mutex_unlock(&model_lock_mu);
+    return p;
+}
+
+static void model_lock_release(waste_lock_entry *entry)
+{
+    if (!entry) return;
+    pthread_mutex_lock(&model_lock_mu);
+    if (--entry->refs == 0) {
+        waste_lock_entry **pp = &model_locks;
+        while (*pp && *pp != entry) pp = &(*pp)->next;
+        if (*pp) *pp = entry->next;
+        flock(entry->fd, LOCK_UN);
+        close(entry->fd);
+        free(entry);
+    }
+    pthread_mutex_unlock(&model_lock_mu);
+}
+#else
+struct waste_lock_entry { int unused; };
+static waste_lock_entry *model_lock_acquire(const char *path, int allow,
+                                            waste_status *status)
+{
+    (void)path; (void)allow; *status = WASTE_OK; return NULL;
+}
+static void model_lock_release(waste_lock_entry *entry) { (void)entry; }
+#endif
 
 
 
@@ -86,6 +175,8 @@ const char *waste_strerror(waste_status s)
     case WASTE_E_ARG:          return "invalid argument";
     case WASTE_E_UNSUPPORTED:  return "unsupported";
     case WASTE_E_CANCELLED:    return "cancelled by callback";
+    case WASTE_E_BUSY:         return "container is already open in another process";
+    case WASTE_E_MEMORY:       return "not enough currently available memory";
     }
     return "unknown error";
 }
@@ -363,8 +454,13 @@ waste_status waste_open(const char *model_path, const waste_cfg *cfg_in,
     c->cfg = cfg;
     snprintf(c->path, sizeof c->path, "%s", model_path);
 
+    waste_status lock_status = WASTE_OK;
+    c->model_lock = model_lock_acquire(model_path, cfg.allow_concurrent_open,
+                                       &lock_status);
+    if (lock_status != WASTE_OK) { free(c); return lock_status; }
+
     waste_status st = waste_plan_memory(model_path, cfg.ctx_tokens, &c->plan);
-    if (st != WASTE_OK) { free(c); return st; }
+    if (st != WASTE_OK) { model_lock_release(c->model_lock); free(c); return st; }
 
     /* Optional vision weights, decode buffers, tower activations and queued
      * embeddings are real memory, so all of them enter the floor. */
@@ -396,7 +492,22 @@ waste_status waste_open(const char *model_path, const waste_cfg *cfg_in,
      * recommendation already fits, like Kimi-Linear, is unaffected. When
      * not even one multiple fits, run at the floor and say so below. */
     const uint64_t phys = waste_physical_ram();
-    const uint64_t cap = phys ? phys - phys / 8 : 0;   /* 12% left to the OS */
+    const uint64_t avail = waste_available_ram();
+    const uint64_t cg_avail = waste_cgroup_available_ram();
+    const uint64_t reserve = phys ? phys / 8 : (4ULL << 30);
+    uint64_t cap = phys ? phys - reserve : 0;
+    /* MemAvailable sees resident competitors that total RAM does not. A
+     * finite cgroup is another, sometimes smaller machine inside the host.
+     * Keep the same OS reserve under every ceiling. Zero from either helper
+     * means unknown/unlimited, not no memory. */
+    if (avail) {
+        const uint64_t a = avail > reserve ? avail - reserve : 1;
+        if (!cap || a < cap) cap = a;
+    }
+    if (cg_avail) {
+        const uint64_t a = cg_avail > reserve ? cg_avail - reserve : 1;
+        if (!cap || a < cap) cap = a;
+    }
     uint64_t budget = cfg.ram_budget_bytes;
 
     if (!budget) {
@@ -407,8 +518,15 @@ waste_status waste_open(const char *model_path, const waste_cfg *cfg_in,
             const uint64_t b = c->plan.floor_bytes + ws * (uint64_t)k;
             if (!cap || b <= cap) { budget = b; break; }
         }
+        if (cap && budget > cap) {
+            model_lock_release(c->model_lock);
+            free(c);
+            return WASTE_E_MEMORY;
+        }
     }
-    if (budget < c->plan.floor_bytes) { free(c); return WASTE_E_RAM_BUDGET; }
+    if (budget < c->plan.floor_bytes) {
+        model_lock_release(c->model_lock); free(c); return WASTE_E_RAM_BUDGET;
+    }
 
     /* A budget close to physical RAM backfires: the OS starts paging out
      * the engine's own expert cache, and a "hit" then costs a page fault
@@ -421,10 +539,10 @@ waste_status waste_open(const char *model_path, const waste_cfg *cfg_in,
      * this machine — worth saying out loud before it crawls. */
     if (cap && budget > cap)
         fprintf(stderr,
-                "waste: budget %.1f GB leaves under 12%% of this machine's "
-                "%.1f GB free\n       the OS will page out the expert cache "
-                "and throughput collapses\n",
-                budget / 1073741824.0, phys / 1073741824.0);
+                "waste: budget %.1f GB exceeds the current safe memory "
+                "ceiling %.1f GB\n       available or cgroup memory may be "
+                "paged; automatic budgeting would choose less\n",
+                budget / 1073741824.0, cap / 1073741824.0);
 
     c->cfg.ram_budget_bytes = budget;   /* what we actually run under */
 
@@ -438,6 +556,7 @@ waste_status waste_open(const char *model_path, const waste_cfg *cfg_in,
         opt.n_threads = cfg.n_threads;
         opt.policy = (int)cfg.cache_policy;
         opt.direct_io = cfg.use_direct_io;
+        opt.trace_path = cfg.trace_path;
         const int rc = waste_model_load(&c->m, model_path, (int)cfg.ctx_tokens,
                                         &opt);
         if (rc) {
@@ -445,6 +564,7 @@ waste_status waste_open(const char *model_path, const waste_cfg *cfg_in,
              * fail, and freeing only the context left all of it behind —
              * on K3 that is tens of gigabytes lost to one bad manifest. */
             waste_model_free(&c->m);
+            model_lock_release(c->model_lock);
             free(c);
             return rc == -2 ? WASTE_E_FORMAT : WASTE_E_IO;
         }
@@ -474,6 +594,7 @@ void waste_close(waste_ctx *c)
     waste_model_free(&c->m);
     waste_tok_free(c->tok);
     free(c->img);
+    model_lock_release(c->model_lock);
     free(c);
 }
 

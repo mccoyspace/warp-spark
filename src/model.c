@@ -858,7 +858,7 @@ static void cfg_from_json(waste_config *c, const js_doc *d, int cfg)
 int waste_model_load(waste_model *m, const char *dir, int kv_cap,
                      const waste_load_opts *opt)
 {
-    static const waste_load_opts defaults = { 0, 0, 0, 0, 1 };
+    static const waste_load_opts defaults = { 0, 0, 0, 0, 1, NULL };
     if (!opt) opt = &defaults;
     const size_t cache_bytes = opt->cache_bytes;
     memset(m, 0, sizeof *m);
@@ -866,6 +866,14 @@ int waste_model_load(waste_model *m, const char *dir, int kv_cap,
     for (int L = 0; L < WASTE_MAX_LAYERS; L++) m->bank[L].fd = -1;
     m->want_vision = opt->want_vision;
     m->want_direct = opt->direct_io;
+    if (opt->trace_path && opt->trace_path[0]) {
+        m->trace = fopen(opt->trace_path, "w");
+        if (!m->trace) return -1;
+        setvbuf(m->trace, NULL, _IOLBF, 0);
+        fprintf(m->trace,
+                "{\"schema\":\"waste.layer_trace.v1\",\"event\":\"meta\","
+                "\"io_backend\":\"pread_sync\",\"queue_depth\":1}\n");
+    }
     pthread_once(&model_opts_once, model_opts_init);
     m->kv_cap = kv_cap;
     m->direct_io = 1;
@@ -1258,6 +1266,8 @@ void waste_model_free(waste_model *m)
     free(m->clat); free(m->cff); free(m->cexp); free(m->cblockres);
     free(m->cprefix); free(m->croute); free(m->crw);
     waste_ecache_free(&m->cache);
+    if (m->trace) fclose(m->trace);
+    m->trace = NULL;
 }
 
 /* ---- expert dequant ---------------------------------------------------- */
@@ -1303,7 +1313,13 @@ static int bank_open(const char *path, size_t rec_bytes, int asked, int *direct)
     const char *e = getenv("WASTE_DIRECT");
     const int want = asked && !(e && e[0] == '0');
     const int aligned = rec_bytes && rec_bytes % WASTE_DIO_ALIGN == 0;
-    (void)want; (void)aligned;
+    /* The cache buffers remain 16 KiB aligned for Apple/Metal compatibility,
+     * but Linux O_DIRECT only needs this format's 4 KiB record multiple.
+     * Requiring the transfer length itself to be 16 KiB rejects valid
+     * converter output such as Kimi-Linear's 651-page records and K3's
+     * 3029-page records. */
+    const int linux_aligned = rec_bytes && rec_bytes % WASTE_ALIGN == 0;
+    (void)want; (void)aligned; (void)linux_aligned;
 #if defined(_WIN32)
     if (want && aligned) {
         const int fd = waste_open_stream(path, 1);
@@ -1315,7 +1331,7 @@ static int bank_open(const char *path, size_t rec_bytes, int asked, int *direct)
     return waste_open_stream(path, 0);
 #else
 #if defined(__linux__) && defined(O_DIRECT)
-    if (want && aligned) {
+    if (want && linux_aligned) {
         const int fd = open(path, O_RDONLY | O_DIRECT);
         if (fd >= 0) return fd;
     }
@@ -1929,6 +1945,12 @@ static void moe_layer(waste_model *m, int L, const float *in, float *out, int *r
 {
     const waste_config *c = &m->cfg;
     const int E = c->n_experts, K = c->top_k, hid = c->hidden;
+    const int trace_on = m->trace != NULL;
+    const double moe_t0 = trace_on ? pnow() : 0;
+    const double route_t0 = moe_t0;
+    double io_ms = 0, expert_ms = 0, shared_ms = 0;
+    const uint64_t hit0 = m->cache.hits, miss0 = m->cache.misses;
+    const uint64_t bytes0 = m->cache.bytes_read;
     /* K3's Stable LatentMoE: experts run on a narrower projection of the
      * hidden state. `in` still drives the router and the shared experts. */
     const int lat = c->latent_dim ? c->latent_dim : hid;
@@ -1960,6 +1982,7 @@ static void moe_layer(waste_model *m, int L, const float *in, float *out, int *r
     }
     for (int j = 0; j < K; j++) w[j] *= c->routed_scale;
     if (routed) for (int j = 0; j < K; j++) routed[j] = idx[j];
+    const double route_ms = trace_on ? (pnow() - route_t0) * 1000.0 : 0;
 
     const int inter = c->moe_inter;
     float *ga = m->ff, *ub = ga + inter, *acc = m->e_gate;
@@ -1977,9 +2000,11 @@ static void moe_layer(waste_model *m, int L, const float *in, float *out, int *r
     float *lut_gate = m->lut, *lut_up = lut_gate + lut_sz, *lut_down = lut_up + lut_sz;
     int lut_ready = 0;
     for (int j = 0; j < K; j++) {
+        const double io_t0 = trace_on ? pnow() : 0;
         PROF_START(P_EDEQ);
         const uint8_t *rec = read_expert(m, L, idx[j]);
         PROF_END(P_EDEQ);
+        if (trace_on) io_ms += (pnow() - io_t0) * 1000.0;
         /* This token is already wrong — the expert it needed is not
          * readable. Stop rather than sum the ones that were, and let the
          * step report it; m->read_error is what carries the reason out. */
@@ -1987,6 +2012,7 @@ static void moe_layer(waste_model *m, int L, const float *in, float *out, int *r
         const waste_expert_hdr *h = (const waste_expert_hdr *)rec;
         const uint16_t *sc = (const uint16_t *)(rec + h->chan_corr_off);
 
+        const double expert_t0 = trace_on ? pnow() : 0;
         PROF_START(P_EMM);
         /* gate/up see the same input and the same per-layer codebooks for
          * every routed expert, so their tables are built once per token. */
@@ -2009,6 +2035,7 @@ static void moe_layer(waste_model *m, int L, const float *in, float *out, int *r
         const float wj = w[j];
         for (int i = 0; i < lat; i++) ysum[i] += wj * acc[i];
         PROF_END(P_EMM);
+        if (trace_on) expert_ms += (pnow() - expert_t0) * 1000.0;
     }
     if (c->latent_dim) {
         if (c->latent_norm)
@@ -2021,12 +2048,37 @@ static void moe_layer(waste_model *m, int L, const float *in, float *out, int *r
     }
 
     /* shared expert — on the original hidden state, not the latent */
+    const double shared_t0 = trace_on ? pnow() : 0;
     float *tmp = m->h;
     ffn(m, waste_find(m, tname("%smodel.layers.%d.block_sparse_moe.shared_experts.gate_proj.weight", c->prefix, L)),
         waste_find(m, tname("%smodel.layers.%d.block_sparse_moe.shared_experts.up_proj.weight", c->prefix, L)),
         waste_find(m, tname("%smodel.layers.%d.block_sparse_moe.shared_experts.down_proj.weight", c->prefix, L)),
         in, tmp, c->moe_inter * (c->n_shared ? c->n_shared : 1), hid, 1.0f, 0);
     for (int i = 0; i < hid; i++) out[i] += tmp[i];
+    if (trace_on) {
+        shared_ms = (pnow() - shared_t0) * 1000.0;
+        fprintf(m->trace,
+                "{\"schema\":\"waste.layer_trace.v1\",\"event\":\"decode_layer\","
+                "\"position\":%d,\"layer\":%d,\"attention_kind\":\"%s\","
+                "\"attention_ms\":%.3f,\"top_k\":%d,\"experts\":[",
+                m->trace_step, L, c->kda_layer[L] ? "kda" : "mla",
+                m->trace_attention_ms, K);
+        for (int j = 0; j < K; j++)
+            fprintf(m->trace, "%s%d", j ? "," : "", idx[j]);
+        fprintf(m->trace,
+                "],\"cache_hits\":%llu,\"cache_misses\":%llu,"
+                "\"bytes_read\":%llu,\"router_ms\":%.3f,"
+                "\"expert_io_ms\":%.3f,\"expert_compute_ms\":%.3f,"
+                "\"shared_compute_ms\":%.3f,\"moe_total_ms\":%.3f,"
+                "\"io_backend\":\"pread_sync\",\"queue_depth\":1,"
+                "\"overlap_ms\":0.0,\"direct_io\":%s,\"read_error\":%s}\n",
+                (unsigned long long)(m->cache.hits - hit0),
+                (unsigned long long)(m->cache.misses - miss0),
+                (unsigned long long)(m->cache.bytes_read - bytes0), route_ms,
+                io_ms, expert_ms, shared_ms, (pnow() - moe_t0) * 1000.0,
+                m->direct_io ? "true" : "false",
+                m->read_error ? "true" : "false");
+    }
 }
 
 /* ---- Attention Residuals (K3) ------------------------------------------
@@ -2815,6 +2867,7 @@ const float *waste_model_step(waste_model *m, int token, int pos, int *routed)
 {
     const waste_config *c = &m->cfg;
     const int hid = c->hidden;
+    m->trace_step = pos;
     {   /* see waste_model_prefill */
         const int cm = waste_model_ctx_max(m);
         if (cm && (pos < 0 || pos >= cm)) { m->ctx_full = 1; return NULL; }
@@ -2864,8 +2917,10 @@ const float *waste_model_step(waste_model *m, int token, int pos, int *routed)
 
         snprintf(b, sizeof b, "%smodel.layers.%d.input_layernorm.weight", c->prefix, L);
         waste_rmsnorm(norm, m->x, waste_find(m, b)->data, hid, c->eps);
+        const double att_t0 = m->trace ? pnow() : 0;
         if (c->kda_layer[L]) { PROF_START(P_KDA); kda_layer(m, L, norm, resid); PROF_END(P_KDA); }
         else { PROF_START(P_MLA); mla_layer(m, L, norm, resid, pos); PROF_END(P_MLA); }
+        m->trace_attention_ms = m->trace ? (pnow() - att_t0) * 1000.0 : 0;
 
         if (ares_on) {
             if (ps_live) for (int i = 0; i < hid; i++) ps[i] += resid[i];

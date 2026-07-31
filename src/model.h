@@ -162,6 +162,9 @@ typedef struct {
      * caught; `verify` adds the crc32 over the payload, which is the part
      * that costs, and it is off unless a caller asks — see waste.h. */
     int      read_error, bad_layer, bad_expert, verify;
+    FILE    *trace;                      /* optional decode-layer JSONL      */
+    int      trace_step;
+    double   trace_attention_ms;
 } waste_model;
 
 /* Everything the load needs that is not in the container. These are
@@ -180,6 +183,7 @@ typedef struct {
     int    n_threads;
     int    policy;
     int    direct_io;
+    const char *trace_path;
 } waste_load_opts;
 
 int  waste_model_load(waste_model *m, const char *dir, int kv_cap,

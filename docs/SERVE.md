@@ -243,11 +243,16 @@ python3 -m serve MODEL [options]
   --budget SIZE      hard RAM ceiling, e.g. 48G (0 = the engine chooses)
   --ctx N            context tokens
   --threads N        compute threads (0 = one per core)
+  --cpu-set SPEC     Linux CPUs, or `performance` for the fastest core class
   --cache {lfru,lru} expert-cache eviction policy
   --no-direct-io     keep the page cache in the way (the bypass is on)
   --vision           load the vision tower
   --verify           check every expert record's crc32 as it is read
   --usage PATH       learned hotlist (default <model>/usage.waste)
+  --trace-layers PATH
+                     decode-layer routing/cache/I/O/compute JSON Lines
+  --allow-concurrent-open
+                     opt out of the per-container process lock
   --max-tokens N     default cap when a request does not set one
   --no-thinking      answer without the think channel unless asked
   --allow-local-images

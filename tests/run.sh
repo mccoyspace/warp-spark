@@ -53,6 +53,18 @@ else
     exit 1
 fi
 
+head_ "host safety and placement"
+if ./test_lock "$MODEL" 2>/dev/null | grep -q '^PASS'; then
+    ok "same-process contexts share one lock; competing processes are refused"
+else
+    no "container process lock"
+fi
+if ./test_system "$TMP" 2>/dev/null | grep -q '^PASS'; then
+    ok "available-memory, cgroup-headroom and CPU-set helpers"
+else
+    no "host accounting and CPU placement"
+fi
+
 # ---------------------------------------------------------------- unit ----
 head_ "kernels vs the reference implementations"
 
@@ -393,7 +405,27 @@ def j(*a):
 
 plan, info = j("plan", sys.argv[1]), j("info", sys.argv[1])
 phys = os.sysconf("SC_PHYS_PAGES") * os.sysconf("SC_PAGE_SIZE")
-cap = phys - phys // 8
+reserve = phys // 8
+cap = phys - reserve
+if sys.platform.startswith("linux"):
+    try:
+        for line in open("/proc/meminfo"):
+            if line.startswith("MemAvailable:"):
+                available = int(line.split()[1]) * 1024
+                cap = min(cap, max(1, available - reserve))
+                break
+    except OSError:
+        pass
+    try:
+        rel = next(line.split("::", 1)[1].strip()
+                   for line in open("/proc/self/cgroup") if line.startswith("0::"))
+        root = "/sys/fs/cgroup" + rel
+        text = open(root + "/memory.max").read().strip()
+        if text != "max":
+            headroom = int(text) - int(open(root + "/memory.current").read())
+            cap = min(cap, max(1, headroom - reserve))
+    except (OSError, StopIteration, ValueError):
+        pass
 # what the engine actually holds: the plan's mandatory parts plus the
 # cache it really allocated, which is what `info` reports
 held = plan["floor_bytes"] - plan["min_expert_cache"] + info["expert_cache_bytes"]
@@ -487,6 +519,39 @@ if [ -d "$MODEL" ]; then
         ok "no --budget picks a ceiling the machine can hold ($out)"
     else
         no "default budget off the rule (${out:-no output})"
+    fi
+
+    TRACE="$TMP/layer-trace.jsonl"
+    TRACE_MODEL="$TMP/trace-tokenizer.waste"
+    if python3 tools/make_test_container.py --tokenizer "$TRACE_MODEL" >/dev/null 2>&1 &&
+       ./waste bench "$TRACE_MODEL" -n 1 --budget 64M --threads 1 \
+         --trace-layers "$TRACE" --json -q >/dev/null 2>&1 &&
+       python3 - "$TRACE" <<'PYTRACE'
+import json, sys
+rows = [json.loads(line) for line in open(sys.argv[1])]
+layers = [r for r in rows if r.get("event") == "decode_layer"]
+need = {"position", "layer", "attention_ms", "experts", "cache_hits",
+        "cache_misses", "bytes_read", "router_ms", "expert_io_ms",
+        "expert_compute_ms", "shared_compute_ms", "moe_total_ms",
+        "io_backend", "queue_depth", "overlap_ms", "direct_io"}
+raise SystemExit(0 if layers and need <= layers[0].keys() else 1)
+PYTRACE
+    then
+        ok "decode-layer JSONL trace has the v1 routing/cache/I/O/compute schema"
+    else
+        no "decode-layer trace schema"
+    fi
+    if [ "$(uname -s)" = Linux ]; then
+        printf 'MemTotal: 1024 kB\nMemAvailable: 1 kB\n' > "$TMP/low-meminfo"
+        pressure=$(WASTE_MEMINFO_PATH="$TMP/low-meminfo" \
+                   ./waste info "$MODEL" --json 2>&1 || true)
+        if printf '%s' "$pressure" | grep -q "not enough currently available memory"; then
+            ok "automatic budget refuses when current available memory cannot hold the floor"
+        else
+            no "automatic available-memory guard"
+        fi
+    else
+        sk "automatic available-memory guard" "Linux MemAvailable only"
     fi
     # A container from a future layout must be refused, not read against the
     # old rules — the field was written from the first converter and read by

@@ -70,6 +70,8 @@ typedef enum {
     WASTE_E_ARG = -5,
     WASTE_E_UNSUPPORTED = -6,  /* arch/quant combination not built in      */
     WASTE_E_CANCELLED = -7,    /* callback asked to stop                   */
+    WASTE_E_BUSY = -8,         /* another process has this container open */
+    WASTE_E_MEMORY = -9,       /* current available/cgroup RAM is too low  */
 } waste_status;
 
 /* Human-readable, static storage; never NULL. A coarse answer by design:
@@ -116,10 +118,11 @@ typedef struct {
      * 0 = the engine picks, and it picks conservatively: expert cache is
      * only useful in whole multiples of one token's working set, so it
      * starts from waste_memplan.recommended_bytes (floor + 3x that set)
-     * and steps down a whole multiple at a time until the total fits
-     * under 7/8 of physical RAM. It does not spend the remainder up to
-     * that ceiling: the last fraction buys a little hit rate and risks
-     * the OS paging the cache out, which costs far more than it gains.
+     * and steps down a whole multiple at a time until the total fits under
+     * the smallest of 7/8 physical RAM, Linux MemAvailable minus the same
+     * reserve, and finite cgroup headroom minus the reserve. It does not
+     * spend the remainder up to that ceiling: the last fraction buys a
+     * little hit rate and risks the OS paging the cache out.
      * When not even floor + 1x fits, it runs at floor_bytes.
      *
      * Loading fails with WASTE_E_RAM_BUDGET if the value given is below
@@ -185,6 +188,16 @@ typedef struct {
      * expert this container does not have are skipped, because it is one
      * of the few files the engine reads that nobody asked it to. */
     const char *usage_path;
+
+    /* One process at a time owns a container by default. Distinct contexts
+     * inside that process share the ownership; a second process receives
+     * WASTE_E_BUSY before allocating model memory. Set this only when the
+     * host deliberately accepts competing full-model loads. */
+    int allow_concurrent_open;
+
+    /* Optional JSON Lines trace for decode-layer routing, cache, expert I/O,
+     * expert compute and shared-expert compute. NULL disables it. */
+    const char *trace_path;
 } waste_cfg;
 
 /* Removed in 0.6.0, having never done anything: `io_threads` (there is no
@@ -393,6 +406,17 @@ waste_status waste_get_stats(const waste_ctx *ctx, waste_stats *out);
  * near this number is counterproductive: the OS pages out the engine's own
  * expert cache, and a hit then costs a page fault. */
 uint64_t waste_physical_ram(void);
+
+/* Linux reports the memory it can satisfy without swapping separately from
+ * physical RAM. The cgroup figure is 0 for an unlimited/unknown group. */
+uint64_t waste_available_ram(void);
+uint64_t waste_cgroup_available_ram(void);
+
+/* Apply a CPU set to the calling process before worker creation. `spec` is
+ * `performance`, `none`, or Linux cpulist syntax such as `5-9,15-19`.
+ * `resolved` receives the effective cpulist when supplied. */
+waste_status waste_set_cpu_affinity(const char *spec,
+                                    char *resolved, size_t resolved_cap);
 
 #ifdef __cplusplus
 }

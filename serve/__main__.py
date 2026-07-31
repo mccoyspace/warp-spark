@@ -101,6 +101,9 @@ examples:
     g.add_argument("--threads", type=bounded_int(0, (1 << 31) - 1),
                    default=0, metavar="N",
                    help="compute threads (0 = one per core)")
+    g.add_argument("--cpu-set", default=os.environ.get("WASTE_CPU_SET"),
+                   metavar="performance|LIST",
+                   help="Linux CPU placement, e.g. performance or 5-9,15-19")
     g.add_argument("--cache", choices=sorted(POLICIES), default="lfru")
     g.add_argument("--no-direct-io", action="store_true",
                    help="keep the page cache in the way. The bypass is on "
@@ -114,6 +117,10 @@ examples:
                         "since. Costs ~5%% on Kimi-Linear, ~1%% on K3")
     g.add_argument("--usage", default=None, metavar="PATH",
                    help="learned hotlist (default <model>/usage.waste)")
+    g.add_argument("--trace-layers", default=None, metavar="PATH",
+                   help="write decode-layer timing and cache JSON Lines")
+    g.add_argument("--allow-concurrent-open", action="store_true",
+                   help="permit another process to load the same container")
 
     s = ap.add_argument_group("serving")
     s.add_argument("--max-tokens", type=bounded_int(1, (1 << 32) - 1),
@@ -157,6 +164,11 @@ examples:
                 print(f"\n  this machine has {human(ram)}")
             return 0
 
+        if args.cpu_set:
+            from .engine import set_cpu_affinity
+            resolved = set_cpu_affinity(args.cpu_set)
+            print(f"CPU set  {resolved}")
+
         engine = Engine(
             str(model),
             ram_budget_bytes=args.budget,
@@ -166,7 +178,9 @@ examples:
             direct_io=not args.no_direct_io,
             vision=args.vision,
             verify_records=args.verify,
-            usage_path=args.usage)
+            usage_path=args.usage,
+            allow_concurrent_open=args.allow_concurrent_open,
+            trace_path=args.trace_layers)
     except EngineError as e:
         print(f"{e}", file=sys.stderr)
         return 1

@@ -113,9 +113,12 @@ largest that fits: `floor + 3x`, else `2x`, else `1x`, else the floor.
 K3 lands on `floor + 1x` here — a 46.24 GB budget, 17.56 GB of cache, and
 the top of the measured curve with no flag given. A 128 GB machine still
 gets the full `3x`, and a model whose recommendation already fits, like
-Kimi-Linear, is unaffected. When even the floor is above the cap the
-engine runs at the floor and says so on stderr, because the alternative
-is refusing to open a model that does technically fit.
+Kimi-Linear, is unaffected. On Linux the cap also accounts for current
+`MemAvailable` and finite cgroup-v2 headroom, each minus the OS reserve.
+When even the floor is above that current cap, automatic sizing returns
+`WASTE_E_MEMORY` before a model-sized allocation. An explicit nonzero budget
+remains the caller's hard contract and is honored, with a warning when it is
+above the current safe ceiling.
 
 ### What the floor is made of
 
