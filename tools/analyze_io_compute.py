@@ -40,6 +40,35 @@ METRICS = (
     "moe_total_ms",
     "other_ms",
 )
+PERF_EVENTS = {
+    "cycles": "armv8_pmuv3_1/cpu_cycles/u",
+    "instructions": "armv8_pmuv3_1/inst_retired/u",
+    "backend_stalls": "armv8_pmuv3_1/stall_backend/u",
+    "memory_stalls": "armv8_pmuv3_1/stall_backend_mem/u",
+    "l1d_refills": "armv8_pmuv3_1/l1d_cache_refill/u",
+    "l2d_refills": "armv8_pmuv3_1/l2d_cache_refill/u",
+    "task_clock_ns": "task-clock",
+    "context_switches": "context-switches",
+    "sched_switches": "sched:sched_switch",
+    "sched_wakeup": "sched:sched_wakeup",
+    "sched_waking": "sched:sched_waking",
+    "futex_calls": "syscalls:sys_enter_futex",
+    "pread64_calls": "syscalls:sys_enter_pread64",
+    "io_uring_enter_calls": "syscalls:sys_enter_io_uring_enter",
+}
+PERF_DERIVED = (
+    "wall_seconds",
+    "cycles",
+    "instructions",
+    "task_clock_ns",
+    "ipc",
+    "ghz_proxy",
+    "active_cpus",
+    "backend_stall_percent",
+    "memory_stall_percent",
+    "l1d_refills_per_kinst",
+    "l2d_refills_per_kinst",
+)
 
 # Two-sided 95% Student-t critical values.  Campaigns normally have six
 # blocks, but retaining a small table makes resumed/extended campaigns useful.
@@ -103,6 +132,79 @@ def distribution(values: list[float]) -> dict[str, float | int]:
 
 def read_jsonl(path: Path) -> list[dict[str, Any]]:
     return [json.loads(line) for line in path.read_text().splitlines() if line]
+
+
+def read_perf(path: Path) -> tuple[dict[str, list[tuple[float, float]]],
+                                   dict[str, float]]:
+    """Parse perf stat -I -x output into intervals and exact summaries."""
+    intervals: dict[str, list[tuple[float, float]]] = {}
+    summaries: dict[str, float] = {}
+    for line in path.read_text().splitlines():
+        if not line or line.startswith("#"):
+            continue
+        fields = line.split("\t")
+        if len(fields) < 4:
+            continue
+        stamp, value, event = fields[0], fields[1], fields[3]
+        try:
+            parsed = float(value)
+        except ValueError:
+            continue
+        if stamp == "summary":
+            summaries[event] = parsed
+            continue
+        try:
+            end = float(stamp)
+        except ValueError:
+            continue
+        intervals.setdefault(event, []).append((end, parsed))
+    return intervals, summaries
+
+
+def integrate_perf(intervals: dict[str, list[tuple[float, float]]],
+                   start: float, end: float) -> dict[str, float]:
+    """Boundary-weight perf intervals into a monotonic phase window.
+
+    The runner records monotonic boundaries immediately around the perf
+    subprocess.  Counts in either boundary's at-most-500 ms interval are
+    prorated by temporal overlap, which assumes events are uniform inside
+    that interval.  Interior intervals are retained exactly.
+    """
+    totals: dict[str, float] = {}
+    for event, samples in intervals.items():
+        previous = 0.0
+        total = 0.0
+        for interval_end, value in samples:
+            duration = interval_end - previous
+            overlap = max(0.0, min(interval_end, end) - max(previous, start))
+            if duration > 0.0 and overlap > 0.0:
+                total += value * overlap / duration
+            previous = interval_end
+        totals[event] = total
+    return totals
+
+
+def derive_perf(events: dict[str, float], wall_seconds: float) -> dict[str, float]:
+    row = {name: events.get(event, 0.0) for name, event in PERF_EVENTS.items()}
+    cycles = row["cycles"]
+    instructions = row["instructions"]
+    task_clock_ns = row["task_clock_ns"]
+    row.update({
+        "wall_seconds": wall_seconds,
+        "ipc": instructions / cycles if cycles else 0.0,
+        # cycles / task-clock nanoseconds is numerically GHz.
+        "ghz_proxy": cycles / task_clock_ns if task_clock_ns else 0.0,
+        "active_cpus": task_clock_ns / 1e9 / wall_seconds if wall_seconds else 0.0,
+        "backend_stall_percent": 100.0 * row["backend_stalls"] / cycles
+        if cycles else 0.0,
+        "memory_stall_percent": 100.0 * row["memory_stalls"] / cycles
+        if cycles else 0.0,
+        "l1d_refills_per_kinst": 1000.0 * row["l1d_refills"] / instructions
+        if instructions else 0.0,
+        "l2d_refills_per_kinst": 1000.0 * row["l2d_refills"] / instructions
+        if instructions else 0.0,
+    })
+    return row
 
 
 def layer_signature(rows: Iterable[dict[str, Any]]) -> str:
@@ -194,6 +296,8 @@ def main() -> int:
     by_treatment: dict[str, list[dict[str, Any]]] = {key: [] for key in TREATMENT_ORDER}
     by_block: dict[int, dict[str, dict[str, Any]]] = {}
     trace_rows: dict[str, list[dict[str, Any]]] = {}
+    perf_rows: dict[str, dict[str, float]] = {}
+    perf_summaries: dict[str, dict[str, float]] = {}
     for run in valid:
         treatment = run["treatment"]
         by_treatment.setdefault(treatment, []).append(run)
@@ -201,6 +305,15 @@ def main() -> int:
         trace = read_jsonl(campaign / run["run_id"] / "trace.jsonl")
         trace_rows[run["run_id"]] = trace
         run["layer_signature_sha256"] = layer_signature(trace)
+        intervals, perf_summary = read_perf(campaign / run["run_id"] / "perf.tsv")
+        phase_start = ((int(run["trace"]["prefill_end_monotonic_ns"])
+                        - int(run["started_monotonic_ns"])) / 1e9)
+        phase_end = ((int(run["trace"]["decode_end_monotonic_ns"])
+                      - int(run["started_monotonic_ns"])) / 1e9)
+        perf_rows[run["run_id"]] = derive_perf(
+            integrate_perf(intervals, phase_start, phase_end),
+            phase_end - phase_start)
+        perf_summaries[run["run_id"]] = perf_summary
     for treatment in by_treatment:
         by_treatment[treatment].sort(key=lambda row: int(row["block"]))
 
@@ -244,6 +357,40 @@ def main() -> int:
             metric: distribution([float(row["trace"]["decode"][metric]) for row in rows])
             for metric in ("total_ms", "expert_io_ms", "expert_compute_ms")
         }
+
+    perf_by_mode: dict[str, Any] = {}
+    for treatment in TREATMENT_ORDER:
+        group = by_treatment[treatment]
+        derived = [perf_rows[run["run_id"]] for run in group]
+        sums = {name: sum(float(row[name]) for row in derived)
+                for name in PERF_EVENTS}
+        pooled_events = {event: sums[name] for name, event in PERF_EVENTS.items()}
+        pooled = derive_perf(
+            pooled_events, sum(float(row["wall_seconds"]) for row in derived))
+        pooled.update({
+            "context_switches_per_wall_second":
+                sums["context_switches"] / pooled["wall_seconds"],
+            "futex_calls_per_wall_second": sums["futex_calls"] / pooled["wall_seconds"],
+            "whole_process_instructions": sum(
+                perf_summaries[run["run_id"]].get(PERF_EVENTS["instructions"], 0.0)
+                for run in group),
+        })
+        perf_by_mode[treatment] = {
+            "pooled": pooled,
+            "per_run": {name: distribution([float(row[name]) for row in derived])
+                        for name in PERF_DERIVED},
+        }
+
+    perf_paired: dict[str, Any] = {}
+    for numerator, denominator in COMPARISONS:
+        comparison: dict[str, Any] = {}
+        for metric in PERF_DERIVED:
+            num = [float(perf_rows[by_block[block][numerator]["run_id"]][metric])
+                   for block in blocks]
+            den = [float(perf_rows[by_block[block][denominator]["run_id"]][metric])
+                   for block in blocks]
+            comparison[metric] = ratio_estimate(num, den)
+        perf_paired[f"{numerator}_vs_{denominator}"] = comparison
 
     # Layer-stratified routed compute.  Cache/miss signatures must match before
     # a mode comparison is meaningful, so validate each block/key explicitly.
@@ -304,6 +451,7 @@ def main() -> int:
 
     prefill_totals: list[dict[str, Any]] = []
     timing_rows: list[dict[str, Any]] = []
+    perf_csv_rows: list[dict[str, Any]] = []
     for run in sorted(valid, key=lambda row: (int(row["block"]), int(row["position"]))):
         trace = trace_rows[run["run_id"]]
         prefill = next(row for row in trace if row.get("event") == "prefill_chunk")
@@ -327,6 +475,15 @@ def main() -> int:
             "route_sha256": run["trace"]["route_sha256"],
             "usage_sha256_after": run["usage_sha256_after"],
             "layer_signature_sha256": run["layer_signature_sha256"],
+        })
+        perf_csv_rows.append({
+            "run_id": run["run_id"],
+            "block": run["block"],
+            "position": run["position"],
+            "treatment": run["treatment"],
+            **perf_rows[run["run_id"]],
+            "whole_process_instructions": perf_summaries[run["run_id"]].get(
+                PERF_EVENTS["instructions"]),
         })
 
     determinism = {
@@ -363,10 +520,17 @@ def main() -> int:
         "paired": paired,
         "position": positions,
         "miss_strata": strata_rows,
+        "perf_decode": {
+            "method": "500 ms perf intervals prorated at monotonic decode boundaries",
+            "boundary_interval_seconds": 0.5,
+            "per_mode": perf_by_mode,
+            "paired": perf_paired,
+        },
     }
     (out / "summary.json").write_text(json.dumps(summary, indent=2, sort_keys=True) + "\n")
     write_csv(out / "runs.csv", timing_rows, list(timing_rows[0]))
     write_csv(out / "miss-strata.csv", strata_rows, list(strata_rows[0]))
+    write_csv(out / "perf-decode.csv", perf_csv_rows, list(perf_csv_rows[0]))
 
     print(f"valid runs: {len(valid)}/{len(runs)}; complete blocks: {len(blocks)}")
     print("\nDecode timing medians (ms)")
@@ -387,8 +551,8 @@ def main() -> int:
             lo, hi = estimate["percent_change_ci95"]
             cells.append(f"{estimate['percent_change']:+.2f}% [{lo:+.2f}, {hi:+.2f}]")
         print(f"{numerator}/{denominator}\t" + "\t".join(cells))
-    print(f"\nWrote {out / 'summary.json'}, {out / 'runs.csv'}, and "
-          f"{out / 'miss-strata.csv'}")
+    print(f"\nWrote {out / 'summary.json'}, {out / 'runs.csv'}, "
+          f"{out / 'miss-strata.csv'}, and {out / 'perf-decode.csv'}")
     return 0
 
 
