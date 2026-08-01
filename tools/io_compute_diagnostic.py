@@ -53,7 +53,10 @@ def sha256(path: Path) -> str:
 def read_text(path: Path) -> str | None:
     try:
         return path.read_text().strip()
-    except (OSError, UnicodeError):
+    # Some Arm CPPC sysfs attributes return EAGAIN while a core is idle.
+    # pathlib normally exposes that as OSError, but Python's text wrapper
+    # can surface an empty kernel read as TypeError during decoding.
+    except (OSError, UnicodeError, TypeError):
         return None
 
 
