@@ -512,7 +512,8 @@ def engine_extra(stats: dict, *, ms: float) -> dict:
         "expert_hit_rate": (stats["experts_hit"] / accesses) if accesses else None,
         "bytes_read": stats["bytes_read"],
         "direct_io": bool(stats["direct_io"]),
-        "io_backend": "io_uring" if stats.get("io_backend") else "pread_sync",
+        "io_backend": {0: "pread_sync", 1: "io_uring", 2: "pread_batch"}.get(
+            stats.get("io_backend"), "unknown"),
         "io_queue_depth": stats.get("io_queue_depth", 1),
         "io_fallback": bool(stats.get("io_fallback", 0)),
         "ms": round(ms, 1),

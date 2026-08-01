@@ -51,7 +51,9 @@ WASTE_E_MEMORY = -9
 # listed there and never implemented, so it selected LFRU like everything
 # else that was not 1.
 CACHE_LFRU, CACHE_LRU = 0, 1
-IO_PREAD, IO_URING = 0, 1
+IO_PREAD, IO_URING, IO_PREAD_BATCH = 0, 1, 2
+IO_BACKENDS = {"pread": IO_PREAD, "io_uring": IO_URING,
+               "pread_batch": IO_PREAD_BATCH}
 
 
 class EngineError(RuntimeError):
@@ -413,8 +415,9 @@ class Engine:
         ctx_tokens = _bounded_int("ctx_tokens", ctx_tokens, 0, (1 << 32) - 1)
         n_threads = _bounded_int("n_threads", n_threads, 0, (1 << 31) - 1)
         io_queue_depth = _bounded_int("io_queue_depth", io_queue_depth, 1, 64)
-        if io_backend not in ("pread", "io_uring"):
-            raise ValueError("io_backend must be 'pread' or 'io_uring'")
+        if io_backend not in IO_BACKENDS:
+            raise ValueError(
+                "io_backend must be 'pread', 'pread_batch', or 'io_uring'")
         self.lib = _lib()
         self.model_path = str(model_path)
         self._lock = threading.RLock()
@@ -437,7 +440,7 @@ class Engine:
         cfg.allow_concurrent_open = 1 if allow_concurrent_open else 0
         self._trace_path = trace_path.encode() if trace_path else None
         cfg.trace_path = self._trace_path
-        cfg.io_backend = IO_URING if io_backend == "io_uring" else IO_PREAD
+        cfg.io_backend = IO_BACKENDS[io_backend]
         cfg.io_queue_depth = io_queue_depth
 
         st = self.lib.waste_open(self.model_path.encode(), C.byref(cfg),

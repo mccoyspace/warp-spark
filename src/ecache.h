@@ -73,7 +73,7 @@ typedef int (*waste_fetch_fn)(void *user, int layer, int expert, uint8_t *dst);
 const uint8_t *waste_ecache_get(waste_ecache *c, int layer, int expert,
                                 waste_fetch_fn fetch, void *user);
 
-/* Batch form used by the Linux async backend. All requests name one layer,
+/* Batch form used by the batched read backends. All requests name one layer,
  * as one router produces them. Existing hits and newly reserved miss slots
  * are pinned until fetch_many completes, so another miss in the same batch
  * cannot overwrite a record whose pointer the caller has not consumed yet.

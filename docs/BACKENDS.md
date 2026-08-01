@@ -123,6 +123,13 @@ surfacing that fact in `waste_stats`. QD4 on the Acer GN100 improved the K3
 16-token median by 14.4% and the 64-token generation time by 15.1%; it is an
 opt-in measured backend rather than a portable assumption.
 
+`pread_batch` is the causal control for that result. It uses the same batched
+cache reservation and unchanged expert order, but executes one synchronous
+`pread` at a time and finishes the layer's reads before compute. Its physical
+queue depth is always one. A speedup over interleaved `pread` therefore comes
+from I/O/compute phase separation; the remaining QD4 advantage comes from
+concurrent storage requests.
+
 ## Status
 
 Implemented and verified today:

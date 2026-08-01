@@ -50,6 +50,10 @@ Linux, `WASTE_IO_URING` with a depth from 2 through 64 uses a raw, bounded
 `waste_stats`. The CLI equivalent is `--io-queue-depth 4` (or explicit
 `--io-backend io_uring --io-queue-depth 4`). It batches only experts already
 selected by the router; it does not speculate or reorder expert arithmetic.
+`WASTE_IO_PREAD_BATCH` is a diagnostic control: it uses physical queue depth
+one but stages all exact routed-expert reads before the unchanged decode
+compute loop. Its CLI spelling is
+`--io-backend pread_batch --io-queue-depth 1`.
 
 ```
 $ waste plan kimi-linear.waste --budget 4G

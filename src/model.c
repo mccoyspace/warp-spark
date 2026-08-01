@@ -11,6 +11,7 @@
 
 #define _GNU_SOURCE
 #include "model.h"
+#include "waste.h"
 
 #include <limits.h>
 #include <math.h>
@@ -45,6 +46,19 @@ static double pnow(void)
 {
     struct timespec t; clock_gettime(CLOCK_MONOTONIC, &t);
     return t.tv_sec + t.tv_nsec / 1e9;
+}
+
+static uint64_t pnow_ns(void)
+{
+    struct timespec t; clock_gettime(CLOCK_MONOTONIC, &t);
+    return (uint64_t)t.tv_sec * 1000000000ULL + (uint64_t)t.tv_nsec;
+}
+
+static const char *io_backend_name(int backend)
+{
+    if (backend == WASTE_IO_URING) return "io_uring";
+    if (backend == WASTE_IO_PREAD_BATCH) return "pread_batch";
+    return "pread_sync";
 }
 #define PROF_START(b) double _t##b = prof_on ? pnow() : 0
 #define PROF_END(b)   do { if (prof_on) { pthread_mutex_lock(&prof_mu); \
@@ -869,10 +883,14 @@ int waste_model_load(waste_model *m, const char *dir, int kv_cap,
     m->want_direct = opt->direct_io;
     m->io_backend = 0;                 /* pread */
     m->io_queue_depth = 1;
-    if (opt->io_backend == 1 && opt->io_queue_depth > 1) {
+    if (opt->io_backend == WASTE_IO_PREAD_BATCH) {
+        m->io_backend = WASTE_IO_PREAD_BATCH;
+        m->io_queue_depth = 1;
+    } else if (opt->io_backend == WASTE_IO_URING &&
+               opt->io_queue_depth > 1) {
         int qd = opt->io_queue_depth > 64 ? 64 : opt->io_queue_depth;
         if (waste_io_ring_init(&m->io_ring, qd) == 0) {
-            m->io_backend = 1;
+            m->io_backend = WASTE_IO_URING;
             m->io_queue_depth = m->io_ring.depth;
         } else {
             m->io_fallback = 1;
@@ -885,9 +903,10 @@ int waste_model_load(waste_model *m, const char *dir, int kv_cap,
         fprintf(m->trace,
                 "{\"schema\":\"waste.layer_trace.v2\",\"event\":\"meta\","
                 "\"io_backend\":\"%s\",\"queue_depth\":%d,"
-                "\"io_fallback\":%s}\n",
-                m->io_backend ? "io_uring" : "pread_sync",
-                m->io_queue_depth, m->io_fallback ? "true" : "false");
+                "\"io_fallback\":%s,\"start_monotonic_ns\":%llu}\n",
+                io_backend_name(m->io_backend),
+                m->io_queue_depth, m->io_fallback ? "true" : "false",
+                (unsigned long long)pnow_ns());
     }
     pthread_once(&model_opts_once, model_opts_init);
     m->kv_cap = kv_cap;
@@ -1519,8 +1538,21 @@ static int bank_fetch_many(void *user, int n, const int *layers,
         lens[i] = (size_t)b->rec_bytes;
     }
     const double t0 = pnow();
-    const int transport = waste_io_ring_read_many(
-        &m->io_ring, n, fds, (void *const *)dst, lens, offs, results);
+    int transport = 0;
+    if (m->io_backend == WASTE_IO_URING) {
+        transport = waste_io_ring_read_many(
+            &m->io_ring, n, fds, (void *const *)dst, lens, offs, results);
+    } else if (m->io_backend == WASTE_IO_PREAD_BATCH) {
+        /* The diagnostic control deliberately finishes every ordinary
+         * pread before returning to the unchanged expert loop. Do not stop
+         * at the first short/error result: io_uring has already submitted
+         * the complete batch, and validating the same request set keeps
+         * error ordering and cache cleanup comparable. */
+        for (int i = 0; i < n; i++)
+            results[i] = waste_pread(fds[i], dst[i], lens[i], offs[i]);
+    } else {
+        transport = -1;
+    }
     m->io_seconds += pnow() - t0;
     if (transport) {
         if (!m->read_error) {
@@ -1549,7 +1581,10 @@ static const uint8_t *read_expert(waste_model *m, int L, int eid)
 static int read_experts_many(waste_model *m, int L, const int *eid, int n,
                              const uint8_t **out)
 {
-    if (!m->io_backend || m->cache.n_slots <= 0 || n <= 1) return -1;
+    if ((m->io_backend != WASTE_IO_URING &&
+         m->io_backend != WASTE_IO_PREAD_BATCH) ||
+        m->cache.n_slots <= 0 || n <= 1)
+        return -1;
     return waste_ecache_get_many(&m->cache, L, eid, n, bank_fetch_many, m,
                                  out);
 }
@@ -2076,7 +2111,9 @@ static void moe_layer(waste_model *m, int L, const float *in, float *out, int *r
     float *lut_gate = m->lut, *lut_up = lut_gate + lut_sz, *lut_down = lut_up + lut_sz;
     int lut_ready = 0;
     const uint8_t *records[64] = { 0 };
-    const int batched = m->io_backend && m->cache.n_slots > 0 && K > 1;
+    const int batched = (m->io_backend == WASTE_IO_URING ||
+                         m->io_backend == WASTE_IO_PREAD_BATCH) &&
+                        m->cache.n_slots > 0 && K > 1;
     if (batched) {
         const double io_t0 = trace_on ? pnow() : 0;
         PROF_START(P_EDEQ);
@@ -2165,14 +2202,16 @@ static void moe_layer(waste_model *m, int L, const float *in, float *out, int *r
                 "\"expert_io_ms\":%.3f,\"expert_compute_ms\":%.3f,"
                 "\"shared_compute_ms\":%.3f,\"moe_total_ms\":%.3f,"
                 "\"io_backend\":\"%s\",\"queue_depth\":%d,"
-                "\"overlap_ms\":0.0,\"direct_io\":%s,\"read_error\":%s}\n",
+                "\"overlap_ms\":0.0,\"direct_io\":%s,\"read_error\":%s,"
+                "\"end_monotonic_ns\":%llu}\n",
                 (unsigned long long)(m->cache.hits - hit0),
                 (unsigned long long)(m->cache.misses - miss0),
                 (unsigned long long)(m->cache.bytes_read - bytes0), route_ms,
                 io_ms, expert_ms, shared_ms, moe_ms,
-                m->io_backend ? "io_uring" : "pread_sync", m->io_queue_depth,
+                io_backend_name(m->io_backend), m->io_queue_depth,
                 m->direct_io ? "true" : "false",
-                m->read_error ? "true" : "false");
+                m->read_error ? "true" : "false",
+                (unsigned long long)pnow_ns());
     }
 }
 
@@ -2845,16 +2884,18 @@ static void moe_chunk(waste_model *m, int L, const float *in, float *out, int nT
                 "\"expert_io_ms\":%.3f,\"expert_compute_ms\":%.3f,"
                 "\"shared_compute_ms\":%.3f,\"moe_total_ms\":%.3f,"
                 "\"io_backend\":\"%s\",\"queue_depth\":%d,"
-                "\"direct_io\":%s,\"read_error\":%s}\n",
+                "\"direct_io\":%s,\"read_error\":%s,"
+                "\"end_monotonic_ns\":%llu}\n",
                 m->trace_step, nT, L, c->kda_layer[L] ? "kda" : "mla",
                 m->trace_attention_ms, K, unique_experts,
                 (unsigned long long)(m->cache.hits - hit0),
                 (unsigned long long)(m->cache.misses - miss0),
                 (unsigned long long)(m->cache.bytes_read - bytes0), route_ms,
                 io_ms, expert_ms, shared_ms, moe_ms,
-                m->io_backend ? "io_uring" : "pread_sync", m->io_queue_depth,
+                io_backend_name(m->io_backend), m->io_queue_depth,
                 m->direct_io ? "true" : "false",
-                m->read_error ? "true" : "false");
+                m->read_error ? "true" : "false",
+                (unsigned long long)pnow_ns());
     }
 }
 
@@ -3042,7 +3083,8 @@ const float *waste_model_prefill(waste_model *m, const int *tokens, int n,
                 "\"moe_total_ms\":%.3f,\"other_ms\":%.3f,"
                 "\"cache_hits\":%llu,\"cache_misses\":%llu,"
                 "\"bytes_read\":%llu,\"io_backend\":\"%s\","
-                "\"queue_depth\":%d,\"direct_io\":%s,\"read_error\":%s}\n",
+                "\"queue_depth\":%d,\"direct_io\":%s,\"read_error\":%s,"
+                "\"end_monotonic_ns\":%llu}\n",
                 pos0, pos0 + n - 1, n, total_ms,
                 m->trace_attention_sum_ms, m->trace_router_sum_ms,
                 m->trace_io_sum_ms, m->trace_expert_sum_ms,
@@ -3050,9 +3092,10 @@ const float *waste_model_prefill(waste_model *m, const int *tokens, int n,
                 (unsigned long long)(m->cache.hits - trace_h0),
                 (unsigned long long)(m->cache.misses - trace_m0),
                 (unsigned long long)(m->cache.bytes_read - trace_b0),
-                m->io_backend ? "io_uring" : "pread_sync", m->io_queue_depth,
+                io_backend_name(m->io_backend), m->io_queue_depth,
                 m->direct_io ? "true" : "false",
-                m->read_error ? "true" : "false");
+                m->read_error ? "true" : "false",
+                (unsigned long long)pnow_ns());
     }
     return m->read_error ? NULL : m->logits;
 }
@@ -3188,7 +3231,8 @@ const float *waste_model_step(waste_model *m, int token, int pos, int *routed)
                 "\"moe_total_ms\":%.3f,\"other_ms\":%.3f,"
                 "\"cache_hits\":%llu,\"cache_misses\":%llu,"
                 "\"bytes_read\":%llu,\"io_backend\":\"%s\","
-                "\"queue_depth\":%d,\"direct_io\":%s,\"read_error\":%s}\n",
+                "\"queue_depth\":%d,\"direct_io\":%s,\"read_error\":%s,"
+                "\"end_monotonic_ns\":%llu}\n",
                 pos, total_ms, m->trace_attention_sum_ms,
                 m->trace_router_sum_ms, m->trace_io_sum_ms,
                 m->trace_expert_sum_ms, m->trace_shared_sum_ms,
@@ -3196,9 +3240,10 @@ const float *waste_model_step(waste_model *m, int token, int pos, int *routed)
                 (unsigned long long)(m->cache.hits - trace_h0),
                 (unsigned long long)(m->cache.misses - trace_m0),
                 (unsigned long long)(m->cache.bytes_read - trace_b0),
-                m->io_backend ? "io_uring" : "pread_sync", m->io_queue_depth,
+                io_backend_name(m->io_backend), m->io_queue_depth,
                 m->direct_io ? "true" : "false",
-                m->read_error ? "true" : "false");
+                m->read_error ? "true" : "false",
+                (unsigned long long)pnow_ns());
     }
     free(resid);
     free(norm);

@@ -563,6 +563,36 @@ PYTRACE
     else
         no "decode-layer trace schema"
     fi
+    BATCH_TRACE="$TMP/layer-trace-pread-batch.jsonl"
+    BATCH_JSON="$TMP/pread-batch.json"
+    if ./waste bench "$TRACE_MODEL" -n 1 --budget 64M --threads 1 \
+         --io-backend pread_batch --io-queue-depth 1 \
+         --trace-layers "$BATCH_TRACE" --json -q > "$BATCH_JSON" 2>/dev/null &&
+       python3 - "$BATCH_TRACE" "$BATCH_JSON" <<'PYBATCH'
+import json, sys
+rows = [json.loads(line) for line in open(sys.argv[1])]
+result = next(json.loads(line) for line in open(sys.argv[2])
+              if line.startswith("{"))
+valid = (rows and
+         all(r.get("io_backend") == "pread_batch" for r in rows) and
+         all(r.get("queue_depth") == 1 for r in rows) and
+         rows[0].get("io_fallback") is False and
+         result.get("io_backend") == "pread_batch" and
+         result.get("io_queue_depth") == 1 and
+         result.get("io_fallback") is False)
+raise SystemExit(0 if valid else 1)
+PYBATCH
+    then
+        ok "batched pread is distinct, synchronous-QD1 and observable"
+    else
+        no "batched pread backend identity"
+    fi
+    if ./waste bench "$TRACE_MODEL" -n 1 --budget 64M --threads 1 \
+         --io-backend pread_batch --io-queue-depth 2 -q >/dev/null 2>&1; then
+        no "batched pread accepted a physical queue depth above one"
+    else
+        ok "batched pread refuses a queue depth above one"
+    fi
     if [ "$(uname -s)" = Linux ]; then
         printf 'MemTotal: 1024 kB\nMemAvailable: 1 kB\n' > "$TMP/low-meminfo"
         pressure=$(WASTE_MEMINFO_PATH="$TMP/low-meminfo" \

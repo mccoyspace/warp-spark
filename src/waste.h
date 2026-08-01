@@ -113,8 +113,9 @@ typedef enum {
 } waste_cache_policy;
 
 typedef enum {
-    WASTE_IO_PREAD = 0,       /* synchronous positional reads (default)   */
+    WASTE_IO_PREAD = 0,       /* interleaved synchronous pread (default)  */
     WASTE_IO_URING = 1,       /* Linux io_uring, synchronous fallback     */
+    WASTE_IO_PREAD_BATCH = 2, /* sequential preads staged before compute  */
 } waste_io_backend;
 
 typedef struct {
@@ -206,7 +207,9 @@ typedef struct {
 
     /* Expert-read transport. io_uring is Linux-only and intentionally
      * opt-in until a host measures it; setup failure falls back to pread.
-     * Queue depth is bounded to 1..64, with 1 always selecting pread. */
+     * pread_batch is a diagnostic ablation: during decode it reserves the
+     * complete routed set and performs ordinary preads sequentially before
+     * any expert arithmetic. Its queue depth must remain one. */
     waste_io_backend io_backend;
     int io_queue_depth;
 } waste_cfg;
@@ -410,7 +413,7 @@ typedef struct {
      * numbers do not transfer to a machine that cannot cache the model. */
     int      direct_io;
     waste_io_backend io_backend; /* transport actually in use             */
-    int      io_queue_depth;     /* 1 for pread, requested depth for ring */
+    int      io_queue_depth;     /* 1 for pread modes, ring depth otherwise */
     int      io_fallback;        /* requested ring but setup was refused  */
 } waste_stats;
 

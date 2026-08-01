@@ -103,7 +103,8 @@ def main() -> int:
     ap.add_argument("--budget", type=int, required=True)
     ap.add_argument("--threads", type=int, default=8)
     ap.add_argument("--cpu-set", default="performance")
-    ap.add_argument("--io-backend", choices=("pread", "io_uring"),
+    ap.add_argument("--io-backend",
+                    choices=("pread", "pread_batch", "io_uring"),
                     default="pread")
     ap.add_argument("--io-queue-depth", type=int, default=1)
     ap.add_argument("--tokens", type=int, default=16)

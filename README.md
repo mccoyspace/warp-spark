@@ -137,6 +137,12 @@ per matrix. That is a `pread` by default; Linux can submit several already
 selected records through a bounded raw `io_uring` with
 `--io-queue-depth 4`. The arithmetic was never the bottleneck.
 
+For measurement, `--io-backend pread_batch --io-queue-depth 1` reserves a
+decoded layer's routed experts together but reads every miss with sequential
+`pread` before compute begins. It is an ablation backend, not a performance
+recommendation: comparing it with ordinary interleaved `pread` separates the
+effect of uninterrupted compute from the ring's storage concurrency.
+
 Reads bypass the page cache (`F_NOCACHE` on macOS, `O_DIRECT` on Linux,
 `FILE_FLAG_NO_BUFFERING` on Windows). That is deliberate: with a container
 smaller than RAM the kernel would cache everything, and the hit rates

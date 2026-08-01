@@ -452,7 +452,11 @@ waste_status waste_open(const char *model_path, const waste_cfg *cfg_in,
     if (!cfg.ctx_tokens) cfg.ctx_tokens = 4096;
     if (!cfg.io_queue_depth) cfg.io_queue_depth = 1;
     if (cfg.io_queue_depth < 1 || cfg.io_queue_depth > 64 ||
-        (cfg.io_backend != WASTE_IO_PREAD && cfg.io_backend != WASTE_IO_URING))
+        (cfg.io_backend != WASTE_IO_PREAD &&
+         cfg.io_backend != WASTE_IO_URING &&
+         cfg.io_backend != WASTE_IO_PREAD_BATCH) ||
+        (cfg.io_backend == WASTE_IO_PREAD_BATCH &&
+         cfg.io_queue_depth != 1))
         return WASTE_E_ARG;
 
     waste_ctx *c = (waste_ctx *)calloc(1, sizeof *c);

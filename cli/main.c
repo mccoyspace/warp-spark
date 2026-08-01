@@ -100,6 +100,13 @@ static void params_human(uint64_t n, char *out, size_t cap)
     else snprintf(out, cap, "%.2f B", (double)n / 1e9);
 }
 
+static const char *io_backend_name(waste_io_backend backend)
+{
+    if (backend == WASTE_IO_URING) return "io_uring";
+    if (backend == WASTE_IO_PREAD_BATCH) return "pread_batch";
+    return "pread_sync";
+}
+
 /* ---- shared option parsing --------------------------------------------- */
 
 #define MAX_POS 2
@@ -297,6 +304,8 @@ static waste_status open_model(const char *path, const opts *o, waste_ctx **ctx)
         cfg.io_backend = o->io_queue_depth > 1 ? WASTE_IO_URING : WASTE_IO_PREAD;
     else if (!strcmp(o->io_backend, "pread")) cfg.io_backend = WASTE_IO_PREAD;
     else if (!strcmp(o->io_backend, "io_uring")) cfg.io_backend = WASTE_IO_URING;
+    else if (!strcmp(o->io_backend, "pread_batch"))
+        cfg.io_backend = WASTE_IO_PREAD_BATCH;
     else return WASTE_E_ARG;
     return waste_open(path, &cfg, ctx);
 }
@@ -1038,7 +1047,7 @@ static int cmd_bench(int argc, char **argv)
                (unsigned long long)s.experts_missed,
                (unsigned long long)s.bytes_read,
                s.direct_io ? "true" : "false",
-               s.io_backend == WASTE_IO_URING ? "io_uring" : "pread_sync",
+               io_backend_name(s.io_backend),
                s.io_queue_depth, s.io_fallback ? "true" : "false");
         waste_close(c);
         return 0;
@@ -1048,7 +1057,7 @@ static int cmd_bench(int argc, char **argv)
         printf("  note      page cache not bypassed on this filesystem — the hit\n"
                "            rate below is partly the kernel's, not the engine's\n");
     printf("  I/O       %s, queue depth %d%s\n",
-           s.io_backend == WASTE_IO_URING ? "io_uring" : "pread",
+           io_backend_name(s.io_backend),
            s.io_queue_depth, s.io_fallback ? " (ring setup fell back)" : "");
     printf("  experts   %llu hit / %llu miss = %.1f%% hit\n",
            (unsigned long long)s.experts_hit, (unsigned long long)s.experts_missed,
@@ -1225,7 +1234,8 @@ int main(int argc, char **argv)
                "options: --budget 8G  --ctx N  -n N  --temp F  --top-p F\n"
                "         --top-k N  --seed N  --threads N  --stop STR\n"
                "         --cpu-set performance|LIST  --trace-layers PATH\n"
-               "         --io-backend pread|io_uring  --io-queue-depth 1..64\n"
+               "         --io-backend pread|pread_batch|io_uring\n"
+               "         --io-queue-depth 1..64\n"
                "         --file F  --json  -q  --learn  --verify\n"
          "  --stop  ends generation when the text appears\n"
          "  --json  machine-readable output for eval, tokenize, plan,\n"
@@ -1238,6 +1248,8 @@ int main(int argc, char **argv)
          "  --trace-layers writes v2 prefill/decode phase/cache JSON Lines\n"
          "  --io-queue-depth above 1 selects Linux io_uring unless an\n"
          "  explicit --io-backend says otherwise; setup safely falls back\n"
+         "  --io-backend pread_batch stages sequential reads before compute\n"
+         "  as a diagnostic and requires --io-queue-depth 1\n"
          "  --verify checks each expert record's checksum as it is read,\n"
          "  for a container you have not read since copying it. Costs ~5%%\n"
          "  on Kimi-Linear, ~1%% on K3; off otherwise\n",

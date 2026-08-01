@@ -249,8 +249,8 @@ python3 -m serve MODEL [options]
   --vision           load the vision tower
   --verify           check every expert record's crc32 as it is read
   --usage PATH       learned hotlist (default <model>/usage.waste)
-  --io-backend {pread,io_uring}
-                     expert-read transport (io_uring is Linux-only)
+  --io-backend {pread,pread_batch,io_uring}
+                     expert-read transport (pread_batch is diagnostic)
   --io-queue-depth N bounded expert-read depth, 1..64
   --trace-layers PATH
                      v2 prefill/decode phase and cache/I/O JSON Lines

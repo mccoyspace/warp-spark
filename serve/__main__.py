@@ -119,7 +119,8 @@ examples:
                    help="learned hotlist (default <model>/usage.waste)")
     g.add_argument("--trace-layers", default=None, metavar="PATH",
                    help="write v2 prefill/decode phase and cache JSON Lines")
-    g.add_argument("--io-backend", choices=("pread", "io_uring"),
+    g.add_argument("--io-backend",
+                   choices=("pread", "pread_batch", "io_uring"),
                    default="pread",
                    help="expert-read transport (default: pread)")
     g.add_argument("--io-queue-depth", type=bounded_int(1, 64), default=1,
@@ -203,7 +204,8 @@ examples:
         print(f"memory   {human(used['floor_bytes'])} resident, "
               f"expert cache {human(used['min_expert_cache'])}")
         actual = engine.stats()
-        io_name = "io_uring" if actual["io_backend"] else "pread"
+        io_name = {0: "pread", 1: "io_uring", 2: "pread_batch"}.get(
+            actual["io_backend"], f"unknown({actual['io_backend']})")
         suffix = " (fallback)" if actual["io_fallback"] else ""
         print(f"I/O      {io_name}, queue depth {actual['io_queue_depth']}{suffix}")
         print(f"thinking {'off by default' if args.no_thinking else 'on'}"
