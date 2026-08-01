@@ -147,7 +147,8 @@ On Linux, `tools/io_compute_diagnostic.py` runs that three-way comparison in
 a balanced A/B/C order while collecting layer traces, PMU counters, CPU-idle
 state, frequency, temperature, memory pressure, and process swap evidence.
 After the campaign, `tools/analyze_io_compute.py CAMPAIGN_DIR` regenerates the
-paired timing estimates, exact determinism checks, and miss-count strata under
+paired timing estimates, exact determinism checks, miss-count strata,
+decode-aligned PMU estimates, and idle/frequency/thermal summaries under
 `CAMPAIGN_DIR/analysis` using only Python's standard library.
 
 Reads bypass the page cache (`F_NOCACHE` on macOS, `O_DIRECT` on Linux,

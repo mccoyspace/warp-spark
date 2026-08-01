@@ -207,6 +207,124 @@ def derive_perf(events: dict[str, float], wall_seconds: float) -> dict[str, floa
     return row
 
 
+def parse_feedback(value: str | None) -> tuple[int, int] | None:
+    if not value:
+        return None
+    fields: dict[str, int] = {}
+    for part in value.split():
+        key, separator, number = part.partition(":")
+        if separator:
+            try:
+                fields[key] = int(number)
+            except ValueError:
+                return None
+    if "ref" not in fields or "del" not in fields:
+        return None
+    return fields["ref"], fields["del"]
+
+
+def pressure_totals(value: str | None) -> dict[str, int]:
+    totals: dict[str, int] = {}
+    for line in (value or "").splitlines():
+        fields = line.split()
+        if not fields:
+            continue
+        for field in fields[1:]:
+            key, separator, number = field.partition("=")
+            if key == "total" and separator:
+                try:
+                    totals[fields[0]] = int(number)
+                except ValueError:
+                    pass
+    return totals
+
+
+def cpuidle_delta(before: dict[str, Any], after: dict[str, Any]) -> dict[str, float]:
+    elapsed = (int(after["monotonic_ns"]) - int(before["monotonic_ns"])) / 1e9
+    cpus = sorted(set(before["cpuidle"]) & set(after["cpuidle"]), key=int)
+    result: dict[str, float] = {"cpuidle_elapsed_seconds": elapsed,
+                                "cpuidle_cpu_count": float(len(cpus))}
+    usage: dict[str, int] = {}
+    idle_us: dict[str, int] = {}
+    for cpu in cpus:
+        old = {row.get("name"): row for row in before["cpuidle"][cpu]}
+        new = {row.get("name"): row for row in after["cpuidle"][cpu]}
+        for name in set(old) & set(new):
+            if not name:
+                continue
+            usage[name] = usage.get(name, 0) + (
+                int(new[name].get("usage") or 0) - int(old[name].get("usage") or 0))
+            idle_us[name] = idle_us.get(name, 0) + (
+                int(new[name].get("time") or 0) - int(old[name].get("time") or 0))
+    denominator = len(cpus) * elapsed
+    for name in sorted(usage):
+        key = name.lower().replace("-", "")
+        result[f"{key}_entries_per_core_second"] = usage[name] / denominator
+        result[f"{key}_time_percent"] = 100.0 * idle_us[name] / 1e6 / denominator
+        result[f"{key}_residency_us_per_entry"] = (
+            idle_us[name] / usage[name] if usage[name] else 0.0)
+    result["recorded_idle_time_percent"] = sum(
+        result[key] for key in result if key.endswith("_time_percent")
+        and key != "recorded_idle_time_percent")
+    return result
+
+
+def derive_telemetry(run: dict[str, Any], before: dict[str, Any],
+                     after: dict[str, Any], rows: list[dict[str, Any]]) -> dict[str, float]:
+    start = int(run["trace"]["prefill_end_monotonic_ns"])
+    end = int(run["trace"]["decode_end_monotonic_ns"])
+    decode = [row for row in rows if start <= int(row["monotonic_ns"]) <= end]
+    result = cpuidle_delta(before, after)
+
+    # ACPI CPPC feedback is cumulative.  Sum del/ref deltas for every CPU and
+    # one-second interval whose midpoint is inside decode.
+    reference_delta = delivered_delta = 0
+    for old, new in zip(rows, rows[1:]):
+        midpoint = (int(old["monotonic_ns"]) + int(new["monotonic_ns"])) / 2
+        if midpoint < start or midpoint > end:
+            continue
+        for cpu in set(old["frequency"]) & set(new["frequency"]):
+            old_feedback = parse_feedback(old["frequency"][cpu].get("feedback_ctrs"))
+            new_feedback = parse_feedback(new["frequency"][cpu].get("feedback_ctrs"))
+            if old_feedback is None or new_feedback is None:
+                continue
+            reference_delta += new_feedback[0] - old_feedback[0]
+            delivered_delta += new_feedback[1] - old_feedback[1]
+    result["cppc_delivered_reference_ratio"] = (
+        delivered_delta / reference_delta if reference_delta else 0.0)
+
+    avg_khz = [int(freq["avg_khz"])
+               for row in decode for freq in row["frequency"].values()
+               if freq.get("avg_khz") is not None]
+    acpi = [int(row["temperature"]["acpi_max_millic"])
+            for row in decode if row["temperature"].get("acpi_max_millic") is not None]
+    nvme = [int(row["temperature"]["nvme_max_millic"])
+            for row in rows if row["temperature"].get("nvme_max_millic") is not None]
+    available = [int(row["meminfo"]["MemAvailable"])
+                 for row in decode if row["meminfo"].get("MemAvailable") is not None]
+    result.update({
+        "cpuinfo_avg_mhz": statistics.fmean(avg_khz) / 1000.0 if avg_khz else 0.0,
+        "decode_acpi_mean_c": statistics.fmean(acpi) / 1000.0 if acpi else 0.0,
+        "decode_acpi_peak_c": max(acpi) / 1000.0 if acpi else 0.0,
+        "whole_process_nvme_peak_c": max(nvme) / 1000.0 if nvme else 0.0,
+        "decode_min_memavailable_gib": min(available) / (1024 ** 3) if available else 0.0,
+        "peak_rss_gib": float(run["peak_rss_bytes"]) / (1024 ** 3),
+        "peak_swap_bytes": float(run["peak_swap_bytes"]),
+    })
+    before_pressure = pressure_totals(before.get("memory_pressure"))
+    after_pressure = pressure_totals(after.get("memory_pressure"))
+    result["memory_psi_some_total_delta_us"] = float(
+        after_pressure.get("some", 0) - before_pressure.get("some", 0))
+    result["memory_psi_full_total_delta_us"] = float(
+        after_pressure.get("full", 0) - before_pressure.get("full", 0))
+    cooling = []
+    for snap in [before, *rows, after]:
+        cooling.extend(int(value) for value in
+                       snap.get("temperature", {}).get("processor_cooling", []))
+    result["max_processor_cooling_state"] = float(max(cooling, default=0))
+    return result
+
+
 def layer_signature(rows: Iterable[dict[str, Any]]) -> str:
     payload = []
     for row in rows:
@@ -298,6 +416,7 @@ def main() -> int:
     trace_rows: dict[str, list[dict[str, Any]]] = {}
     perf_rows: dict[str, dict[str, float]] = {}
     perf_summaries: dict[str, dict[str, float]] = {}
+    telemetry_rows: dict[str, dict[str, float]] = {}
     for run in valid:
         treatment = run["treatment"]
         by_treatment.setdefault(treatment, []).append(run)
@@ -314,6 +433,11 @@ def main() -> int:
             integrate_perf(intervals, phase_start, phase_end),
             phase_end - phase_start)
         perf_summaries[run["run_id"]] = perf_summary
+        before = json.loads((campaign / run["run_id"] / "before.json").read_text())
+        after = json.loads((campaign / run["run_id"] / "after.json").read_text())
+        samples = read_jsonl(campaign / run["run_id"] / "telemetry.jsonl")
+        telemetry_rows[run["run_id"]] = derive_telemetry(
+            run, before, after, samples)
     for treatment in by_treatment:
         by_treatment[treatment].sort(key=lambda row: int(row["block"]))
 
@@ -392,6 +516,28 @@ def main() -> int:
             comparison[metric] = ratio_estimate(num, den)
         perf_paired[f"{numerator}_vs_{denominator}"] = comparison
 
+    telemetry_metrics = tuple(next(iter(telemetry_rows.values())).keys())
+    telemetry_by_mode: dict[str, Any] = {}
+    for treatment in TREATMENT_ORDER:
+        group = by_treatment[treatment]
+        derived = [telemetry_rows[run["run_id"]] for run in group]
+        telemetry_by_mode[treatment] = {
+            metric: distribution([float(row[metric]) for row in derived])
+            for metric in telemetry_metrics
+        }
+    telemetry_paired: dict[str, Any] = {}
+    for numerator, denominator in COMPARISONS:
+        comparison = {}
+        for metric in telemetry_metrics:
+            num = [float(telemetry_rows[by_block[block][numerator]["run_id"]][metric])
+                   for block in blocks]
+            den = [float(telemetry_rows[by_block[block][denominator]["run_id"]][metric])
+                   for block in blocks]
+            comparison[metric] = {"difference": difference_estimate(num, den)}
+            if all(value > 0 for value in num + den):
+                comparison[metric]["ratio"] = ratio_estimate(num, den)
+        telemetry_paired[f"{numerator}_vs_{denominator}"] = comparison
+
     # Layer-stratified routed compute.  Cache/miss signatures must match before
     # a mode comparison is meaningful, so validate each block/key explicitly.
     strata_by_block: dict[int, dict[str, dict[str, float]]] = {}
@@ -452,6 +598,7 @@ def main() -> int:
     prefill_totals: list[dict[str, Any]] = []
     timing_rows: list[dict[str, Any]] = []
     perf_csv_rows: list[dict[str, Any]] = []
+    telemetry_csv_rows: list[dict[str, Any]] = []
     for run in sorted(valid, key=lambda row: (int(row["block"]), int(row["position"]))):
         trace = trace_rows[run["run_id"]]
         prefill = next(row for row in trace if row.get("event") == "prefill_chunk")
@@ -484,6 +631,13 @@ def main() -> int:
             **perf_rows[run["run_id"]],
             "whole_process_instructions": perf_summaries[run["run_id"]].get(
                 PERF_EVENTS["instructions"]),
+        })
+        telemetry_csv_rows.append({
+            "run_id": run["run_id"],
+            "block": run["block"],
+            "position": run["position"],
+            "treatment": run["treatment"],
+            **telemetry_rows[run["run_id"]],
         })
 
     determinism = {
@@ -526,11 +680,19 @@ def main() -> int:
             "per_mode": perf_by_mode,
             "paired": perf_paired,
         },
+        "telemetry": {
+            "cpuidle_scope": "whole process, before/after counters",
+            "frequency_temperature_scope": "1 Hz samples attributed to decode",
+            "per_mode": telemetry_by_mode,
+            "paired": telemetry_paired,
+        },
     }
     (out / "summary.json").write_text(json.dumps(summary, indent=2, sort_keys=True) + "\n")
     write_csv(out / "runs.csv", timing_rows, list(timing_rows[0]))
     write_csv(out / "miss-strata.csv", strata_rows, list(strata_rows[0]))
     write_csv(out / "perf-decode.csv", perf_csv_rows, list(perf_csv_rows[0]))
+    write_csv(out / "telemetry.csv", telemetry_csv_rows,
+              list(telemetry_csv_rows[0]))
 
     print(f"valid runs: {len(valid)}/{len(runs)}; complete blocks: {len(blocks)}")
     print("\nDecode timing medians (ms)")
@@ -552,7 +714,8 @@ def main() -> int:
             cells.append(f"{estimate['percent_change']:+.2f}% [{lo:+.2f}, {hi:+.2f}]")
         print(f"{numerator}/{denominator}\t" + "\t".join(cells))
     print(f"\nWrote {out / 'summary.json'}, {out / 'runs.csv'}, "
-          f"{out / 'miss-strata.csv'}, and {out / 'perf-decode.csv'}")
+          f"{out / 'miss-strata.csv'}, {out / 'perf-decode.csv'}, and "
+          f"{out / 'telemetry.csv'}")
     return 0
 
 
