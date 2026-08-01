@@ -51,6 +51,66 @@ per-request cache status, reused/evaluated prompt tokens, snapshot size and
 first-to-second request speedup. The first request must be a stored miss and
 the second an exact hit; both answers must have the same digest.
 
+The semantic-family gate is a separate compact real-K3 campaign. It launches
+the control and prefix-cache servers sequentially at the same total RAM
+budget, pins both to direct `io_uring` QD4, sends two user prompts under one
+explicit system prompt and compact tool schema, then changes only the tool
+declaration for an invalidation check. Control A warms the expert cache before
+control B just as treatment A does before treatment B; seed request hashes,
+outputs and generated-token routes must match. Two generated tokens per
+request keep the five-request campaign short enough for the Spark:
+
+Both child servers force the stable row-arithmetic environment
+`WASTE_EXPERT_SCHED=row`, `WASTE_PROFILE=0`, `WASTE_Q8=1`, `WASTE_SDOT=0`,
+`WASTE_I8MM=0`, and `WASTE_VERIFY=0`; the exact overrides are recorded in
+`campaign.json`, each run record, and each raw `command.json`.
+
+```bash
+python3 tools/family_prefix_acceptance.py /models/k3.waste \
+  --repo . --library ./libwaste.so \
+  --out results/k3-family-root-qd4 \
+  --label k3-family-root-qd4 \
+  --budget 86583021568 --prefix-cache 1073741824 \
+  --threads 8 --cpu-set performance --tokens 2
+```
+
+The command creates `campaign.json`, append-only `runs.jsonl`, a `control/`
+and `prefix/` tree containing server logs, raw responses, per-request layer
+traces and half-second Linux memory telemetry, plus `analysis.json` and
+`analysis.md`. It exits nonzero if any acceptance gate fails. Analysis can be
+reproduced without rerunning K3:
+
+```bash
+python3 tools/analyze_family_prefix.py \
+  results/k3-family-root-qd4/runs.jsonl \
+  --output results/k3-family-root-qd4/analysis.json \
+  --markdown results/k3-family-root-qd4/analysis.md
+```
+
+The analyzer requires canonical output identity for cold B versus cached B,
+QD4 direct I/O without fallback or read errors, an exact semantic-root depth
+and multi-token suffix replay, identical generated-token expert routes,
+strictly fewer expert bytes, one root snapshot inside its reservation, fixed
+budget and RSS ceilings, zero process swap/swap I/O/reclaim, bounded memory
+PSI, and a miss after the tool schema changes that is admitted as a second
+family root without evicting the first or exceeding the reservation.
+
+Canonical response equality is not a logits oracle. Before claiming
+real-model bit exactness, also run the native state regression against the
+actual container; it byte-compares cold versus restored multi-token-suffix
+logits and exported state:
+
+```bash
+./test_state /models/k3.waste
+```
+
+Per-request trace slicing relies on each aggregate `prefill_chunk` and
+`decode_token` line being flushed before the HTTP response completes. The
+runner does not assume that silently: it requires a newline-terminated slice
+with exactly the response's completion-token count (plus the rooted request's
+one final-prompt replay). A trace-buffering regression therefore fails the
+transport gate instead of assigning late rows to the next request.
+
 Scheduler hypotheses are measured separately from the primary benchmark:
 
 ```bash
@@ -83,6 +143,36 @@ python3 tools/analyze_offcpu_pair.py \
   --output results/offcpu-comparison.json \
   --markdown results/offcpu-comparison.md
 ```
+
+For the expert-granular scheduler and idle-depth interaction, use the balanced
+2x2 Spark campaign. It crosses the stable row scheduler versus
+`WASTE_EXPERT_SCHED=whole` with no PM-QoS request versus an FD-scoped 0 us
+`/dev/cpu_dma_latency` request. Four Williams-balanced blocks give every
+treatment every run position and every ordered carryover once. The helper
+requires passwordless `sudo` for the QoS rows, drops the benchmark child back
+to `--user`, permits only 0 us, never writes sysfs, and closes the request in
+`finally` and on process exit:
+
+```bash
+python3 tools/spark_whole_expert_campaign.py /models/k3.waste \
+  --binary ./waste --out results/whole-expert-qos0-qd4 \
+  --budget 86583021568 --threads 8 --blocks 4 \
+  --cpus 5-9,15-19 --sampler-cpus 0-4,10-14 \
+  --user "$USER"
+
+python3 tools/analyze_spark_whole_expert.py \
+  results/whole-expert-qos0-qd4
+```
+
+The runner is append-only and resumable. It fixes direct `io_uring` QD4 and
+one deterministic token, retains layer traces plus memory/CPPC/idle/thermal/
+GPU telemetry, and verifies the requested scheduler at every decode layer.
+The analyzer estimates schedule, QoS, and interaction effects from paired
+within-block log ratios. Output and expert-route identity are hard gates.
+Traffic identity is reported separately because whole mode honestly charges
+its per-expert scratch to the same total budget and can therefore have one or
+two fewer cache slots; total latency intentionally includes that practical
+tradeoff.
 
 An optimization is acceptable only when deterministic output is unchanged,
 all tests pass, direct I/O remains active, `pswpout` and process swap remain

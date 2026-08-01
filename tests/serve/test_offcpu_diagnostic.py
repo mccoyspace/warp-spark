@@ -10,7 +10,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
-from tools.offcpu_diagnostic import analyze, parse_cpu_set       # noqa: E402
+from tools.offcpu_diagnostic import analyze, load_windows, parse_cpu_set  # noqa: E402
 from tools.analyze_offcpu_pair import compare as compare_pair    # noqa: E402
 
 
@@ -66,6 +66,36 @@ class TestOffcpuDiagnostic(unittest.TestCase):
         self.events.write_text("\n".join(rows[:-1]) + "\n")
         with self.assertRaisesRegex(ValueError, "does not cover"):
             analyze(self.trace, self.events)
+
+    def test_parallel_expert_windows_are_coalesced_without_double_counting(self):
+        self.trace.write_text(json.dumps({
+            "schema": "waste.layer_trace.v2",
+            "event": "decode_layer", "position": 7, "layer": 3,
+            "expert_schedule": "whole",
+            "routed_loop_start_monotonic_ns": 900_000,
+            "routed_loop_end_monotonic_ns": 2_100_000,
+            "expert_compute_intervals_monotonic_ns": [
+                [1_000_000, 1_600_000], [1_200_000, 2_000_000]],
+        }) + "\n")
+        windows, meta = load_windows(self.trace)
+        self.assertEqual([(w.start, w.end) for w in windows],
+                         [(900_000, 2_100_000)])
+        self.assertEqual(meta["raw_expert_intervals"], 2)
+        self.assertEqual(meta["overlapping_interval_rows"], 1)
+        self.assertEqual(meta["whole_schedule_rows"], 1)
+        self.assertEqual(meta["raw_expert_work_ms"], 1.4)
+        self.assertEqual(meta["raw_expert_union_ms"], 1.0)
+        self.assertTrue(meta["exact_intervals"])
+
+    def test_caller_futex_wait_is_not_attributed_to_workers(self):
+        with self.events.open("a") as f:
+            f.write("WASTE_OFFCPU\tFUTEX_EXIT\t1300000\t5\t100\t0\t9999\t0\t200000\n")
+        result = analyze(self.trace, self.events, idle_lookback_us=50)
+        self.assertEqual(result["futex"]["wait_calls_overlapping_compute"], 2)
+        self.assertEqual(result["futex"]["wait_worker_ms"], 0.31)
+        self.assertEqual(
+            result["futex"]["all_thread_wait_calls_overlapping_compute"], 3)
+        self.assertEqual(result["futex"]["all_thread_wait_ms"], 0.51)
 
     def test_cpu_set_parser(self):
         self.assertEqual(parse_cpu_set("5-7,10,12-13"), [5, 6, 7, 10, 12, 13])

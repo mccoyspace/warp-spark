@@ -60,10 +60,23 @@ static const char *io_backend_name(int backend)
     if (backend == WASTE_IO_PREAD_BATCH) return "pread_batch";
     return "pread_sync";
 }
+
+static const char *expert_schedule_name(const waste_model *m)
+{
+    const int batched = m->io_backend == WASTE_IO_URING ||
+                        m->io_backend == WASTE_IO_PREAD_BATCH;
+    return m->expert_sched_whole && batched && m->cache.n_slots > 0 &&
+           m->cfg.top_k > 1 ? "whole" : "row";
+}
 #define PROF_START(b) double _t##b = prof_on ? pnow() : 0
-#define PROF_END(b)   do { if (prof_on) { pthread_mutex_lock(&prof_mu); \
-    waste_prof[b] += pnow() - _t##b; waste_prof_n[b]++; \
-    pthread_mutex_unlock(&prof_mu); } } while (0)
+static void prof_record(int bucket, double elapsed)
+{
+    pthread_mutex_lock(&prof_mu);
+    waste_prof[bucket] += elapsed;
+    waste_prof_n[bucket]++;
+    pthread_mutex_unlock(&prof_mu);
+}
+#define PROF_END(b)   do { if (prof_on) prof_record((b), pnow() - _t##b); } while (0)
 
 static char *slurp(const char *path, size_t *len)
 {
@@ -178,6 +191,27 @@ static int q8_off = 1;     /* 1 = keep the trunk stored as int8          */
 static int sdot_on = 0;    /* 1 = also quantize activations (SDOT path)  */
 static int i8mm_on = 0;    /* SMMLA batched matmul; costs activation int8 */
 static pthread_once_t model_opts_once = PTHREAD_ONCE_INIT;
+
+uint64_t waste_model_whole_expert_scratch_bytes(int top_k, int inter, int lat,
+                                                int vec_dim, int stages,
+                                                int entries)
+{
+    if (top_k <= 0 || inter <= 0 || lat <= 0 || vec_dim <= 0 ||
+        stages <= 0 || entries <= 0)
+        return UINT64_MAX;
+    uint64_t down_lut = (uint64_t)(inter / vec_dim);
+    if (down_lut > UINT64_MAX / (uint64_t)stages) return UINT64_MAX;
+    down_lut *= (uint64_t)stages;
+    if (down_lut > UINT64_MAX / (uint64_t)entries) return UINT64_MAX;
+    down_lut *= (uint64_t)entries;
+    const uint64_t ordinary = 2u * (uint64_t)inter + (uint64_t)lat;
+    if (down_lut > UINT64_MAX - ordinary) return UINT64_MAX;
+    const uint64_t per_expert = ordinary + down_lut;
+    if (per_expert > UINT64_MAX / (uint64_t)top_k) return UINT64_MAX;
+    const uint64_t floats = per_expert * (uint64_t)top_k;
+    return floats > UINT64_MAX / sizeof(float)
+             ? UINT64_MAX : floats * sizeof(float);
+}
 
 static void model_opts_init(void)
 {
@@ -896,17 +930,14 @@ int waste_model_load(waste_model *m, const char *dir, int kv_cap,
             m->io_fallback = 1;
         }
     }
+    {
+        const char *e = getenv("WASTE_EXPERT_SCHED");
+        m->expert_sched_whole = e && strcmp(e, "whole") == 0;
+    }
     if (opt->trace_path && opt->trace_path[0]) {
         m->trace = fopen(opt->trace_path, "w");
         if (!m->trace) return -1;
         setvbuf(m->trace, NULL, _IOLBF, 0);
-        fprintf(m->trace,
-                "{\"schema\":\"waste.layer_trace.v2\",\"event\":\"meta\","
-                "\"io_backend\":\"%s\",\"queue_depth\":%d,"
-                "\"io_fallback\":%s,\"start_monotonic_ns\":%llu}\n",
-                io_backend_name(m->io_backend),
-                m->io_queue_depth, m->io_fallback ? "true" : "false",
-                (unsigned long long)pnow_ns());
     }
     pthread_once(&model_opts_once, model_opts_init);
     m->kv_cap = kv_cap;
@@ -1243,6 +1274,28 @@ int waste_model_load(waste_model *m, const char *dir, int kv_cap,
         m->lut = (float *)malloc((size_t)3 * (nmax / m->vec_dim + 1) *
                                  m->stages * m->cb_entries * sizeof(float));
     }
+    if (m->expert_sched_whole) {
+        /* Keep this opt-in scratch explicit and model-owned.  Per-expert
+         * slices are intentionally simple: they make the outer job safe on
+         * every pool chunking scheme and cost only ~20 MB on K3. */
+        const uint64_t bytes = waste_model_whole_expert_scratch_bytes(
+            c->top_k, c->moe_inter, c->latent_dim ? c->latent_dim : c->hidden,
+            m->vec_dim, m->stages, m->cb_entries);
+        if (bytes == UINT64_MAX || bytes > SIZE_MAX) return -3;
+        const size_t k = (size_t)c->top_k;
+        const size_t inter = (size_t)c->moe_inter;
+        const size_t lat = (size_t)(c->latent_dim ? c->latent_dim : c->hidden);
+        m->whole_down_lut_stride = (inter / (size_t)m->vec_dim) *
+                                   (size_t)m->stages * (size_t)m->cb_entries;
+        m->whole_gate = (float *)malloc(k * inter * sizeof(float));
+        m->whole_up = (float *)malloc(k * inter * sizeof(float));
+        m->whole_down_lut = (float *)malloc(
+            k * m->whole_down_lut_stride * sizeof(float));
+        m->whole_out = (float *)malloc(k * lat * sizeof(float));
+        if (!m->whole_gate || !m->whole_up || !m->whole_down_lut ||
+            !m->whole_out)
+            return -3;
+    }
     {   /* expert cache, sized by the caller's budget */
         int64_t rec = 0;
         for (int L = 0; L < c->n_layers; L++)
@@ -1266,6 +1319,24 @@ int waste_model_load(waste_model *m, const char *dir, int kv_cap,
         else if (!m->latcache[L]) return -1;
     }
     if (c->attn_res_block && !m->blockres) return -1;
+    if (m->trace) {
+        /* Emit effective metadata only after the cache exists.  Whole-expert
+         * ownership requires a batched transport, more than one route, and
+         * enough cache to stage the complete routed set; requested alone is
+         * not an effective schedule. */
+        fprintf(m->trace,
+                "{\"schema\":\"waste.layer_trace.v2\",\"event\":\"meta\","
+                "\"io_backend\":\"%s\",\"queue_depth\":%d,"
+                "\"expert_schedule_requested\":\"%s\","
+                "\"expert_schedule\":\"%s\","
+                "\"io_fallback\":%s,\"start_monotonic_ns\":%llu}\n",
+                io_backend_name(m->io_backend), m->io_queue_depth,
+                m->expert_sched_whole ? "whole" : "row",
+                expert_schedule_name(m),
+                m->io_fallback ? "true" : "false",
+                (unsigned long long)pnow_ns());
+        fflush(m->trace);
+    }
     return 0;
 }
 
@@ -1294,6 +1365,8 @@ void waste_model_free(waste_model *m)
     }
     free(m->x); free(m->h); free(m->tmp); free(m->att); free(m->logits);
     free(m->ff); free(m->e_gate); free(m->e_up); free(m->e_down); free(m->lut);
+    free(m->whole_gate); free(m->whole_up); free(m->whole_down_lut);
+    free(m->whole_out);
     free(m->xq); free(m->xs); waste_dio_free(m->miss_buf);
     free(m->blockres); free(m->prefix_sum); free(m->ares);
     free(m->cx); free(m->cnorm); free(m->cresid); free(m->cq); free(m->ckv);
@@ -1785,6 +1858,74 @@ static void vq_matvec(waste_model *m, float *y, const uint8_t *idx,
     vq_apply(m, y, idx, scale, M, N, lut);
 }
 
+/* The whole-expert scheduler is itself a waste_parallel_for job.  Calling
+ * either public VQ wrapper from inside it would submit a nested job to the
+ * same process-wide pool while the outer descriptor is still owned, which
+ * deadlocks.  These two helpers deliberately execute the unchanged range
+ * kernels over the full range on the current worker. */
+static void vq_build_lut_serial(waste_model *m, float *lut, int cb_base,
+                                const float *x, int N)
+{
+    PROF_START(P_LUTB);
+    lutb_arg a = { lut, m->codebooksT, x, cb_base, m->stages,
+                   m->cb_entries, m->vec_dim };
+    waste_k.lutb_range(0, N / m->vec_dim, &a);
+    PROF_END(P_LUTB);
+}
+
+static void vq_apply_serial(waste_model *m, float *y, const uint8_t *idx,
+                            const uint16_t *scale, int M, int N,
+                            const float *lut)
+{
+    PROF_START(P_LUTA);
+    vq_arg a = { y, idx, scale, lut, N / m->vec_dim,
+                 m->stages, m->cb_entries };
+    vq_rows(0, M, &a);
+    PROF_END(P_LUTA);
+}
+
+typedef struct {
+    waste_model *m;
+    const uint8_t *const *records;
+    const float *lut_gate, *lut_up;
+    int inter, lat, trace_on;
+    uint64_t *trace_start, *trace_end;
+} whole_expert_arg;
+
+static void whole_expert_range(int begin, int end, void *p)
+{
+    whole_expert_arg *a = (whole_expert_arg *)p;
+    waste_model *m = a->m;
+    const waste_config *c = &m->cfg;
+    for (int j = begin; j < end; j++) {
+        const uint8_t *rec = a->records[j];
+        const waste_expert_hdr *h = (const waste_expert_hdr *)rec;
+        const uint16_t *sc = (const uint16_t *)(rec + h->chan_corr_off);
+        float *ga = m->whole_gate + (size_t)j * a->inter;
+        float *ub = m->whole_up + (size_t)j * a->inter;
+        float *lut_down = m->whole_down_lut +
+                          (size_t)j * m->whole_down_lut_stride;
+        float *acc = m->whole_out + (size_t)j * a->lat;
+
+        if (a->trace_on) a->trace_start[j] = pnow_ns();
+        vq_apply_serial(m, ga, rec + h->gate_off, sc,
+                        a->inter, a->lat, a->lut_gate);
+        vq_apply_serial(m, ub, rec + h->up_off, sc + a->inter,
+                        a->inter, a->lat, a->lut_up);
+        if (c->act_situ)
+            for (int i = 0; i < a->inter; i++)
+                ga[i] = waste_situ_pair(ga[i], ub[i], c->situ_beta,
+                                        c->situ_linear_beta);
+        else
+            for (int i = 0; i < a->inter; i++) ga[i] = silu(ga[i]) * ub[i];
+        vq_build_lut_serial(m, lut_down,
+                            h->codebook_id + 2 * m->stages, ga, a->inter);
+        vq_apply_serial(m, acc, rec + h->down_off, sc + 2 * a->inter,
+                        a->lat, a->inter, lut_down);
+        if (a->trace_on) a->trace_end[j] = pnow_ns();
+    }
+}
+
 /* ---- layers ------------------------------------------------------------ */
 
 /* Log-space decay gate, in place over [H][D].
@@ -2123,55 +2264,96 @@ static void moe_layer(waste_model *m, int L, const float *in, float *out, int *r
         PROF_END(P_EDEQ);
         if (trace_on) io_ms += (pnow() - io_t0) * 1000.0;
     }
+    int records_complete = batched;
+    for (int j = 0; records_complete && j < K; j++)
+        if (!records[j]) records_complete = 0;
+    const int whole_sched = m->expert_sched_whole && records_complete;
     const uint64_t routed_loop_start_ns = trace_on ? pnow_ns() : 0;
-    for (int j = 0; j < K; j++) {
-        const uint8_t *rec = records[j];
-        if (!batched) {
-            const double io_t0 = trace_on ? pnow() : 0;
-            PROF_START(P_EDEQ);
-            rec = read_expert(m, L, idx[j]);
-            PROF_END(P_EDEQ);
-            if (trace_on) io_ms += (pnow() - io_t0) * 1000.0;
-        }
-        /* This token is already wrong — the expert it needed is not
-         * readable. Stop rather than sum the ones that were, and let the
-         * step report it; m->read_error is what carries the reason out. */
-        if (!rec) break;
-        const waste_expert_hdr *h = (const waste_expert_hdr *)rec;
-        const uint16_t *sc = (const uint16_t *)(rec + h->chan_corr_off);
-
-        const uint64_t expert_t0_ns = trace_on ? pnow_ns() : 0;
+    if (whole_sched) {
+        const waste_expert_hdr *h = (const waste_expert_hdr *)records[0];
         PROF_START(P_EMM);
         /* gate/up see the same input and the same per-layer codebooks for
          * every routed expert, so their tables are built once per token. */
-        if (!lut_ready) {
-            vq_build_lut(m, lut_gate, h->codebook_id + 0 * m->stages,
-                         xin, lat, m->stages, m->cb_entries, m->vec_dim);
-            vq_build_lut(m, lut_up, h->codebook_id + 1 * m->stages,
-                         xin, lat, m->stages, m->cb_entries, m->vec_dim);
-            lut_ready = 1;
+        vq_build_lut(m, lut_gate, h->codebook_id + 0 * m->stages,
+                     xin, lat, m->stages, m->cb_entries, m->vec_dim);
+        vq_build_lut(m, lut_up, h->codebook_id + 1 * m->stages,
+                     xin, lat, m->stages, m->cb_entries, m->vec_dim);
+        whole_expert_arg a = {
+            m, records, lut_gate, lut_up, inter, lat, trace_on,
+            expert_start_ns, expert_end_ns
+        };
+        /* This is the only pool submission for expert-specific arithmetic.
+         * The callback invokes serial range kernels, never this pool. */
+        waste_parallel_for(K, 1, whole_expert_range, &a);
+        /* The expert jobs never touch the shared sum.  Reducing here in the
+         * original route order preserves the exact floating-point sequence
+         * of the row-parallel implementation. */
+        for (int j = 0; j < K; j++) {
+            const float *expert_out = m->whole_out + (size_t)j * lat;
+            const float wj = w[j];
+            for (int i = 0; i < lat; i++) ysum[i] += wj * expert_out[i];
         }
-        vq_apply(m, ga, rec + h->gate_off, sc, inter, lat, lut_gate);
-        vq_apply(m, ub, rec + h->up_off, sc + inter, inter, lat, lut_up);
-        if (c->act_situ)
-            for (int i = 0; i < inter; i++)
-                ga[i] = waste_situ_pair(ga[i], ub[i], c->situ_beta, c->situ_linear_beta);
-        else
-            for (int i = 0; i < inter; i++) ga[i] = silu(ga[i]) * ub[i];
-        vq_matvec(m, acc, rec + h->down_off, sc + 2 * inter, ga, lat, inter,
-                  h->codebook_id + 2 * m->stages, lut_down);
-        const float wj = w[j];
-        for (int i = 0; i < lat; i++) ysum[i] += wj * acc[i];
         PROF_END(P_EMM);
-        if (trace_on) {
-            const uint64_t expert_t1_ns = pnow_ns();
-            expert_start_ns[expert_intervals] = expert_t0_ns;
-            expert_end_ns[expert_intervals] = expert_t1_ns;
-            expert_intervals++;
-            expert_ms += (double)(expert_t1_ns - expert_t0_ns) / 1e6;
+        if (trace_on) expert_intervals = K;
+    } else {
+        for (int j = 0; j < K; j++) {
+            const uint8_t *rec = records[j];
+            if (!batched) {
+                const double io_t0 = trace_on ? pnow() : 0;
+                PROF_START(P_EDEQ);
+                rec = read_expert(m, L, idx[j]);
+                PROF_END(P_EDEQ);
+                if (trace_on) io_ms += (pnow() - io_t0) * 1000.0;
+            }
+            /* This token is already wrong — the expert it needed is not
+             * readable. Stop rather than sum the ones that were, and let the
+             * step report it; m->read_error is what carries the reason out. */
+            if (!rec) break;
+            const waste_expert_hdr *h = (const waste_expert_hdr *)rec;
+            const uint16_t *sc = (const uint16_t *)(rec + h->chan_corr_off);
+
+            const uint64_t expert_t0_ns = trace_on ? pnow_ns() : 0;
+            PROF_START(P_EMM);
+            /* gate/up see the same input and the same per-layer codebooks for
+             * every routed expert, so their tables are built once per token. */
+            if (!lut_ready) {
+                vq_build_lut(m, lut_gate, h->codebook_id + 0 * m->stages,
+                             xin, lat, m->stages, m->cb_entries, m->vec_dim);
+                vq_build_lut(m, lut_up, h->codebook_id + 1 * m->stages,
+                             xin, lat, m->stages, m->cb_entries, m->vec_dim);
+                lut_ready = 1;
+            }
+            vq_apply(m, ga, rec + h->gate_off, sc, inter, lat, lut_gate);
+            vq_apply(m, ub, rec + h->up_off, sc + inter, inter, lat, lut_up);
+            if (c->act_situ)
+                for (int i = 0; i < inter; i++)
+                    ga[i] = waste_situ_pair(ga[i], ub[i], c->situ_beta,
+                                            c->situ_linear_beta);
+            else
+                for (int i = 0; i < inter; i++) ga[i] = silu(ga[i]) * ub[i];
+            vq_matvec(m, acc, rec + h->down_off, sc + 2 * inter, ga, lat, inter,
+                      h->codebook_id + 2 * m->stages, lut_down);
+            const float wj = w[j];
+            for (int i = 0; i < lat; i++) ysum[i] += wj * acc[i];
+            PROF_END(P_EMM);
+            if (trace_on) {
+                const uint64_t expert_t1_ns = pnow_ns();
+                expert_start_ns[expert_intervals] = expert_t0_ns;
+                expert_end_ns[expert_intervals] = expert_t1_ns;
+                expert_intervals++;
+                expert_ms += (double)(expert_t1_ns - expert_t0_ns) / 1e6;
+            }
         }
     }
     const uint64_t routed_loop_end_ns = trace_on ? pnow_ns() : 0;
+    double expert_work_ms = expert_ms;
+    if (trace_on && whole_sched) {
+        expert_ms = (double)(routed_loop_end_ns - routed_loop_start_ns) / 1e6;
+        expert_work_ms = 0;
+        for (int j = 0; j < expert_intervals; j++)
+            expert_work_ms += (double)(expert_end_ns[j] - expert_start_ns[j]) /
+                              1e6;
+    }
     if (c->latent_dim) {
         if (c->latent_norm)
             waste_rmsnorm(ysum, ysum, waste_find(m, tname(
@@ -2210,8 +2392,10 @@ static void moe_layer(waste_model *m, int L, const float *in, float *out, int *r
                 "],\"cache_hits\":%llu,\"cache_misses\":%llu,"
                 "\"bytes_read\":%llu,\"router_ms\":%.3f,"
                 "\"expert_io_ms\":%.3f,\"expert_compute_ms\":%.3f,"
+                "\"expert_compute_work_ms\":%.3f,"
                 "\"shared_compute_ms\":%.3f,\"moe_total_ms\":%.3f,"
                 "\"io_backend\":\"%s\",\"queue_depth\":%d,"
+                "\"expert_schedule\":\"%s\","
                 "\"overlap_ms\":0.0,\"direct_io\":%s,\"read_error\":%s,"
                 "\"routed_loop_start_monotonic_ns\":%llu,"
                 "\"routed_loop_end_monotonic_ns\":%llu,"
@@ -2219,8 +2403,9 @@ static void moe_layer(waste_model *m, int L, const float *in, float *out, int *r
                 (unsigned long long)(m->cache.hits - hit0),
                 (unsigned long long)(m->cache.misses - miss0),
                 (unsigned long long)(m->cache.bytes_read - bytes0), route_ms,
-                io_ms, expert_ms, shared_ms, moe_ms,
+                io_ms, expert_ms, expert_work_ms, shared_ms, moe_ms,
                 io_backend_name(m->io_backend), m->io_queue_depth,
+                whole_sched ? "whole" : "row",
                 m->direct_io ? "true" : "false",
                 m->read_error ? "true" : "false",
                 (unsigned long long)routed_loop_start_ns,
@@ -3293,6 +3478,11 @@ const float *waste_model_prefill(waste_model *m, const int *tokens, int n,
                 m->direct_io ? "true" : "false",
                 m->read_error ? "true" : "false",
                 (unsigned long long)pnow_ns());
+        /* A server may delimit consecutive requests from this append-only
+         * trace as soon as the HTTP response returns.  Flush only at the
+         * aggregate step boundary (not for every layer) so the final rows of
+         * one request cannot remain buffered and appear in the next slice. */
+        fflush(m->trace);
     }
     return m->read_error ? NULL : m->logits;
 }
@@ -3441,6 +3631,7 @@ const float *waste_model_step(waste_model *m, int token, int pos, int *routed)
                 m->direct_io ? "true" : "false",
                 m->read_error ? "true" : "false",
                 (unsigned long long)pnow_ns());
+        fflush(m->trace);
     }
     free(resid);
     free(norm);

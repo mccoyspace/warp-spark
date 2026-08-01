@@ -212,6 +212,30 @@ class TestStructure(unittest.TestCase):
             xtml.build_chat_segments(**cases["tools_unsorted_keys"]))
         self.assertEqual(a, b)
 
+    def test_family_root_ends_after_tools_thinking_and_leading_system(self):
+        segs = xtml.build_chat_segments(
+            messages=[
+                {"role": "system", "content": "Stable policy."},
+                {"role": "user", "content": "Variable question."},
+                {"role": "system", "content": "Late request note."},
+            ],
+            tools=[{"type": "function", "function": {
+                "name": "lookup", "parameters": {"type": "object"}}}],
+            thinking=True, thinking_effort="high")
+        root = xtml.render_text(segs[:segs.family_root_segments])
+        suffix = xtml.render_text(segs[segs.family_root_segments:])
+        self.assertIn("# Tools", root)
+        self.assertIn("thinking_effort=high", root)
+        self.assertIn("Stable policy.", root)
+        self.assertNotIn("Variable question.", root)
+        self.assertIn("Variable question.", suffix)
+        self.assertIn("Late request note.", suffix)
+
+    def test_no_leading_semantics_has_no_family_root(self):
+        segs = xtml.build_chat_segments(
+            messages=[{"role": "user", "content": "hello"}])
+        self.assertEqual(segs.family_root_segments, 0)
+
     def test_tool_result_order_does_not_change_the_prompt(self):
         cases = dict(CASES)
         a = xtml.render_text(

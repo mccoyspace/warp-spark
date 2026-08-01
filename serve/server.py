@@ -349,7 +349,8 @@ class Handler(BaseHTTPRequestHandler):
             return True
 
         run_prompt, prefix = self.server.prefix_cache.prepare(
-            prompt.tokens, n_images=prompt.n_images)
+            prompt.tokens, n_images=prompt.n_images,
+            family_root_tokens=prompt.family_root_tokens)
         completed = engine.generate(
             run_prompt, on_token,
             temperature=opts["temperature"], top_p=opts["top_p"],

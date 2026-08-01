@@ -150,6 +150,13 @@ typedef struct {
     uint16_t *embsc;
     float *qabs, *cacc, *mrow;      /* MLA absorption scratch, per head    */
     float *e_gate, *e_up, *e_down, *ff, *lut, *xs;
+    /* Experimental expert-granular decode scheduler.  These buffers are
+     * allocated only when WASTE_EXPERT_SCHED=whole; one slice per routed
+     * expert makes the outer parallel job race-free without teaching the
+     * process-wide pool about nested jobs or worker identities. */
+    float *whole_gate, *whole_up, *whole_down_lut, *whole_out;
+    size_t whole_down_lut_stride;
+    int    expert_sched_whole;
     int8_t *xq;
     uint64_t expert_reads;
     waste_ecache cache;
@@ -198,6 +205,12 @@ typedef struct {
 int  waste_model_load(waste_model *m, const char *dir, int kv_cap,
                       const waste_load_opts *opt);
 void waste_model_free(waste_model *m);
+/* Extra scratch selected by WASTE_EXPERT_SCHED=whole.  The planner and
+ * allocator share this calculation so an experimental run cannot hide
+ * memory outside the caller's hard budget.  UINT64_MAX means overflow. */
+uint64_t waste_model_whole_expert_scratch_bytes(int top_k, int inter, int lat,
+                                                int vec_dim, int stages,
+                                                int entries);
 /* Runs one token; returns logits (vocab floats, owned by the model), or
  * NULL when an expert record failed to read or failed verification —
  * waste_model_read_error then says which one and why.

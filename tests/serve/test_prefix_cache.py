@@ -83,6 +83,76 @@ class TestPrefixCache(unittest.TestCase):
         self.assertEqual(report["entries"], 0)
         self.assertEqual(report["resident_bytes"], 0)
 
+    def test_family_root_replays_changed_suffix_bit_exactly(self):
+        engine = FakeEngine(prefix_cache_bytes=4096)
+        cache = PrefixCache(engine)
+        root = [10, 20]
+        first_tokens = root + [30, 40, 50]
+        second_tokens = root + [31, 41, 51]
+
+        tail, first = cache.prepare(
+            first_tokens, family_root_tokens=root)
+        self.assertEqual(tail, [50])
+        self.assertEqual(first["status"], "miss_stored_family")
+        self.assertEqual(engine.state_tokens, first_tokens[:-1])
+        self.assertEqual(first["family_entries"], 1)
+        self.assertEqual(first["exact_entries"], 0)
+
+        tail, second = cache.prepare(
+            second_tokens, family_root_tokens=root)
+        self.assertEqual(tail, [51])
+        self.assertTrue(second["hit"])
+        self.assertEqual(second["hit_kind"], "family")
+        self.assertEqual(second["checkpoint_tokens"], len(root))
+        self.assertEqual(second["reused_tokens"], len(root))
+        self.assertEqual(second["prompt_tokens_evaluated"], 3)
+        self.assertEqual(engine.state_tokens, second_tokens[:-1])
+
+        # Reconstructing the same state cold gives the identical evaluated
+        # token sequence; the real-engine suite covers identical logits.
+        cold = FakeEngine(prefix_cache_bytes=0)
+        cold.state_reset()
+        cold.prefill(second_tokens[:-1])
+        self.assertEqual(engine.state_export(), cold.state_export())
+
+    def test_changed_semantic_root_is_an_exact_miss(self):
+        engine = FakeEngine(prefix_cache_bytes=4096)
+        cache = PrefixCache(engine)
+        cache.prepare([1, 2, 30, 40], family_root_tokens=[1, 2])
+        _, report = cache.prepare(
+            [1, 3, 30, 40], family_root_tokens=[1, 3])
+        self.assertFalse(report["hit"])
+        self.assertEqual(report["hit_kind"], "none")
+
+    def test_bad_family_root_is_invalidated_and_rebuilt_cold(self):
+        engine = FakeEngine(prefix_cache_bytes=4096)
+        cache = PrefixCache(engine)
+        tokens = [7, 8, 9, 10, 11]
+        root = tokens[:2]
+        cache.prepare(tokens, family_root_tokens=root)
+        engine.fail_next_import = True
+        _, report = cache.prepare(tokens, family_root_tokens=root)
+        self.assertFalse(report["hit"])
+        self.assertEqual(report["status"], "miss_invalidated")
+        self.assertEqual(report["invalidations"], 1)
+        self.assertEqual(engine.state_tokens, tokens[:-1])
+
+    def test_two_family_roots_coexist_without_exact_leaf_duplication(self):
+        # Two-token root: 8-byte key + 8-byte state + fixed overhead.
+        one = 8 + 8 + ENTRY_OVERHEAD
+        engine = FakeEngine(prefix_cache_bytes=one * 2)
+        cache = PrefixCache(engine)
+        cache.prepare([1, 2, 10, 11], family_root_tokens=[1, 2])
+        cache.prepare([3, 4, 20, 21], family_root_tokens=[3, 4])
+        self.assertEqual(cache.stats()["family_entries"], 2)
+        self.assertEqual(cache.stats()["exact_entries"], 0)
+        self.assertLessEqual(cache.resident_bytes, cache.capacity_bytes)
+
+        _, report = cache.prepare(
+            [1, 2, 12, 13], family_root_tokens=[1, 2])
+        self.assertTrue(report["hit"])
+        self.assertEqual(report["hit_kind"], "family")
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)

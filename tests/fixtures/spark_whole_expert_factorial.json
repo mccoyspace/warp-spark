@@ -1,0 +1,15 @@
+{
+  "block_baselines_ms": [100.0, 110.0, 90.0, 105.0],
+  "treatment_ratios": {
+    "RN": 1.0,
+    "WN": 0.8,
+    "RQ": 0.9,
+    "WQ": 0.684
+  },
+  "expected_effect_percent": {
+    "whole_at_no_qos": -20.0,
+    "whole_at_qos0": -24.0,
+    "schedule_x_qos": -5.0
+  },
+  "moe_layers": 92
+}

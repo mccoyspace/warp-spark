@@ -85,6 +85,11 @@ def load_windows(path: Path) -> tuple[list[Window], dict]:
     windows: list[Window] = []
     layer_rows = 0
     exact_rows = 0
+    raw_exact_intervals = 0
+    overlapping_rows = 0
+    whole_schedule_rows = 0
+    raw_expert_work_ns = 0
+    raw_expert_union_ns = 0
     with path.open(encoding="utf-8") as f:
         for lineno, line in enumerate(f, 1):
             line = line.strip()
@@ -100,6 +105,7 @@ def load_windows(path: Path) -> tuple[list[Window], dict]:
             raw = row.get("expert_compute_intervals_monotonic_ns")
             if raw:
                 exact_rows += 1
+                row_windows: list[tuple[int, int, int]] = []
                 for j, pair in enumerate(raw):
                     if (not isinstance(pair, list) or len(pair) != 2 or
                             not all(isinstance(v, int) for v in pair)):
@@ -109,9 +115,42 @@ def load_windows(path: Path) -> tuple[list[Window], dict]:
                     if end <= start:
                         raise ValueError(
                             f"{path}:{lineno}: non-positive compute interval")
-                    windows.append(Window(start, end,
-                                          int(row.get("position", -1)),
-                                          int(row.get("layer", -1)), j, True))
+                    row_windows.append((start, end, j))
+                raw_exact_intervals += len(row_windows)
+                raw_expert_work_ns += sum(end - start
+                                          for start, end, _ in row_windows)
+                row_windows.sort()
+                merged: list[tuple[int, int, int]] = []
+                row_overlaps = False
+                for start, end, expert_index in row_windows:
+                    if merged and start < merged[-1][1]:
+                        row_overlaps = True
+                        old_start, old_end, _ = merged[-1]
+                        merged[-1] = (old_start, max(old_end, end), -1)
+                    else:
+                        merged.append((start, end, expert_index))
+                overlapping_rows += int(row_overlaps)
+                raw_expert_union_ns += sum(end - start
+                                           for start, end, _ in merged)
+                position = int(row.get("position", -1))
+                layer = int(row.get("layer", -1))
+                if row.get("expert_schedule") == "whole":
+                    # Expert intervals overlap and intentionally exclude the
+                    # two shared LUT pool jobs plus the ordered reduction.
+                    # Gate scheduler/off-CPU accounting on the exact outer
+                    # phase, while retaining interval work/union metadata.
+                    start = row.get("routed_loop_start_monotonic_ns")
+                    end = row.get("routed_loop_end_monotonic_ns")
+                    if not (isinstance(start, int) and isinstance(end, int)
+                            and end > start):
+                        raise ValueError(
+                            f"{path}:{lineno}: whole schedule lacks routed phase")
+                    whole_schedule_rows += 1
+                    windows.append(Window(start, end, position, layer, -1, True))
+                else:
+                    windows.extend(Window(start, end, position, layer,
+                                          expert_index, True)
+                                   for start, end, expert_index in merged)
             else:
                 start = row.get("routed_loop_start_monotonic_ns")
                 end = row.get("routed_loop_end_monotonic_ns")
@@ -132,6 +171,12 @@ def load_windows(path: Path) -> tuple[list[Window], dict]:
         "decode_layer_rows": layer_rows,
         "exact_interval_rows": exact_rows,
         "exact_intervals": all(w.exact for w in windows),
+        "raw_expert_intervals": raw_exact_intervals,
+        "overlapping_interval_rows": overlapping_rows,
+        "whole_schedule_rows": whole_schedule_rows,
+        "raw_expert_work_ms": round(raw_expert_work_ns / 1e6, 3),
+        "raw_expert_union_ms": round(raw_expert_union_ns / 1e6, 3),
+        "coalesced_routed_intervals": len(windows),
     }
 
 
@@ -375,9 +420,15 @@ def analyze(trace_path: Path, events_path: Path,
                 layer_metrics[key]["blocked_ns"] += overlap
 
     futex_wait_ns = 0
+    all_thread_futex_wait_ns = 0
     futex_wait_calls_in_window: set[tuple[int, int]] = set()
+    all_thread_futex_wait_calls: set[tuple[int, int]] = set()
     for n, wait in enumerate(futex_waits):
         for w, overlap in index.overlaps(wait["start"], wait["ts"]):
+            all_thread_futex_wait_ns += overlap
+            all_thread_futex_wait_calls.add((wait["tid"], n))
+            if wait["tid"] not in worker_ids:
+                continue
             futex_wait_ns += overlap
             futex_wait_calls_in_window.add((wait["tid"], n))
             layer_metrics[(w.position, w.layer)]["futex_wait_ns"] += overlap
@@ -479,6 +530,9 @@ def analyze(trace_path: Path, events_path: Path,
         "futex": {
             "wait_calls_overlapping_compute": len(futex_wait_calls_in_window),
             "wait_worker_ms": round(futex_wait_ns / 1e6, 3),
+            "all_thread_wait_calls_overlapping_compute":
+                len(all_thread_futex_wait_calls),
+            "all_thread_wait_ms": round(all_thread_futex_wait_ns / 1e6, 3),
         },
         "wake_to_run": {
             "all_workers": distribution_ns(

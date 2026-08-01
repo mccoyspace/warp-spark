@@ -210,6 +210,12 @@ static double nowf(void)
 
 /* ---- memory planning ---------------------------------------------------- */
 
+static int whole_expert_schedule_requested(void)
+{
+    const char *e = getenv("WASTE_EXPERT_SCHED");
+    return e && strcmp(e, "whole") == 0;
+}
+
 static char *slurp_all(const char *path)
 {
     FILE *f = fopen(path, "rb");
@@ -369,6 +375,8 @@ waste_status waste_plan_memory(const char *model_path, uint32_t ctx_tokens,
     const int stages = (int)js_int(&d, js_get(&d, eq, "stages"), 3);
     const int vec_dim = (int)js_int(&d, js_get(&d, eq, "vec_dim"), 8);
     const int entries = (int)js_int(&d, js_get(&d, eq, "entries"), 256);
+    const int top_k = (int)js_int(&d,
+        js_get(&d, cfg, "num_experts_per_token"), 8);
     if (stages < 1 || stages > 8 || vec_dim < 1 || vec_dim > 64 ||
         entries < 1 || entries > 256) {
         js_free(&d); free(src); return WASTE_E_FORMAT;
@@ -413,10 +421,17 @@ waste_status waste_plan_memory(const char *model_path, uint32_t ctx_tokens,
     sc += (uint64_t)3 * moe_inter * lat * 4;                /* one expert      */
     sc += (uint64_t)T * nb * hidden * 4 + (uint64_t)T * hidden * 4;
     sc += (uint64_t)T * 64 * 8;
+    if (whole_expert_schedule_requested()) {
+        const uint64_t whole = waste_model_whole_expert_scratch_bytes(
+            top_k, moe_inter, lat, vec_dim, stages, entries);
+        if (whole == UINT64_MAX || sc > UINT64_MAX - whole) {
+            js_free(&d); free(src); return WASTE_E_FORMAT;
+        }
+        sc += whole;
+    }
     out->scratch_bytes = sc;
 
     /* one layer's top-k experts, double buffered */
-    const int top_k = (int)js_int(&d, js_get(&d, cfg, "num_experts_per_token"), 8);
     const int lyr = js_get(&d, 0, "layers");
     uint64_t rec = 0;
     if (js_size(&d, lyr) > 0) {
@@ -588,7 +603,8 @@ waste_status waste_open(const char *model_path, const waste_cfg *cfg_in,
             waste_model_free(&c->m);
             model_lock_release(c->model_lock);
             free(c);
-            return rc == -2 ? WASTE_E_FORMAT : WASTE_E_IO;
+            return rc == -2 ? WASTE_E_FORMAT
+                 : rc == -3 ? WASTE_E_OOM : WASTE_E_IO;
         }
     }
     /* Before the warm, which reads records too. The load already applied
@@ -626,6 +642,15 @@ waste_status waste_memory_used(const waste_ctx *c, waste_memplan *out)
     *out = c->plan;
     out->min_expert_cache = (uint64_t)c->m.cache.n_slots * c->m.cache.rec_bytes;
     return WASTE_OK;
+}
+
+const char *waste_expert_schedule(const waste_ctx *c)
+{
+    if (!c) return "row";
+    return c->m.expert_sched_whole &&
+           (c->m.io_backend == WASTE_IO_URING ||
+            c->m.io_backend == WASTE_IO_PREAD_BATCH) &&
+           c->m.cache.n_slots > 0 && c->m.cfg.top_k > 1 ? "whole" : "row";
 }
 
 /* ---- tokenizer ---------------------------------------------------------- */

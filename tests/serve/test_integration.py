@@ -190,6 +190,66 @@ class TestRealStack(unittest.TestCase):
         self.assertEqual(status, 200, changed)
         self.assertFalse(changed["waste"]["prefix_cache"]["hit"])
 
+    def test_family_root_replay_matches_cold_changed_suffix(self):
+        self.server.prefix_cache.clear()
+
+        def body(question):
+            return {"model": "tiny", "max_tokens": 8, "temperature": 0,
+                    "messages": [
+                        {"role": "system", "content": "Stable family policy."},
+                        {"role": "user", "content": question},
+                    ]}
+
+        status, first = self.post("/v1/chat/completions", body("first"))
+        self.assertEqual(status, 200, first)
+        self.assertEqual(first["waste"]["prefix_cache"]["status"],
+                         "miss_stored_family")
+
+        status, replay = self.post("/v1/chat/completions", body("second"))
+        self.assertEqual(status, 200, replay)
+        report = replay["waste"]["prefix_cache"]
+        self.assertTrue(report["hit"])
+        self.assertEqual(report["hit_kind"], "family")
+        self.assertGreater(report["reused_tokens"], 0)
+        self.assertEqual(report["exact_entries"], 0)
+
+        self.server.prefix_cache.clear()
+        status, cold = self.post("/v1/chat/completions", body("second"))
+        self.assertEqual(status, 200, cold)
+        self.assertEqual(replay["choices"][0]["message"],
+                         cold["choices"][0]["message"])
+
+    def test_changed_system_and_tools_do_not_hit_family_root(self):
+        self.server.prefix_cache.clear()
+
+        def system_body(policy):
+            return {"model": "tiny", "max_tokens": 4, "temperature": 0,
+                    "messages": [
+                        {"role": "system", "content": policy},
+                        {"role": "user", "content": "question"},
+                    ]}
+
+        self.post("/v1/chat/completions", system_body("policy A"))
+        status, changed_system = self.post(
+            "/v1/chat/completions", system_body("policy B"))
+        self.assertEqual(status, 200, changed_system)
+        self.assertFalse(changed_system["waste"]["prefix_cache"]["hit"])
+
+        self.server.prefix_cache.clear()
+
+        def tool_body(name):
+            return {"model": "tiny", "max_tokens": 4, "temperature": 0,
+                    "messages": [{"role": "user", "content": "question"}],
+                    "tools": [{"type": "function", "function": {
+                        "name": name,
+                        "parameters": {"type": "object"}}}]}
+
+        self.post("/v1/chat/completions", tool_body("tool_a"))
+        status, changed_tool = self.post(
+            "/v1/chat/completions", tool_body("tool_b"))
+        self.assertEqual(status, 200, changed_tool)
+        self.assertFalse(changed_tool["waste"]["prefix_cache"]["hit"])
+
     def test_tools_render_and_run(self):
         """A tool declaration must survive rendering into a real prompt."""
         status, body = self.post("/v1/chat/completions", {

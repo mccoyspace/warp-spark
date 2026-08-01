@@ -438,6 +438,10 @@ typedef struct {
 } waste_stats;
 
 waste_status waste_get_stats(const waste_ctx *ctx, waste_stats *out);
+/* Effective routed-compute scheduler for this context: "row" (the stable
+ * default) or "whole" when the experimental scheduler was requested and
+ * the selected I/O transport can stage a complete expert set. */
+const char *waste_expert_schedule(const waste_ctx *ctx);
 
 /* Physical RAM of this machine, or 0 if it cannot be determined. A budget
  * near this number is counterproductive: the OS pages out the engine's own

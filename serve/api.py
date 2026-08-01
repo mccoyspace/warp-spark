@@ -281,10 +281,12 @@ class Prompt:
     """A request rendered down to what the engine takes."""
 
     def __init__(self, tokens: list[int], *, thinking: bool,
-                 n_images: int = 0):
+                 n_images: int = 0,
+                 family_root_tokens: Optional[list[int]] = None):
         self.tokens = tokens
         self.thinking = thinking
         self.n_images = n_images
+        self.family_root_tokens = list(family_root_tokens or [])
 
 
 def build_prompt(engine: Engine, body: dict, *, default_thinking: bool,
@@ -376,9 +378,18 @@ def build_prompt(engine: Engine, body: dict, *, default_thinking: bool,
     except xtml.XTMLError as e:
         raise APIError(str(e), param="messages")
 
-    tokens = engine.tokenize_segments(segments)
+    root_segments = getattr(segments, "family_root_segments", 0)
+    # Segments are independently encoded, so tokenizing these two slices and
+    # concatenating is exactly equivalent to tokenizing the whole list.  The
+    # split exposes the *actual evaluated tokens* at the semantic family root
+    # rather than deriving a key from request JSON or rendered text.
+    family_root_tokens = engine.tokenize_segments(segments[:root_segments])
+    tokens = family_root_tokens + engine.tokenize_segments(
+        segments[root_segments:])
     if n_images:
         tokens = engine.image_expand(tokens)
+        # Media state is intentionally not content-addressed yet.
+        family_root_tokens = []
 
     ctx_max = engine.model_info()["ctx_max"]
     if ctx_max and len(tokens) >= ctx_max:
@@ -387,7 +398,8 @@ def build_prompt(engine: Engine, body: dict, *, default_thinking: bool,
             f"{ctx_max}", status=400, code="context_length_exceeded",
             param="messages")
 
-    return Prompt(tokens, thinking=thinking, n_images=n_images)
+    return Prompt(tokens, thinking=thinking, n_images=n_images,
+                  family_root_tokens=family_root_tokens)
 
 
 # ---- sampling ------------------------------------------------------------

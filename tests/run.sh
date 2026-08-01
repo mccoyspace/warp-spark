@@ -74,6 +74,13 @@ if ./test_ecache 2>/dev/null | grep -q '^PASS'; then
 else
     no "batched expert cache"
 fi
+SCHED_MODEL="$TMP/expert-sched.waste"
+if python3 tools/make_test_container.py "$SCHED_MODEL" >/dev/null 2>&1 &&
+   ./test_expert_sched "$SCHED_MODEL" 2>/dev/null | grep -q '^PASS'; then
+    ok "whole-expert scheduler preserves logits, routes, traffic and state"
+else
+    no "whole-expert scheduler core regression"
+fi
 
 # ---------------------------------------------------------------- unit ----
 head_ "kernels vs the reference implementations"

@@ -173,16 +173,25 @@ token keys, snapshot blobs and entry overhead. The two caches therefore
 negotiate the advertised RAM budget instead of meeting later through Linux
 reclaim.
 
-The initial policy is deliberately exact and deterministic:
+The policy is exact and deterministic, with one selective family checkpoint:
 
-1. The key is the complete int32 prompt-token sequence. There is no hash-only
-   match, longest-common-prefix search or block reuse.
-2. On a miss, the server evaluates all but the final prompt token and exports
-   the canonical KDA/MLA session representation.
-3. On a hit, it imports that state and replays the final token through the
-   ordinary forward path. That regenerates the logits bit-for-bit, so cached
-   logits and sampling-specific entries are unnecessary.
-4. Requests containing images bypass the cache: identical media placeholder
+1. Chat rendering exposes the boundary after top-level tool declarations,
+   the thinking-effort note, and contiguous leading system messages. The
+   cache key is the actual evaluated int32 token sequence through that
+   boundary, not request JSON, rendered text, or a hash-only identity.
+2. A rooted chat request restores the deepest matching semantic ancestor and
+   evaluates the exact conversation suffix through the ordinary chunked
+   prefill path. The final prompt token is replayed normally, regenerating
+   logits bit-for-bit without sampling-specific entries.
+3. Rooted requests retain one semantic root and do not automatically add an
+   exact leaf. Every K3 checkpoint duplicates roughly 443 MiB of fixed KDA
+   state; a root plus one leaf would let one family consume a 1 GiB reserve.
+4. Requests without a usable semantic root retain the Sprint 4 exact policy:
+   the complete prompt-token sequence is the lookup key and the checkpoint is
+   taken after all but its final token.
+5. Lookup is linear over admitted roots and exact entries. There are no block
+   snapshots, hash-only matches, or reuse beyond an exact token ancestor.
+6. Requests containing images bypass the cache: identical media placeholder
    ids do not prove identical pixels.
 
 K3 makes this unusually attractive. Most layers retain fixed-size KDA
@@ -190,10 +199,12 @@ recurrent state, while MLA layers store only compressed latent KV rows. The
 snapshot grows slowly with prompt length instead of retaining conventional
 per-head K/V tensors for every layer.
 
-Every response reports `waste.prefix_cache`: hit/miss/bypass reason, reused
-and evaluated prompt tokens, snapshot/resident/capacity bytes, timings,
-evictions and invalidations. `/health` reports cumulative cache state. A bad
-entry is transactionally rejected, evicted and rebuilt through the cold path.
+Every response reports `waste.prefix_cache`: exact/family hit kind, checkpoint
+and family-root depths, reused and suffix-evaluated tokens, exact/family entry
+counts and admissions, snapshot/resident/capacity bytes, restore/prefill/export
+timings, evictions and invalidations. `/health` reports cumulative cache state.
+A bad entry is transactionally rejected, evicted and rebuilt through the cold
+path.
 
 ### Concurrency
 

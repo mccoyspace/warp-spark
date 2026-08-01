@@ -579,11 +579,13 @@ static int cmd_info(int argc, char **argv)
         printf("{\"engine\":\"%s\",\"arch\":\"%s\",\"layers\":%u,"
                "\"experts\":%u,\"top_k\":%u,\"hidden\":%u,"
                "\"params_total\":%llu,\"params_active\":%llu,"
-               "\"quantization\":\"%s\",\"expert_cache_bytes\":%llu}\n",
+               "\"quantization\":\"%s\",\"expert_cache_bytes\":%llu,"
+               "\"expert_schedule\":\"%s\"}\n",
                waste_version(), mi.arch, mi.n_layers, mi.n_experts, mi.top_k,
                mi.hidden, (unsigned long long)mi.params_total,
                (unsigned long long)mi.params_active, mi.quant_summary,
-               (unsigned long long)used.min_expert_cache);
+               (unsigned long long)used.min_expert_cache,
+               waste_expert_schedule(c));
         waste_close(c);
         return 0;
     }
@@ -600,6 +602,7 @@ static int cmd_info(int argc, char **argv)
     printf("  parameters    %s total, %s active/token\n", pt, pa);
     printf("  quantization  %s\n", mi.quant_summary);
     printf("  expert cache  %s\n", cb);
+    printf("  expert sched  %s\n", waste_expert_schedule(c));
     waste_close(c);
     return 0;
 }
@@ -1041,14 +1044,16 @@ static int cmd_bench(int argc, char **argv)
         printf("{\"tokens\":%llu,\"tok_per_s\":%.4f,\"experts_hit\":%llu,"
                "\"experts_missed\":%llu,\"bytes_read\":%llu,"
                "\"direct_io\":%s,\"io_backend\":\"%s\","
-               "\"io_queue_depth\":%d,\"io_fallback\":%s}\n",
+               "\"io_queue_depth\":%d,\"io_fallback\":%s,"
+               "\"expert_schedule\":\"%s\"}\n",
                (unsigned long long)s.tokens_generated, tps,
                (unsigned long long)s.experts_hit,
                (unsigned long long)s.experts_missed,
                (unsigned long long)s.bytes_read,
                s.direct_io ? "true" : "false",
                io_backend_name(s.io_backend),
-               s.io_queue_depth, s.io_fallback ? "true" : "false");
+               s.io_queue_depth, s.io_fallback ? "true" : "false",
+               waste_expert_schedule(c));
         waste_close(c);
         return 0;
     }
@@ -1059,6 +1064,7 @@ static int cmd_bench(int argc, char **argv)
     printf("  I/O       %s, queue depth %d%s\n",
            io_backend_name(s.io_backend),
            s.io_queue_depth, s.io_fallback ? " (ring setup fell back)" : "");
+    printf("  compute   %s expert schedule\n", waste_expert_schedule(c));
     printf("  experts   %llu hit / %llu miss = %.1f%% hit\n",
            (unsigned long long)s.experts_hit, (unsigned long long)s.experts_missed,
            100.0 * (double)s.experts_hit / (double)(acc ? acc : 1));

@@ -76,6 +76,19 @@ class Segment:
     markup: bool = False
 
 
+class ChatSegments(list[Segment]):
+    """Rendered segments plus the stable leading-family boundary.
+
+    The boundary follows top-level tool declarations, the optional thinking
+    effort note, and contiguous leading system messages.  Everything after
+    it is request/conversation-specific.  It is segment-based because BPE is
+    deliberately run once per Segment; callers can therefore tokenize the
+    two slices independently and concatenate them without changing a token.
+    """
+
+    family_root_segments: int = 0
+
+
 def image_prompt(width: int, height: int) -> str:
     """The media block K3 wraps an image in, at its source resolution.
 
@@ -593,7 +606,7 @@ def build_chat_segments(messages: list[Any],
                         add_generation_prompt: bool = True,
                         thinking: bool = True,
                         image_prompts: Optional[list[str]] = None,
-                        **kwargs: Any) -> list[Segment]:
+                        **kwargs: Any) -> ChatSegments:
     """Render a conversation into segments, in K3's own order.
 
     That order is: tool declarations, then a thinking-effort note, then the
@@ -621,7 +634,7 @@ def build_chat_segments(messages: list[Any],
         kwargs["response_schema"] = deep_sort_dict(kwargs["response_schema"])
 
     image_state = _ImagePromptState(image_prompts)
-    segments: list[Segment] = []
+    segments = ChatSegments()
 
     tool_calls = None
     tool_index = 0
@@ -643,11 +656,20 @@ def build_chat_segments(messages: list[Any],
             "supported values include `low`, `medium`, `high`, and `max`.\n"
             f"Now the system is invoked with `thinking_effort={thinking_effort}`."))
 
+    # Tools and the thinking-effort note are synthesized ahead of the
+    # conversation and are stable across a prompt family.  Contiguous system
+    # turns at the start of the caller's conversation extend the same root.
+    # A later system turn is conversation history and must stay in the suffix.
+    family_root_segments = len(segments)
+    leading_system = True
+
     for message in messages:
         if not isinstance(message, dict):
             continue
 
         role = message["role"]
+        if role != "system":
+            leading_system = False
         if role == "user":
             attrs = [("role", "user")]
             if message.get("name"):
@@ -700,6 +722,9 @@ def build_chat_segments(messages: list[Any],
             segments.extend(_close_tag("message"))
             segments.extend(_end_of_msg())
 
+        if leading_system:
+            family_root_segments = len(segments)
+
     tool_choice = kwargs.get("tool_choice")
     if tool_choice == "required":
         segments.extend(_internal_system_message(
@@ -738,6 +763,7 @@ def build_chat_segments(messages: list[Any],
         segments.extend(_open_tag("think" if thinking else "response"))
 
     image_state.assert_consumed()
+    segments.family_root_segments = family_root_segments
     return segments
 
 

@@ -23,6 +23,94 @@ static int on_tok(const waste_token_info *i, const char *piece, void *user)
     return 0;
 }
 
+/* A semantic family checkpoint is earlier than the exact n-1 checkpoint:
+ * restore it, evaluate a genuinely multi-token suffix in one call, and
+ * require the result to be indistinguishable from a cold full-prompt eval. */
+static int test_family_root_replay(waste_ctx *c, const int32_t *prompt,
+                                   size_t n)
+{
+    const size_t root_n = n / 2;
+    const size_t suffix_n = n - root_n;
+    const float *logits = NULL;
+    size_t cold_vocab = 0, replay_vocab = 0;
+    size_t cold_n = 0, root_state_n = 0, replay_n = 0, written = 0;
+    unsigned char *cold_state = NULL;
+    unsigned char *root_state = NULL;
+    unsigned char *replay_state = NULL;
+    float *cold_logits = NULL;
+    int rc = 1;
+
+    if (n < 4 || root_n == 0 || suffix_n < 2) {
+        fprintf(stderr, "family replay prompt needs a multi-token suffix\n");
+        return 1;
+    }
+
+    waste_state_reset(c);
+    if (waste_eval(c, prompt, n, &logits, &cold_vocab) != WASTE_OK ||
+        !logits || !cold_vocab) {
+        fprintf(stderr, "cold family eval\n");
+        goto done;
+    }
+    cold_logits = (float *)malloc(cold_vocab * sizeof(*cold_logits));
+    if (!cold_logits) goto done;
+    memcpy(cold_logits, logits, cold_vocab * sizeof(*cold_logits));
+    if (waste_state_size(c, &cold_n) != WASTE_OK || !cold_n) goto done;
+    cold_state = (unsigned char *)malloc(cold_n);
+    if (!cold_state) goto done;
+    if (waste_state_export(c, cold_state, cold_n, &written) != WASTE_OK ||
+        written != cold_n) {
+        fprintf(stderr, "cold family state export\n");
+        goto done;
+    }
+
+    waste_state_reset(c);
+    if (waste_eval(c, prompt, root_n, NULL, NULL) != WASTE_OK ||
+        waste_state_size(c, &root_state_n) != WASTE_OK || !root_state_n) {
+        fprintf(stderr, "family root eval\n");
+        goto done;
+    }
+    root_state = (unsigned char *)malloc(root_state_n);
+    if (!root_state) goto done;
+    if (waste_state_export(c, root_state, root_state_n, &written) != WASTE_OK ||
+        written != root_state_n) {
+        fprintf(stderr, "family root export\n");
+        goto done;
+    }
+
+    waste_state_reset(c);
+    if (waste_state_import(c, root_state, root_state_n) != WASTE_OK) {
+        fprintf(stderr, "family root import\n");
+        goto done;
+    }
+    if (waste_eval(c, prompt + root_n, suffix_n,
+                   &logits, &replay_vocab) != WASTE_OK || !logits) {
+        fprintf(stderr, "family suffix eval\n");
+        goto done;
+    }
+    if (replay_vocab != cold_vocab ||
+        memcmp(cold_logits, logits, cold_vocab * sizeof(*cold_logits)) != 0) {
+        fprintf(stderr, "family suffix logits changed after restore\n");
+        goto done;
+    }
+    if (waste_state_size(c, &replay_n) != WASTE_OK || !replay_n) goto done;
+    replay_state = (unsigned char *)malloc(replay_n);
+    if (!replay_state) goto done;
+    if (waste_state_export(c, replay_state, replay_n, &written) != WASTE_OK ||
+        written != replay_n || replay_n != cold_n ||
+        memcmp(cold_state, replay_state, cold_n) != 0) {
+        fprintf(stderr, "family suffix state changed after restore\n");
+        goto done;
+    }
+
+    rc = 0;
+done:
+    free(cold_logits);
+    free(replay_state);
+    free(root_state);
+    free(cold_state);
+    return rc;
+}
+
 int main(int argc, char **argv)
 {
     if (argc < 2) { fprintf(stderr, "usage: %s MODEL\n", argv[0]); return 2; }
@@ -58,8 +146,11 @@ int main(int argc, char **argv)
     waste_gen_params_init(&p);
     p.max_tokens = 6;
 
-    if (n < 2) { fprintf(stderr, "prompt too short\n"); return 1; }
+    if (n < 4) { fprintf(stderr, "prompt too short\n"); return 1; }
     const char *path = "/tmp/waste_state_test.bin";
+
+    if (test_family_root_replay(c, prompt, n)) return 1;
+    waste_state_reset(c);
 
     /* Exact-prefix contract: checkpoint after all but the final prompt
      * token, restore, replay that token, and require every float in the
