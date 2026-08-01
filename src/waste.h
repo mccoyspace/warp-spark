@@ -94,6 +94,10 @@ typedef struct {
      * the queued image embeddings. waste_open folds it into the figures
      * above when vision is on, so the resolved budget accounts for it. */
     uint64_t vision_bytes;
+    /* Caller-owned prefix snapshots reserved inside ram_budget_bytes.
+     * The engine gives these bytes up from its expert cache; the serving
+     * layer then enforces this same ceiling for snapshot keys and blobs. */
+    uint64_t prefix_cache_bytes;
 } waste_memplan;
 
 /* Compute the memory floor without loading weights. ctx_tokens sizes the
@@ -212,6 +216,12 @@ typedef struct {
      * any expert arithmetic. Its queue depth must remain one. */
     waste_io_backend io_backend;
     int io_queue_depth;
+
+    /* Space held back from the expert cache for caller-owned, in-process
+     * prefix snapshots. It is part of ram_budget_bytes, not additional to
+     * it. A non-zero value therefore requires
+     * ram_budget_bytes >= floor_bytes + prefix_cache_bytes. */
+    uint64_t prefix_cache_bytes;
 } waste_cfg;
 
 /* Removed in 0.6.0, having never done anything: `io_threads` (there is no
@@ -380,6 +390,16 @@ waste_status waste_eval(waste_ctx *ctx, const int32_t *tokens, size_t n,
  * costs minutes at streaming speeds. */
 waste_status waste_state_save(waste_ctx *ctx, const char *path);
 waste_status waste_state_load(waste_ctx *ctx, const char *path);
+/* The same canonical checkpoint representation without a filesystem
+ * round trip. `waste_state_size` returns the exact current size. Export
+ * writes that many bytes and reports the required size through `written`;
+ * a short buffer returns WASTE_E_ARG without touching it. Import fully
+ * validates shape, bounds, and length before modifying live state, so a
+ * rejected snapshot leaves the current conversation bit-for-bit intact. */
+waste_status waste_state_size(waste_ctx *ctx, size_t *bytes);
+waste_status waste_state_export(waste_ctx *ctx, void *dst, size_t capacity,
+                                size_t *written);
+waste_status waste_state_import(waste_ctx *ctx, const void *src, size_t bytes);
 void         waste_state_reset(waste_ctx *ctx);
 
 /* ---- introspection ----------------------------------------------------- */

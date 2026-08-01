@@ -80,7 +80,8 @@ class MemPlan(C.Structure):
                 ("min_expert_cache", C.c_uint64),
                 ("floor_bytes", C.c_uint64),
                 ("recommended_bytes", C.c_uint64),
-                ("vision_bytes", C.c_uint64)]
+                ("vision_bytes", C.c_uint64),
+                ("prefix_cache_bytes", C.c_uint64)]
 
 
 class Cfg(C.Structure):
@@ -95,7 +96,8 @@ class Cfg(C.Structure):
                 ("allow_concurrent_open", C.c_int),
                 ("trace_path", C.c_char_p),
                 ("io_backend", C.c_int),
-                ("io_queue_depth", C.c_int)]
+                ("io_queue_depth", C.c_int),
+                ("prefix_cache_bytes", C.c_uint64)]
 
 
 class GenParams(C.Structure):
@@ -272,6 +274,13 @@ def _bind(lib) -> None:
     lib.waste_state_save.argtypes = [C.c_void_p, C.c_char_p]
     lib.waste_state_load.restype = C.c_int
     lib.waste_state_load.argtypes = [C.c_void_p, C.c_char_p]
+    lib.waste_state_size.restype = C.c_int
+    lib.waste_state_size.argtypes = [C.c_void_p, C.POINTER(C.c_size_t)]
+    lib.waste_state_export.restype = C.c_int
+    lib.waste_state_export.argtypes = [C.c_void_p, C.c_void_p, C.c_size_t,
+                                       C.POINTER(C.c_size_t)]
+    lib.waste_state_import.restype = C.c_int
+    lib.waste_state_import.argtypes = [C.c_void_p, C.c_void_p, C.c_size_t]
     lib.waste_state_reset.restype = None
     lib.waste_state_reset.argtypes = [C.c_void_p]
 
@@ -409,12 +418,15 @@ class Engine:
                  allow_concurrent_open: bool = False,
                  trace_path: Optional[str] = None,
                  io_backend: str = "pread",
-                 io_queue_depth: int = 1):
+                 io_queue_depth: int = 1,
+                 prefix_cache_bytes: int = 0):
         ram_budget_bytes = _bounded_int(
             "ram_budget_bytes", ram_budget_bytes, 0, (1 << 64) - 1)
         ctx_tokens = _bounded_int("ctx_tokens", ctx_tokens, 0, (1 << 32) - 1)
         n_threads = _bounded_int("n_threads", n_threads, 0, (1 << 31) - 1)
         io_queue_depth = _bounded_int("io_queue_depth", io_queue_depth, 1, 64)
+        prefix_cache_bytes = _bounded_int(
+            "prefix_cache_bytes", prefix_cache_bytes, 0, (1 << 64) - 1)
         if io_backend not in IO_BACKENDS:
             raise ValueError(
                 "io_backend must be 'pread', 'pread_batch', or 'io_uring'")
@@ -442,6 +454,7 @@ class Engine:
         cfg.trace_path = self._trace_path
         cfg.io_backend = IO_BACKENDS[io_backend]
         cfg.io_queue_depth = io_queue_depth
+        cfg.prefix_cache_bytes = prefix_cache_bytes
 
         st = self.lib.waste_open(self.model_path.encode(), C.byref(cfg),
                                  C.byref(self._ctx))
@@ -680,6 +693,57 @@ class Engine:
         st = self.lib.waste_state_load(self._ctx, str(path).encode())
         if st != WASTE_OK:
             raise EngineError("state_load", st, str(path))
+
+    def state_size(self) -> int:
+        """Exact bytes in the current compact KDA/MLA checkpoint."""
+        self._check()
+        n = C.c_size_t()
+        st = self.lib.waste_state_size(self._ctx, C.byref(n))
+        if st != WASTE_OK:
+            raise EngineError("state_size", st)
+        return n.value
+
+    def state_export(self) -> bytearray:
+        """Copy the current checkpoint once, directly into its cache blob."""
+        self._check()
+        size = self.state_size()
+        blob = bytearray(size)
+        dst = (C.c_ubyte * size).from_buffer(blob)
+        written = C.c_size_t()
+        st = self.lib.waste_state_export(
+            self._ctx, dst, size, C.byref(written))
+        if st != WASTE_OK:
+            raise EngineError("state_export", st)
+        if written.value != size:
+            raise EngineError("state_export", WASTE_E_IO,
+                              f"size changed from {size} to {written.value}")
+        return blob
+
+    def state_import(self, blob) -> None:
+        """Transactionally restore an in-memory checkpoint."""
+        self._check()
+        view = memoryview(blob)
+        if not view.contiguous:
+            raise ValueError("state snapshot must be contiguous")
+        view = view.cast("B")
+        if not view:
+            raise ValueError("state snapshot is empty")
+        array_type = C.c_ubyte * len(view)
+        src = (array_type.from_buffer_copy(view) if view.readonly
+               else array_type.from_buffer(view))
+        st = self.lib.waste_state_import(self._ctx, src, len(view))
+        if st != WASTE_OK:
+            raise EngineError("state_import", st)
+
+    def prefill(self, tokens: list[int]) -> None:
+        """Evaluate prompt tokens without copying the vocabulary logits."""
+        self._check()
+        if not tokens:
+            raise EngineError("prefill", WASTE_E_ARG, "empty prompt")
+        src = (C.c_int32 * len(tokens))(*tokens)
+        st = self.lib.waste_eval(self._ctx, src, len(tokens), None, None)
+        if st != WASTE_OK:
+            raise EngineError("prefill", st, self._detail())
 
     # ---- generation -----------------------------------------------------
 

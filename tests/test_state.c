@@ -58,12 +58,76 @@ int main(int argc, char **argv)
     waste_gen_params_init(&p);
     p.max_tokens = 6;
 
-    /* run the prompt, save, then continue */
+    if (n < 2) { fprintf(stderr, "prompt too short\n"); return 1; }
     const char *path = "/tmp/waste_state_test.bin";
-    sink a = {{0}, 0};
+
+    /* Exact-prefix contract: checkpoint after all but the final prompt
+     * token, restore, replay that token, and require every float in the
+     * resulting logits to have the same bits. */
     const float *lg;
     size_t vocab = 0;
-    if (waste_eval(c, prompt, n, &lg, &vocab) != WASTE_OK) return 1;
+    if (waste_eval(c, prompt, n - 1, NULL, NULL) != WASTE_OK) return 1;
+    size_t snap_n = 0, written = 0;
+    if (waste_state_size(c, &snap_n) != WASTE_OK || !snap_n) return 1;
+    unsigned char *snap = (unsigned char *)malloc(snap_n);
+    unsigned char *again = (unsigned char *)malloc(snap_n);
+    if (!snap || !again) return 1;
+    memset(again, 0xa5, snap_n);
+    if (waste_state_export(c, again, snap_n - 1, &written) != WASTE_E_ARG ||
+        written != snap_n || again[0] != 0xa5) {
+        fprintf(stderr, "short export was not side-effect free\n"); return 1;
+    }
+    if (waste_state_export(c, snap, snap_n, &written) != WASTE_OK ||
+        written != snap_n) return 1;
+    if (waste_eval(c, prompt + n - 1, 1, &lg, &vocab) != WASTE_OK) return 1;
+    float *want_logits = (float *)malloc(vocab * sizeof(float));
+    if (!want_logits) return 1;
+    memcpy(want_logits, lg, vocab * sizeof(float));
+
+    waste_state_reset(c);
+    if (waste_state_import(c, snap, snap_n) != WASTE_OK) {
+        fprintf(stderr, "memory import\n"); return 1;
+    }
+    if (waste_state_export(c, again, snap_n, &written) != WASTE_OK ||
+        written != snap_n || memcmp(snap, again, snap_n) != 0) {
+        fprintf(stderr, "state bytes changed on round trip\n"); return 1;
+    }
+    if (waste_eval(c, prompt + n - 1, 1, &lg, &vocab) != WASTE_OK ||
+        memcmp(want_logits, lg, vocab * sizeof(float)) != 0) {
+        fprintf(stderr, "logits changed after memory restore\n"); return 1;
+    }
+    free(want_logits);
+    free(again);
+    free(snap);
+
+    /* A rejected import is transactional. Snapshot the now-full prompt,
+     * offer a truncated copy, and require live bytes to remain identical. */
+    if (waste_state_size(c, &snap_n) != WASTE_OK) return 1;
+    snap = (unsigned char *)malloc(snap_n);
+    again = (unsigned char *)malloc(snap_n);
+    if (!snap || !again) return 1;
+    if (waste_state_export(c, snap, snap_n, &written) != WASTE_OK) return 1;
+    if (waste_state_import(c, snap, snap_n - 1) != WASTE_E_FORMAT) {
+        fprintf(stderr, "truncated memory state accepted\n"); return 1;
+    }
+    if (waste_state_export(c, again, snap_n, &written) != WASTE_OK ||
+        memcmp(snap, again, snap_n) != 0) {
+        fprintf(stderr, "bad import modified live state\n"); return 1;
+    }
+    if (waste_state_save(c, path) != WASTE_OK) return 1;
+    FILE *checkpoint = fopen(path, "rb");
+    if (!checkpoint || fread(again, 1, snap_n, checkpoint) != snap_n ||
+        fgetc(checkpoint) != EOF || memcmp(snap, again, snap_n) != 0) {
+        fprintf(stderr, "file and memory state formats diverged\n"); return 1;
+    }
+    fclose(checkpoint);
+    remove(path);
+    free(again);
+    free(snap);
+
+    /* Run the full prompt, save, then continue through the original file
+     * API too: disk and memory snapshots share the same representation. */
+    sink a = {{0}, 0};
     if (waste_state_save(c, path) != WASTE_OK) { fprintf(stderr, "save\n"); return 1; }
     int32_t nxt[1] = { 0 };
     /* vocab comes from the model, not from a constant: a synthetic
@@ -87,7 +151,7 @@ int main(int argc, char **argv)
     for (int i = 0; i < a.n; i++) printf(" %d", a.ids[i]);
     printf("\nrestored:");
     for (int i = 0; i < b.n; i++) printf(" %d", b.ids[i]);
-    printf("\n%s\n", same ? "STATE OK — restored session continues identically"
+    printf("\n%s\n", same ? "STATE OK — memory logits and file continuation are bit-exact"
                           : "STATE MISMATCH");
     remove(path);
     return same ? 0 : 1;

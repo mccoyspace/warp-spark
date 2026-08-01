@@ -101,6 +101,8 @@ def main() -> int:
     ap.add_argument("--label", required=True)
     ap.add_argument("--port", type=int, default=18080)
     ap.add_argument("--budget", type=int, required=True)
+    ap.add_argument("--prefix-cache", type=int, default=0,
+                    help="bytes reserved inside --budget for exact prefixes")
     ap.add_argument("--threads", type=int, default=8)
     ap.add_argument("--cpu-set", default="performance")
     ap.add_argument("--io-backend",
@@ -129,6 +131,8 @@ def main() -> int:
            "--io-backend", args.io_backend,
            "--io-queue-depth", str(args.io_queue_depth),
            "--max-tokens", str(args.tokens), "--no-thinking"]
+    if args.prefix_cache:
+        cmd += ["--prefix-cache", str(args.prefix_cache)]
     if args.trace:
         cmd += ["--trace-layers", str(trace_path)]
 
@@ -203,8 +207,13 @@ def main() -> int:
             elapsed = (time.time_ns() - request_started) / 1e9
             response_path = args.artifacts / f"{args.label}-response-{index}.json"
             response_path.write_text(json.dumps(response, indent=2) + "\n")
+            answer = response.get("choices", [{}])[0].get("message")
+            answer_sha = hashlib.sha256(
+                json.dumps(answer, sort_keys=True,
+                           separators=(",", ":")).encode()).hexdigest()
             responses.append({"index": index, "wall_seconds": elapsed,
                               "response_path": str(response_path),
+                              "answer_sha256": answer_sha,
                               "usage": response.get("usage"),
                               "waste": response.get("waste")})
     except Exception as exc:  # preserve partial evidence before returning
@@ -233,6 +242,27 @@ def main() -> int:
                               stdout_path.read_text(errors="replace"),
                               re.MULTILINE)
     ended_ns = time.time_ns()
+    answer_hashes = [r["answer_sha256"] for r in responses]
+    prefix_reports = [(r.get("waste") or {}).get("prefix_cache") or {}
+                      for r in responses]
+    prefix_acceptance = {
+        "answers_identical": (len(set(answer_hashes)) == 1
+                              if answer_hashes else None),
+        "statuses": [r.get("status") for r in prefix_reports],
+        "hits": [bool(r.get("hit")) for r in prefix_reports],
+        "first_to_second_speedup":
+            (responses[0]["wall_seconds"] / responses[1]["wall_seconds"]
+             if len(responses) >= 2 and responses[1]["wall_seconds"] else None),
+        "second_prompt_tokens_evaluated":
+            (prefix_reports[1].get("prompt_tokens_evaluated")
+             if len(prefix_reports) >= 2 else None),
+        "second_reused_tokens":
+            (prefix_reports[1].get("reused_tokens")
+             if len(prefix_reports) >= 2 else None),
+        "snapshot_bytes":
+            next((r.get("snapshot_bytes") for r in reversed(prefix_reports)
+                  if r.get("snapshot_bytes")), None),
+    }
     record = {
         "schema": "waste.server_acceptance.v1",
         "run_id": args.label,
@@ -249,13 +279,17 @@ def main() -> int:
         "manifest_sha256": sha256(model / "manifest.json"),
         "usage_sha256": sha256(model / "usage.waste"),
         "budget_bytes": args.budget,
+        "prefix_cache_bytes": args.prefix_cache,
         "threads": args.threads,
         "cpu_set": args.cpu_set,
         "resolved_cpu_set": cpu_match.group(1) if cpu_match else None,
         "io_backend_requested": args.io_backend,
         "io_queue_depth_requested": args.io_queue_depth,
         "tokens_requested": args.tokens,
+        "prompt": args.prompt,
+        "prompt_sha256": hashlib.sha256(args.prompt.encode()).hexdigest(),
         "requests": responses,
+        "prefix_acceptance": prefix_acceptance,
         "lock_probe": lock_probe,
         "peak_rss_bytes": peak_rss or None,
         "peak_process_swap_bytes": peak_swap,

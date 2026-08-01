@@ -519,13 +519,22 @@ waste_status waste_open(const char *model_path, const waste_cfg *cfg_in,
         if (!cap || a < cap) cap = a;
     }
     uint64_t budget = cfg.ram_budget_bytes;
+    if (cfg.prefix_cache_bytes > UINT64_MAX - c->plan.floor_bytes) {
+        model_lock_release(c->model_lock); free(c); return WASTE_E_RAM_BUDGET;
+    }
+    /* Prefix snapshots live in the serving process rather than waste_ctx,
+     * but they still consume the same physical pool. Reserve them before
+     * sizing the expert cache so the two caches cannot overcommit the host
+     * and meet later through reclaim. */
+    const uint64_t engine_base = c->plan.floor_bytes + cfg.prefix_cache_bytes;
 
     if (!budget) {
         /* exact: recommended_bytes is floor + 3 * working_set by construction */
         const uint64_t ws = (c->plan.recommended_bytes - c->plan.floor_bytes) / 3;
-        budget = c->plan.floor_bytes;
+        budget = engine_base;
         for (int k = 3; k >= 1; k--) {
-            const uint64_t b = c->plan.floor_bytes + ws * (uint64_t)k;
+            if (ws > (UINT64_MAX - engine_base) / (uint64_t)k) continue;
+            const uint64_t b = engine_base + ws * (uint64_t)k;
             if (!cap || b <= cap) { budget = b; break; }
         }
         if (cap && budget > cap) {
@@ -534,7 +543,7 @@ waste_status waste_open(const char *model_path, const waste_cfg *cfg_in,
             return WASTE_E_MEMORY;
         }
     }
-    if (budget < c->plan.floor_bytes) {
+    if (budget < engine_base) {
         model_lock_release(c->model_lock); free(c); return WASTE_E_RAM_BUDGET;
     }
 
@@ -555,8 +564,9 @@ waste_status waste_open(const char *model_path, const waste_cfg *cfg_in,
                 budget / 1073741824.0, cap / 1073741824.0);
 
     c->cfg.ram_budget_bytes = budget;   /* what we actually run under */
+    c->plan.prefix_cache_bytes = cfg.prefix_cache_bytes;
 
-    const uint64_t cache_bytes = budget - c->plan.floor_bytes +
+    const uint64_t cache_bytes = budget - engine_base +
                                  c->plan.min_expert_cache;
     {
         waste_load_opts opt;
@@ -1094,6 +1104,35 @@ waste_status waste_state_load(waste_ctx *c, const char *path)
         if (rc == -3) waste_state_reset(c);
         return WASTE_E_IO;
     }
+    c->pos = pos;
+    return WASTE_OK;
+}
+
+waste_status waste_state_size(waste_ctx *c, size_t *bytes)
+{
+    if (!c || !bytes) return WASTE_E_ARG;
+    return waste_model_state_size(&c->m, c->pos, bytes) == 0
+         ? WASTE_OK : WASTE_E_FORMAT;
+}
+
+waste_status waste_state_export(waste_ctx *c, void *dst, size_t capacity,
+                                size_t *written)
+{
+    if (!c || !dst || !written) return WASTE_E_ARG;
+    size_t need = 0;
+    if (waste_model_state_size(&c->m, c->pos, &need)) return WASTE_E_FORMAT;
+    *written = need;
+    if (capacity < need) return WASTE_E_ARG;
+    return waste_model_state_export(&c->m, c->pos, dst, capacity, written) == 0
+         ? WASTE_OK : WASTE_E_FORMAT;
+}
+
+waste_status waste_state_import(waste_ctx *c, const void *src, size_t bytes)
+{
+    if (!c || !src || !bytes) return WASTE_E_ARG;
+    int pos = 0;
+    if (waste_model_state_import(&c->m, src, bytes, &pos))
+        return WASTE_E_FORMAT;
     c->pos = pos;
     return WASTE_OK;
 }

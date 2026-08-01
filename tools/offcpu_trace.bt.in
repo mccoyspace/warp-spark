@@ -1,0 +1,100 @@
+/* bpftrace template used by offcpu_diagnostic.py.
+ *
+ * `cpid` is the command launched by bpftrace -c. Threads share its TGID,
+ * while sched tracepoints name TIDs, so sched_process_fork seeds a TID map
+ * and the syscall probes use `pid == cpid` to include the whole process.
+ * All timestamps are bpftrace nsecs (CLOCK_MONOTONIC), the same clock used
+ * by waste.layer_trace.v2.
+ */
+
+BEGIN
+{
+    @target[cpid] = 1;
+/*CPU_MAP*/
+    printf("WASTE_OFFCPU\tMETA\t%llu\t%d\n", nsecs, cpid);
+}
+
+/* moe_layer is the decode-only MoE path (prefill uses moe_chunk). Gating in
+ * kernel here avoids millions of prefill scheduler records; the analyzer
+ * later narrows these layer envelopes to the exact expert intervals emitted
+ * by waste.layer_trace.v2. */
+/*UPROBES*/
+
+tracepoint:sched:sched_process_fork
+/pid == cpid/
+{
+    @target[args->child_pid] = 1;
+    printf("WASTE_OFFCPU\tTHREAD\t%llu\t%d\t%d\n",
+           nsecs, args->parent_pid, args->child_pid);
+}
+
+tracepoint:sched:sched_switch
+/@phase[cpid] && @target[args->prev_pid]/
+{
+    @target_cpu[cpu] = nsecs;
+    printf("WASTE_OFFCPU\tSWITCH_OUT\t%llu\t%d\t%d\t%ld\t%d\n",
+           nsecs, cpu, args->prev_pid, args->prev_state, args->next_pid);
+}
+
+tracepoint:sched:sched_switch
+/@phase[cpid] && @target[args->next_pid]/
+{
+    @target_cpu[cpu] = nsecs;
+    printf("WASTE_OFFCPU\tSWITCH_IN\t%llu\t%d\t%d\t%d\n",
+           nsecs, cpu, args->next_pid, args->prev_pid);
+}
+
+tracepoint:sched:sched_wakeup
+/@phase[cpid] && @target[args->pid]/
+{
+    @target_cpu[args->target_cpu] = nsecs;
+    printf("WASTE_OFFCPU\tWAKEUP\t%llu\t%d\t%d\t%d\t%d\n",
+           nsecs, cpu, args->pid, tid, args->target_cpu);
+}
+
+tracepoint:syscalls:sys_enter_futex
+/pid == cpid && @phase[cpid]/
+{
+    @futex_start[tid] = nsecs;
+    @futex_op[tid] = args->op & 127;
+    @futex_addr[tid] = (uint64)args->uaddr;
+    printf("WASTE_OFFCPU\tFUTEX_ENTER\t%llu\t%d\t%d\t%d\t%llu\n",
+           nsecs, cpu, tid, args->op & 127, (uint64)args->uaddr);
+}
+
+tracepoint:syscalls:sys_exit_futex
+/pid == cpid && @futex_start[tid]/
+{
+    printf("WASTE_OFFCPU\tFUTEX_EXIT\t%llu\t%d\t%d\t%d\t%llu\t%ld\t%llu\n",
+           nsecs, cpu, tid, @futex_op[tid], @futex_addr[tid], args->ret,
+           nsecs - @futex_start[tid]);
+    delete(@futex_start[tid]);
+    delete(@futex_op[tid]);
+    delete(@futex_addr[tid]);
+}
+
+tracepoint:power:cpu_idle
+/@phase[cpid] && @perf_cpu[args->cpu_id] && @target_cpu[args->cpu_id] &&
+ nsecs - @target_cpu[args->cpu_id] < 5000000/
+{
+    printf("WASTE_OFFCPU\tCPU_IDLE\t%llu\t%d\t%u\n",
+           nsecs, args->cpu_id, args->state);
+}
+
+tracepoint:sched:sched_process_exit
+/@target[tid]/
+{
+    printf("WASTE_OFFCPU\tTHREAD_EXIT\t%llu\t%d\n", nsecs, tid);
+    delete(@target[tid]);
+}
+
+END
+{
+    clear(@target);
+    clear(@phase);
+    clear(@perf_cpu);
+    clear(@target_cpu);
+    clear(@futex_start);
+    clear(@futex_op);
+    clear(@futex_addr);
+}

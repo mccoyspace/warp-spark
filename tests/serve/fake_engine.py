@@ -18,6 +18,7 @@ this checks everything above it.
 from __future__ import annotations
 
 import threading
+import struct
 from dataclasses import dataclass, field
 from typing import Callable, Optional
 
@@ -69,11 +70,15 @@ class FakeEngine:
     fail_with: Optional[Exception] = None
     # Sleep this long before each token, to test client disconnects.
     delay: float = 0.0
+    prefix_cache_bytes: int = 0
+    fail_next_import: bool = False
 
     prompts: list[list[int]] = field(default_factory=list)
     calls: list[dict] = field(default_factory=list)
     images: list[str] = field(default_factory=list)
     resets: int = 0
+    prefills: list[list[int]] = field(default_factory=list)
+    state_tokens: list[int] = field(default_factory=list)
     closed: bool = False
     _lock: threading.RLock = field(default_factory=threading.RLock)
 
@@ -101,7 +106,8 @@ class FakeEngine:
     def memory_used(self) -> dict:
         return {"trunk_bytes": 1, "state_bytes": 1, "scratch_bytes": 1,
                 "min_expert_cache": 1, "floor_bytes": 4,
-                "recommended_bytes": 8, "vision_bytes": 0}
+                "recommended_bytes": 8, "vision_bytes": 0,
+                "prefix_cache_bytes": self.prefix_cache_bytes}
 
     def tokenize(self, text: str, *, markup: bool = False,
                  add_bos: bool = False) -> list[int]:
@@ -144,6 +150,26 @@ class FakeEngine:
 
     def state_reset(self) -> None:
         self.resets += 1
+        self.state_tokens.clear()
+
+    def prefill(self, tokens: list[int]) -> None:
+        self.prefills.append(list(tokens))
+        self.state_tokens.extend(tokens)
+
+    def state_export(self) -> bytearray:
+        return bytearray(struct.pack(f"<{len(self.state_tokens)}i",
+                                     *self.state_tokens))
+
+    def state_size(self) -> int:
+        return len(self.state_tokens) * 4
+
+    def state_import(self, blob) -> None:
+        if self.fail_next_import:
+            self.fail_next_import = False
+            raise EngineError("state_import", -2)
+        if len(blob) % 4:
+            raise EngineError("state_import", -2)
+        self.state_tokens[:] = struct.unpack(f"<{len(blob) // 4}i", blob)
 
     def close(self) -> None:
         self.closed = True

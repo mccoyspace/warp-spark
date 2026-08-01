@@ -171,6 +171,33 @@ class TestLibrary(EngineTestCase):
             E.Engine(str(self.model), ram_budget_bytes=plan.floor_bytes // 2)
         self.assertEqual(cm.exception.status, E.WASTE_E_RAM_BUDGET)
 
+    def test_prefix_reservation_is_inside_the_hard_budget(self):
+        plan = E.plan_memory(str(self.model), 4096)
+        reserve = plan.min_expert_cache
+        budget = plan.floor_bytes + reserve
+        baseline = E.Engine(str(self.model), ram_budget_bytes=budget)
+        reserved = E.Engine(str(self.model), ram_budget_bytes=budget,
+                            prefix_cache_bytes=reserve)
+        try:
+            a = baseline.memory_used()
+            b = reserved.memory_used()
+            self.assertEqual(b["prefix_cache_bytes"], reserve)
+            self.assertLess(b["min_expert_cache"], a["min_expert_cache"])
+            total = (b["trunk_bytes"] + b["state_bytes"] +
+                     b["scratch_bytes"] + b["min_expert_cache"] +
+                     b["prefix_cache_bytes"])
+            self.assertLessEqual(total, budget)
+        finally:
+            reserved.close()
+            baseline.close()
+
+    def test_prefix_reservation_that_does_not_fit_is_refused(self):
+        plan = E.plan_memory(str(self.model), 4096)
+        with self.assertRaises(E.EngineError) as cm:
+            E.Engine(str(self.model), ram_budget_bytes=plan.floor_bytes,
+                     prefix_cache_bytes=1)
+        self.assertEqual(cm.exception.status, E.WASTE_E_RAM_BUDGET)
+
 
 class TestIntrospection(EngineTestCase):
     def test_model_info(self):
@@ -422,6 +449,23 @@ class TestGeneration(EngineTestCase):
 
 
 class TestState(EngineTestCase):
+    def test_memory_snapshot_round_trip_is_byte_exact(self):
+        tokens = self.engine.tokenize("hello world")
+        self.engine.prefill(tokens)
+        original = self.engine.state_export()
+        self.assertEqual(len(original), self.engine.state_size())
+        self.engine.state_reset()
+        self.engine.state_import(original)
+        self.assertEqual(self.engine.state_export(), original)
+
+    def test_bad_memory_snapshot_does_not_modify_live_state(self):
+        self.engine.prefill(self.engine.tokenize("hello world"))
+        original = self.engine.state_export()
+        with self.assertRaises(E.EngineError) as cm:
+            self.engine.state_import(original[:-1])
+        self.assertEqual(cm.exception.status, E.WASTE_E_FORMAT)
+        self.assertEqual(self.engine.state_export(), original)
+
     def test_save_and_load(self):
         path = Path(self.tmp) / "session.state"
         self.engine.generate(self.engine.tokenize("hello"),

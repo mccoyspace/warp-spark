@@ -125,6 +125,10 @@ examples:
                    help="expert-read transport (default: pread)")
     g.add_argument("--io-queue-depth", type=bounded_int(1, 64), default=1,
                    metavar="N", help="bounded expert-read queue depth")
+    g.add_argument("--prefix-cache", type=parse_size, default=0,
+                   metavar="SIZE",
+                   help="reserve this much of --budget for exact prompt "
+                        "state snapshots (for example 1G)")
     g.add_argument("--allow-concurrent-open", action="store_true",
                    help="permit another process to load the same container")
 
@@ -166,6 +170,9 @@ examples:
             if plan.vision_bytes:
                 print(f"  vision       {human(plan.vision_bytes)} "
                       f"(only with --vision)")
+            if args.prefix_cache:
+                print(f"  prefix cache {human(args.prefix_cache)} "
+                      f"(reserved inside the runtime budget)")
             if ram:
                 print(f"\n  this machine has {human(ram)}")
             return 0
@@ -188,7 +195,8 @@ examples:
             allow_concurrent_open=args.allow_concurrent_open,
             trace_path=args.trace_layers,
             io_backend=args.io_backend,
-            io_queue_depth=args.io_queue_depth)
+            io_queue_depth=args.io_queue_depth,
+            prefix_cache_bytes=args.prefix_cache)
     except EngineError as e:
         print(f"{e}", file=sys.stderr)
         return 1
@@ -201,8 +209,12 @@ examples:
               f"{info['n_experts']} experts, ctx {info['ctx_max']}")
         if info.get("quant_summary"):
             print(f"quant    {info['quant_summary']}")
-        print(f"memory   {human(used['floor_bytes'])} resident, "
-              f"expert cache {human(used['min_expert_cache'])}")
+        held = (used["trunk_bytes"] + used["state_bytes"] +
+                used["scratch_bytes"] + used["min_expert_cache"] +
+                used["vision_bytes"] + used["prefix_cache_bytes"])
+        print(f"memory   {human(held)} budgeted, "
+              f"expert cache {human(used['min_expert_cache'])}, "
+              f"prefix reserve {human(used['prefix_cache_bytes'])}")
         actual = engine.stats()
         io_name = {0: "pread", 1: "io_uring", 2: "pread_batch"}.get(
             actual["io_backend"], f"unknown({actual['io_backend']})")

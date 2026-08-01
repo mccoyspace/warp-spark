@@ -2111,6 +2111,8 @@ static void moe_layer(waste_model *m, int L, const float *in, float *out, int *r
     float *lut_gate = m->lut, *lut_up = lut_gate + lut_sz, *lut_down = lut_up + lut_sz;
     int lut_ready = 0;
     const uint8_t *records[64] = { 0 };
+    uint64_t expert_start_ns[64] = { 0 }, expert_end_ns[64] = { 0 };
+    int expert_intervals = 0;
     const int batched = (m->io_backend == WASTE_IO_URING ||
                          m->io_backend == WASTE_IO_PREAD_BATCH) &&
                         m->cache.n_slots > 0 && K > 1;
@@ -2121,6 +2123,7 @@ static void moe_layer(waste_model *m, int L, const float *in, float *out, int *r
         PROF_END(P_EDEQ);
         if (trace_on) io_ms += (pnow() - io_t0) * 1000.0;
     }
+    const uint64_t routed_loop_start_ns = trace_on ? pnow_ns() : 0;
     for (int j = 0; j < K; j++) {
         const uint8_t *rec = records[j];
         if (!batched) {
@@ -2137,7 +2140,7 @@ static void moe_layer(waste_model *m, int L, const float *in, float *out, int *r
         const waste_expert_hdr *h = (const waste_expert_hdr *)rec;
         const uint16_t *sc = (const uint16_t *)(rec + h->chan_corr_off);
 
-        const double expert_t0 = trace_on ? pnow() : 0;
+        const uint64_t expert_t0_ns = trace_on ? pnow_ns() : 0;
         PROF_START(P_EMM);
         /* gate/up see the same input and the same per-layer codebooks for
          * every routed expert, so their tables are built once per token. */
@@ -2160,8 +2163,15 @@ static void moe_layer(waste_model *m, int L, const float *in, float *out, int *r
         const float wj = w[j];
         for (int i = 0; i < lat; i++) ysum[i] += wj * acc[i];
         PROF_END(P_EMM);
-        if (trace_on) expert_ms += (pnow() - expert_t0) * 1000.0;
+        if (trace_on) {
+            const uint64_t expert_t1_ns = pnow_ns();
+            expert_start_ns[expert_intervals] = expert_t0_ns;
+            expert_end_ns[expert_intervals] = expert_t1_ns;
+            expert_intervals++;
+            expert_ms += (double)(expert_t1_ns - expert_t0_ns) / 1e6;
+        }
     }
+    const uint64_t routed_loop_end_ns = trace_on ? pnow_ns() : 0;
     if (c->latent_dim) {
         if (c->latent_norm)
             waste_rmsnorm(ysum, ysum, waste_find(m, tname(
@@ -2203,7 +2213,9 @@ static void moe_layer(waste_model *m, int L, const float *in, float *out, int *r
                 "\"shared_compute_ms\":%.3f,\"moe_total_ms\":%.3f,"
                 "\"io_backend\":\"%s\",\"queue_depth\":%d,"
                 "\"overlap_ms\":0.0,\"direct_io\":%s,\"read_error\":%s,"
-                "\"end_monotonic_ns\":%llu}\n",
+                "\"routed_loop_start_monotonic_ns\":%llu,"
+                "\"routed_loop_end_monotonic_ns\":%llu,"
+                "\"expert_compute_intervals_monotonic_ns\":[",
                 (unsigned long long)(m->cache.hits - hit0),
                 (unsigned long long)(m->cache.misses - miss0),
                 (unsigned long long)(m->cache.bytes_read - bytes0), route_ms,
@@ -2211,6 +2223,13 @@ static void moe_layer(waste_model *m, int L, const float *in, float *out, int *r
                 io_backend_name(m->io_backend), m->io_queue_depth,
                 m->direct_io ? "true" : "false",
                 m->read_error ? "true" : "false",
+                (unsigned long long)routed_loop_start_ns,
+                (unsigned long long)routed_loop_end_ns);
+        for (int j = 0; j < expert_intervals; j++)
+            fprintf(m->trace, "%s[%llu,%llu]", j ? "," : "",
+                    (unsigned long long)expert_start_ns[j],
+                    (unsigned long long)expert_end_ns[j]);
+        fprintf(m->trace, "],\"end_monotonic_ns\":%llu}\n",
                 (unsigned long long)pnow_ns());
     }
 }
@@ -2294,6 +2313,184 @@ static void state_fill(const waste_model *m, waste_state_hdr *h, int pos)
     h->n_heads = c->n_heads; h->qk_nope = c->qk_nope; h->qk_rope = c->qk_rope;
     h->v_head = c->v_head; h->attn_res_block = c->attn_res_block;
     h->pos = pos; h->n_blockres = m->n_blockres;
+}
+
+static int state_add_bytes(uint64_t *total, uint64_t count, uint64_t width)
+{
+    if (width && count > UINT64_MAX / width) return -1;
+    const uint64_t bytes = count * width;
+    if (*total > UINT64_MAX - bytes) return -1;
+    *total += bytes;
+    return 0;
+}
+
+/* Exact serialized size of the live portion of a context.  In particular,
+ * MLA contributes only `pos` latent rows rather than its ctx-sized backing
+ * allocation.  This is the property that makes a K3 prefix snapshot a
+ * small state checkpoint rather than a conventional full-KV cache. */
+int waste_model_state_size(const waste_model *m, int pos, size_t *bytes)
+{
+    if (!m || !bytes) return -1;
+    const waste_config *c = &m->cfg;
+    const int H = c->kda_heads, D = c->kda_dim, C = H * D;
+    const int nb_max = c->attn_res_block
+                     ? c->n_layers / c->attn_res_block + 2 : 0;
+    if (pos < 0 || pos == INT32_MAX ||
+        (m->has_mla && pos > m->kv_cap) ||
+        m->n_blockres < 0 || m->n_blockres > nb_max)
+        return -1;
+
+    uint64_t n = sizeof(waste_state_hdr);
+    for (int L = 0; L < c->n_layers; L++) {
+        if (c->kda_layer[L]) {
+            const uint64_t nf = (uint64_t)H * (uint64_t)D * (uint64_t)D +
+                                (uint64_t)3 * (uint64_t)C *
+                                (uint64_t)(c->conv_k - 1);
+            if (state_add_bytes(&n, nf, sizeof(float))) return -1;
+        } else {
+            const int nkv = m->n_kv[L];
+            if (nkv < 0 || nkv > m->kv_cap || nkv != pos) return -1;
+            if (state_add_bytes(&n, 1, sizeof(int32_t)) ||
+                state_add_bytes(&n, (uint64_t)nkv *
+                                     (uint64_t)(c->kv_lora + c->qk_rope),
+                                sizeof(float)))
+                return -1;
+        }
+    }
+    if (state_add_bytes(&n, (uint64_t)m->n_blockres *
+                             (uint64_t)c->hidden, sizeof(float)) ||
+        state_add_bytes(&n, (uint64_t)c->hidden, sizeof(float)) ||
+        n > SIZE_MAX)
+        return -1;
+    *bytes = (size_t)n;
+    return 0;
+}
+
+int waste_model_state_export(const waste_model *m, int pos, void *dst,
+                             size_t capacity, size_t *written)
+{
+    size_t need = 0;
+    if (!written || waste_model_state_size(m, pos, &need)) return -1;
+    *written = need;
+    /* A sizing failure is side-effect free: callers can evict old prefix
+     * entries before allocating the replacement without a transient budget
+     * overshoot. */
+    if (!dst || capacity < need) return -1;
+
+    const waste_config *c = &m->cfg;
+    uint8_t *p = (uint8_t *)dst;
+    waste_state_hdr h;
+    state_fill(m, &h, pos);
+    memcpy(p, &h, sizeof h); p += sizeof h;
+
+    const int H = c->kda_heads, D = c->kda_dim, C = H * D;
+    for (int L = 0; L < c->n_layers; L++) {
+        if (c->kda_layer[L]) {
+            size_t n = (size_t)H * (size_t)D * (size_t)D * sizeof(float);
+            memcpy(p, m->S[L], n); p += n;
+            n = (size_t)3 * (size_t)C * (size_t)(c->conv_k - 1) *
+                sizeof(float);
+            memcpy(p, m->conv[L], n); p += n;
+        } else {
+            const int32_t nkv = m->n_kv[L];
+            memcpy(p, &nkv, sizeof nkv); p += sizeof nkv;
+            const size_t n = (size_t)nkv *
+                             (size_t)(c->kv_lora + c->qk_rope) *
+                             sizeof(float);
+            if (n) { memcpy(p, m->latcache[L], n); p += n; }
+        }
+    }
+    if (c->attn_res_block && m->n_blockres > 0) {
+        const size_t n = (size_t)m->n_blockres * (size_t)c->hidden *
+                         sizeof(float);
+        memcpy(p, m->blockres, n); p += n;
+    }
+    {
+        const size_t n = (size_t)c->hidden * sizeof(float);
+        memcpy(p, m->x, n); p += n;
+    }
+    return (size_t)(p - (uint8_t *)dst) == need ? 0 : -1;
+}
+
+int waste_model_state_import(waste_model *m, const void *src, size_t bytes,
+                             int *pos)
+{
+    if (!m || !src || bytes < sizeof(waste_state_hdr)) return -2;
+    const waste_config *c = &m->cfg;
+    waste_state_hdr h, want;
+    memcpy(&h, src, sizeof h);
+    state_fill(m, &want, 0);
+    if (h.magic != want.magic || h.version != want.version ||
+        h.n_layers != want.n_layers || h.hidden != want.hidden ||
+        h.kda_heads != want.kda_heads || h.kda_dim != want.kda_dim ||
+        h.conv_k != want.conv_k || h.n_heads != want.n_heads ||
+        h.qk_nope != want.qk_nope || h.qk_rope != want.qk_rope ||
+        h.v_head != want.v_head || h.attn_res_block != want.attn_res_block)
+        return -2;
+
+    const int H = c->kda_heads, D = c->kda_dim, C = H * D;
+    const int nb_max = c->attn_res_block
+                     ? c->n_layers / c->attn_res_block + 2 : 0;
+    if (h.pos < 0 || h.pos == INT32_MAX ||
+        (m->has_mla && h.pos > m->kv_cap) ||
+        h.n_blockres < 0 || h.n_blockres > nb_max)
+        return -2;
+
+    /* Preflight the complete buffer before replacing one byte of live
+     * state. `memcpy` reads the per-layer count because the field is not
+     * guaranteed to be naturally aligned in a byte buffer. */
+    size_t off = sizeof h;
+    for (int L = 0; L < c->n_layers; L++) {
+        uint64_t n = 0;
+        if (c->kda_layer[L]) {
+            n = ((uint64_t)H * D * D +
+                 (uint64_t)3 * C * (c->conv_k - 1)) * sizeof(float);
+        } else {
+            int32_t nkv = 0;
+            if (off > bytes || bytes - off < sizeof nkv) return -2;
+            memcpy(&nkv, (const uint8_t *)src + off, sizeof nkv);
+            if (nkv < 0 || nkv > m->kv_cap || nkv != h.pos) return -2;
+            n = sizeof nkv + (uint64_t)nkv *
+                (uint64_t)(c->kv_lora + c->qk_rope) * sizeof(float);
+        }
+        if (n > SIZE_MAX || off > bytes || (size_t)n > bytes - off)
+            return -2;
+        off += (size_t)n;
+    }
+    {
+        const uint64_t tail = ((uint64_t)h.n_blockres * c->hidden +
+                               (uint64_t)c->hidden) * sizeof(float);
+        if (tail > SIZE_MAX || off > bytes || (size_t)tail != bytes - off)
+            return -2;
+    }
+
+    const uint8_t *p = (const uint8_t *)src + sizeof h;
+    for (int L = 0; L < c->n_layers; L++) {
+        if (c->kda_layer[L]) {
+            size_t n = (size_t)H * (size_t)D * (size_t)D * sizeof(float);
+            memcpy(m->S[L], p, n); p += n;
+            n = (size_t)3 * (size_t)C * (size_t)(c->conv_k - 1) *
+                sizeof(float);
+            memcpy(m->conv[L], p, n); p += n;
+        } else {
+            int32_t nkv = 0;
+            memcpy(&nkv, p, sizeof nkv); p += sizeof nkv;
+            const size_t n = (size_t)nkv *
+                             (size_t)(c->kv_lora + c->qk_rope) *
+                             sizeof(float);
+            if (n) { memcpy(m->latcache[L], p, n); p += n; }
+            m->n_kv[L] = nkv;
+        }
+    }
+    m->n_blockres = h.n_blockres;
+    if (c->attn_res_block && h.n_blockres > 0) {
+        const size_t n = (size_t)h.n_blockres * (size_t)c->hidden *
+                         sizeof(float);
+        memcpy(m->blockres, p, n); p += n;
+    }
+    memcpy(m->x, p, (size_t)c->hidden * sizeof(float));
+    if (pos) *pos = h.pos;
+    return 0;
 }
 
 int waste_model_state_save(const waste_model *m, const char *path, int pos)

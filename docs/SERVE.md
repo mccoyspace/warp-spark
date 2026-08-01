@@ -156,13 +156,44 @@ override either way.
 
 ### Statelessness
 
-Each HTTP request resets the engine's conversation state before it is
-prefilled. A `waste_ctx` keeps its KDA state and MLA KV across calls —
+Each HTTP request starts from an independently reset or restored engine
+state. A `waste_ctx` keeps its KDA state and MLA KV across calls —
 that is what makes `waste chat` a conversation — and carrying that into a
 stateless server means request N is prefilled on top of request N-1: the
 same request gets different answers depending on what came before, and one
 client's turn conditions another's. The lock spans prompt building *and*
 generation, so the image queue cannot be crossed between requests either.
+
+### Exact prefix snapshots
+
+`--prefix-cache 1G` reserves that space *inside* `--budget` for compact
+session snapshots. The C engine subtracts the reservation before sizing its
+expert cache; the Python LRU enforces the same byte ceiling across packed
+token keys, snapshot blobs and entry overhead. The two caches therefore
+negotiate the advertised RAM budget instead of meeting later through Linux
+reclaim.
+
+The initial policy is deliberately exact and deterministic:
+
+1. The key is the complete int32 prompt-token sequence. There is no hash-only
+   match, longest-common-prefix search or block reuse.
+2. On a miss, the server evaluates all but the final prompt token and exports
+   the canonical KDA/MLA session representation.
+3. On a hit, it imports that state and replays the final token through the
+   ordinary forward path. That regenerates the logits bit-for-bit, so cached
+   logits and sampling-specific entries are unnecessary.
+4. Requests containing images bypass the cache: identical media placeholder
+   ids do not prove identical pixels.
+
+K3 makes this unusually attractive. Most layers retain fixed-size KDA
+recurrent state, while MLA layers store only compressed latent KV rows. The
+snapshot grows slowly with prompt length instead of retaining conventional
+per-head K/V tensors for every layer.
+
+Every response reports `waste.prefix_cache`: hit/miss/bypass reason, reused
+and evaluated prompt tokens, snapshot/resident/capacity bytes, timings,
+evictions and invalidations. `/health` reports cumulative cache state. A bad
+entry is transactionally rejected, evicted and rebuilt through the cold path.
 
 ### Concurrency
 
@@ -252,6 +283,8 @@ python3 -m serve MODEL [options]
   --io-backend {pread,pread_batch,io_uring}
                      expert-read transport (pread_batch is diagnostic)
   --io-queue-depth N bounded expert-read depth, 1..64
+  --prefix-cache SIZE
+                     reserve exact prompt snapshots inside --budget
   --trace-layers PATH
                      v2 prefill/decode phase and cache/I/O JSON Lines
   --allow-concurrent-open

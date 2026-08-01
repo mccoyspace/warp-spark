@@ -53,6 +53,7 @@ class TestRealStack(unittest.TestCase):
     def setUpClass(cls):
         cls.tmp = tempfile.mkdtemp(prefix="waste-serve-e2e-")
         model = Path(cls.tmp) / "tiny.waste"
+        cls.model = model
         r = subprocess.run(
             [sys.executable, str(ROOT / "tools" / "make_test_container.py"),
              "--tokenizer", str(model)],
@@ -61,7 +62,8 @@ class TestRealStack(unittest.TestCase):
             shutil.rmtree(cls.tmp, ignore_errors=True)
             raise unittest.SkipTest(f"make_test_container failed: {r.stderr}")
 
-        cls.engine = E.Engine(str(model), ram_budget_bytes=1 << 30)
+        cls.engine = E.Engine(str(model), ram_budget_bytes=1 << 30,
+                              prefix_cache_bytes=4 << 20)
         cls.server = serve(cls.engine, host="127.0.0.1", port=0,
                            model_id="tiny", default_max_tokens=16,
                            log_requests=False)
@@ -158,6 +160,35 @@ class TestRealStack(unittest.TestCase):
         _, a = self.post("/v1/chat/completions", body)
         _, b = self.post("/v1/chat/completions", body)
         self.assertEqual(a["choices"][0]["message"], b["choices"][0]["message"])
+
+    def test_second_exact_request_restores_prefix_state(self):
+        body = {"model": "tiny", "max_tokens": 8, "temperature": 0,
+                "messages": [{"role": "user",
+                              "content": "unique exact prefix acceptance"}]}
+        status, first = self.post("/v1/chat/completions", body)
+        self.assertEqual(status, 200, first)
+        status, second = self.post("/v1/chat/completions", body)
+        self.assertEqual(status, 200, second)
+        a = first["waste"]["prefix_cache"]
+        b = second["waste"]["prefix_cache"]
+        self.assertEqual(a["status"], "miss_stored")
+        self.assertEqual(b["status"], "hit")
+        self.assertEqual(b["prompt_tokens_evaluated"], 1)
+        self.assertEqual(b["reused_tokens"], b["key_tokens"] - 1)
+        self.assertGreater(b["snapshot_bytes"], 0)
+        self.assertLessEqual(b["resident_bytes"], b["capacity_bytes"])
+        self.assertEqual(first["choices"][0]["message"],
+                         second["choices"][0]["message"])
+
+    def test_changed_prompt_is_an_exact_cache_miss(self):
+        def body(suffix):
+            return {"model": "tiny", "max_tokens": 4, "temperature": 0,
+                    "messages": [{"role": "user",
+                                  "content": "cache key change " + suffix}]}
+        self.post("/v1/chat/completions", body("A"))
+        status, changed = self.post("/v1/chat/completions", body("B"))
+        self.assertEqual(status, 200, changed)
+        self.assertFalse(changed["waste"]["prefix_cache"]["hit"])
 
     def test_tools_render_and_run(self):
         """A tool declaration must survive rendering into a real prompt."""

@@ -240,6 +240,19 @@ file read. `waste chat` exposes it as `/save FILE` and `/load FILE`, and
 `tests/test_state.c` asserts that a reloaded session continues with
 exactly the same tokens.
 
+`waste_state_size` / `waste_state_export` / `waste_state_import` expose the
+same canonical representation in memory. Export reports its exact live size:
+fixed KDA matrices and conv rings, only the populated MLA latent rows, live
+AttnRes history and the current hidden vector. Import preflights the complete
+header, shape, position, per-layer KV counts and total length before touching
+live state. A malformed snapshot is therefore a `WASTE_E_FORMAT` that leaves
+the current conversation byte-identical. `tests/test_state.c` additionally
+requires restore + final-token replay to produce bit-identical logits.
+
+Hosts that retain snapshots set `waste_cfg.prefix_cache_bytes`. This is a
+caller-owned reservation within `ram_budget_bytes`; it is reported through
+`waste_memory_used` and removed from the expert-cache allocation at open.
+
 ## Learned hotlist
 
 The cache records which experts a workload actually touches, and

@@ -41,8 +41,47 @@ python3 tools/perf_acceptance.py /models/k3.waste \
 python3 tools/server_acceptance.py /models/k3.waste \
   --repo . --binary ./waste --out results/server.jsonl \
   --artifacts results/server-raw --label k3-server \
-  --budget 86583021568 --threads 8 --cpu-set performance \
+  --budget 86583021568 --prefix-cache 1073741824 \
+  --threads 8 --cpu-set performance \
   --io-backend io_uring --io-queue-depth 4 --tokens 16 --requests 2
+```
+
+With a prefix reservation, server acceptance records the exact-output digest,
+per-request cache status, reused/evaluated prompt tokens, snapshot size and
+first-to-second request speedup. The first request must be a stored miss and
+the second an exact hit; both answers must have the same digest.
+
+Scheduler hypotheses are measured separately from the primary benchmark:
+
+```bash
+python3 tools/offcpu_diagnostic.py record \
+  --cpus 5-9,15-19 --trace results/layers.jsonl \
+  --events results/offcpu.tsv --summary results/offcpu.json \
+  --markdown results/offcpu.md -- \
+  ./waste run /models/k3.waste "Explain NVMe clearly." -n 1 \
+    --budget 86583021568 --threads 8 --cpu-set performance \
+    --io-backend io_uring --io-queue-depth 4 \
+    --trace-layers results/layers.jsonl
+```
+
+The layer trace stores exact monotonic start/end pairs for each routed-expert
+arithmetic interval without writing from inside the hot loop. A small
+bpftrace sidecar gates capture with the decode-only `moe_layer` symbol, then
+records the target thread group's sched-switch, wakeup and futex events, plus
+CPU-idle transitions on recently targeted CPUs. The analyzer narrows them to
+the exact intervals and separates futex/barrier wakes with a tightly matched
+idle exit from wakes where no such exit was observed. It also reports the
+matched idle state and residency. Sidecar numbers are diagnostic evidence,
+never primary throughput measurements. Compare a matched QD1/QD4 pair with:
+
+```bash
+python3 tools/analyze_offcpu_pair.py \
+  --pread-summary results/pread/offcpu.json \
+  --qd4-summary results/qd4/offcpu.json \
+  --pread-trace results/pread/layers.jsonl \
+  --qd4-trace results/qd4/layers.jsonl \
+  --output results/offcpu-comparison.json \
+  --markdown results/offcpu-comparison.md
 ```
 
 An optimization is acceptable only when deterministic output is unchanged,

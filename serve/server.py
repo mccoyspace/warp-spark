@@ -42,6 +42,7 @@ from typing import Optional
 
 from . import api
 from .engine import Cancelled, Engine, EngineError
+from .prefix_cache import PrefixCache
 from .regions import RegionParser
 
 SERVER_NAME = "waste"
@@ -80,6 +81,9 @@ class ChatServer(ThreadingHTTPServer):
             self.model_info = engine.model_info()
         except EngineError:
             self.model_info = {}
+        # Capacity comes from waste_memory_used: the C engine has already
+        # removed exactly this reservation from its expert cache.
+        self.prefix_cache = PrefixCache(engine)
         # Markers by token id: the parser decides structure from ids, not
         # from what the text happens to spell. See regions.py.
         self.markers = engine.marker_ids()
@@ -98,6 +102,10 @@ class ChatServer(ThreadingHTTPServer):
                             TimeoutError)):
             return
         super().handle_error(request, client_address)
+
+    def server_close(self):
+        self.prefix_cache.clear()
+        super().server_close()
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -222,6 +230,7 @@ class Handler(BaseHTTPRequestHandler):
             "model": self.server.model_id,
             "engine": engine_mod.build_info(),
             "uptime_s": api.now() - self.server.started,
+            "prefix_cache": self.server.prefix_cache.stats(),
         })
 
     def _models(self):
@@ -264,8 +273,6 @@ class Handler(BaseHTTPRequestHandler):
         #    between its own build and generate would hand the second
         #    request the first one's pictures.
         with engine.lock:
-            engine.state_reset()
-
             prompt = api.build_prompt(
                 engine, body,
                 default_thinking=srv.default_thinking,
@@ -341,8 +348,10 @@ class Handler(BaseHTTPRequestHandler):
                 return False
             return True
 
+        run_prompt, prefix = self.server.prefix_cache.prepare(
+            prompt.tokens, n_images=prompt.n_images)
         completed = engine.generate(
-            prompt.tokens, on_token,
+            run_prompt, on_token,
             temperature=opts["temperature"], top_p=opts["top_p"],
             top_k=opts["top_k"], seed=opts["seed"],
             max_tokens=opts["max_tokens"],
@@ -352,20 +361,22 @@ class Handler(BaseHTTPRequestHandler):
             if deliver(tail, final=True):
                 state["stopped"] = True
         hit_limit = completed and state["n"] >= opts["max_tokens"]
-        return state["n"], hit_limit, state["stopped"]
+        return state["n"], hit_limit, state["stopped"], prefix
 
     def _chat_blocking(self, body, prompt, opts, stops, parser,
                        request_id, created):
         t0 = time.time()
-        n, hit_limit, stopped = self._run(prompt, opts, stops, parser,
-                                          lambda d: None)
+        n, hit_limit, stopped, prefix = self._run(
+            prompt, opts, stops, parser, lambda d: None)
         reason = api.finish_reason(parser, hit_limit=hit_limit, stopped=stopped)
         usage = api.usage_block(len(prompt.tokens), n)
+        extra = api.engine_extra(self.server.engine.stats(),
+                                 ms=(time.time() - t0) * 1000)
+        extra["prefix_cache"] = prefix
         payload = api.chat_completion(
             parser, model=self.server.model_id, request_id=request_id,
             created=created, reason=reason, usage=usage,
-            extra=api.engine_extra(self.server.engine.stats(),
-                                   ms=(time.time() - t0) * 1000))
+            extra=extra)
         self._send_json(200, payload)
 
     def _chat_stream(self, body, prompt, opts, stops, parser,
@@ -424,8 +435,8 @@ class Handler(BaseHTTPRequestHandler):
                 raise Cancelled()
 
         try:
-            n, hit_limit, stopped = self._run(prompt, opts, stops, parser,
-                                              on_delta)
+            n, hit_limit, stopped, prefix = self._run(
+                prompt, opts, stops, parser, on_delta)
         except Cancelled:
             # The client is gone. Nothing left to write to.
             return
@@ -458,10 +469,12 @@ class Handler(BaseHTTPRequestHandler):
                 write({"id": request_id, "object": "chat.completion.chunk",
                        "created": created, "model": model, "choices": [],
                        "usage": usage})
+            extra = api.engine_extra(self.server.engine.stats(),
+                                     ms=(time.time() - t0) * 1000)
+            extra["prefix_cache"] = prefix
             write({"id": request_id, "object": "chat.completion.chunk",
                    "created": created, "model": model, "choices": [],
-                   "waste": api.engine_extra(self.server.engine.stats(),
-                                             ms=(time.time() - t0) * 1000)})
+                   "waste": extra})
             write("[DONE]")
             self.wfile.write(b"0\r\n\r\n")
             self.wfile.flush()
@@ -489,7 +502,6 @@ class Handler(BaseHTTPRequestHandler):
                                param="prompt")
 
         with srv.engine.lock:
-            srv.engine.state_reset()      # each request stands alone
             tokens = srv.engine.tokenize(prompt_text)
             if not tokens:
                 raise api.APIError("'prompt' encoded to no tokens",
@@ -511,8 +523,10 @@ class Handler(BaseHTTPRequestHandler):
                         return False
                 return True
 
+            t0 = time.time()
+            run_prompt, prefix = srv.prefix_cache.prepare(tokens)
             completed = srv.engine.generate(
-                tokens, on_token, temperature=opts["temperature"],
+                run_prompt, on_token, temperature=opts["temperature"],
                 top_p=opts["top_p"], top_k=opts["top_k"], seed=opts["seed"],
                 max_tokens=opts["max_tokens"],
                 stop_tokens=srv.stop_tokens or None)
@@ -522,6 +536,9 @@ class Handler(BaseHTTPRequestHandler):
             if s and s in text:
                 text = text.split(s, 1)[0]
         hit_limit = completed and len(pieces) >= opts["max_tokens"]
+        extra = api.engine_extra(srv.engine.stats(),
+                                 ms=(time.time() - t0) * 1000)
+        extra["prefix_cache"] = prefix
         self._send_json(200, {
             "id": api.new_id("cmpl"),
             "object": "text_completion",
@@ -530,6 +547,7 @@ class Handler(BaseHTTPRequestHandler):
             "choices": [{"index": 0, "text": text, "logprobs": None,
                          "finish_reason": "length" if hit_limit else "stop"}],
             "usage": api.usage_block(len(tokens), len(pieces)),
+            "waste": extra,
         })
 
 
