@@ -143,6 +143,13 @@ decoded layer's routed experts together but reads every miss with sequential
 recommendation: comparing it with ordinary interleaved `pread` separates the
 effect of uninterrupted compute from the ring's storage concurrency.
 
+On Linux, `tools/io_compute_diagnostic.py` runs that three-way comparison in
+a balanced A/B/C order while collecting layer traces, PMU counters, CPU-idle
+state, frequency, temperature, memory pressure, and process swap evidence.
+After the campaign, `tools/analyze_io_compute.py CAMPAIGN_DIR` regenerates the
+paired timing estimates, exact determinism checks, and miss-count strata under
+`CAMPAIGN_DIR/analysis` using only Python's standard library.
+
 Reads bypass the page cache (`F_NOCACHE` on macOS, `O_DIRECT` on Linux,
 `FILE_FLAG_NO_BUFFERING` on Windows). That is deliberate: with a container
 smaller than RAM the kernel would cache everything, and the hit rates
