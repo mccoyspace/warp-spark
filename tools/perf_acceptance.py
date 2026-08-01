@@ -127,6 +127,9 @@ def main() -> int:
     ap.add_argument("--budget", type=int, required=True)
     ap.add_argument("--threads", type=int, default=8)
     ap.add_argument("--cpu-set", default="performance")
+    ap.add_argument("--io-backend", choices=("pread", "io_uring"),
+                    default="pread")
+    ap.add_argument("--io-queue-depth", type=int, default=1)
     ap.add_argument("--trace", action="store_true")
     args = ap.parse_args()
 
@@ -142,7 +145,9 @@ def main() -> int:
             cmd.append(args.prompt)
             cmd += ["--temp", "0"]
         cmd += ["-n", str(args.tokens), "--budget", str(args.budget),
-                "--threads", str(args.threads), "--cpu-set", args.cpu_set]
+                "--threads", str(args.threads), "--cpu-set", args.cpu_set,
+                "--io-backend", args.io_backend,
+                "--io-queue-depth", str(args.io_queue_depth)]
         if args.workload == "bench":
             # Bench already makes its generated text quiet.  Do not pass the
             # CLI-wide quiet flag: it would also hide the resolved CPU set,
@@ -189,6 +194,8 @@ def main() -> int:
             "threads": args.threads,
             "cpu_set": args.cpu_set,
             "resolved_cpu_set": resolved_cpu_set(stderr),
+            "io_backend_requested": args.io_backend,
+            "io_queue_depth_requested": args.io_queue_depth,
             "tokens_requested": args.tokens,
             "peak_rss_bytes": peak_rss or None,
             "peak_process_swap_bytes": peak_swap,

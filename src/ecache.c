@@ -5,6 +5,7 @@
 
 #include "ecache.h"
 
+#include <limits.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -47,7 +48,14 @@ int waste_ecache_init(waste_ecache *c, size_t budget_bytes, size_t rec_bytes,
     c->rng = 0x9e3779b9u;
     if (!rec_bytes || budget_bytes < rec_bytes) return 0;   /* no cache */
 
-    c->n_slots = (int)(budget_bytes / rec_bytes);
+    const size_t slots = budget_bytes / rec_bytes;
+    /* n_slots and the open-addressing table size are ints. This limit leaves
+     * room to double the slot count and round the hash table up to a power of
+     * two without signed overflow. Real models are thousands of slots, not
+     * hundreds of millions; an impossible budget is an argument error, not
+     * permission to wrap an allocation size. */
+    if (slots > (size_t)INT_MAX / 4) return -1;
+    c->n_slots = (int)slots;
     int hs = 1;
     while (hs < c->n_slots * 2) hs <<= 1;
     c->hash_mask = hs - 1;
@@ -107,7 +115,7 @@ static int ec_victim(waste_ecache *c)
 {
     /* free slot first */
     for (int i = 0; i < c->n_slots; i++)
-        if (c->slot[i].key < 0) return i;
+        if (c->slot[i].key < 0 && !c->slot[i].pinned) return i;
 
     int best = -1;
     uint32_t best_h = 0;
@@ -116,6 +124,7 @@ static int ec_victim(waste_ecache *c)
         c->rng = c->rng * 1664525u + 1013904223u;
         const int i = (int)(c->rng % (uint32_t)c->n_slots);
         const waste_eslot *sl = &c->slot[i];
+        if (sl->pinned) continue;
         int better;
         if (c->policy == 1)                       /* LRU */
             better = (best < 0) || sl->last < best_l;
@@ -123,6 +132,20 @@ static int ec_victim(waste_ecache *c)
             better = (best < 0) || sl->hits < best_h ||
                      (sl->hits == best_h && sl->last < best_l);
         if (better) { best = i; best_h = sl->hits; best_l = sl->last; }
+    }
+    /* A small batch can make all 16 random samples land on pinned slots.
+     * That is not an out-of-cache condition; find the best unpinned slot
+     * deterministically rather than failing or overwriting live data. */
+    if (best < 0) {
+        for (int i = 0; i < c->n_slots; i++) {
+            const waste_eslot *sl = &c->slot[i];
+            if (sl->pinned) continue;
+            const int better = c->policy == 1
+                ? (best < 0 || sl->last < best_l)
+                : (best < 0 || sl->hits < best_h ||
+                   (sl->hits == best_h && sl->last < best_l));
+            if (better) { best = i; best_h = sl->hits; best_l = sl->last; }
+        }
     }
     return best;
 }
@@ -160,6 +183,81 @@ const uint8_t *waste_ecache_get(waste_ecache *c, int layer, int expert,
     c->slot[vi].hits = 1;
     c->slot[vi].last = c->clock;
     return c->slot[vi].data;
+}
+
+int waste_ecache_get_many(waste_ecache *c, int layer, const int *experts,
+                          int n, waste_fetch_many_fn fetch_many, void *user,
+                          const uint8_t **out)
+{
+    if (!c || !experts || !fetch_many || !out || n <= 0 || n > 64 ||
+        c->n_slots <= 0)
+        return -1;
+    int initial[64], slots[64], miss_at[64], miss_layers[64],
+        miss_experts[64];
+    uint8_t *miss_dst[64];
+
+    /* Snapshot and pin the hits before choosing a victim. Without this,
+     * an early miss could evict a later hit and overwrite its destination
+     * while the batch I/O is in flight. */
+    for (int i = 0; i < n; i++) {
+        initial[i] = ec_lookup(c, ec_key(layer, experts[i]));
+        slots[i] = -1;
+        if (initial[i] >= 0) c->slot[initial[i]].pinned = 1;
+    }
+
+    int nm = 0, failed = 0;
+    for (int i = 0; i < n; i++) {
+        c->clock++;
+        int si = initial[i];
+        if (si < 0) {
+            /* A duplicate later in the same batch is a hit on the slot we
+             * just reserved; routers normally return distinct ids, but the
+             * cache API need not depend on that. */
+            for (int j = 0; j < i; j++)
+                if (experts[j] == experts[i]) { si = slots[j]; break; }
+        }
+        if (si >= 0) {
+            c->hits++;
+            c->slot[si].hits++;
+            c->slot[si].last = c->clock;
+            c->slot[si].pinned = 1;
+            slots[i] = si;
+            out[i] = c->slot[si].data;
+            continue;
+        }
+
+        c->misses++;
+        c->bytes_read += c->rec_bytes;
+        const int vi = ec_victim(c);
+        if (vi < 0) { failed = 1; break; }
+        const int had = c->slot[vi].key >= 0;
+        c->slot[vi].key = ec_key(layer, experts[i]);
+        c->slot[vi].hits = 1;
+        c->slot[vi].last = c->clock;
+        c->slot[vi].pinned = 1;
+        if (had) { c->evictions++; ec_rehash(c); }
+        else ec_insert(c, c->slot[vi].key, vi);
+        slots[i] = vi;
+        out[i] = c->slot[vi].data;
+        miss_at[nm] = i;
+        miss_layers[nm] = layer;
+        miss_experts[nm] = experts[i];
+        miss_dst[nm] = c->slot[vi].data;
+        nm++;
+    }
+
+    if (!failed && nm && fetch_many(user, nm, miss_layers, miss_experts,
+                                    miss_dst) != 0)
+        failed = 1;
+    if (failed) {
+        for (int k = 0; k < nm; k++) {
+            const int si = slots[miss_at[k]];
+            if (si >= 0) c->slot[si].key = -1;
+        }
+        ec_rehash(c);
+    }
+    for (int i = 0; i < c->n_slots; i++) c->slot[i].pinned = 0;
+    return failed ? -1 : 0;
 }
 
 /* ---- learned hotlist ---------------------------------------------------- */

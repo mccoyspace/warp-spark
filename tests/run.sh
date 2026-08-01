@@ -64,6 +64,16 @@ if ./test_system "$TMP" 2>/dev/null | grep -q '^PASS'; then
 else
     no "host accounting and CPU placement"
 fi
+if ./test_io "$TMP" 2>/dev/null | grep -q '^PASS'; then
+    ok "raw io_uring transport or non-Linux fallback"
+else
+    no "raw io_uring transport"
+fi
+if ./test_ecache 2>/dev/null | grep -q '^PASS'; then
+    ok "batched cache pins live records across concurrent misses"
+else
+    no "batched expert cache"
+fi
 
 # ---------------------------------------------------------------- unit ----
 head_ "kernels vs the reference implementations"
@@ -529,15 +539,27 @@ if [ -d "$MODEL" ]; then
        python3 - "$TRACE" <<'PYTRACE'
 import json, sys
 rows = [json.loads(line) for line in open(sys.argv[1])]
-layers = [r for r in rows if r.get("event") == "decode_layer"]
-need = {"position", "layer", "attention_ms", "experts", "cache_hits",
-        "cache_misses", "bytes_read", "router_ms", "expert_io_ms",
-        "expert_compute_ms", "shared_compute_ms", "moe_total_ms",
-        "io_backend", "queue_depth", "overlap_ms", "direct_io"}
-raise SystemExit(0 if layers and need <= layers[0].keys() else 1)
+by_event = {event: [r for r in rows if r.get("event") == event]
+            for event in ("meta", "prefill_layer", "prefill_chunk",
+                          "decode_layer", "decode_token")}
+layer_need = {"layer", "attention_ms", "cache_hits", "cache_misses",
+              "bytes_read", "router_ms", "expert_io_ms",
+              "expert_compute_ms", "shared_compute_ms", "moe_total_ms",
+              "io_backend", "queue_depth", "direct_io", "read_error"}
+total_need = {"total_ms", "attention_ms", "router_ms", "expert_io_ms",
+              "expert_compute_ms", "shared_compute_ms", "moe_total_ms",
+              "other_ms", "cache_hits", "cache_misses", "bytes_read",
+              "io_backend", "queue_depth", "direct_io", "read_error"}
+valid = (all(by_event.values()) and
+         all(r.get("schema") == "waste.layer_trace.v2" for r in rows) and
+         layer_need <= by_event["prefill_layer"][0].keys() and
+         layer_need <= by_event["decode_layer"][0].keys() and
+         total_need <= by_event["prefill_chunk"][0].keys() and
+         total_need <= by_event["decode_token"][0].keys())
+raise SystemExit(0 if valid else 1)
 PYTRACE
     then
-        ok "decode-layer JSONL trace has the v1 routing/cache/I/O/compute schema"
+        ok "v2 JSONL trace reconciles prefill/decode layer and token phases"
     else
         no "decode-layer trace schema"
     fi

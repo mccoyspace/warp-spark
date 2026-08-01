@@ -51,6 +51,7 @@ WASTE_E_MEMORY = -9
 # listed there and never implemented, so it selected LFRU like everything
 # else that was not 1.
 CACHE_LFRU, CACHE_LRU = 0, 1
+IO_PREAD, IO_URING = 0, 1
 
 
 class EngineError(RuntimeError):
@@ -90,7 +91,9 @@ class Cfg(C.Structure):
                 ("verify_records", C.c_int),
                 ("usage_path", C.c_char_p),
                 ("allow_concurrent_open", C.c_int),
-                ("trace_path", C.c_char_p)]
+                ("trace_path", C.c_char_p),
+                ("io_backend", C.c_int),
+                ("io_queue_depth", C.c_int)]
 
 
 class GenParams(C.Structure):
@@ -134,7 +137,10 @@ class Stats(C.Structure):
                 ("bytes_read", C.c_uint64),
                 ("sec_total", C.c_double),
                 ("sec_io", C.c_double),
-                ("direct_io", C.c_int)]
+                ("direct_io", C.c_int),
+                ("io_backend", C.c_int),
+                ("io_queue_depth", C.c_int),
+                ("io_fallback", C.c_int)]
 
 
 TOKEN_CB = C.CFUNCTYPE(C.c_int, C.POINTER(TokenInfo), C.c_char_p, C.c_void_p)
@@ -399,11 +405,16 @@ class Engine:
                  verify_records: bool = False,
                  usage_path: Optional[str] = None,
                  allow_concurrent_open: bool = False,
-                 trace_path: Optional[str] = None):
+                 trace_path: Optional[str] = None,
+                 io_backend: str = "pread",
+                 io_queue_depth: int = 1):
         ram_budget_bytes = _bounded_int(
             "ram_budget_bytes", ram_budget_bytes, 0, (1 << 64) - 1)
         ctx_tokens = _bounded_int("ctx_tokens", ctx_tokens, 0, (1 << 32) - 1)
         n_threads = _bounded_int("n_threads", n_threads, 0, (1 << 31) - 1)
+        io_queue_depth = _bounded_int("io_queue_depth", io_queue_depth, 1, 64)
+        if io_backend not in ("pread", "io_uring"):
+            raise ValueError("io_backend must be 'pread' or 'io_uring'")
         self.lib = _lib()
         self.model_path = str(model_path)
         self._lock = threading.RLock()
@@ -426,6 +437,8 @@ class Engine:
         cfg.allow_concurrent_open = 1 if allow_concurrent_open else 0
         self._trace_path = trace_path.encode() if trace_path else None
         cfg.trace_path = self._trace_path
+        cfg.io_backend = IO_URING if io_backend == "io_uring" else IO_PREAD
+        cfg.io_queue_depth = io_queue_depth
 
         st = self.lib.waste_open(self.model_path.encode(), C.byref(cfg),
                                  C.byref(self._ctx))

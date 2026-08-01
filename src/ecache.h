@@ -37,6 +37,7 @@ typedef struct {
     uint32_t hits;       /* LFRU frequency term                             */
     uint64_t last;       /* LFRU recency term                               */
     uint8_t *data;
+    int      pinned;     /* transient: a batch still needs this slot       */
 } waste_eslot;
 
 typedef struct {
@@ -71,6 +72,18 @@ void waste_ecache_free(waste_ecache *c);
 typedef int (*waste_fetch_fn)(void *user, int layer, int expert, uint8_t *dst);
 const uint8_t *waste_ecache_get(waste_ecache *c, int layer, int expert,
                                 waste_fetch_fn fetch, void *user);
+
+/* Batch form used by the Linux async backend. All requests name one layer,
+ * as one router produces them. Existing hits and newly reserved miss slots
+ * are pinned until fetch_many completes, so another miss in the same batch
+ * cannot overwrite a record whose pointer the caller has not consumed yet.
+ * Returns 0 and fills out[] on success; -1 when caching is disabled or a
+ * fetch fails. */
+typedef int (*waste_fetch_many_fn)(void *user, int n, const int *layers,
+                                   const int *experts, uint8_t *const *dst);
+int waste_ecache_get_many(waste_ecache *c, int layer, const int *experts,
+                          int n, waste_fetch_many_fn fetch_many, void *user,
+                          const uint8_t **out);
 
 /* Persist / restore which experts this workload actually uses. Gate 5
  * measured a 0% hit rate until the cache exceeds one token's working set;

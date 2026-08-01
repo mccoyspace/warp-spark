@@ -112,6 +112,11 @@ typedef enum {
     WASTE_CACHE_LRU = 1,
 } waste_cache_policy;
 
+typedef enum {
+    WASTE_IO_PREAD = 0,       /* synchronous positional reads (default)   */
+    WASTE_IO_URING = 1,       /* Linux io_uring, synchronous fallback     */
+} waste_io_backend;
+
 typedef struct {
     /* Hard ceiling on all engine allocations, used exactly as given.
      *
@@ -195,9 +200,15 @@ typedef struct {
      * host deliberately accepts competing full-model loads. */
     int allow_concurrent_open;
 
-    /* Optional JSON Lines trace for decode-layer routing, cache, expert I/O,
-     * expert compute and shared-expert compute. NULL disables it. */
+    /* Optional waste.layer_trace.v2 JSON Lines for prefill/decode layers and
+     * reconciled chunk/token phase totals. NULL disables it. */
     const char *trace_path;
+
+    /* Expert-read transport. io_uring is Linux-only and intentionally
+     * opt-in until a host measures it; setup failure falls back to pread.
+     * Queue depth is bounded to 1..64, with 1 always selecting pread. */
+    waste_io_backend io_backend;
+    int io_queue_depth;
 } waste_cfg;
 
 /* Removed in 0.6.0, having never done anything: `io_threads` (there is no
@@ -398,6 +409,9 @@ typedef struct {
      * The hit rate is then partly the kernel's, not the engine's, and the
      * numbers do not transfer to a machine that cannot cache the model. */
     int      direct_io;
+    waste_io_backend io_backend; /* transport actually in use             */
+    int      io_queue_depth;     /* 1 for pread, requested depth for ring */
+    int      io_fallback;        /* requested ring but setup was refused  */
 } waste_stats;
 
 waste_status waste_get_stats(const waste_ctx *ctx, waste_stats *out);

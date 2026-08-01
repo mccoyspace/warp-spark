@@ -16,7 +16,7 @@ learned list           retained usage.waste
 ```
 
 `tools/perf_acceptance.py` appends `waste.acceptance.v1` JSON Lines and keeps
-stdout, stderr and optional `waste.layer_trace.v1` data beside it. Each record
+stdout, stderr and optional `waste.layer_trace.v2` data beside it. Each record
 identifies the binary, model manifest, learned list, exact command, wall time,
 peak RSS, minimum Linux `MemAvailable`, process swap, VM/PSI deltas and the
 engine's own result.
@@ -33,7 +33,8 @@ python3 tools/perf_acceptance.py /models/k3.waste \
   --binary ./waste --out results/acceptance.jsonl \
   --artifacts results/raw --label learned-3x --workload bench \
   --tokens 16 --repetitions 2 --budget 86583021568 \
-  --threads 8 --cpu-set performance --trace
+  --threads 8 --cpu-set performance \
+  --io-backend io_uring --io-queue-depth 4 --trace
 ```
 
 ```bash
@@ -41,7 +42,7 @@ python3 tools/server_acceptance.py /models/k3.waste \
   --repo . --binary ./waste --out results/server.jsonl \
   --artifacts results/server-raw --label k3-server \
   --budget 86583021568 --threads 8 --cpu-set performance \
-  --tokens 16 --requests 2
+  --io-backend io_uring --io-queue-depth 4 --tokens 16 --requests 2
 ```
 
 An optimization is acceptable only when deterministic output is unchanged,
@@ -73,3 +74,39 @@ expert-read time, 8.32 s routed-expert compute, 1.84 s shared-expert compute,
 5.45 s attention and 0.20 s routing. This supports bounded async/prefetch as
 the next experiment, but puts its first-order opportunity near 15–20% of
 decoded-layer time rather than enough to explain the full Mac/Acer gap.
+
+## Acer GN100 second-sprint acceptance
+
+The second sprint added a raw Linux `io_uring` transport with no liburing
+dependency. It submits only the router's exact expert records, in bounded
+batches, and computes them in the original order. Cache slots returned to a
+batch are pinned until all reads finish, so an in-flight miss cannot evict and
+overwrite another live record. Ring setup failure reports a fallback and uses
+synchronous `pread`.
+
+The 16-token K3 queue-depth sweep used the same model, learned list, budget,
+threads and CPU set as the first sprint:
+
+| Backend | QD | Runs (tok/s) | Median | vs QD1 |
+|---|---:|---:|---:|---:|
+| synchronous `pread` | 1 | 0.0969, 0.0955 | 0.0962 | — |
+| `io_uring` | 2 | 0.1029, 0.1038 | 0.10335 | +7.4% |
+| `io_uring` | 4 | 0.1106, 0.1095 | **0.11005** | **+14.4%** |
+
+QD4 passed the longer gates as well:
+
+| Check | Pread/control | QD4 | Change |
+|---|---:|---:|---:|
+| Same-request persistent server | 208.75 s | 182.67 s | -12.49% |
+| 64-token generation | 371.17 s | 315.15 s | -15.09% |
+| 64-token wall | 549.83 s | 478.04 s | -13.06% |
+| 64-token throughput | 0.17243 tok/s | 0.20308 tok/s | +17.78% |
+
+The server responses and the 64-token CLI output were byte-identical between
+the compared transports. All 368 routed-expert arrays in the four-token QD4
+decode trace exactly matched the first-sprint trace. That trace reduced expert
+I/O from 3.60 s to 2.81 s (-21.8%) with identical decode cache counts and
+bytes. QD4 remained direct-I/O throughout, never fell back, and every
+acceptance run recorded zero process swap, swap-out, direct/kswapd reclaim and
+sustained memory pressure. Use `--io-queue-depth 4` on Linux to select this
+measured configuration; synchronous `pread` remains the portable default.

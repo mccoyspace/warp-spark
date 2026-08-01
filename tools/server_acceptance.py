@@ -103,6 +103,9 @@ def main() -> int:
     ap.add_argument("--budget", type=int, required=True)
     ap.add_argument("--threads", type=int, default=8)
     ap.add_argument("--cpu-set", default="performance")
+    ap.add_argument("--io-backend", choices=("pread", "io_uring"),
+                    default="pread")
+    ap.add_argument("--io-queue-depth", type=int, default=1)
     ap.add_argument("--tokens", type=int, default=16)
     ap.add_argument("--requests", type=int, default=2)
     ap.add_argument("--prompt", default="Explain NVMe clearly.")
@@ -122,6 +125,8 @@ def main() -> int:
            "--host", "127.0.0.1", "--port", str(args.port),
            "--model-id", args.label, "--budget", str(args.budget),
            "--threads", str(args.threads), "--cpu-set", args.cpu_set,
+           "--io-backend", args.io_backend,
+           "--io-queue-depth", str(args.io_queue_depth),
            "--max-tokens", str(args.tokens), "--no-thinking"]
     if args.trace:
         cmd += ["--trace-layers", str(trace_path)]
@@ -246,6 +251,8 @@ def main() -> int:
         "threads": args.threads,
         "cpu_set": args.cpu_set,
         "resolved_cpu_set": cpu_match.group(1) if cpu_match else None,
+        "io_backend_requested": args.io_backend,
+        "io_queue_depth_requested": args.io_queue_depth,
         "tokens_requested": args.tokens,
         "requests": responses,
         "lock_probe": lock_probe,

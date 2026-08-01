@@ -113,10 +113,11 @@ typedef struct {
     uint32_t ctx, max_tokens;
     float temperature, top_p;
     int top_k, threads, quiet, learn, json, no_echo, allow_concurrent;
+    int io_queue_depth;
     int media_inlined;              /* the media block is already in the
                                        prompt string, inside the user turn */
     uint64_t seed;
-    const char *file, *stop, *system, *cpu_set, *trace_path;
+    const char *file, *stop, *system, *cpu_set, *trace_path, *io_backend;
     const char *image[WASTE_MAX_IMAGES_CLI];
     int n_image;
     int raw;
@@ -132,6 +133,8 @@ static void opts_init(opts *o)
     o->max_tokens = 128;
     o->top_p = 1.0f;
     o->cpu_set = getenv("WASTE_CPU_SET");
+    o->io_backend = getenv("WASTE_IO_BACKEND");
+    o->io_queue_depth = 1;
 }
 
 /* Options and positionals in any order.
@@ -152,7 +155,8 @@ static int parse_opts(int argc, char **argv, int from, opts *o)
             !strcmp(a, "--seed") || !strcmp(a, "--threads") ||
             !strcmp(a, "--file") || !strcmp(a, "--stop") ||
             !strcmp(a, "--system") || !strcmp(a, "--image") ||
-            !strcmp(a, "--cpu-set") || !strcmp(a, "--trace-layers")) {
+            !strcmp(a, "--cpu-set") || !strcmp(a, "--trace-layers") ||
+            !strcmp(a, "--io-backend") || !strcmp(a, "--io-queue-depth")) {
             need = 1;
             /* `--temp --budget 8G` used to make "--budget" the temperature
              * and then complain about 8G. A value that looks like an option
@@ -179,6 +183,9 @@ static int parse_opts(int argc, char **argv, int from, opts *o)
         else if (!strcmp(a, "--system")) o->system = v;
         else if (!strcmp(a, "--cpu-set")) o->cpu_set = v;
         else if (!strcmp(a, "--trace-layers")) o->trace_path = v;
+        else if (!strcmp(a, "--io-backend")) o->io_backend = v;
+        else if (!strcmp(a, "--io-queue-depth"))
+            bad = parse_nonnegative_int(v, &o->io_queue_depth);
         else if (!strcmp(a, "--image")) {
             if (o->n_image >= WASTE_MAX_IMAGES_CLI) {
                 fprintf(stderr, "at most %d images\n", WASTE_MAX_IMAGES_CLI);
@@ -284,6 +291,13 @@ static waste_status open_model(const char *path, const opts *o, waste_ctx **ctx)
     cfg.verify_records = o->verify;
     cfg.allow_concurrent_open = o->allow_concurrent;
     cfg.trace_path = o->trace_path;
+    if (o->io_queue_depth < 1 || o->io_queue_depth > 64) return WASTE_E_ARG;
+    cfg.io_queue_depth = o->io_queue_depth;
+    if (!o->io_backend || !*o->io_backend)
+        cfg.io_backend = o->io_queue_depth > 1 ? WASTE_IO_URING : WASTE_IO_PREAD;
+    else if (!strcmp(o->io_backend, "pread")) cfg.io_backend = WASTE_IO_PREAD;
+    else if (!strcmp(o->io_backend, "io_uring")) cfg.io_backend = WASTE_IO_URING;
+    else return WASTE_E_ARG;
     return waste_open(path, &cfg, ctx);
 }
 
@@ -1017,12 +1031,15 @@ static int cmd_bench(int argc, char **argv)
     if (o.json) {
         printf("{\"tokens\":%llu,\"tok_per_s\":%.4f,\"experts_hit\":%llu,"
                "\"experts_missed\":%llu,\"bytes_read\":%llu,"
-               "\"direct_io\":%s}\n",
+               "\"direct_io\":%s,\"io_backend\":\"%s\","
+               "\"io_queue_depth\":%d,\"io_fallback\":%s}\n",
                (unsigned long long)s.tokens_generated, tps,
                (unsigned long long)s.experts_hit,
                (unsigned long long)s.experts_missed,
                (unsigned long long)s.bytes_read,
-               s.direct_io ? "true" : "false");
+               s.direct_io ? "true" : "false",
+               s.io_backend == WASTE_IO_URING ? "io_uring" : "pread_sync",
+               s.io_queue_depth, s.io_fallback ? "true" : "false");
         waste_close(c);
         return 0;
     }
@@ -1030,6 +1047,9 @@ static int cmd_bench(int argc, char **argv)
     if (!s.direct_io)
         printf("  note      page cache not bypassed on this filesystem — the hit\n"
                "            rate below is partly the kernel's, not the engine's\n");
+    printf("  I/O       %s, queue depth %d%s\n",
+           s.io_backend == WASTE_IO_URING ? "io_uring" : "pread",
+           s.io_queue_depth, s.io_fallback ? " (ring setup fell back)" : "");
     printf("  experts   %llu hit / %llu miss = %.1f%% hit\n",
            (unsigned long long)s.experts_hit, (unsigned long long)s.experts_missed,
            100.0 * (double)s.experts_hit / (double)(acc ? acc : 1));
@@ -1205,6 +1225,7 @@ int main(int argc, char **argv)
                "options: --budget 8G  --ctx N  -n N  --temp F  --top-p F\n"
                "         --top-k N  --seed N  --threads N  --stop STR\n"
                "         --cpu-set performance|LIST  --trace-layers PATH\n"
+               "         --io-backend pread|io_uring  --io-queue-depth 1..64\n"
                "         --file F  --json  -q  --learn  --verify\n"
          "  --stop  ends generation when the text appears\n"
          "  --json  machine-readable output for eval, tokenize, plan,\n"
@@ -1214,7 +1235,9 @@ int main(int argc, char **argv)
          "  --threads sets the compute pool; 0 (default) is one per core\n"
          "  --cpu-set performance selects the fastest Linux core class\n"
          "  --allow-concurrent-open permits another process to load MODEL\n"
-         "  --trace-layers writes decode-layer timing and cache JSON Lines\n"
+         "  --trace-layers writes v2 prefill/decode phase/cache JSON Lines\n"
+         "  --io-queue-depth above 1 selects Linux io_uring unless an\n"
+         "  explicit --io-backend says otherwise; setup safely falls back\n"
          "  --verify checks each expert record's checksum as it is read,\n"
          "  for a container you have not read since copying it. Costs ~5%%\n"
          "  on Kimi-Linear, ~1%% on K3; off otherwise\n",

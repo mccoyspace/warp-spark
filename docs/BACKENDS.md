@@ -101,19 +101,27 @@ site carries a branch:
 | concern | macOS | Linux | Windows |
 |---|---|---|---|
 | cache-bypass read | `fcntl(F_NOCACHE)` | `O_DIRECT` | `FILE_FLAG_NO_BUFFERING` |
-| positional read | `pread` | `pread` | `ReadFile` + `OVERLAPPED` |
+| positional read | `pread` | `pread`, optional raw `io_uring` | `ReadFile` + `OVERLAPPED` |
 | aligned allocation | `posix_memalign` | `posix_memalign` | `_aligned_malloc` |
 | CPU count | `sysconf` | `sysconf` | `GetActiveProcessorCount` |
 | physical RAM | `sysctlbyname("hw.memsize")` | `sysconf(_SC_PHYS_PAGES)` | `GlobalMemoryStatusEx` |
 | CPU features | `sysctlbyname("hw.optional.arm.*")` | `getauxval(AT_HWCAP/2)` | `IsProcessorFeaturePresent` / CPUID |
 | threads | pthreads | pthreads | pthreads (winpthreads) |
 
-Nothing is mapped: the engine reads by offset and never calls `mmap`,
-which is what makes the streaming path one shim rather than two.
+Model data is never mapped: the engine reads by offset. The optional Linux
+ring maps only the kernel's submission/completion queues and SQE array, as the
+`io_uring` ABI requires; expert banks remain direct positional reads.
 
 The expert-streaming path is the one that really cares: Gate H showed
 throughput is set by random 12 MB reads with the page cache bypassed, and
 that call differs on all three platforms.
+
+The Linux ring is implemented directly against `linux/io_uring.h`, with no
+runtime liburing dependency. A depth is bounded to 64, completion results are
+matched by request index, and setup failure falls back to `pread` while
+surfacing that fact in `waste_stats`. QD4 on the Acer GN100 improved the K3
+16-token median by 14.4% and the 64-token generation time by 15.1%; it is an
+opt-in measured backend rather than a portable assumption.
 
 ## Status
 

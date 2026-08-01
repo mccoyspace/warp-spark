@@ -188,6 +188,8 @@ void waste_cfg_init(waste_cfg *cfg)
     cfg->cache_policy = WASTE_CACHE_LFRU;
     cfg->use_direct_io = 1;
     cfg->ctx_tokens = 4096;
+    cfg->io_backend = WASTE_IO_PREAD;
+    cfg->io_queue_depth = 1;
 }
 
 void waste_gen_params_init(waste_gen_params *p)
@@ -448,6 +450,10 @@ waste_status waste_open(const char *model_path, const waste_cfg *cfg_in,
     if (cfg_in) cfg = *cfg_in;
     else waste_cfg_init(&cfg);
     if (!cfg.ctx_tokens) cfg.ctx_tokens = 4096;
+    if (!cfg.io_queue_depth) cfg.io_queue_depth = 1;
+    if (cfg.io_queue_depth < 1 || cfg.io_queue_depth > 64 ||
+        (cfg.io_backend != WASTE_IO_PREAD && cfg.io_backend != WASTE_IO_URING))
+        return WASTE_E_ARG;
 
     waste_ctx *c = (waste_ctx *)calloc(1, sizeof *c);
     if (!c) return WASTE_E_OOM;
@@ -557,6 +563,8 @@ waste_status waste_open(const char *model_path, const waste_cfg *cfg_in,
         opt.policy = (int)cfg.cache_policy;
         opt.direct_io = cfg.use_direct_io;
         opt.trace_path = cfg.trace_path;
+        opt.io_backend = (int)cfg.io_backend;
+        opt.io_queue_depth = cfg.io_queue_depth;
         const int rc = waste_model_load(&c->m, model_path, (int)cfg.ctx_tokens,
                                         &opt);
         if (rc) {
@@ -958,6 +966,7 @@ waste_status waste_generate(waste_ctx *c, const int32_t *prompt, size_t n,
     uint64_t rng = p.seed ? p.seed : 0x853c49e6748fea9bULL;
 
     const uint64_t h0 = c->m.cache.hits, m0 = c->m.cache.misses;
+    const double io0 = c->m.io_seconds;
     const float *lg = NULL;
     double t0 = nowf();
     /* Prefill in chunks: tokens in a chunk route to overlapping expert
@@ -992,6 +1001,7 @@ waste_status waste_generate(waste_ctx *c, const int32_t *prompt, size_t n,
         if (ctx_room(c) == 0) { ctx_full_report(c); break; }
         const uint64_t hb = c->m.cache.hits, mb = c->m.cache.misses;
         const uint64_t bb = c->m.cache.bytes_read;
+        const double iob = c->m.io_seconds;
         t0 = nowf();
         lg = waste_model_step(&c->m, cur, c->pos++, NULL);
         const double dt = nowf() - t0;
@@ -1011,6 +1021,7 @@ waste_status waste_generate(waste_ctx *c, const int32_t *prompt, size_t n,
             info.experts_missed = (uint32_t)(c->m.cache.misses - mb);
             info.bytes_read = c->m.cache.bytes_read - bb;
             info.ms_total = dt * 1000.0;
+            info.ms_io = (c->m.io_seconds - iob) * 1000.0;
             char local[256], *piece = local;
             int pn = 0, need = 0;
             if (c->tok) need = waste_tok_decode_len1(c->tok, cur);
@@ -1036,6 +1047,7 @@ waste_status waste_generate(waste_ctx *c, const int32_t *prompt, size_t n,
     c->stats.experts_hit += c->m.cache.hits - h0;
     c->stats.experts_missed += c->m.cache.misses - m0;
     c->stats.bytes_read = c->m.cache.bytes_read;
+    c->stats.sec_io += c->m.io_seconds - io0;
     return st;
 }
 
@@ -1143,5 +1155,8 @@ waste_status waste_get_stats(const waste_ctx *c, waste_stats *out)
     out->experts_missed = c->m.cache.misses;
     out->bytes_read = c->m.cache.bytes_read;
     out->direct_io = c->m.direct_io;
+    out->io_backend = (waste_io_backend)c->m.io_backend;
+    out->io_queue_depth = c->m.io_queue_depth;
+    out->io_fallback = c->m.io_fallback;
     return WASTE_OK;
 }

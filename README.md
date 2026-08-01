@@ -132,8 +132,10 @@ expansion here, that is the shell's job.
 A model is converted once into a `.waste` container: a JSON manifest, a
 resident trunk, and one expert bank per layer. Each expert record is
 4 KiB-aligned with its gate, up and down matrices adjacent, so routing to
-an expert costs exactly **one `pread`** — not three, not a seek per
-matrix. The arithmetic was never the bottleneck.
+an expert costs exactly **one aligned record read** — not three, not a seek
+per matrix. That is a `pread` by default; Linux can submit several already
+selected records through a bounded raw `io_uring` with
+`--io-queue-depth 4`. The arithmetic was never the bottleneck.
 
 Reads bypass the page cache (`F_NOCACHE` on macOS, `O_DIRECT` on Linux,
 `FILE_FLAG_NO_BUFFERING` on Windows). That is deliberate: with a container

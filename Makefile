@@ -72,7 +72,7 @@ CFLAGS  += -MMD -MP
 
 SRC := src/model.c src/kda.c src/backend.c src/ecache.c src/version.c \
        src/tokenizer.c src/waste.c src/vq.c src/vision.c src/image.c \
-       src/crc32.c src/system.c
+       src/crc32.c src/system.c src/io_uring.c
 # Match what backend.c tests for. Linux/aarch64 reports "aarch64", which
 # does not contain "arm" — the old findstring left kda_neon.c out of the
 # build while backend.c still emitted the call to it, so the link failed
@@ -198,7 +198,8 @@ waste$(EXE): cli/main.o libwaste.a
 # the two failures tests/run.sh was written to catch, so a binary that
 # `test` builds and `clean` forgets defeats the check meant to notice it.
 TESTNAMES := test_kda test_container test_forward test_tokenizer test_k3parts \
-             test_state test_vision test_image test_lock test_system
+             test_state test_vision test_image test_lock test_system test_io \
+             test_ecache
 TESTBINS  := $(addsuffix $(EXE),$(TESTNAMES))
 
 test: $(TESTBINS)
@@ -231,6 +232,10 @@ test_state$(EXE): tests/test_state.o libwaste.a
 test_lock$(EXE): tests/test_lock.o libwaste.a
 	$(CC) $(CFLAGS) -o $@ $^ $(LDLIBS)
 test_system$(EXE): tests/test_system.o libwaste.a
+	$(CC) $(CFLAGS) -o $@ $^ $(LDLIBS)
+test_io$(EXE): tests/test_io.o libwaste.a
+	$(CC) $(CFLAGS) -o $@ $^ $(LDLIBS)
+test_ecache$(EXE): tests/test_ecache.o libwaste.a
 	$(CC) $(CFLAGS) -o $@ $^ $(LDLIBS)
 
 %.o: %.c

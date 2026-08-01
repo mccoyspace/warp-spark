@@ -960,3 +960,43 @@ reads unconditionally — embeddings, final norm, head — are now required
 at load. Checking *every* tensor the pass might want would mean a second
 copy of its naming rules, and a wrong entry there would refuse a
 container that works; these three cannot be wrong.
+
+## 22. Exact read concurrency pays; speculative prefetch does not yet (2026-08-01)
+
+The GN100's direct-I/O fio sweep said queue depth mattered, but a storage
+benchmark is permission to test the engine, not evidence that the engine got
+faster. The second sprint therefore changed one variable at a time: raw Linux
+`io_uring`, exact router-selected records only, and queue depths 1, 2 and 4.
+No liburing is required. The cache pins every record returned to a batch until
+the reads complete, because a correct async transport that lets another miss
+overwrite a live cache pointer is not correct.
+
+The 16-token K3 medians were 0.0962 tok/s at synchronous QD1, 0.10335 at QD2
+and **0.11005 at QD4**. That makes QD4 14.4% faster than the control. The
+longer result held: the same 64-token output fell from 371.17 to 315.15 seconds
+of generation, a 15.1% time reduction and 17.8% throughput increase. A fresh
+same-request server control fell from 208.75 to 182.67 seconds (-12.5%). The
+assistant bytes, usage and finish reason were identical; the 64-token CLI
+stdout was also byte-identical.
+
+The v2 trace explains enough of the result to trust its direction. Across four
+decode tokens, exact expert I/O fell from 3.60 to 2.81 seconds (-21.8%). All
+368 layer routes matched the synchronous first-sprint trace exactly, as did
+decode hits, misses and bytes. The trace now covers prefill layers/chunks and
+whole decode tokens, with attention, router, expert I/O, routed compute, shared
+compute and residual time reconciling to the measured total.
+
+Cross-layer speculative prefetch did not pass its gate and was not written.
+Using the preceding token's same-layer routes predicts only 40.33% of the next
+token's experts (43.75% median by layer), with no exact route repeats in the
+four-token K3 trace. Prefetching that set would issue about 1,472 reads per
+token for roughly 594 useful and 878 wasted records. On this SSD, bounded
+concurrency over known work is a win; multiplying the work by 2.5 to guess
+ahead is not supported by the evidence.
+
+Memory was not the source of the improvement or a hidden cost. The 86.58 GB
+budget peaked near 85.76 GB RSS with about 39 GB minimum `MemAvailable`, zero
+process swap, zero swap-out/reclaim, and no sustained memory PSI. The earlier
+3x paging anomaly did not recur on the idle Spark. The portable default stays
+at synchronous `pread`; `--io-queue-depth 4` is the measured GN100 setting,
+and ring setup failure is visible in stats before falling back safely.

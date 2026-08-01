@@ -192,6 +192,9 @@ class TestChatCompletions(ServerTestCase):
         _, body = self.chat()
         self.assertIn("waste", body)
         self.assertEqual(body["waste"]["expert_hit_rate"], 0.75)
+        self.assertEqual(body["waste"]["io_backend"], "io_uring")
+        self.assertEqual(body["waste"]["io_queue_depth"], 4)
+        self.assertFalse(body["waste"]["io_fallback"])
 
     def test_no_thinking_request(self):
         self.engine.reply = reply_plain("Direct.", thinking=False)

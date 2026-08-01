@@ -16,6 +16,7 @@
 #include <stdio.h>
 
 #include "ecache.h"
+#include "io_uring.h"
 
 /* Public image requests are decoded before resize.  Keep the source-image
  * allocation finite so the memory planner can include its true worst case. */
@@ -155,6 +156,9 @@ typedef struct {
     uint8_t *miss_buf;               /* used when the cache is disabled     */
     int      want_direct;            /* the caller asked for the bypass     */
     int      direct_io;              /* 0 = a bank fell back to page cache  */
+    waste_io_ring io_ring;
+    int      io_backend, io_queue_depth, io_fallback;
+    double   io_seconds;                 /* actual expert-read wall time    */
     /* A record that failed on the way in. Sticky until cleared, because
      * the forward pass that hit it is already wrong and the caller has to
      * hear about it once rather than once per expert. A short read and a
@@ -162,9 +166,12 @@ typedef struct {
      * caught; `verify` adds the crc32 over the payload, which is the part
      * that costs, and it is off unless a caller asks — see waste.h. */
     int      read_error, bad_layer, bad_expert, verify;
-    FILE    *trace;                      /* optional decode-layer JSONL      */
+    FILE    *trace;                      /* optional v2 phase/cache JSONL    */
     int      trace_step;
     double   trace_attention_ms;
+    double   trace_attention_sum_ms, trace_router_sum_ms;
+    double   trace_io_sum_ms, trace_expert_sum_ms, trace_shared_sum_ms;
+    double   trace_moe_sum_ms;
 } waste_model;
 
 /* Everything the load needs that is not in the container. These are
@@ -184,6 +191,8 @@ typedef struct {
     int    policy;
     int    direct_io;
     const char *trace_path;
+    int    io_backend;
+    int    io_queue_depth;
 } waste_load_opts;
 
 int  waste_model_load(waste_model *m, const char *dir, int kv_cap,

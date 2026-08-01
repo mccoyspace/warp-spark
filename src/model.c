@@ -858,21 +858,36 @@ static void cfg_from_json(waste_config *c, const js_doc *d, int cfg)
 int waste_model_load(waste_model *m, const char *dir, int kv_cap,
                      const waste_load_opts *opt)
 {
-    static const waste_load_opts defaults = { 0, 0, 0, 0, 1, NULL };
+    static const waste_load_opts defaults = { 0, 0, 0, 0, 1, NULL, 0, 1 };
     if (!opt) opt = &defaults;
     const size_t cache_bytes = opt->cache_bytes;
     memset(m, 0, sizeof *m);
     m->trunk_fd = -1;
+    m->io_ring.fd = -1;
     for (int L = 0; L < WASTE_MAX_LAYERS; L++) m->bank[L].fd = -1;
     m->want_vision = opt->want_vision;
     m->want_direct = opt->direct_io;
+    m->io_backend = 0;                 /* pread */
+    m->io_queue_depth = 1;
+    if (opt->io_backend == 1 && opt->io_queue_depth > 1) {
+        int qd = opt->io_queue_depth > 64 ? 64 : opt->io_queue_depth;
+        if (waste_io_ring_init(&m->io_ring, qd) == 0) {
+            m->io_backend = 1;
+            m->io_queue_depth = m->io_ring.depth;
+        } else {
+            m->io_fallback = 1;
+        }
+    }
     if (opt->trace_path && opt->trace_path[0]) {
         m->trace = fopen(opt->trace_path, "w");
         if (!m->trace) return -1;
         setvbuf(m->trace, NULL, _IOLBF, 0);
         fprintf(m->trace,
-                "{\"schema\":\"waste.layer_trace.v1\",\"event\":\"meta\","
-                "\"io_backend\":\"pread_sync\",\"queue_depth\":1}\n");
+                "{\"schema\":\"waste.layer_trace.v2\",\"event\":\"meta\","
+                "\"io_backend\":\"%s\",\"queue_depth\":%d,"
+                "\"io_fallback\":%s}\n",
+                m->io_backend ? "io_uring" : "pread_sync",
+                m->io_queue_depth, m->io_fallback ? "true" : "false");
     }
     pthread_once(&model_opts_once, model_opts_init);
     m->kv_cap = kv_cap;
@@ -1266,6 +1281,7 @@ void waste_model_free(waste_model *m)
     free(m->clat); free(m->cff); free(m->cexp); free(m->cblockres);
     free(m->cprefix); free(m->croute); free(m->crw);
     waste_ecache_free(&m->cache);
+    waste_io_ring_free(&m->io_ring);
     if (m->trace) fclose(m->trace);
     m->trace = NULL;
 }
@@ -1430,9 +1446,9 @@ static rec_status record_check(const waste_model *m, int layer, int expert,
  * and then the check that it is the record it says it is.
  * The offset is computed in 64 bits before the multiply: a bank of 384
  * experts crosses 2 GB well before the biggest layer does. */
-static int bank_fetch(void *user, int layer, int expert, uint8_t *dst)
+static int bank_request(waste_model *m, int layer, int expert,
+                        waste_bank **bank, int64_t *off)
 {
-    waste_model *m = (waste_model *)user;
     /* The ids are not always the engine's own. waste_ecache_warm takes
      * them from usage.waste, which travels next to a container and is
      * read at open without anyone asking for it — and its layer field is
@@ -1451,8 +1467,15 @@ static int bank_fetch(void *user, int layer, int expert, uint8_t *dst)
         }
         return -1;
     }
-    const int64_t got = waste_pread(b->fd, dst, (size_t)b->rec_bytes,
-                                    (int64_t)expert * (int64_t)b->rec_bytes);
+    *bank = b;
+    *off = (int64_t)expert * (int64_t)b->rec_bytes;
+    return 0;
+}
+
+static int bank_complete(waste_model *m, int layer, int expert,
+                         uint8_t *dst, int64_t got)
+{
+    const waste_bank *b = &m->bank[layer];
     rec_status st = got == (int64_t)b->rec_bytes ? REC_OK : REC_E_READ;
     if (st == REC_OK) st = record_check(m, layer, expert, dst);
     if (st != REC_OK) {
@@ -1469,6 +1492,51 @@ static int bank_fetch(void *user, int layer, int expert, uint8_t *dst)
     return 0;
 }
 
+static int bank_fetch(void *user, int layer, int expert, uint8_t *dst)
+{
+    waste_model *m = (waste_model *)user;
+    waste_bank *b = NULL;
+    int64_t off = 0;
+    if (bank_request(m, layer, expert, &b, &off)) return -1;
+    const double t0 = pnow();
+    const int64_t got = waste_pread(b->fd, dst, (size_t)b->rec_bytes, off);
+    m->io_seconds += pnow() - t0;
+    return bank_complete(m, layer, expert, dst, got);
+}
+
+static int bank_fetch_many(void *user, int n, const int *layers,
+                           const int *experts, uint8_t *const *dst)
+{
+    waste_model *m = (waste_model *)user;
+    if (n <= 0 || n > 64) return -1;
+    int fds[64];
+    size_t lens[64];
+    int64_t offs[64], results[64];
+    for (int i = 0; i < n; i++) {
+        waste_bank *b = NULL;
+        if (bank_request(m, layers[i], experts[i], &b, &offs[i])) return -1;
+        fds[i] = b->fd;
+        lens[i] = (size_t)b->rec_bytes;
+    }
+    const double t0 = pnow();
+    const int transport = waste_io_ring_read_many(
+        &m->io_ring, n, fds, (void *const *)dst, lens, offs, results);
+    m->io_seconds += pnow() - t0;
+    if (transport) {
+        if (!m->read_error) {
+            m->read_error = (int)REC_E_READ;
+            m->bad_layer = layers[0];
+            m->bad_expert = experts[0];
+        }
+        return -1;
+    }
+    int bad = 0;
+    for (int i = 0; i < n; i++)
+        if (bank_complete(m, layers[i], experts[i], dst[i], results[i]))
+            bad = 1;
+    return bad ? -1 : 0;
+}
+
 static const uint8_t *read_expert(waste_model *m, int L, int eid)
 {
     if (m->cache.n_slots > 0)
@@ -1476,6 +1544,14 @@ static const uint8_t *read_expert(waste_model *m, int L, int eid)
     m->cache.misses++;
     m->cache.bytes_read += (size_t)m->bank[L].rec_bytes;
     return bank_fetch(m, L, eid, m->miss_buf) == 0 ? m->miss_buf : NULL;
+}
+
+static int read_experts_many(waste_model *m, int L, const int *eid, int n,
+                             const uint8_t **out)
+{
+    if (!m->io_backend || m->cache.n_slots <= 0 || n <= 1) return -1;
+    return waste_ecache_get_many(&m->cache, L, eid, n, bank_fetch_many, m,
+                                 out);
 }
 
 const char *waste_model_read_error(const waste_model *m, int *layer, int *expert)
@@ -1999,12 +2075,24 @@ static void moe_layer(waste_model *m, int L, const float *in, float *out, int *r
     const int lut_sz = ((hid > lat ? hid : lat) / m->vec_dim) * m->stages * m->cb_entries;
     float *lut_gate = m->lut, *lut_up = lut_gate + lut_sz, *lut_down = lut_up + lut_sz;
     int lut_ready = 0;
-    for (int j = 0; j < K; j++) {
+    const uint8_t *records[64] = { 0 };
+    const int batched = m->io_backend && m->cache.n_slots > 0 && K > 1;
+    if (batched) {
         const double io_t0 = trace_on ? pnow() : 0;
         PROF_START(P_EDEQ);
-        const uint8_t *rec = read_expert(m, L, idx[j]);
+        (void)read_experts_many(m, L, idx, K, records);
         PROF_END(P_EDEQ);
         if (trace_on) io_ms += (pnow() - io_t0) * 1000.0;
+    }
+    for (int j = 0; j < K; j++) {
+        const uint8_t *rec = records[j];
+        if (!batched) {
+            const double io_t0 = trace_on ? pnow() : 0;
+            PROF_START(P_EDEQ);
+            rec = read_expert(m, L, idx[j]);
+            PROF_END(P_EDEQ);
+            if (trace_on) io_ms += (pnow() - io_t0) * 1000.0;
+        }
         /* This token is already wrong — the expert it needed is not
          * readable. Stop rather than sum the ones that were, and let the
          * step report it; m->read_error is what carries the reason out. */
@@ -2057,8 +2145,14 @@ static void moe_layer(waste_model *m, int L, const float *in, float *out, int *r
     for (int i = 0; i < hid; i++) out[i] += tmp[i];
     if (trace_on) {
         shared_ms = (pnow() - shared_t0) * 1000.0;
+        const double moe_ms = (pnow() - moe_t0) * 1000.0;
+        m->trace_router_sum_ms += route_ms;
+        m->trace_io_sum_ms += io_ms;
+        m->trace_expert_sum_ms += expert_ms;
+        m->trace_shared_sum_ms += shared_ms;
+        m->trace_moe_sum_ms += moe_ms;
         fprintf(m->trace,
-                "{\"schema\":\"waste.layer_trace.v1\",\"event\":\"decode_layer\","
+                "{\"schema\":\"waste.layer_trace.v2\",\"event\":\"decode_layer\","
                 "\"position\":%d,\"layer\":%d,\"attention_kind\":\"%s\","
                 "\"attention_ms\":%.3f,\"top_k\":%d,\"experts\":[",
                 m->trace_step, L, c->kda_layer[L] ? "kda" : "mla",
@@ -2070,12 +2164,13 @@ static void moe_layer(waste_model *m, int L, const float *in, float *out, int *r
                 "\"bytes_read\":%llu,\"router_ms\":%.3f,"
                 "\"expert_io_ms\":%.3f,\"expert_compute_ms\":%.3f,"
                 "\"shared_compute_ms\":%.3f,\"moe_total_ms\":%.3f,"
-                "\"io_backend\":\"pread_sync\",\"queue_depth\":1,"
+                "\"io_backend\":\"%s\",\"queue_depth\":%d,"
                 "\"overlap_ms\":0.0,\"direct_io\":%s,\"read_error\":%s}\n",
                 (unsigned long long)(m->cache.hits - hit0),
                 (unsigned long long)(m->cache.misses - miss0),
                 (unsigned long long)(m->cache.bytes_read - bytes0), route_ms,
-                io_ms, expert_ms, shared_ms, (pnow() - moe_t0) * 1000.0,
+                io_ms, expert_ms, shared_ms, moe_ms,
+                m->io_backend ? "io_uring" : "pread_sync", m->io_queue_depth,
                 m->direct_io ? "true" : "false",
                 m->read_error ? "true" : "false");
     }
@@ -2569,6 +2664,13 @@ static void moe_chunk(waste_model *m, int L, const float *in, float *out, int nT
     const waste_config *c = &m->cfg;
     const int E = c->n_experts, K = c->top_k, hid = c->hidden;
     const int lat = c->latent_dim ? c->latent_dim : hid, inter = c->moe_inter;
+    const int trace_on = m->trace != NULL;
+    const double moe_t0 = trace_on ? pnow() : 0;
+    const double route_t0 = moe_t0;
+    double io_ms = 0, expert_ms = 0, shared_ms = 0;
+    const uint64_t hit0 = m->cache.hits, miss0 = m->cache.misses;
+    const uint64_t bytes0 = m->cache.bytes_read;
+    int unique_experts = 0;
     int *route = m->croute;
     float *rw = m->crw;
 
@@ -2599,6 +2701,7 @@ static void moe_chunk(waste_model *m, int L, const float *in, float *out, int nT
         }
         for (int j = 0; j < K; j++) w[j] *= c->routed_scale;
     }
+    const double route_ms = trace_on ? (pnow() - route_t0) * 1000.0 : 0;
 
     const float *xin = in;
     float *lat_in = m->clat, *ysum = lat_in + (size_t)nT * lat;
@@ -2618,53 +2721,78 @@ static void moe_chunk(waste_model *m, int L, const float *in, float *out, int nT
 
     float *ga = m->cff, *ub = ga + inter, *acc = m->cff + 2 * inter;
 
-    for (int e = 0; e < E; e++) {
-        int used = 0;
-        for (int i = 0; i < nT * K; i++) if (route[i] == e) { used = 1; break; }
-        if (!used) continue;
-
+    for (int next = 0; next < E; ) {
+        int ids[64], nb = 0;
+        const uint8_t *records[64] = { 0 };
+        const int want = m->io_backend ? m->io_queue_depth : 1;
+        while (next < E && nb < want) {
+            const int e = next++;
+            int used = 0;
+            for (int i = 0; i < nT * K; i++)
+                if (route[i] == e) { used = 1; break; }
+            if (used) ids[nb++] = e;
+        }
+        if (!nb) continue;
+        unique_experts += nb;
+        const double io_t0 = trace_on ? pnow() : 0;
         PROF_START(P_EDEQ);
-        const uint8_t *rec = read_expert(m, L, e);
+        const int batched = nb > 1 &&
+                            read_experts_many(m, L, ids, nb, records) == 0;
+        if (!batched && !m->read_error)
+            for (int i = 0; i < nb; i++) records[i] = read_expert(m, L, ids[i]);
         PROF_END(P_EDEQ);
-        if (!rec) break;                 /* see moe_layer: the chunk is lost */
-        const waste_expert_hdr *h = (const waste_expert_hdr *)rec;
-        const uint16_t *s16 = (const uint16_t *)(rec + h->chan_corr_off);
+        if (trace_on) io_ms += (pnow() - io_t0) * 1000.0;
 
-        PROF_START(P_EMM);
-        if (!lut_ready) {
-            for (int t = 0; t < nT; t++) {
-                vq_build_lut(m, lut_gu + (size_t)(2 * t) * lut_sz,
-                             h->codebook_id + 0 * m->stages,
-                             xin + (size_t)t * lat, lat, m->stages,
-                             m->cb_entries, m->vec_dim);
-                vq_build_lut(m, lut_gu + (size_t)(2 * t + 1) * lut_sz,
-                             h->codebook_id + 1 * m->stages,
-                             xin + (size_t)t * lat, lat, m->stages,
-                             m->cb_entries, m->vec_dim);
+        for (int bi = 0; bi < nb; bi++) {
+            const int e = ids[bi];
+            const uint8_t *rec = records[bi];
+            if (!rec) break;             /* see moe_layer: the chunk is lost */
+            const waste_expert_hdr *h = (const waste_expert_hdr *)rec;
+            const uint16_t *s16 = (const uint16_t *)(rec + h->chan_corr_off);
+
+            const double expert_t0 = trace_on ? pnow() : 0;
+            PROF_START(P_EMM);
+            if (!lut_ready) {
+                for (int t = 0; t < nT; t++) {
+                    vq_build_lut(m, lut_gu + (size_t)(2 * t) * lut_sz,
+                                 h->codebook_id + 0 * m->stages,
+                                 xin + (size_t)t * lat, lat, m->stages,
+                                 m->cb_entries, m->vec_dim);
+                    vq_build_lut(m, lut_gu + (size_t)(2 * t + 1) * lut_sz,
+                                 h->codebook_id + 1 * m->stages,
+                                 xin + (size_t)t * lat, lat, m->stages,
+                                 m->cb_entries, m->vec_dim);
+                }
+                lut_ready = 1;
             }
-            lut_ready = 1;
-        }
-        for (int t = 0; t < nT; t++) {
-            float wj = 0;
-            for (int j = 0; j < K; j++)
-                if (route[(size_t)t * K + j] == e) { wj = rw[(size_t)t * K + j]; break; }
-            if (wj == 0.0f) continue;
+            for (int t = 0; t < nT; t++) {
+                float wj = 0;
+                for (int j = 0; j < K; j++)
+                    if (route[(size_t)t * K + j] == e) {
+                        wj = rw[(size_t)t * K + j];
+                        break;
+                    }
+                if (wj == 0.0f) continue;
 
-            vq_apply(m, ga, rec + h->gate_off, s16, inter, lat,
-                     lut_gu + (size_t)(2 * t) * lut_sz);
-            vq_apply(m, ub, rec + h->up_off, s16 + inter, inter, lat,
-                     lut_gu + (size_t)(2 * t + 1) * lut_sz);
-            if (c->act_situ)
-                for (int i = 0; i < inter; i++)
-                    ga[i] = waste_situ_pair(ga[i], ub[i], c->situ_beta, c->situ_linear_beta);
-            else
-                for (int i = 0; i < inter; i++) ga[i] = silu(ga[i]) * ub[i];
-            vq_matvec(m, acc, rec + h->down_off, s16 + 2 * inter, ga, lat, inter,
-                      h->codebook_id + 2 * m->stages, lut_down);
-            float *dst = ysum + (size_t)t * lat;
-            for (int i = 0; i < lat; i++) dst[i] += wj * acc[i];
+                vq_apply(m, ga, rec + h->gate_off, s16, inter, lat,
+                         lut_gu + (size_t)(2 * t) * lut_sz);
+                vq_apply(m, ub, rec + h->up_off, s16 + inter, inter, lat,
+                         lut_gu + (size_t)(2 * t + 1) * lut_sz);
+                if (c->act_situ)
+                    for (int i = 0; i < inter; i++)
+                        ga[i] = waste_situ_pair(ga[i], ub[i], c->situ_beta,
+                                              c->situ_linear_beta);
+                else
+                    for (int i = 0; i < inter; i++) ga[i] = silu(ga[i]) * ub[i];
+                vq_matvec(m, acc, rec + h->down_off, s16 + 2 * inter, ga,
+                          lat, inter, h->codebook_id + 2 * m->stages, lut_down);
+                float *dst = ysum + (size_t)t * lat;
+                for (int i = 0; i < lat; i++) dst[i] += wj * acc[i];
+            }
+            PROF_END(P_EMM);
+            if (trace_on) expert_ms += (pnow() - expert_t0) * 1000.0;
         }
-        PROF_END(P_EMM);
+        if (m->read_error) break;
     }
 
     if (c->latent_dim) {
@@ -2683,6 +2811,7 @@ static void moe_chunk(waste_model *m, int L, const float *in, float *out, int nT
     }
 
     /* shared experts, on the full hidden state */
+    const double shared_t0 = trace_on ? pnow() : 0;
     const int si = inter * (c->n_shared ? c->n_shared : 1);
     float *sa = m->ckv, *sb = sa + (size_t)nT * si, *sh = sb + (size_t)nT * si;
     waste_matmul_t(m, sa, waste_find(m, tname(
@@ -2698,6 +2827,35 @@ static void moe_chunk(waste_model *m, int L, const float *in, float *out, int nT
                  "%smodel.layers.%d.block_sparse_moe.shared_experts.down_proj.weight",
                  c->prefix, L)), sa, hid, si, nT);
     for (int i = 0; i < nT * hid; i++) out[i] += sh[i];
+    if (trace_on) {
+        shared_ms = (pnow() - shared_t0) * 1000.0;
+        const double moe_ms = (pnow() - moe_t0) * 1000.0;
+        m->trace_router_sum_ms += route_ms;
+        m->trace_io_sum_ms += io_ms;
+        m->trace_expert_sum_ms += expert_ms;
+        m->trace_shared_sum_ms += shared_ms;
+        m->trace_moe_sum_ms += moe_ms;
+        fprintf(m->trace,
+                "{\"schema\":\"waste.layer_trace.v2\",\"event\":\"prefill_layer\","
+                "\"position_start\":%d,\"tokens\":%d,\"layer\":%d,"
+                "\"attention_kind\":\"%s\",\"attention_ms\":%.3f,"
+                "\"top_k\":%d,\"unique_experts\":%d,"
+                "\"cache_hits\":%llu,\"cache_misses\":%llu,"
+                "\"bytes_read\":%llu,\"router_ms\":%.3f,"
+                "\"expert_io_ms\":%.3f,\"expert_compute_ms\":%.3f,"
+                "\"shared_compute_ms\":%.3f,\"moe_total_ms\":%.3f,"
+                "\"io_backend\":\"%s\",\"queue_depth\":%d,"
+                "\"direct_io\":%s,\"read_error\":%s}\n",
+                m->trace_step, nT, L, c->kda_layer[L] ? "kda" : "mla",
+                m->trace_attention_ms, K, unique_experts,
+                (unsigned long long)(m->cache.hits - hit0),
+                (unsigned long long)(m->cache.misses - miss0),
+                (unsigned long long)(m->cache.bytes_read - bytes0), route_ms,
+                io_ms, expert_ms, shared_ms, moe_ms,
+                m->io_backend ? "io_uring" : "pread_sync", m->io_queue_depth,
+                m->direct_io ? "true" : "false",
+                m->read_error ? "true" : "false");
+    }
 }
 
 /* Prefill a chunk. KDA and MLA still walk the tokens in order — the
@@ -2734,6 +2892,13 @@ const float *waste_model_prefill(waste_model *m, const int *tokens, int n,
         const int cm = waste_model_ctx_max(m);
         if (cm && (pos0 < 0 || pos0 > cm - n)) { m->ctx_full = 1; return NULL; }
     }
+    m->trace_step = pos0;
+    const double prefill_t0 = m->trace ? pnow() : 0;
+    const uint64_t trace_h0 = m->cache.hits, trace_m0 = m->cache.misses;
+    const uint64_t trace_b0 = m->cache.bytes_read;
+    m->trace_attention_sum_ms = m->trace_router_sum_ms = 0;
+    m->trace_io_sum_ms = m->trace_expert_sum_ms = 0;
+    m->trace_shared_sum_ms = m->trace_moe_sum_ms = 0;
     if (prefill_alloc(m, n)) return NULL;
 
     for (int t = 0; t < n; t++) {
@@ -2789,12 +2954,15 @@ const float *waste_model_prefill(waste_model *m, const int *tokens, int n,
             waste_rmsnorm(m->cnorm + (size_t)t * hid, m->cx + (size_t)t * hid, iln, hid, c->eps);
 
         /* attention: per token, but on the batched norm buffer */
+        const double att_t0 = m->trace ? pnow() : 0;
         for (int t = 0; t < n; t++) {
             if (c->kda_layer[L]) kda_layer(m, L, m->cnorm + (size_t)t * hid,
                                            m->cresid + (size_t)t * hid);
             else mla_layer(m, L, m->cnorm + (size_t)t * hid,
                            m->cresid + (size_t)t * hid, pos0 + t);
         }
+        m->trace_attention_ms = m->trace ? (pnow() - att_t0) * 1000.0 : 0;
+        m->trace_attention_sum_ms += m->trace_attention_ms;
 
         if (ares_on) {
             if (ps_live) for (int i = 0; i < n * hid; i++) m->cprefix[i] += m->cresid[i];
@@ -2860,6 +3028,32 @@ const float *waste_model_prefill(waste_model *m, const int *tokens, int n,
     matvec_t(m, m->logits, waste_find(m, tname("%slm_head.weight", c->prefix)), last,
              c->vocab, hid);
     memcpy(m->x, m->cx + (size_t)(n - 1) * hid, (size_t)hid * sizeof(float));
+    if (m->trace) {
+        const double total_ms = (pnow() - prefill_t0) * 1000.0;
+        double other_ms = total_ms - m->trace_attention_sum_ms -
+                          m->trace_moe_sum_ms;
+        if (other_ms < 0) other_ms = 0;
+        fprintf(m->trace,
+                "{\"schema\":\"waste.layer_trace.v2\",\"event\":\"prefill_chunk\","
+                "\"position_start\":%d,\"position_end\":%d,\"tokens\":%d,"
+                "\"total_ms\":%.3f,\"attention_ms\":%.3f,"
+                "\"router_ms\":%.3f,\"expert_io_ms\":%.3f,"
+                "\"expert_compute_ms\":%.3f,\"shared_compute_ms\":%.3f,"
+                "\"moe_total_ms\":%.3f,\"other_ms\":%.3f,"
+                "\"cache_hits\":%llu,\"cache_misses\":%llu,"
+                "\"bytes_read\":%llu,\"io_backend\":\"%s\","
+                "\"queue_depth\":%d,\"direct_io\":%s,\"read_error\":%s}\n",
+                pos0, pos0 + n - 1, n, total_ms,
+                m->trace_attention_sum_ms, m->trace_router_sum_ms,
+                m->trace_io_sum_ms, m->trace_expert_sum_ms,
+                m->trace_shared_sum_ms, m->trace_moe_sum_ms, other_ms,
+                (unsigned long long)(m->cache.hits - trace_h0),
+                (unsigned long long)(m->cache.misses - trace_m0),
+                (unsigned long long)(m->cache.bytes_read - trace_b0),
+                m->io_backend ? "io_uring" : "pread_sync", m->io_queue_depth,
+                m->direct_io ? "true" : "false",
+                m->read_error ? "true" : "false");
+    }
     return m->read_error ? NULL : m->logits;
 }
 
@@ -2868,6 +3062,12 @@ const float *waste_model_step(waste_model *m, int token, int pos, int *routed)
     const waste_config *c = &m->cfg;
     const int hid = c->hidden;
     m->trace_step = pos;
+    const double step_t0 = m->trace ? pnow() : 0;
+    const uint64_t trace_h0 = m->cache.hits, trace_m0 = m->cache.misses;
+    const uint64_t trace_b0 = m->cache.bytes_read;
+    m->trace_attention_sum_ms = m->trace_router_sum_ms = 0;
+    m->trace_io_sum_ms = m->trace_expert_sum_ms = 0;
+    m->trace_shared_sum_ms = m->trace_moe_sum_ms = 0;
     {   /* see waste_model_prefill */
         const int cm = waste_model_ctx_max(m);
         if (cm && (pos < 0 || pos >= cm)) { m->ctx_full = 1; return NULL; }
@@ -2921,6 +3121,7 @@ const float *waste_model_step(waste_model *m, int token, int pos, int *routed)
         if (c->kda_layer[L]) { PROF_START(P_KDA); kda_layer(m, L, norm, resid); PROF_END(P_KDA); }
         else { PROF_START(P_MLA); mla_layer(m, L, norm, resid, pos); PROF_END(P_MLA); }
         m->trace_attention_ms = m->trace ? (pnow() - att_t0) * 1000.0 : 0;
+        m->trace_attention_sum_ms += m->trace_attention_ms;
 
         if (ares_on) {
             if (ps_live) for (int i = 0; i < hid; i++) ps[i] += resid[i];
@@ -2974,6 +3175,31 @@ const float *waste_model_step(waste_model *m, int token, int pos, int *routed)
     PROF_START(P_HEAD);
     matvec_t(m, m->logits, waste_find(m, tname("%slm_head.weight", c->prefix)), norm, c->vocab, hid);
     PROF_END(P_HEAD);
+    if (m->trace) {
+        const double total_ms = (pnow() - step_t0) * 1000.0;
+        double other_ms = total_ms - m->trace_attention_sum_ms -
+                          m->trace_moe_sum_ms;
+        if (other_ms < 0) other_ms = 0;
+        fprintf(m->trace,
+                "{\"schema\":\"waste.layer_trace.v2\",\"event\":\"decode_token\","
+                "\"position\":%d,\"total_ms\":%.3f,\"attention_ms\":%.3f,"
+                "\"router_ms\":%.3f,\"expert_io_ms\":%.3f,"
+                "\"expert_compute_ms\":%.3f,\"shared_compute_ms\":%.3f,"
+                "\"moe_total_ms\":%.3f,\"other_ms\":%.3f,"
+                "\"cache_hits\":%llu,\"cache_misses\":%llu,"
+                "\"bytes_read\":%llu,\"io_backend\":\"%s\","
+                "\"queue_depth\":%d,\"direct_io\":%s,\"read_error\":%s}\n",
+                pos, total_ms, m->trace_attention_sum_ms,
+                m->trace_router_sum_ms, m->trace_io_sum_ms,
+                m->trace_expert_sum_ms, m->trace_shared_sum_ms,
+                m->trace_moe_sum_ms, other_ms,
+                (unsigned long long)(m->cache.hits - trace_h0),
+                (unsigned long long)(m->cache.misses - trace_m0),
+                (unsigned long long)(m->cache.bytes_read - trace_b0),
+                m->io_backend ? "io_uring" : "pread_sync", m->io_queue_depth,
+                m->direct_io ? "true" : "false",
+                m->read_error ? "true" : "false");
+    }
     free(resid);
     free(norm);
     return m->read_error ? NULL : m->logits;

@@ -118,7 +118,12 @@ examples:
     g.add_argument("--usage", default=None, metavar="PATH",
                    help="learned hotlist (default <model>/usage.waste)")
     g.add_argument("--trace-layers", default=None, metavar="PATH",
-                   help="write decode-layer timing and cache JSON Lines")
+                   help="write v2 prefill/decode phase and cache JSON Lines")
+    g.add_argument("--io-backend", choices=("pread", "io_uring"),
+                   default="pread",
+                   help="expert-read transport (default: pread)")
+    g.add_argument("--io-queue-depth", type=bounded_int(1, 64), default=1,
+                   metavar="N", help="bounded expert-read queue depth")
     g.add_argument("--allow-concurrent-open", action="store_true",
                    help="permit another process to load the same container")
 
@@ -180,7 +185,9 @@ examples:
             verify_records=args.verify,
             usage_path=args.usage,
             allow_concurrent_open=args.allow_concurrent_open,
-            trace_path=args.trace_layers)
+            trace_path=args.trace_layers,
+            io_backend=args.io_backend,
+            io_queue_depth=args.io_queue_depth)
     except EngineError as e:
         print(f"{e}", file=sys.stderr)
         return 1
@@ -195,6 +202,10 @@ examples:
             print(f"quant    {info['quant_summary']}")
         print(f"memory   {human(used['floor_bytes'])} resident, "
               f"expert cache {human(used['min_expert_cache'])}")
+        actual = engine.stats()
+        io_name = "io_uring" if actual["io_backend"] else "pread"
+        suffix = " (fallback)" if actual["io_fallback"] else ""
+        print(f"I/O      {io_name}, queue depth {actual['io_queue_depth']}{suffix}")
         print(f"thinking {'off by default' if args.no_thinking else 'on'}"
               f" — reasoning_effort per request")
         if args.vision:

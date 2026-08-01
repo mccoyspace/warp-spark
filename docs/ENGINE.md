@@ -43,6 +43,14 @@ Every one of them goes through `waste.h`. `plan` is the CLI face of
 `waste_generate` and its per-token callback — the same callback an
 embedding host would use to draw a progress UI.
 
+Expert reads are configurable through that same public surface. The portable
+default is synchronous positional I/O (`WASTE_IO_PREAD`, queue depth 1). On
+Linux, `WASTE_IO_URING` with a depth from 2 through 64 uses a raw, bounded
+`io_uring` and reports the actual backend, depth and any setup fallback in
+`waste_stats`. The CLI equivalent is `--io-queue-depth 4` (or explicit
+`--io-backend io_uring --io-queue-depth 4`). It batches only experts already
+selected by the router; it does not speculate or reorder expert arithmetic.
+
 ```
 $ waste plan kimi-linear.waste --budget 4G
   resident trunk             1.55 GB
@@ -57,6 +65,9 @@ $ waste plan kimi-linear.waste --budget 4G
 $ waste run kimi-linear.waste "The capital of France is" -n 16 --budget 8G
 The capital of France is Paris, and the capital of Italy is Rome. ...
 [16 tokens, 1.79 s, 8.92 tok/s | experts 2605 hit / 723 miss = 78%]
+
+$ waste run k3.waste "Explain NVMe clearly." -n 64 --budget 86583021568 \
+    --threads 8 --cpu-set performance --io-queue-depth 4
 ```
 
 A budget under the floor fails at open with `WASTE_E_RAM_BUDGET` and a
