@@ -460,7 +460,7 @@ def run_telemetry_summary(before: dict[str, Any], after: dict[str, Any],
 
 def exact_run_reasons(*, record: dict[str, Any], expected: dict[str, Any],
                       geometry: dict[str, Any], gpu_limit: float,
-                      cpu_temp_limit: int, nvme_temp_limit: int) -> list[str]:
+                      cpu_peak_limit: int, nvme_peak_limit: int) -> list[str]:
     reasons = list(record.get("cooldown_reasons", []))
     trace = record.get("trace") or {}
     treatment = TREATMENTS[record["treatment"]]
@@ -512,10 +512,10 @@ def exact_run_reasons(*, record: dict[str, Any], expected: dict[str, Any],
     if telemetry.get("any_cppc_perf_limited") is True:
         reasons.append("cppc_perf_limited")
     if (telemetry.get("cpu_peak_millic") is not None and
-            telemetry["cpu_peak_millic"] > cpu_temp_limit):
+            telemetry["cpu_peak_millic"] > cpu_peak_limit):
         reasons.append("cpu_temperature")
     if (telemetry.get("nvme_peak_millic") is not None and
-            telemetry["nvme_peak_millic"] > nvme_temp_limit):
+            telemetry["nvme_peak_millic"] > nvme_peak_limit):
         reasons.append("nvme_temperature")
     gpu = telemetry.get("gpu", {})
     if gpu.get("available_all_samples") is not True:
@@ -546,8 +546,14 @@ def parser() -> argparse.ArgumentParser:
                     help="system Python used by sudo for the QoS holder")
     ap.add_argument("--telemetry-interval", type=float, default=1.0)
     ap.add_argument("--cooldown-timeout", type=int, default=600)
-    ap.add_argument("--cpu-temp-limit", type=int, default=52000)
-    ap.add_argument("--nvme-temp-limit", type=int, default=55000)
+    ap.add_argument("--cpu-temp-limit", type=int, default=52000,
+                    help="maximum CPU temperature before starting a run")
+    ap.add_argument("--nvme-temp-limit", type=int, default=55000,
+                    help="maximum NVMe temperature before starting a run")
+    ap.add_argument("--cpu-peak-limit", type=int, default=80000,
+                    help="reject a run whose measured CPU peak exceeds this")
+    ap.add_argument("--nvme-peak-limit", type=int, default=70000,
+                    help="reject a run whose measured NVMe peak exceeds this")
     ap.add_argument("--gpu-util-limit", type=float, default=5.0)
     ap.add_argument("--skip-warmup", action="store_true")
     ap.add_argument("--retry-invalid", action="store_true")
@@ -565,6 +571,11 @@ def main(argv: Sequence[str] | None = None) -> int:
         ap.error(str(exc))
     if args.telemetry_interval <= 0 or args.gpu_util_limit < 0:
         ap.error("telemetry interval must be positive and GPU limit nonnegative")
+    if (args.cpu_temp_limit <= 0 or args.nvme_temp_limit <= 0 or
+            args.cpu_peak_limit < args.cpu_temp_limit or
+            args.nvme_peak_limit < args.nvme_temp_limit):
+        ap.error("temperature limits must be positive and peak limits must "
+                 "not be lower than start limits")
 
     model, binary, out = args.model.resolve(), args.binary.resolve(), args.out.resolve()
     helper = Path(__file__).with_name("pm_qos_exec.py").resolve()
@@ -613,8 +624,10 @@ def main(argv: Sequence[str] | None = None) -> int:
         "identity": identity, "binary_version_stdout": version.stdout.strip(),
         "binary_version_stderr": version.stderr.strip(),
         "qos_helper_sha256": sha256(helper),
-        "limits": {"cpu_temp_millic": args.cpu_temp_limit,
-                   "nvme_temp_millic": args.nvme_temp_limit,
+        "limits": {"cpu_start_millic": args.cpu_temp_limit,
+                   "nvme_start_millic": args.nvme_temp_limit,
+                   "cpu_peak_millic": args.cpu_peak_limit,
+                   "nvme_peak_millic": args.nvme_peak_limit,
                    "gpu_util_percent": args.gpu_util_limit},
         "gpu_identity": nvidia_query(),
     }
@@ -739,8 +752,8 @@ def main(argv: Sequence[str] | None = None) -> int:
             reasons = exact_run_reasons(
                 record=record, expected=identity, geometry=geometry,
                 gpu_limit=args.gpu_util_limit,
-                cpu_temp_limit=args.cpu_temp_limit,
-                nvme_temp_limit=args.nvme_temp_limit)
+                cpu_peak_limit=args.cpu_peak_limit,
+                nvme_peak_limit=args.nvme_peak_limit)
             record.update({"valid": not reasons, "invalid_reasons": reasons})
             atomic_json(run_dir / "record.json", record)
             append_jsonl(runs_path, record)

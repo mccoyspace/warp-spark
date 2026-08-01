@@ -181,8 +181,8 @@ def analyze(campaign_dir: Path) -> dict[str, Any]:
         recomputed[run_id] = exact_run_reasons(
             record=row, expected=identity, geometry=geometry,
             gpu_limit=float(limits["gpu_util_percent"]),
-            cpu_temp_limit=int(limits["cpu_temp_millic"]),
-            nvme_temp_limit=int(limits["nvme_temp_millic"]))
+            cpu_peak_limit=int(limits["cpu_peak_millic"]),
+            nvme_peak_limit=int(limits["nvme_peak_millic"]))
 
     design_ok = (not missing and not extra and not placement_errors and
                  int(campaign.get("decoded_tokens", 0)) == 1 and
@@ -232,9 +232,9 @@ def analyze(campaign_dir: Path) -> dict[str, Any]:
         row.get("telemetry", {}).get("max_processor_cooling_state") == 0 and
         row.get("telemetry", {}).get("any_cppc_perf_limited") is False and
         (row["telemetry"].get("cpu_peak_millic") is None or
-         row["telemetry"]["cpu_peak_millic"] <= limits["cpu_temp_millic"]) and
+         row["telemetry"]["cpu_peak_millic"] <= limits["cpu_peak_millic"]) and
         (row["telemetry"].get("nvme_peak_millic") is None or
-         row["telemetry"]["nvme_peak_millic"] <= limits["nvme_temp_millic"])
+         row["telemetry"]["nvme_peak_millic"] <= limits["nvme_peak_millic"])
         for row in rows)
     gpu_ok = all(
         row.get("telemetry", {}).get("gpu", {}).get(

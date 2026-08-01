@@ -33,8 +33,10 @@ class SparkCampaignFixture:
             "decoded_tokens": 1,
             "io_backend": "io_uring", "io_queue_depth": 4,
             "direct_io": True, "identity": self.identity,
-            "limits": {"cpu_temp_millic": 52000,
-                       "nvme_temp_millic": 55000,
+            "limits": {"cpu_start_millic": 52000,
+                       "nvme_start_millic": 55000,
+                       "cpu_peak_millic": 80000,
+                       "nvme_peak_millic": 70000,
                        "gpu_util_percent": 5.0},
         }
         self.records = self._records()
@@ -209,6 +211,25 @@ class TestSparkWholeExpertCampaign(unittest.TestCase):
                 effects[name]["total_ms"]["ratio"]["percent_change"],
                 value, places=9)
         self.assertLess(result["performance"]["whole_schedule_total_percent"], 0)
+
+    def test_peak_temperature_gate_is_independent_of_start_gate(self):
+        fixture = SparkCampaignFixture(self.root)
+        record = copy.deepcopy(fixture.records[0])
+        record["telemetry"]["cpu_peak_millic"] = 73600
+        record["telemetry"]["nvme_peak_millic"] = 58850
+        reasons = campaign.exact_run_reasons(
+            record=record, expected=fixture.identity,
+            geometry=fixture.identity["model_geometry"], gpu_limit=5.0,
+            cpu_peak_limit=80000, nvme_peak_limit=70000)
+        self.assertNotIn("cpu_temperature", reasons)
+        self.assertNotIn("nvme_temperature", reasons)
+
+        reasons = campaign.exact_run_reasons(
+            record=record, expected=fixture.identity,
+            geometry=fixture.identity["model_geometry"], gpu_limit=5.0,
+            cpu_peak_limit=70000, nvme_peak_limit=58000)
+        self.assertIn("cpu_temperature", reasons)
+        self.assertIn("nvme_temperature", reasons)
 
     def test_traffic_drift_is_reported_without_invalidating_campaign(self):
         fixture = SparkCampaignFixture(self.root)
