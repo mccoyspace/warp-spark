@@ -294,6 +294,8 @@ def main() -> int:
     ap.add_argument("--threads", type=int, default=8)
     ap.add_argument("--tokens", type=int, default=4)
     ap.add_argument("--blocks", type=int, choices=range(1, 7), default=3)
+    ap.add_argument("--start-block", type=int, choices=range(1, 7), default=1,
+                    help="resume at this 1-based Williams block")
     ap.add_argument("--cpus", default="5-9,15-19")
     ap.add_argument("--sampler-cpus", default="0-4,10-14")
     ap.add_argument("--user", default=getpass.getuser())
@@ -302,6 +304,9 @@ def main() -> int:
     ap.add_argument("--nvme-temp-limit", type=int, default=55000)
     ap.add_argument("--skip-warmup", action="store_true")
     args = ap.parse_args()
+
+    if args.start_block > args.blocks:
+        ap.error("--start-block cannot exceed --blocks")
 
     if os.uname().sysname != "Linux":
         ap.error("this diagnostic requires Linux perf and sysfs")
@@ -358,7 +363,8 @@ def main() -> int:
         "syscalls:sys_enter_io_uring_enter",
     ]
 
-    for block, order in enumerate(ORDERS[:args.blocks], 1):
+    for block in range(args.start_block, args.blocks + 1):
+        order = ORDERS[block - 1]
         for position, code in enumerate(order, 1):
             treatment = TREATMENTS[code]
             run_id = f"b{block:02d}-p{position}-{code}-{treatment['name']}"
