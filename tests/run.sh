@@ -56,6 +56,12 @@ fi
 # ---------------------------------------------------------------- unit ----
 head_ "kernels vs the reference implementations"
 
+if ./test_memory "$TMP" 2>/dev/null | grep -q "^PASS"; then
+    ok "automatic memory budget arithmetic and host accounting"
+else
+    no "automatic memory budget arithmetic or host accounting"
+fi
+
 if command -v uv >/dev/null 2>&1; then
     ./test_k3parts "$TMP/k3parts.bin" >/dev/null 2>&1
     if uv run --quiet --with torch --no-project python tools/k3parts_ref.py \
@@ -607,10 +613,10 @@ head_ "RAM budget"
 # the machine — K3 asks for 80.63 GB — and a swap storm. So assert the
 # rule, not a number, and it holds on any host: the engine steps down a
 # whole token working set at a time and takes the largest of
-# floor + 3x, 2x, 1x that fits under 7/8 of physical RAM, or the floor
-# when not even one multiple does, less at most one expert record of slot
-# rounding. Filling the cap instead is what put a 27 GB cache on a 64 GB
-# machine and cost 8x throughput — docs/LEARNED.md §16.
+# floor + 3x, 2x, 1x that fits under the engine's current memory ceiling,
+# or the floor when not even one multiple does, less at most one expert
+# record of slot rounding. Filling the cap instead is what put a 27 GB
+# cache on a 64 GB machine and cost 8x throughput — docs/LEARNED.md §16.
 default_budget() {
     python3 - "$1" <<'PY'
 import json, os, subprocess, sys
@@ -624,16 +630,11 @@ def j(*a):
     return json.loads(r.stdout)
 
 plan, info = j("plan", sys.argv[1]), j("info", sys.argv[1])
-# From the engine rather than os.sysconf, which does not exist in Windows
-# CPython at all. This is the same number the engine sized itself against,
-# so what the check still tests is the rule — floor + the largest whole
-# working set under 7/8 of RAM — and not the RAM reading, which has its
-# own platform code and no business being written twice.
+# From the engine rather than duplicating Linux proc/cgroup parsing here.
+# This is the same snapshot the engine sizes itself against, so the check
+# tests floor + the largest whole working set under that ceiling.
 phys = plan["physical_ram_bytes"]
-if not phys:
-    print("physical RAM unknown on this host")
-    sys.exit(0)
-cap = phys - phys // 8
+cap = plan["memory_ceiling_bytes"]
 # what the engine actually holds: the plan's mandatory parts plus the
 # cache it really allocated, which is what `info` reports
 held = plan["floor_bytes"] - plan["min_expert_cache"] + info["expert_cache_bytes"]
@@ -641,12 +642,13 @@ held = plan["floor_bytes"] - plan["min_expert_cache"] + info["expert_cache_bytes
 ws = (plan["recommended_bytes"] - plan["floor_bytes"]) // 3
 want = plan["floor_bytes"]
 for k in (3, 2, 1):
-    if plan["floor_bytes"] + ws * k <= cap:
+    if not cap or plan["floor_bytes"] + ws * k <= cap:
         want = plan["floor_bytes"] + ws * k
         break
 rec = plan["min_expert_cache"] // (2 * info["top_k"]) if info["top_k"] else 0
 G = 1 << 30
-print(f"{held/G:.2f} GB held, ceiling {want/G:.2f} GB, machine {phys/G:.2f} GB")
+print(f"{held/G:.2f} GB held, budget {want/G:.2f} GB, "
+      f"current ceiling {cap/G:.2f} GB, machine {phys/G:.2f} GB")
 sys.exit(0 if want - rec - 1 <= held <= want else 1)
 PY
 }

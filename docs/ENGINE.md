@@ -113,11 +113,16 @@ does not change them — see [EFFICIENCY.md](EFFICIENCY.md).)
 So the default steps down a whole working set at a time and takes the
 largest that fits: `floor + 3x`, else `2x`, else `1x`, else the floor.
 K3 lands on `floor + 1x` here — a 46.24 GB budget, 17.56 GB of cache, and
-the top of the measured curve with no flag given. A 128 GB machine still
-gets the full `3x`, and a model whose recommendation already fits, like
-Kimi-Linear, is unaffected. When even the floor is above the cap the
-engine runs at the floor and says so on stderr, because the alternative
-is refusing to open a model that does technically fit.
+the top of the measured curve with no flag given. An otherwise idle 128 GB
+machine still gets the full `3x`, and a model whose recommendation already
+fits, like Kimi-Linear, is unaffected. On Linux, the ceiling is also bounded by
+current `MemAvailable` minus the host reserve and by finite cgroup-v2
+headroom minus one eighth of that cgroup's effective capacity. The engine
+walks cgroup ancestors because a leaf can say `memory.max=max` while its
+parent is finite. When even the floor is above a known current ceiling,
+automatic sizing returns `WASTE_E_MEMORY` before a model-sized allocation.
+An explicit nonzero budget remains the caller's contract and is honored,
+with a warning when it is above the current safe ceiling.
 
 ### What the floor is made of
 
@@ -280,7 +285,7 @@ print:
 | `eval` | `waste_eval`, `waste_detokenize` |
 | `tokenize` / `detokenize` | `waste_tokenize`, `waste_detokenize` |
 | `bench` | `waste_get_stats` |
-| `plan` | `waste_plan_memory`, `waste_physical_ram` |
+| `plan` | `waste_plan_memory`, `waste_physical_ram`, `waste_memory_ceiling` |
 | `info` | `waste_model_get_info`, `waste_memory_used` |
 
 Images add three more, reachable from `run`, `chat` and `eval` via

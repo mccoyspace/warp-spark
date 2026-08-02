@@ -277,6 +277,9 @@ static int fail(const char *what, waste_status s)
     fprintf(stderr, "%s: %s\n", what, waste_strerror(s));
     if (s == WASTE_E_RAM_BUDGET)
         fprintf(stderr, "  (run `waste plan MODEL` to see the floor)\n");
+    if (s == WASTE_E_MEMORY)
+        fprintf(stderr, "  (free memory, lower other workloads, or set an "
+                        "explicit --budget)\n");
     return 1;
 }
 
@@ -479,13 +482,13 @@ static int cmd_plan(int argc, char **argv)
                (unsigned long long)p.min_expert_cache,
                (unsigned long long)p.floor_bytes,
                (unsigned long long)p.recommended_bytes);
-        /* The human form already says "machine N GB" and the JSON did not,
-         * so anything reading this had to work out physical RAM for itself
-         * — which on Windows means neither sysconf nor /proc exists and the
-         * caller reimplements GlobalMemoryStatusEx. The engine already
-         * knows; 0 when it cannot tell. */
-        printf(",\"physical_ram_bytes\":%llu",
-               (unsigned long long)waste_physical_ram());
+        /* The engine already owns both platform questions, so JSON clients
+         * should not reimplement GlobalMemoryStatusEx, /proc/meminfo and
+         * cgroup-v2 traversal. Either figure is 0 when it cannot be known;
+         * unlike physical RAM, the current ceiling can change. */
+        printf(",\"physical_ram_bytes\":%llu,\"memory_ceiling_bytes\":%llu",
+               (unsigned long long)waste_physical_ram(),
+               (unsigned long long)waste_memory_ceiling());
         if (p.vision_bytes)
             printf(",\"vision_bytes\":%llu", (unsigned long long)p.vision_bytes);
         if (o.budget)

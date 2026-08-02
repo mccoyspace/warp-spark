@@ -23,6 +23,7 @@
 #include <time.h>
 
 #include "json.h"
+#include "memory.h"
 #include "model.h"
 #include "platform.h"
 #include "tokenizer.h"
@@ -86,6 +87,7 @@ const char *waste_strerror(waste_status s)
     case WASTE_E_ARG:          return "invalid argument";
     case WASTE_E_UNSUPPORTED:  return "unsupported";
     case WASTE_E_CANCELLED:    return "cancelled by callback";
+    case WASTE_E_MEMORY:       return "not enough currently available memory";
     }
     return "unknown error";
 }
@@ -149,6 +151,19 @@ uint64_t waste_physical_ram(void)
 #else
     return 0;
 #endif
+}
+
+static uint64_t current_memory_ceiling(uint64_t physical)
+{
+    waste_memory_pressure pressure;
+    waste_memory_pressure_read(&pressure, physical, "/proc/meminfo",
+                               "/proc/self/cgroup", "/sys/fs/cgroup");
+    return waste_memory_safe_ceiling(physical, &pressure);
+}
+
+uint64_t waste_memory_ceiling(void)
+{
+    return current_memory_ceiling(waste_physical_ram());
 }
 
 waste_status waste_plan_memory(const char *model_path, uint32_t ctx_tokens,
@@ -392,39 +407,57 @@ waste_status waste_open(const char *model_path, const waste_cfg *cfg_in,
      *
      * So step down a whole working set at a time and take the largest
      * that fits. On 64 GB K3 gets floor + 1x = 46 GB, the measured
-     * optimum; on 128 GB it still gets the full floor + 3x; a model whose
-     * recommendation already fits, like Kimi-Linear, is unaffected. When
-     * not even one multiple fits, run at the floor and say so below. */
+     * optimum; on an otherwise idle 128 GB host it still gets the full
+     * floor + 3x; a model whose recommendation already fits, like
+     * Kimi-Linear, is unaffected. Linux also applies current MemAvailable
+     * and cgroup-v2 limits. If those cannot hold even the floor, fail before
+     * making the model-sized allocation. */
     const uint64_t phys = waste_physical_ram();
-    const uint64_t cap = phys ? phys - phys / 8 : 0;   /* 12% left to the OS */
+    const uint64_t cap = current_memory_ceiling(phys);
     uint64_t budget = cfg.ram_budget_bytes;
 
     if (!budget) {
-        /* exact: recommended_bytes is floor + 3 * working_set by construction */
-        const uint64_t ws = (c->plan.recommended_bytes - c->plan.floor_bytes) / 3;
-        budget = c->plan.floor_bytes;
-        for (int k = 3; k >= 1; k--) {
-            const uint64_t b = c->plan.floor_bytes + ws * (uint64_t)k;
-            if (!cap || b <= cap) { budget = b; break; }
+        budget = waste_memory_auto_budget(c->plan.floor_bytes,
+                                          c->plan.recommended_bytes, cap);
+        if (!budget) {
+#if defined(__linux__)
+            free(c);
+            return WASTE_E_MEMORY;
+#else
+            /* Before current-pressure accounting, a floor above the 7/8
+             * physical ceiling still opened with a warning. Preserve that
+             * behavior on platforms that supplied no new current signal. */
+            budget = c->plan.floor_bytes;
+#endif
         }
     }
     if (budget < c->plan.floor_bytes) { free(c); return WASTE_E_RAM_BUDGET; }
 
-    /* A budget close to physical RAM backfires: the OS starts paging out
+    /* A budget close to the memory currently available to this process
+     * backfires: the OS starts paging out
      * the engine's own expert cache, and a "hit" then costs a page fault
      * instead of the disk read the engine was managing. Measured on K3:
      * 29.1 GB of cache on a 64 GB machine ran at 0.04 tok/s against 0.32
      * with 28.0 GB — a better hit rate and eight times slower. This tests
      * the resolved budget, not the caller's field: the default used to skip
      * the check entirely by being zero here, which is exactly the case that
-     * needed it. What survives the clamp above is a floor that does not fit
-     * this machine — worth saying out loud before it crawls. */
-    if (cap && budget > cap)
+     * needed it. Explicit budgets remain the caller's contract, so warn
+     * rather than silently changing one. */
+    if (cap && budget > cap) {
+#if defined(__linux__)
+        fprintf(stderr,
+                "waste: budget %.1f GB exceeds the current safe memory "
+                "ceiling %.1f GB\n       available or cgroup memory may be "
+                "paged; automatic budgeting would choose less\n",
+                budget / 1073741824.0, cap / 1073741824.0);
+#else
         fprintf(stderr,
                 "waste: budget %.1f GB leaves under 12%% of this machine's "
                 "%.1f GB free\n       the OS will page out the expert cache "
                 "and throughput collapses\n",
                 budget / 1073741824.0, phys / 1073741824.0);
+#endif
+    }
 
     c->cfg.ram_budget_bytes = budget;   /* what we actually run under */
 

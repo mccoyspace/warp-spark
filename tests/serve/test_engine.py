@@ -105,6 +105,13 @@ class TestLibrary(EngineTestCase):
         ram = E.physical_ram()
         self.assertTrue(ram == 0 or ram > (1 << 28), ram)
 
+    def test_memory_ceiling(self):
+        ceiling, ram = E.memory_ceiling(), E.physical_ram()
+        self.assertIsInstance(ceiling, int)
+        self.assertGreaterEqual(ceiling, 0)
+        if ceiling and ram:
+            self.assertLessEqual(ceiling, ram)
+
     def test_plan_memory_without_loading(self):
         plan = E.plan_memory(str(self.model), 512)
         self.assertGreater(plan.floor_bytes, 0)

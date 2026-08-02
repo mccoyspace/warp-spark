@@ -2042,3 +2042,42 @@ column instead of two, which read as a broken reconstruction rather than a
 stale binary. §17 recorded exactly this ("once to a stale test binary") and
 the fix is the same as it was then: `make test`, or `make check`, which
 rebuilds first.
+
+## 38. Physical RAM is not current capacity (2026-08-01)
+
+The automatic budget used one machine number: physical RAM. That is stable,
+portable, and insufficient on Linux. `MemTotal` does not say how much another
+service already holds, and a process can live inside a finite cgroup whose
+limit is much smaller than the host. A budget below seven eighths of
+`MemTotal` can therefore still ask the kernel to reclaim or swap.
+
+The Spark made the gap conspicuous but did **not** prove the original
+hypothesis. Its first 80.64 GiB run recorded paging despite 119.69 GiB of
+visible RAM. Clean replays showed that sample was contaminated by an earlier
+process: idle `MemAvailable` was about 115 GiB and the same 80.64 GiB budget
+then ran without process or cgroup swap. Sizing from startup
+`MemAvailable` would not have repaired that historical sample. It does
+repair the general case where pressure already exists when a model opens,
+which is the only state an allocator can honestly size from.
+
+Linux automatic sizing now takes the smallest of three ceilings:
+
+- seven eighths of physical RAM;
+- `MemAvailable` minus the host's one-eighth reserve; and
+- cgroup-v2 headroom minus one eighth of that cgroup's effective capacity.
+
+The last reserve cannot be copied from the host. The first prototype did
+exactly that, so an 8 GiB cgroup on a 128 GiB machine had 7 GiB of headroom
+and then lost a 16 GiB *host* reserve: it appeared exhausted. With the
+group's own 1 GiB reserve, the usable ceiling is 6 GiB. The reader also
+walks ancestors, because `memory.max` is hierarchical and a leaf saying
+`max` does not cancel a finite parent.
+
+This is a safety change, not a new throughput row. On an idle Spark the full
+3x recommendation still fits and is still selected. Under synthetic inputs,
+the unit test fixes the policy at the boundary cases: a 128 GiB host with
+116 GiB available has a 100 GiB current ceiling; the 8/1 GiB cgroup above
+has 6 GiB; a 16 GiB parent at 13 GiB current narrows that to 1 GiB; and a
+known ceiling below the model floor refuses the automatic open before any
+model-sized allocation. Explicit budgets remain explicit and receive a
+warning rather than being silently rewritten.
