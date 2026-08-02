@@ -100,6 +100,16 @@ ifneq (,$(filter arm% aarch64%,$(ARCH)))
 SRC += src/kda_neon.c
 endif
 
+# SVE is optional even on aarch64 and Apple ARM does not provide it.  Keep
+# the implementation in its own Linux/aarch64 translation unit, then select
+# it from HWCAP at runtime so the same binary remains valid on non-SVE hosts.
+ifneq (,$(filter aarch64%,$(ARCH)))
+ifneq (,$(findstring linux,$(ARCH)))
+SRC += src/simd_sve.c
+override CFLAGS += -DWASTE_HAVE_SVE=1
+endif
+endif
+
 # One translation unit per x86 ISA, each built with its own flags so the
 # baseline binary stays runnable on a CPU that has neither. waste_backend_init
 # picks between them from CPUID, so a single binary adapts at run time —
@@ -176,6 +186,7 @@ src/metal.o: src/metal.m
 # where these translation units are not in SRC at all.
 src/simd_avx2.o:   override CFLAGS += -mavx2 -mfma
 src/simd_avx512.o: override CFLAGS += -mavx512f -mavx512bw
+src/simd_sve.o:    override CFLAGS += -march=armv8.2-a+sve
 
 all: waste$(EXE) libwaste.a libwaste.$(SOEXT) libwastevq.$(SOEXT)
 
@@ -206,6 +217,7 @@ src/metal.pic.o: src/metal.m
 
 src/simd_avx2.pic.o:   override CFLAGS += -mavx2 -mfma
 src/simd_avx512.pic.o: override CFLAGS += -mavx512f -mavx512bw
+src/simd_sve.pic.o:    override CFLAGS += -march=armv8.2-a+sve
 
 libwaste.$(SOEXT): $(SHOBJ)
 	$(CC) $(CFLAGS) -shared -o $@ $^ $(SHLDFLAGS) $(LDLIBS)
@@ -217,7 +229,8 @@ waste$(EXE): cli/main.o libwaste.a
 # the two failures tests/run.sh was written to catch, so a binary that
 # `test` builds and `clean` forgets defeats the check meant to notice it.
 TESTNAMES := test_kda test_container test_forward test_tokenizer test_k3parts \
-             test_state test_vision test_image test_lock test_memory
+             test_state test_vision test_image test_lock test_memory \
+             test_vq_gather
 TESTBINS  := $(addsuffix $(EXE),$(TESTNAMES))
 
 test: $(TESTBINS)
@@ -250,6 +263,8 @@ test_state$(EXE): tests/test_state.o libwaste.a
 test_lock$(EXE): tests/test_lock.o libwaste.a
 	$(CC) $(CFLAGS) -o $@ $^ $(LDLIBS)
 test_memory$(EXE): tests/test_memory.o src/memory.o
+	$(CC) $(CFLAGS) -o $@ $^ $(LDLIBS)
+test_vq_gather$(EXE): tests/test_vq_gather.o libwaste.a
 	$(CC) $(CFLAGS) -o $@ $^ $(LDLIBS)
 
 %.o: %.c

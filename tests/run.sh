@@ -73,6 +73,17 @@ else
     no "automatic memory budget arithmetic or host accounting"
 fi
 
+vq_gather=$(./test_vq_gather 2>&1); vq_gather_rc=$?
+if [ "$vq_gather_rc" -ne 0 ]; then
+    no "SVE expert-VQ gather differs from the scalar kernel"
+elif printf '%s\n' "$vq_gather" | grep -q '^PASS'; then
+    ok "SVE expert-VQ gather is bit-identical to scalar"
+elif printf '%s\n' "$vq_gather" | grep -q '^SKIP'; then
+    sk "SVE expert-VQ gather" "not built or unavailable on this target"
+else
+    no "SVE expert-VQ gather produced no result"
+fi
+
 if command -v uv >/dev/null 2>&1; then
     ./test_k3parts "$TMP/k3parts.bin" >/dev/null 2>&1
     if uv run --quiet --with torch --no-project python tools/k3parts_ref.py \

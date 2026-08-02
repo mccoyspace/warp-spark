@@ -2,15 +2,16 @@
  * Copyright 2026 SQLite Cloud, Inc.
  */
 /*
- * simd.h — the two range kernels that carry the engine's arithmetic, in a
+ * simd.h — the range kernels that carry the engine's arithmetic, in a
  * form other translation units can implement.
  *
- * Everything hot is either a gather (the VQ apply, which no SIMD helps —
- * see LEARNED.md §12) or one of these two:
+ * Everything hot is either a gather (the VQ apply, whose data-dependent
+ * table lookups need a dedicated implementation) or one of these kernels:
  *
  *   mvq_rows_f32   quantized weights x f32 activations, one row at a time.
  *                  Every trunk projection goes through it.
  *   lutb_range     the VQ codebook table, dst[c] = sum_d x[d]*C[d][c].
+ *   vq_rows        apply the VQ table to blocked expert indices.
  *
  * They take a (begin, end, arg) range because that is what the thread pool
  * hands out, so dispatch costs one indirect call per range rather than one
@@ -42,6 +43,29 @@ typedef struct {
     float *lut; const float *booksT; const float *x;
     int cb_base, stages, entries, vec_dim;
 } lutb_arg;
+
+/* Expert VQ application is blocked in the container by 64 output rows.
+ * VQ_SUPER controls how many complete blocks one pool range handles at a
+ * time; it remains a build-time tuning knob, with two as the measured
+ * default. */
+#define WASTE_VQ_TILE 64
+#ifndef VQ_SUPER
+#define VQ_SUPER 2
+#endif
+#define WASTE_VQ_RANGE (WASTE_VQ_TILE * VQ_SUPER)
+
+typedef struct {
+    float *y;
+    const uint8_t *idx;
+    const uint16_t *scale;
+    const float *lut;
+    int nv, stages, entries;
+} vq_arg;
+
+void waste_vq_rows_cpu(int b, int e, void *arg);
+#if defined(WASTE_HAVE_SVE)
+void waste_vq_rows_sve(int b, int e, void *arg);
+#endif
 
 /* fp16 scale -> float, and one signed 3-bit code out of a packed row. Both
  * are needed by every implementation, and both are small enough that a

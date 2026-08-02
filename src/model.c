@@ -1705,11 +1705,6 @@ static void vq_build_lut(waste_model *m, float *lut, int cb_base,
     PROF_END(P_LUTB);
 }
 
-typedef struct {
-    float *y; const uint8_t *idx; const uint16_t *scale; const float *lut;
-    int nv, stages, entries;
-} vq_arg;
-
 /* Row-tiled so the per-position table block is loaded once for a whole
  * tile instead of once per row. The naive row-outer/vector-inner order
  * streams the entire table (884 KB for a 2304-wide matrix) M times; at
@@ -1717,11 +1712,6 @@ typedef struct {
  * table is read M/64 times and the tile's indices (55 KB) stay in L1.
  * This is a cache-blocking win, not a SIMD one: the inner op is a gather,
  * which NEON cannot vectorize. */
-#define VQ_TILE 64          /* must equal the container's index_block */
-#ifndef VQ_SUPER
-#define VQ_SUPER 2          /* index blocks handled per pass (swept: 2 wins) */
-#endif
-
 /* What this loop actually costs, measured rather than assumed:
  *   - it is NOT table bandwidth. Re-reading the 884 KB table once per
  *     64-row tile works out to 8.2 GB/token, which would need 165 GB/s —
@@ -1736,25 +1726,25 @@ typedef struct {
  *     Interleaving four independent rows keeps four chains in flight and
  *     is what finally moved it.
  * Swept: VQ_SUPER 1 and 2 tie within noise, 4+ is worse. */
-static void vq_rows(int b, int e, void *p)
+void waste_vq_rows_cpu(int b, int e, void *p)
 {
     vq_arg *a = (vq_arg *)p;
     const int nv = a->nv, st = a->stages, en = a->entries;
-    float acc[VQ_TILE * VQ_SUPER];
+    float acc[WASTE_VQ_RANGE];
 
-    for (int r0 = b; r0 < e; r0 += VQ_TILE * VQ_SUPER) {
-        const int rows = (r0 + VQ_TILE * VQ_SUPER < e) ? VQ_TILE * VQ_SUPER : e - r0;
-        const int nblk = (rows + VQ_TILE - 1) / VQ_TILE;
+    for (int r0 = b; r0 < e; r0 += WASTE_VQ_RANGE) {
+        const int rows = (r0 + WASTE_VQ_RANGE < e) ? WASTE_VQ_RANGE : e - r0;
+        const int nblk = (rows + WASTE_VQ_TILE - 1) / WASTE_VQ_TILE;
         memset(acc, 0, (size_t)rows * sizeof(float));
 
         for (int v = 0; v < nv; v++) {
             const float *blk = a->lut + (size_t)v * st * en;
             for (int j = 0; j < nblk; j++) {
-                const int nr = (j + 1) * VQ_TILE <= rows ? VQ_TILE
-                                                         : rows - j * VQ_TILE;
+                const int nr = (j + 1) * WASTE_VQ_TILE <= rows ? WASTE_VQ_TILE
+                                                               : rows - j * WASTE_VQ_TILE;
                 const uint8_t *ix = a->idx +
-                    ((size_t)(r0 / VQ_TILE + j) * nv + v) * VQ_TILE * st;
-                float *ac = acc + (size_t)j * VQ_TILE;
+                    ((size_t)(r0 / WASTE_VQ_TILE + j) * nv + v) * WASTE_VQ_TILE * st;
+                float *ac = acc + (size_t)j * WASTE_VQ_TILE;
                 /* Each gather is load -> address -> load, a ~5-cycle chain.
                  * Four rows are independent, so interleaving them keeps
                  * four chains in flight instead of one.
@@ -1811,9 +1801,9 @@ static void vq_apply(waste_model *m, float *y, const uint8_t *idx,
 {
     PROF_START(P_LUTA);
     vq_arg a = { y, idx, scale, lut, N / m->vec_dim, m->stages, m->cb_entries };
-    /* min_chunk = VQ_TILE keeps every thread's range block-aligned, which
+    /* The minimum chunk keeps every thread's range block-aligned, which
      * the blocked index layout requires. */
-    waste_parallel_for(M, VQ_TILE * VQ_SUPER, vq_rows, &a);
+    waste_parallel_for(M, WASTE_VQ_RANGE, waste_k.vq_rows, &a);
     PROF_END(P_LUTA);
 }
 

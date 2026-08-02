@@ -47,6 +47,9 @@ const char *waste_kda_register_cpu(waste_kernels *t);
 #if defined(__ARM_NEON) || defined(__aarch64__)
 const char *waste_kda_register_neon(waste_kernels *t);
 #endif
+#if defined(WASTE_HAVE_SVE)
+const char *waste_register_sve(waste_kernels *t);
+#endif
 #if defined(__x86_64__) || defined(_M_X64)
 const char *waste_register_avx2(waste_kernels *t);
 const char *waste_register_avx512(waste_kernels *t);
@@ -184,6 +187,9 @@ void waste_backend_init(unsigned flags)
 #if defined(__ARM_NEON) || defined(__aarch64__)
     if (f & WASTE_CPU_NEON) g_backend_name = waste_kda_register_neon(&waste_k);
 #endif
+#if defined(WASTE_HAVE_SVE)
+    if (f & WASTE_CPU_SVE) g_backend_name = waste_register_sve(&waste_k);
+#endif
 #if defined(__x86_64__) || defined(_M_X64)
     /* Widest first: a machine with AVX-512 also reports AVX2. FMA is
      * checked with AVX2 because the kernels use fmadd. */
@@ -192,7 +198,7 @@ void waste_backend_init(unsigned flags)
     else if ((f & WASTE_CPU_AVX2) && (f & WASTE_CPU_FMA))
         g_backend_name = waste_register_avx2(&waste_k);
 #endif
-    /* AVX2 / AVX-512 / SVE / RVV modules register here as they land, in
+    /* AVX2 / AVX-512 / RVV modules register here as they land, in
      * best-first order, each overwriting only what it implements. */
 
     /* 3. accelerators: compiled in only when enabled at build time, and

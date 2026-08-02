@@ -11,6 +11,7 @@
  */
 
 #include "kda.h"
+#include "simd.h"
 #include "waste_backend.h"
 
 #include <math.h>
@@ -119,9 +120,10 @@ const char *waste_kda_register_cpu(waste_kernels *t)
 {
     t->kda_step = waste_kda_step;
     /* The portable range kernels live in model.c, next to the code that
-     * builds their arguments; an ISA backend overwrites these two. */
+     * builds their arguments; an ISA backend may overwrite any of them. */
     t->mvq_rows_f32 = waste_mvq_rows_f32;
     t->lutb_range = waste_lutb_range;
+    t->vq_rows = waste_vq_rows_cpu;
     t->short_conv_step = waste_short_conv_step;
     t->rmsnorm_gated = waste_rmsnorm_gated;
     return "CPU";
