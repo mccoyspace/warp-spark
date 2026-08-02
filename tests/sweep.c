@@ -28,6 +28,7 @@
  *   sweep CONTAINER ids,.. n_gen lookahead=0,6 [repeat]
  *   sweep CONTAINER ids,.. n_gen iodepth=2,4,8 [repeat]
  *   sweep CONTAINER ids,.. n_gen cache=3400,17736,23879 [repeat]
+ *   sweep CONTAINER ids,.. n_gen cuda=0,1,2 [repeat]
  *
  * `cache` is in MB and re-makes the expert cache in place. The trunk is what
  * a load costs, not the cache, so a budget sweep no longer needs a process
@@ -81,7 +82,7 @@ int main(int argc, char **argv)
     if (argc < 5) {
         fprintf(stderr,
                 "usage: %s CONTAINER ids,.. n_gen KEY=v1,v2,.. [repeat]\n"
-                "  KEY is lookahead, iodepth or cache (MB)\n", argv[0]);
+                "  KEY is lookahead, iodepth, cache (MB), or cuda\n", argv[0]);
         return 2;
     }
     int ids[MAX_IDS], n = 0;
@@ -109,7 +110,8 @@ int main(int argc, char **argv)
     const int is_look = !strcmp(key, "lookahead");
     const int is_depth = !strcmp(key, "iodepth");
     const int is_cache = !strcmp(key, "cache");
-    if (!is_look && !is_depth && !is_cache) {
+    const int is_cuda = !strcmp(key, "cuda");
+    if (!is_look && !is_depth && !is_cache && !is_cuda) {
         fprintf(stderr, "unknown key %s\n", key);
         return 2;
     }
@@ -119,7 +121,7 @@ int main(int argc, char **argv)
     memset(&lo, 0, sizeof lo);
     const char *cmb = getenv("WASTE_CACHE_MB");
     const unsigned long long cache_mb = cmb ? strtoull(cmb, NULL, 10) : 0;
-    if ((is_look || is_depth) && cache_mb == 0) {
+    if ((is_look || is_depth || is_cuda) && cache_mb == 0) {
         fprintf(stderr, "WASTE_CACHE_MB must be positive for %s sweeps\n", key);
         return 2;
     }
@@ -139,7 +141,8 @@ int main(int argc, char **argv)
         waste_model_free(&m);
         return 1;
     }
-    if ((is_look || is_depth) && waste_ecache_io_threads(&m.cache) == 0) {
+    if ((is_look || is_depth || is_cuda) &&
+        waste_ecache_io_threads(&m.cache) == 0) {
         fprintf(stderr, "%s sweep has no effective reader threads\n", key);
         waste_model_free(&m);
         return 1;
@@ -158,10 +161,11 @@ int main(int argc, char **argv)
     /* Interleaved rather than grouped: if the machine drifts over the run —
      * and it does — a grouped sweep charges the drift to the last arm and
      * an interleaved one spreads it across all of them. */
-    printf("%8s %4s %7s %3s %3s %6s %10s %11s %9s %9s %8s %14s "
-           "%18s %18s\n",
-           key, "rep", "slots", "io", "qd", "warm", "seconds", "tok/s",
-           "hits", "misses", "hit", "bytes", "token_hash", "logit_hash");
+    printf("%8s %4s %7s %3s %3s %3s %4s %6s %10s %11s %9s %9s %8s %14s "
+           "%18s %18s %18s\n",
+           key, "rep", "slots", "io", "qd", "eff", "fall", "warm",
+           "seconds", "tok/s", "hits", "misses", "hit", "bytes",
+           "token_hash", "logit_hash", "route_hash");
     for (int r = 0; r < repeat; r++) {
         for (int a = 0; a < n_arms; a++) {
             const int ai = (r & 1) ? n_arms - 1 - a : a;
@@ -174,6 +178,9 @@ int main(int argc, char **argv)
                 const int max_depth = m.cache.n_slots / 4;
                 if (max_depth > 0 && value > max_depth) value = max_depth;
                 m.cache.depth = value;
+            } else if (is_cuda) {
+                waste_model_set_cuda_kda(&m, value);
+                value = waste_model_get_cuda_kda(&m);
             } else if (value < 0 ||
                        waste_model_resize_cache(&m, (size_t)value << 20)) {
                 fprintf(stderr, "resize to %d MB failed\n", value);
@@ -227,12 +234,15 @@ int main(int argc, char **argv)
             const uint64_t b0 = m.cache.bytes_read;
             uint64_t token_hash = UINT64_C(14695981039346656037);
             uint64_t logit_hash = UINT64_C(14695981039346656037);
+            uint64_t route_hash = UINT64_C(14695981039346656037);
             logit_hash = hash_bytes(logit_hash, lg,
                                     (size_t)m.cfg.vocab * sizeof *lg);
+            int routed[WASTE_MAX_LAYERS * 64];
             const double s = now();
             for (int i = 0; i < n_gen; i++) {
                 token_hash = hash_bytes(token_hash, &cur, sizeof cur);
-                lg = waste_model_step(&m, cur, n + i, NULL);
+                memset(routed, 0xff, sizeof routed);
+                lg = waste_model_step(&m, cur, n + i, routed);
                 if (!lg) {
                     fprintf(stderr, "step failed\n");
                     waste_model_free(&m);
@@ -240,6 +250,11 @@ int main(int argc, char **argv)
                 }
                 logit_hash = hash_bytes(logit_hash, lg,
                                         (size_t)m.cfg.vocab * sizeof *lg);
+                route_hash = hash_bytes(
+                    route_hash,
+                    routed + (size_t)m.cfg.first_dense * m.cfg.top_k,
+                    (size_t)(m.cfg.n_layers - m.cfg.first_dense) *
+                    m.cfg.top_k * sizeof *routed);
                 cur = 0;
                 for (int v = 1; v < m.cfg.vocab; v++) if (lg[v] > lg[cur]) cur = v;
             }
@@ -248,14 +263,18 @@ int main(int argc, char **argv)
             const uint64_t h = m.cache.hits - h0;
             const uint64_t mi = m.cache.misses - mi0;
             const uint64_t bytes = m.cache.bytes_read - b0;
-            printf("%8d %4d %7d %3d %3d %6d %10.6f %11.6f %9" PRIu64
+            printf("%8d %4d %7d %3d %3d %3d %4" PRIu64
+                   " %6d %10.6f %11.6f %9" PRIu64
                    " %9" PRIu64 " %7.2f%% %14" PRIu64 " 0x%016" PRIx64
-                   " 0x%016" PRIx64 "\n",
+                   " 0x%016" PRIx64 " 0x%016" PRIx64 "\n",
                    value, r + 1, m.cache.n_slots,
                    waste_ecache_io_threads(&m.cache),
-                   waste_ecache_io_depth(&m.cache), warmed, dt, n_gen / dt,
+                   waste_ecache_io_depth(&m.cache),
+                   waste_model_cuda_kda_effective(&m),
+                   waste_model_cuda_kda_fallbacks(&m),
+                   warmed, dt, n_gen / dt,
                    h, mi, 100.0 * (double)h / (double)(h + mi ? h + mi : 1),
-                   bytes, token_hash, logit_hash);
+                   bytes, token_hash, logit_hash, route_hash);
             fflush(stdout);
         }
     }
