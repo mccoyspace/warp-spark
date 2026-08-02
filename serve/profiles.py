@@ -89,8 +89,8 @@ class ResolvedProfile:
             self.environment.get("WASTE_IO_THREADS"), 2)
         io_depth = _c_atoi(
             self.environment.get("WASTE_IO_DEPTH"), 2)
-        # These are current upstream's configuration transforms, not a claim
-        # that runtime-effective reader state can be queried from the ABI.
+        # These are current upstream's request transforms. Server startup
+        # fills the separate effective fields from the engine ABI after open.
         if io_depth < io_threads:
             io_depth = io_threads
         lookahead = _c_atoi(

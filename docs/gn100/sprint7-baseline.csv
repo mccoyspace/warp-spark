@@ -1,0 +1,11 @@
+run,condition,tokens,decode_seconds,tok_per_s,wall_seconds,experts_hit,experts_missed,major_faults,swaps,filesystem_inputs,max_rss_kib,stdout_sha256
+b1-upstream-default,current-base-defaults,16,58.89,0.27,176.02,12448,11104,1,0,790697928,83712064,ab2b8bf824da22851c55f95bc32faed91bfcaac2e657c619ab30299fabcec516
+b1-spark-noq0,reader-2-depth-2-lookahead-0,16,59.72,0.27,175.60,9948,13604,2,0,756167920,83712048,ab2b8bf824da22851c55f95bc32faed91bfcaac2e657c619ab30299fabcec516
+b1-spark-q0,reader-2-depth-2-lookahead-0-q0,16,46.99,0.34,137.58,9948,13604,8,0,737938720,83711800,ab2b8bf824da22851c55f95bc32faed91bfcaac2e657c619ab30299fabcec516
+b2-spark-q0,reader-2-depth-2-lookahead-0-q0,16,47.63,0.34,141.17,9948,13604,0,0,737937832,83711656,ab2b8bf824da22851c55f95bc32faed91bfcaac2e657c619ab30299fabcec516
+b2-spark-noq0,reader-2-depth-2-lookahead-0,16,59.89,0.27,175.08,9948,13604,0,0,737937832,83711796,ab2b8bf824da22851c55f95bc32faed91bfcaac2e657c619ab30299fabcec516
+b2-upstream-default,current-base-defaults,16,58.12,0.28,170.07,12448,11104,0,0,772468432,83711800,ab2b8bf824da22851c55f95bc32faed91bfcaac2e657c619ab30299fabcec516
+b3-spark-noq0,reader-2-depth-2-lookahead-0,16,60.25,0.27,174.27,9948,13604,0,0,737937832,83711996,ab2b8bf824da22851c55f95bc32faed91bfcaac2e657c619ab30299fabcec516
+b3-upstream-default,current-base-defaults,16,59.93,0.27,174.87,12448,11104,0,0,772468432,83711480,ab2b8bf824da22851c55f95bc32faed91bfcaac2e657c619ab30299fabcec516
+b3-spark-q0,reader-2-depth-2-lookahead-0-q0,16,46.86,0.34,136.93,9948,13604,0,0,737937832,83711800,ab2b8bf824da22851c55f95bc32faed91bfcaac2e657c619ab30299fabcec516
+sustained-64-detailed,reader-2-depth-2-lookahead-0-q0,64,189.44,0.34,338.00,36737,57471,0,0,2018576784,83800932,ba604f26f93c374e5b6cb71ed8acf95ae57fb39f488c148c85055b8bac6c9571

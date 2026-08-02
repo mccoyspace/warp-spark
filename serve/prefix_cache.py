@@ -81,7 +81,7 @@ class _Entry:
 
 
 class PrefixCache:
-    """Deterministic LRU over exact family-root token prefixes."""
+    """Deterministic LRU over exact roots and one optional mutable head."""
 
     def __init__(self, max_bytes: int, max_entries: int, identity: Any,
                  *, conversation_head: bool = False):

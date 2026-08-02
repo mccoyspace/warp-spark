@@ -190,6 +190,11 @@ hit/miss and restored/replayed/promoted token counts under
 [PREFIX_CACHE.md](PREFIX_CACHE.md) for the precise accounting boundary,
 policy, invalidation, and failure behavior.
 
+`--conversation-head` adds one exact mutable checkpoint for the active chat
+branch while retaining its stable family root. It requires an enabled prefix
+cache and at least two entries. The old head is replaced rather than forming a
+block tree; altered history falls back to the root.
+
 ### Concurrency
 
 `waste.h`: a `waste_ctx` is not thread-safe. So generations serialize on
@@ -233,6 +238,22 @@ sudo python3 tools/pm_qos_exec.py \
   taskset -c 5-9,15-19 python3 -m serve /path/to/k3.waste \
     --performance-profile spark-q0 --port 8000
 ```
+
+For the measured single-user workstation setup, the repository includes a
+thin launcher with those choices and no service manager or persistent system
+configuration:
+
+```bash
+make -j
+tools/spark_serve.sh /path/to/k3.waste
+```
+
+It defaults to CPUs `5-9,15-19`, budget `86583021568`, a two-GiB/two-entry
+prefix cache, one conversation head, and a 3600-second maximum Q0 lease. The
+`WASTE_SPARK_*` variables in the script expose the few operational overrides;
+additional server flags may follow the model path. The server's strict
+profile verifies that direct I/O and the requested two-reader/depth-two
+configuration actually became effective before accepting requests.
 
 All accepted GN100 Q0 measurements used CPU set `5-9,15-19`. `taskset` above
 reproduces that external condition, but this profile neither sets nor verifies
@@ -371,5 +392,6 @@ python3 -m serve MODEL [options]
   --allow-local-images
   --prefix-cache SIZE          exact-prefix snapshot bytes (off by default)
   --prefix-cache-entries N     hard entry limit (default 8)
+  --conversation-head          one exact mutable chat checkpoint (needs cache)
   --plan             print the memory plan and exit
 ```

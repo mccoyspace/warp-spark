@@ -526,6 +526,12 @@ reserves a bounded in-process cache for exact system-prompt/tool-schema state.
 It restores the shared family root and replays only the divergent tail while
 keeping output and state bit-identical to an uncached request.
 
+On the single-user Spark server, add `--conversation-head` with at least two
+entries to retain one exact mutable checkpoint for the active conversation as
+well as its stable family root. `tools/spark_serve.sh MODEL` supplies the
+measured CPU set, budget, request-scoped Q0 profile, two-GiB/two-entry cache,
+and this head policy without installing a service or changing system files.
+
 ```bash
 curl localhost:8000/v1/chat/completions \
   -H 'Content-Type: application/json' \
