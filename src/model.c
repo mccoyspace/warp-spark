@@ -32,6 +32,13 @@
 #include "waste_backend.h"
 #include "waste_format.h"
 
+#if defined(WASTE_ENABLE_CUDA)
+int  waste_cuda_q4_matvec(waste_model *m, float *y,
+                          const waste_tensor *tensor, const float *x,
+                          int out, int in, int mode);
+void waste_cuda_kda_free(waste_model *m);
+#endif
+
 #define MAXP 512
 
 /* ---- lightweight phase profiling (WASTE_PROFILE=1) --------------------- */
@@ -370,6 +377,31 @@ static void matvec_t(waste_model *m, float *y, const waste_tensor *t,
         mvq_arg a = { y, t->q, t->qs, NULL, x, in, ng, g, t->bits, t->rowbytes };
         run_rows(out, 64, waste_k.mvq_rows_f32, &a);
     }
+}
+
+/* Decode-only CUDA experiment. Keeping this wrapper separate from matvec_t
+ * prevents one opt-in attention study from silently moving MLA, the shared
+ * experts, lm_head, vision, or chunked prefill onto the device too. */
+static void kda_matvec_t(waste_model *m, float *y, const waste_tensor *t,
+                         const float *x, int out, int in, int cuda_mode)
+{
+#if defined(WASTE_ENABLE_CUDA)
+    if (cuda_mode && !m->cuda_kda_failed && t && t->q &&
+        t->bits == 4 && t->group == 128) {
+        if (waste_cuda_q4_matvec(m, y, t, x, out, in, cuda_mode) == 0) {
+            m->cuda_kda_effective = cuda_mode;
+            return;
+        }
+        /* A fallback keeps the process diagnosable, but it invalidates an
+         * acceptance run and is reported explicitly by the harness. */
+        m->cuda_kda_failed = 1;
+        m->cuda_kda_effective = 0;
+        m->cuda_kda_fallbacks++;
+    }
+#else
+    (void)cuda_mode;
+#endif
+    matvec_t(m, y, t, x, out, in);
 }
 
 /* Dequantize one row of a trunk tensor into dst[cols].
@@ -933,6 +965,15 @@ int waste_model_load(waste_model *m, const char *dir, int kv_cap,
     m->want_vision = opt->want_vision;
     m->want_direct = opt->direct_io;
     pthread_once(&model_opts_once, model_opts_init);
+#if defined(WASTE_ENABLE_CUDA)
+    {
+        const char *e = getenv("WASTE_CUDA_KDA");
+        int mode = e ? atoi(e) : 0;
+        if (mode < 0) mode = 0;
+        if (mode > 2) mode = 2;
+        m->cuda_kda_mode = mode;
+    }
+#endif
     m->kv_cap = kv_cap;
     m->direct_io = 1;
     waste_backend_init(WASTE_BE_AUTO);
@@ -1319,6 +1360,9 @@ void waste_model_free(waste_model *m)
      * a failed load left behind, so nothing here may assume the load got
      * as far as its own allocation. */
     if (!m->t) m->n_tensors = 0;
+#if defined(WASTE_ENABLE_CUDA)
+    waste_cuda_kda_free(m);
+#endif
     /* Device backends may hold no-copy wrappers keyed by these host
      * addresses.  Drop them while the allocations are still alive. */
     waste_backend_release_host_buffers();
@@ -1878,7 +1922,8 @@ static void kda_step_range(int lo, int hi, void *ap)
                      a->u + (size_t)lo * a->V);
 }
 
-static void kda_layer(waste_model *m, int L, const float *in, float *out)
+static void kda_layer(waste_model *m, int L, const float *in, float *out,
+                      int cuda_mode)
 {
     const waste_config *c = &m->cfg;
     const int H = c->kda_heads, D = c->kda_dim, C = H * D, hid = c->hidden;
@@ -1892,7 +1937,8 @@ static void kda_layer(waste_model *m, int L, const float *in, float *out)
         snprintf(b, sizeof b, "%smodel.layers.%d.self_attn.%s_proj.weight", c->prefix, L, nm[i]);
         {
             PROF_START(P_KDA_QKV);
-            matvec_t(m, dstv[i], waste_find(m, b), in, C, hid);
+            kda_matvec_t(m, dstv[i], waste_find(m, b), in, C, hid,
+                         cuda_mode);
             PROF_END(P_KDA_QKV);
         }
         snprintf(b, sizeof b, "%smodel.layers.%d.self_attn.%s_conv1d.weight", c->prefix, L, nm[i]);
@@ -1907,8 +1953,8 @@ static void kda_layer(waste_model *m, int L, const float *in, float *out)
 
     {
         PROF_START(P_KDA_AUX);
-        matvec_t(m, lo, waste_find(m, tname("%smodel.layers.%d.self_attn.f_a_proj.weight", c->prefix, L)), in, D, hid);
-        matvec_t(m, g, waste_find(m, tname("%smodel.layers.%d.self_attn.f_b_proj.weight", c->prefix, L)), lo, C, D);
+        kda_matvec_t(m, lo, waste_find(m, tname("%smodel.layers.%d.self_attn.f_a_proj.weight", c->prefix, L)), in, D, hid, cuda_mode);
+        kda_matvec_t(m, g, waste_find(m, tname("%smodel.layers.%d.self_attn.f_b_proj.weight", c->prefix, L)), lo, C, D, cuda_mode);
         const waste_tensor *At = waste_find(m, tname("%smodel.layers.%d.self_attn.A_log",
                                                      c->prefix, L));
         const float *dt = T(m, "%smodel.layers.%d.self_attn.dt_bias", c->prefix, L);
@@ -1916,7 +1962,7 @@ static void kda_layer(waste_model *m, int L, const float *in, float *out)
          * by h, and K3 ships it padded to head_dim (indices 96..127 are exactly
          * zero on every layer we checked). */
         waste_kda_decay_gate_ex(g, At->data, dt, H, D, c->gate_lower_bound, 0);
-        matvec_t(m, beta, waste_find(m, tname("%smodel.layers.%d.self_attn.b_proj.weight", c->prefix, L)), in, H, hid);
+        kda_matvec_t(m, beta, waste_find(m, tname("%smodel.layers.%d.self_attn.b_proj.weight", c->prefix, L)), in, H, hid, cuda_mode);
         for (int h = 0; h < H; h++) beta[h] = 1.0f / (1.0f + expf(-beta[h]));
         PROF_END(P_KDA_AUX);
     }
@@ -1936,15 +1982,18 @@ static void kda_layer(waste_model *m, int L, const float *in, float *out)
 
     if (c->full_rank_gate) {
         PROF_START(P_KDA_GATE);
-        matvec_t(m, gate, waste_find(m, tname("%smodel.layers.%d.self_attn.g_proj.weight",
-                                              c->prefix, L)), in, C, hid);
+        kda_matvec_t(m, gate, waste_find(m, tname("%smodel.layers.%d.self_attn.g_proj.weight",
+                                                  c->prefix, L)), in, C, hid,
+                     cuda_mode);
         PROF_END(P_KDA_GATE);
     } else {
         PROF_START(P_KDA_GATE);
-        matvec_t(m, lo, waste_find(m, tname("%smodel.layers.%d.self_attn.g_a_proj.weight",
-                                            c->prefix, L)), in, D, hid);
-        matvec_t(m, gate, waste_find(m, tname("%smodel.layers.%d.self_attn.g_b_proj.weight",
-                                              c->prefix, L)), lo, C, D);
+        kda_matvec_t(m, lo, waste_find(m, tname("%smodel.layers.%d.self_attn.g_a_proj.weight",
+                                                c->prefix, L)), in, D, hid,
+                     cuda_mode);
+        kda_matvec_t(m, gate, waste_find(m, tname("%smodel.layers.%d.self_attn.g_b_proj.weight",
+                                                  c->prefix, L)), lo, C, D,
+                     cuda_mode);
         PROF_END(P_KDA_GATE);
     }
     const float *onw = T(m, "%smodel.layers.%d.self_attn.o_norm.weight", c->prefix, L);
@@ -1954,7 +2003,7 @@ static void kda_layer(waste_model *m, int L, const float *in, float *out)
     PROF_END(P_KDA_NORM);
 
     PROF_START(P_KDA_OUT);
-    matvec_t(m, out, waste_find(m, tname("%smodel.layers.%d.self_attn.o_proj.weight", c->prefix, L)), o, hid, C);
+    kda_matvec_t(m, out, waste_find(m, tname("%smodel.layers.%d.self_attn.o_proj.weight", c->prefix, L)), o, hid, C, cuda_mode);
     PROF_END(P_KDA_OUT);
 }
 
@@ -2648,6 +2697,7 @@ void waste_model_reset(waste_model *m)
         const int nb = c->n_layers / c->attn_res_block + 2;
         memset(m->blockres, 0, (size_t)nb * c->hidden * sizeof(float));
     }
+    m->cuda_kda_fallbacks = 0;
 }
 
 /* The one tuning knob a sweep varies between arms in a single process.
@@ -2661,6 +2711,37 @@ void waste_model_set_lookahead(int n)
     lookahead_n = n;
 }
 int  waste_model_get_lookahead(void)  { return lookahead_n; }
+
+void waste_model_set_cuda_kda(waste_model *m, int mode)
+{
+    if (!m) return;
+#if defined(WASTE_ENABLE_CUDA)
+    if (mode < 0) mode = 0;
+    if (mode > 2) mode = 2;
+    m->cuda_kda_mode = mode;
+    m->cuda_kda_effective = 0;
+    m->cuda_kda_failed = 0;
+    m->cuda_kda_fallbacks = 0;
+#else
+    (void)mode;
+    m->cuda_kda_mode = 0;
+#endif
+}
+
+int waste_model_get_cuda_kda(const waste_model *m)
+{
+    return m ? m->cuda_kda_mode : 0;
+}
+
+int waste_model_cuda_kda_effective(const waste_model *m)
+{
+    return m ? m->cuda_kda_effective : 0;
+}
+
+uint64_t waste_model_cuda_kda_fallbacks(const waste_model *m)
+{
+    return m ? m->cuda_kda_fallbacks : 0;
+}
 
 /* Read-ahead. The internal SSD reaches 12.89 GB/s at queue depth 2 against
  * 10.73 at depth 1, so two readers is the whole of the bandwidth story; the
@@ -3373,7 +3454,7 @@ const float *waste_model_prefill(waste_model *m, const int *tokens, int n,
         /* attention: per token, but on the batched norm buffer */
         for (int t = 0; t < n; t++) {
             if (c->kda_layer[L]) kda_layer(m, L, m->cnorm + (size_t)t * hid,
-                                           m->cresid + (size_t)t * hid);
+                                           m->cresid + (size_t)t * hid, 0);
             else mla_layer(m, L, m->cnorm + (size_t)t * hid,
                            m->cresid + (size_t)t * hid, pos0 + t);
         }
@@ -3499,7 +3580,7 @@ const float *waste_model_step(waste_model *m, int token, int pos, int *routed)
 
         snprintf(b, sizeof b, "%smodel.layers.%d.input_layernorm.weight", c->prefix, L);
         waste_rmsnorm(norm, m->x, waste_find(m, b)->data, hid, c->eps);
-        if (c->kda_layer[L]) { PROF_START(P_KDA); kda_layer(m, L, norm, resid); PROF_END(P_KDA); }
+        if (c->kda_layer[L]) { PROF_START(P_KDA); kda_layer(m, L, norm, resid, m->cuda_kda_mode); PROF_END(P_KDA); }
         else { PROF_START(P_MLA); mla_layer(m, L, norm, resid, pos); PROF_END(P_MLA); }
 
         if (ares_on) {
