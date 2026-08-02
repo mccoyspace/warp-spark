@@ -1,0 +1,164 @@
+{
+  "schema": "waste.gn100.gpu_sprint.v1",
+  "date": "2026-08-02",
+  "machine": "NVIDIA DGX Spark / Acer Veriton GN100",
+  "device": "NVIDIA GB10",
+  "branch": "exp/cuda-gb10",
+  "implementation_commit": "378f8814bc659cca0e3a7d6661e570be20bccef5",
+  "status": "strict_contract_pass_experimental",
+  "model": {
+    "manifest_sha256": "da3232925d8eeaf0df07ee45743f6467c7eecbc4c0e2513899028e788a1a07f2",
+    "usage_sha256": "e2949e8d14da3c46d766daa99e6b93f946c8cfc0425eba4815450079996899dd",
+    "prompt_ids": [1008, 10484, 318, 15383, 387],
+    "decode_tokens": 64
+  },
+  "profile": {
+    "threads": 8,
+    "cpu_set": "5-9,15-19",
+    "pm_qos_latency_us": 0,
+    "q8": 1,
+    "sdot": 0,
+    "i8mm": 0,
+    "cache_mb": 53196,
+    "io_threads": 2,
+    "io_depth": 2,
+    "lookahead": 0,
+    "direct_io": 1,
+    "mlock": 0,
+    "purgeable": 0
+  },
+  "route_margin_study": {
+    "decisions": 6348,
+    "decode_decisions": 5888,
+    "minimum": 4.17e-7,
+    "p0_1_percent": 1.16e-6,
+    "p1": 9.77e-6,
+    "p5": 5.04e-5,
+    "median": 8.21e-4,
+    "ties": 0,
+    "nonfinite": 0
+  },
+  "q4_projection_pilot": {
+    "commit": "4662c46b061f530db8dc5c7102a0bc07204f83fd",
+    "q_projection": {
+      "shape": [12288, 7168],
+      "cpu_ms": 3.080087,
+      "cuda_fast_ms": 0.352262,
+      "speedup": 8.744,
+      "max_abs": 2.08616257e-7
+    },
+    "output_projection": {
+      "shape": [7168, 12288],
+      "cpu_ms": 3.080895,
+      "cuda_fast_ms": 0.367796,
+      "speedup": 8.377,
+      "max_abs": 2.5331974e-7
+    }
+  },
+  "integrated_16_token_campaign": {
+    "commit": "cb53b2cbd37490dbd92c72bcfd30f91960d4d5c4",
+    "repeats": 2,
+    "cpu_tok_s": [0.353799, 0.341846],
+    "cuda_tok_s": [0.477685, 0.500151],
+    "cpu_median_tok_s": 0.3478225,
+    "cuda_median_tok_s": 0.488918,
+    "improvement_percent": 40.5654,
+    "cuda_calls_per_arm": 8832,
+    "fallbacks": 0,
+    "major_faults": 0,
+    "swaps": 0
+  },
+  "final_64_token_capture": {
+    "cpu_seconds": 189.752417,
+    "cpu_tok_s": 0.337282,
+    "cuda_seconds": 134.500956,
+    "cuda_tok_s": 0.475833,
+    "improvement_percent": 41.0787,
+    "cuda_calls": 35328,
+    "expected_cuda_calls": 35328,
+    "fallbacks": 0,
+    "causal_logit_steps": 65,
+    "route_rows": 5888,
+    "selected_expert_slots": 94208,
+    "changed_route_rows": 0,
+    "ordered_route_changes": 0,
+    "expert_replacements": 0,
+    "argmax_changes": 0,
+    "top10_set_changes": 0,
+    "max_abs_logit_error": 3.62396240234375e-5,
+    "max_step_mean_abs_logit_error": 2.588821858839907e-6,
+    "nonfinite_cpu": 0,
+    "nonfinite_cuda": 0,
+    "cpu_expert_hits": 43435,
+    "cuda_expert_hits": 43435,
+    "cpu_expert_misses": 50773,
+    "cuda_expert_misses": 50773,
+    "cpu_expert_bytes": 629929644032,
+    "cuda_expert_bytes": 629929644032,
+    "major_faults": 0,
+    "swaps": 0,
+    "peak_rss_kib": 83771808,
+    "pm_qos_fd_open_count": 1,
+    "pm_qos_fd_close_count": 1,
+    "pm_qos_fd_close_errors": 0
+  },
+  "storage_contention": {
+    "fio": {
+      "direct": 1,
+      "ioengine": "libaio",
+      "rw": "randread",
+      "block_bytes": 12582912,
+      "queue_depth": 2,
+      "runtime_seconds": 60,
+      "ramp_seconds": 10
+    },
+    "gpu_stressor": {
+      "seconds": 85.075255,
+      "launches": 247552,
+      "logical_model_gib_s": 123.288
+    },
+    "baseline_before": {
+      "bandwidth_bytes_s": 13393643938,
+      "p95_ns": 1548288,
+      "p99_ns": 1646592
+    },
+    "gpu_contended": {
+      "bandwidth_bytes_s": 12857205766,
+      "p95_ns": 1957888,
+      "p99_ns": 2179072
+    },
+    "baseline_after": {
+      "bandwidth_bytes_s": 13393224522,
+      "p95_ns": 1630208,
+      "p99_ns": 1728512
+    },
+    "versus_baseline_mean_percent": {
+      "bandwidth": -4.0037,
+      "p95": 23.1959,
+      "p99": 29.1262
+    }
+  },
+  "tests": {
+    "local": "35 passed, 0 failed, 12 skipped",
+    "spark": "33 passed, 0 failed, 13 skipped",
+    "spark_cuda_build": "make -j8 WASTE_NATIVE=1 WASTE_ENABLE_CUDA=1 all test",
+    "comparator_checks": 11
+  },
+  "evidence_root": "/home/kevin/waste-gn100-experiment-20260730/validation/sprint11-gpu-margin-b2944b5-20260802",
+  "evidence_sha256": {
+    "cuda-final64-378f881.txt": "ecd2e532231e8e734e6405abcc94776615ffb1b1f774e82284708335c86130bc",
+    "cuda-final64-378f881-time.txt": "b08bd9421babf8fed2725659d63769ede49015f2bb3fba86980e29fd14bc90b1",
+    "cuda-final64-378f881-qos.json": "6e1a8179fb32657958ee4a283faf2559a6d86a0dabbef3e10e3416bfbdf13f9d",
+    "compare-cpu-fast-64-378f881.json": "ede32319371a432895eae1534c2f9a960f11f6cf9397f578b4937772ac957dfb",
+    "captures64-378f881/cuda-0-rep1.json": "998366b40235200416b41c1e98a9aa12a869f101b220b8421fbbe3dc78179676",
+    "captures64-378f881/cuda-0-rep1.logits.f32": "be57a70db666a8dec38b2e2171ab51c38eeee4b0d76b3942c7475e5648234398",
+    "captures64-378f881/cuda-1-rep1.json": "ffe2a5e1d31152a3d3fffc67c1600f046d83bca872602565c478581a14cf59fa",
+    "captures64-378f881/cuda-1-rep1.logits.f32": "19198c9be95b63f0c72b5087f6aa08a0c57b18b846f621bc759c2fc53a92b1bd",
+    "fio-q2-baseline-378f881.json": "55a77fed91da58d5d8a26b5bb57e9dbf152da223fde20764b660cfa24a78d800",
+    "fio-q2-contended-378f881.json": "65aa477a62c0d191b33386e9f7d6a53071361f9e2acc13c82815bd0ab78792ae",
+    "fio-q2-baseline2-378f881.json": "760aa65eea4000ee4e3c99637944432d9044d2610aa66abbf134e92b7beae157",
+    "cuda-q4-stress-fio-378f881.txt": "36ecb36d9b824da35d143faecbf58d4b7a01b4f07e86ccd51886eb10e269e9c5",
+    "cuda-hardened-campaign16-cb53b2c.txt": "59bb8438e25641d0b49496a118b2665e4c448fc291cf31f300b211b5651e92ca",
+    "tests-378f881.txt": "fa7ee2e1ef2fd3852a59928f91c925163c1656dce988f93d40843381328807b1"
+  }
+}

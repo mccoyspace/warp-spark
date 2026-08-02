@@ -6,6 +6,10 @@
 > uses eight compute threads on pinned performance CPUs, child-scoped Q0, two
 > direct-I/O readers at depth two, Q8, and no router lookahead, and measures
 > **0.34–0.35 tok/s**.
+> The separate `exp/cuda-gb10` branch now has an opt-in decode-KDA CUDA path
+> that passed its 64-token strict route/logit gate at **0.4758 tok/s** versus
+> **0.3373 tok/s** CPU; it remains experimental. See
+> [the GB10 CUDA result](docs/GPU_GB10.md).
 > Start with [GN100 results and reproduction notes](docs/GN100.md), then see
 > [the upstreaming map](docs/UPSTREAMING.md) and
 > [upstream issue #14](https://github.com/sqliteai/waste/issues/14).
@@ -189,7 +193,7 @@ Every token answered by a cloud service is paid for twice: once on the invoice, 
 
 ## Project status
 
-The format and API are not frozen. K3 is the main target and the best-tested model. The CPU path is currently the fastest measured implementation for this workload, but it is not assumed to be the final answer. CUDA, Metal, and other hardware-specific optimizations remain to be explored and may provide significant gains. Current backend results are documented in [docs/BACKENDS.md](docs/BACKENDS.md), while open directions are tracked in [docs/RESEARCH.md](docs/RESEARCH.md). Read [docs/LEARNED.md](docs/LEARNED.md) before proposing an optimization: failed ideas and negative results are kept there deliberately.
+The format and API are not frozen. K3 is the main target and the best-tested model. The CPU path remains the qualified default. An opt-in GB10 CUDA experiment is now the fastest measured path on that machine, but it has not been promoted from its experimental branch. CUDA beyond that narrow path, Metal, and other hardware-specific optimizations remain open. Current backend results are documented in [docs/BACKENDS.md](docs/BACKENDS.md), while open directions are tracked in [docs/RESEARCH.md](docs/RESEARCH.md). Read [docs/LEARNED.md](docs/LEARNED.md) before proposing an optimization: failed ideas and negative results are kept there deliberately.
 
 Contributors are more than welcome. New experiments, support for additional hardware, and open discussion about how to improve performance are all encouraged—even when an idea produces a negative result.
 

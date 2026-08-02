@@ -1,10 +1,10 @@
 # GB10 CUDA experiment
 
-This document is the pre-registered decision record for the CUDA work on the
+This document is the pre-registered decision and result record for CUDA work on the
 NVIDIA GB10 / DGX Spark / Acer Veriton GN100. The work stays on
-`exp/cuda-gb10` until both its numerical and integrated performance gates pass.
-It is not an upstream proposal and it is not part of the qualified
-`spark/integration` profile.
+`exp/cuda-gb10` until it is deliberately promoted, even when its numerical and
+integrated performance gates pass. It is not an upstream proposal and it is
+not part of the qualified `spark/integration` profile.
 
 ## What must be established first
 
@@ -75,7 +75,8 @@ The 1.1 MiB raw CSV is retained in the Spark evidence directory with SHA-256
 ## Amdahl result
 
 Commit `867c2c2` separated the recurrent update from the existing full-KDA
-profile bucket. On the fixed 16-token CPU profile:
+profile bucket. Commit `32a3b6b` then split the layer into the phases a CUDA
+graph would have to replace. On the fixed 16-token CPU profile:
 
 | phase | cumulative time | accounted decode share |
 | --- | ---: | ---: |
@@ -84,13 +85,52 @@ profile bucket. On the fixed 16-token CPU profile:
 
 The recurrent update is roughly 1.5% of KDA time. Even making it free cannot
 clear the 5% integrated engine gate. A recurrence kernel remains useful for
-validating CUDA arithmetic and handoff, but the performance pilot must capture
-the whole KDA layer: projections, convolutions, decay/beta path, recurrence,
-gated normalization, and output projection.
+validating CUDA arithmetic and handoff, but phase profiling must identify a
+coarse enough portion of the KDA layer to clear the integrated gate.
+
+The detailed repeat measured 1,449 KDA layer calls across five chunked-prefill
+and 16 decode tokens. Its sub-totals normalize to about 14.6 ms per layer:
+
+| KDA sub-phase | cumulative time | time per KDA layer |
+| --- | ---: | ---: |
+| q/k/v Q4 projections | 11.75 s | 8.11 ms |
+| output-gate Q4 projection | 3.92 s | 2.71 ms |
+| output Q4 projection | 4.18 s | 2.89 ms |
+| auxiliary projections + decay/beta | 0.52 s | 0.36 ms |
+| three short convolutions | 0.47 s | 0.32 ms |
+| recurrence | 0.22 s | 0.15 ms |
+| gated output norm | 0.05 s | 0.03 ms |
+
+The five large Q4 projections account for 19.85 of 21.11 seconds of detailed
+KDA time (94%). The next pilot therefore targets the real Q4G/group-128 trunk
+format, not recurrence in isolation. Raw profile SHA-256:
+`85973216030dd136f68c32301c6603c1793611ccd11c777c0322d1c9dcab2829`.
+
+## Recurrence and handoff pilot
+
+The standalone GB10 recurrence kernel is numerically close to the precise CPU
+reference: maximum absolute error was `5.59e-9` for output and `2.98e-8` for
+the recurrent state, with no non-finite values. For 96 heads of 128 x 128
+state, its matched kernel-only control and CUDA paths were:
+
+| path | time per call | speedup over persistent 8-thread CPU control |
+| --- | ---: | ---: |
+| CPU control | 0.0529 ms | 1.00x |
+| CUDA direct, event timed | 0.0274 ms | 1.93x |
+| CUDA Graph, event timed | 0.0287 ms | 1.84x |
+| CUDA Graph, host synchronize | 0.0304 ms | 1.74x |
+| CUDA Graph, mapped-flag poll | 0.0308 ms | 1.72x |
+
+This narrowly misses a 2x isolated screen and graph launch does not help a
+single kernel. More importantly, recurrence is only about 1.5% of KDA time,
+so it is rejected as a standalone speed feature while retained as the
+correctness and handoff building block for a coarse graph. Raw result SHA-256:
+`d6d3ab154ea7ceaaa96980010be7a2a1ad43edae33f5906eca100641708762b9`.
 
 ## GB10 memory result
 
-The standalone CUDA 13 probe at `dc165d5` found compute capability 12.1 and:
+The corrected standalone CUDA 13 probe at `f220fab` found compute capability
+12.1 and:
 
 - coherent pageable-memory access through host page tables;
 - concurrent managed access and host-native atomics;
@@ -99,12 +139,111 @@ The standalone CUDA 13 probe at `dc165d5` found compute capability 12.1 and:
 - no direct host access to device-prefetched managed memory.
 
 For a 6 MiB one-layer state repeatedly resident in cache, aligned pageable and
-registered host pointers took about 2.0 ms for 100 passes; managed-prefetched
-and device-resident pointers took about 1.05 ms. A full explicit 6 MiB
+registered host pointers took 1.97 and 1.92 ms for 100 passes;
+managed-prefetched and device-resident pointers took 1.09 and 1.05 ms. A full explicit 6 MiB
 host-device-kernel-host round trip took 0.233 ms. These are pointer-path
 screening numbers, not LPDDR bandwidth claims: repeated access to 6 MiB is
 cache-resident. They say which paths deserve the real KDA benchmark, not how
-fast the model will run.
+fast the model will run. Raw result SHA-256:
+`0751ffb86cded8ce4a37efee64b25bbe1561fcef5197010ae84222d1ec772c02`.
+
+## Real Q4 projection pilot
+
+The next pilot read K3's actual Q4G/group-128 matrices directly from
+`trunk.bin`. The candidate path leaves the 29 GiB trunk in ordinary pageable
+host memory and lets GB10's host-page-table support read it directly. Only the
+small activation and result vectors use mapped pinned staging. It therefore
+does not create a second trunk allocation behind the expert cache's back.
+
+Two representative 43.4 MiB projection scans at commit `4662c46` measured:
+
+| projection | CPU control | CUDA fast | fast speedup | CUDA CPU-order | CPU-order speedup |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| 12,288 x 7,168 | 3.080 ms | 0.352 ms | 8.74x | 1.239 ms | 2.49x |
+| 7,168 x 12,288 | 3.081 ms | 0.368 ms | 8.38x | 1.644 ms | 1.87x |
+
+The fast kernel's maximum element error against the four-accumulator CPU
+control was `2.53e-7`; the diagnostic CPU-order kernel was byte-exact. Direct
+launch, host synchronization, graph-plus-poll, and registered-host results
+were effectively tied for the fast kernel. This rejected two assumptions at
+once: GB10 pageable access is fast enough for the trunk, and a graph is not
+needed merely to amortize one projection this large. The engine pilot could
+therefore stay small: offload the eight decode-time KDA Q4 projections and
+leave convolution, recurrence, normalization, MLA, MoE, prefill, and the
+language-model head on the CPU.
+
+## Integrated CUDA path
+
+The experimental implementation is opt-in at both build and runtime:
+
+```sh
+make clean
+make -j8 WASTE_NATIVE=1 WASTE_ENABLE_CUDA=1
+WASTE_CUDA_KDA=1 ./waste ...
+```
+
+`WASTE_CUDA_KDA=1` selects the fast reduction. Mode `2` retains the
+CPU-order kernel for diagnosis, and `WASTE_BACKEND=cpu` forces the control
+path even if the CUDA variable is present. A clean build is required when
+toggling `WASTE_ENABLE_CUDA`.
+
+The path performs 69 KDA layers times eight projections, or 552 CUDA calls per
+decode token. It synchronizes after each projection; no graph or CPU/GPU
+overlap is claimed. Preflight checks every projection before decode and warms
+the real kernel outside the timer. A runtime failure aborts the token rather
+than mixing GPU and CPU arithmetic, poisons the partially changed recurrent
+state, blocks prefill/decode/snapshot export, and requires a reset for CPU
+recovery after selecting CPU mode, or a model reload before CUDA can be
+attempted again. Captures record requested and effective mode, fallbacks,
+actual calls, and expected calls. The comparator refuses missing metadata,
+missing decode routes, or a call shortfall.
+
+The balanced two-repeat, 16-token campaign at `cb53b2c` produced:
+
+| arm | repeat 1 | repeat 2 | median |
+| --- | ---: | ---: | ---: |
+| qualified CPU | 0.353799 tok/s | 0.341846 tok/s | 0.347823 tok/s |
+| CUDA fast | 0.477685 tok/s | 0.500151 tok/s | 0.488918 tok/s |
+
+That is a 40.6% median improvement. Every CUDA arm executed exactly 8,832
+projections with zero fallbacks. Both arms had the same token and route hashes,
+12,526 hits, 11,026 misses, and 136,797,200,384 expert bytes read. The whole
+campaign had zero major faults and zero swaps.
+
+The fully audited final commit is `378f881`. Its short capture was deliberately
+rerun after the acceptance hardening, not reused from an earlier binary:
+
+| arm | throughput | calls | fallbacks |
+| --- | ---: | ---: | ---: |
+| qualified CPU | 0.348210 tok/s | 0 | 0 |
+| CUDA fast | 0.473351 tok/s | 2,208 / 2,208 | 0 |
+
+The final short proof improved throughput by 35.9%, preserved all 368 route
+sets (zero replacements in 5,888 selected slots), preserved every greedy
+argmax and top-10 set, and had maximum absolute logit error `1.19e-5` and
+maximum per-step mean error `1.68e-6`. It also recorded zero major faults and
+zero swaps. The longer final strict-contract result is recorded below.
+
+## Shared-memory contention
+
+The storage screen paired 12 MiB random O_DIRECT reads at queue depth two with
+an 85-second fast-Q4 loop. The GPU loop continuously scanned a 43.4 MiB real
+K3 projection at 123.3 GiB/s of logical model traffic through the same
+pageable/HMM path as the engine. This is a controlled near-100%-duty stressor,
+not a claim about physical DRAM counters or the engine's bursty duty cycle.
+
+| arm | bandwidth | p95 completion | p99 completion |
+| --- | ---: | ---: | ---: |
+| no GPU, before | 13.394 GB/s | 1.548 ms | 1.647 ms |
+| sustained GPU | 12.857 GB/s | 1.958 ms | 2.179 ms |
+| no GPU, after | 13.393 GB/s | 1.630 ms | 1.729 ms |
+
+The two bracketing baselines agree within 0.004% on bandwidth. Against their
+mean, sustained GPU traffic reduced SSD bandwidth by 4.0%, raised p95 by
+23.2%, and raised p99 by 29.1%. Shared LPDDR contention is therefore real but
+bounded in this deliberately harsher-than-engine screen. It is not hiding in
+the integrated speed result: the matched engine arms read identical expert
+bytes, and CUDA remained 35.9-40.6% faster after that traffic was included.
 
 ## Numerical contracts
 
@@ -134,27 +273,62 @@ Those limits are an operational experimental boundary, not a general quality
 theorem. Failing them ends decode integration until a stricter arithmetic path
 or a separate quality study is designed.
 
-## Pilot gates and fallback ladder
+## Strict-contract result
 
-1. Implement the precise recurrence kernel without `--use_fast_math`, using a
-   coarse all-head dispatch so eight CPU pool workers cannot launch it eight
-   times. Measure direct launch, CUDA Graph launch, event wait, and mapped-flag
-   polling. This validates state access and numerical instrumentation; it is
-   not the end-to-end speed target.
-2. Capture a fixed-shape whole-KDA-layer graph. Kernel-only and host-observed
-   median time must each be at least 2x faster than the qualified CPU layer.
-3. Add a runtime one-load A/B arm, CUDA warmup, per-step logit deltas, ordered
-   route hash, route-set replacements, and explicit fallback reporting.
-4. The interleaved integrated campaign must improve median decode throughput
-   by at least 5%, with zero faults/swap/thermal invalidation and one of the
-   numerical contracts above.
-5. Measure storage contention separately: pair the active GPU loop with the
-   existing 11 MiB O_DIRECT/QD2 fio workload and compare bandwidth plus p95/p99
-   latency. Nsight runs are diagnostic and never promotion rows.
+The final 64-token capture at `378f881` passed the strict contract, so the
+relaxed contract was not needed:
 
-If the whole-layer graph loses primarily to launch/handoff overhead, increase
-granularity to a multi-layer or whole-block graph. If decode shapes remain too
-small, restrict CUDA to chunked prefill. Only after dense attention clears its
-gate does VQ expert gather become the stretch target. If decode offload is
-still uneconomic, speculative decoding is the next architectural experiment;
-its batch dimension may make a later GPU attempt materially different.
+| measurement | CPU | CUDA fast |
+| --- | ---: | ---: |
+| decode time | 189.752 s | 134.501 s |
+| throughput | 0.337282 tok/s | 0.475833 tok/s |
+| CUDA calls | 0 / 0 | 35,328 / 35,328 |
+| fallbacks | 0 | 0 |
+| expert hits / misses | 43,435 / 50,773 | 43,435 / 50,773 |
+| expert bytes read | 629,929,644,032 | 629,929,644,032 |
+
+CUDA improved throughput by 41.1%. All 65 causal logit rows were comparable.
+Across 5,888 routed layer-token rows and 94,208 selected expert slots there
+were zero membership changes, zero order-only changes, and zero replacements.
+Every greedy argmax and top-10 set was unchanged. Maximum absolute logit error
+was `3.62e-5`, maximum per-step mean error was `2.59e-6`, and there were no
+non-finite values. The combined process recorded zero major faults, zero
+swaps, and a 79.9 GiB peak RSS. The PM-QoS holder and child both exited
+cleanly.
+
+This is stronger than the 5% engine gate and stays well inside the `0.01`
+strict logit bound. It also reproduces the earlier 64-token hashes exactly,
+which confirms that the later failure and acceptance hardening did not change
+the arithmetic path. Exact settings, counters, artifact hashes, and fio values
+are retained in
+[gn100/sprint11-gpu-summary.json](gn100/sprint11-gpu-summary.json).
+
+## Pilot-gate disposition and fallback ladder
+
+1. **Recurrence screen: rejected alone.** It reached 1.93x kernel-only, missed
+   the 2x screen, and represented only about 1.5% of KDA time.
+2. **Whole-layer graph: not built; re-scoped by measurement.** Profiling
+   showed that five large Q4 projections were 94% of KDA time. Representative
+   real matrices exceeded 8x on the fast kernel, while graph launch did not
+   improve a single projection. We explicitly deferred the original
+   whole-layer-graph pilot and tested the smaller projection-only integration;
+   the engine result below shows that it was already coarse enough.
+3. **Runtime and instrumentation: passed.** One-load balanced arms, untimed
+   preflight/warmup, full logits, ordered and set route comparisons, exact
+   CUDA call counts, and fail-closed behavior are all present.
+4. **Integrated engine: passed.** The repeated campaign improved the median by
+   40.6%; the final 64-token proof improved by 41.1%, passed the strict
+   numerical contract, and recorded zero major faults and swaps. The repeated
+   campaign's GPU endpoint moved from 47 to 48 C, so there was no thermal
+   invalidation in the qualified comparison.
+5. **Storage contention: measured.** A sustained worst-case loop costs 4.0%
+   bandwidth and 23-29% p95/p99 latency against stable bracketing baselines.
+
+Dense decode has now cleared its gate. The next independent GPU target is the
+VQ expert gather, where irregular lookup defeated the SVE prototype and is a
+better architectural match for the GPU. Whole-layer graphs, CPU/GPU overlap,
+and prefill CUDA remain possible follow-ons, but the direct Q4 path is already
+large enough that they should be justified by a measured profile rather than
+added by default. If VQ offload is uneconomic, speculative decoding remains
+the next architectural experiment; its batch dimension may also make a later
+whole-block GPU design materially different.
