@@ -9,11 +9,16 @@ against the new base before opening the next PR.
 
 | Candidate | Fork branch | Draft | State |
 | --- | --- | --- | --- |
-| Linux available-memory budgeting | [`pr/linux-memory-budget`](https://github.com/mccoyspace/waste-spark/tree/pr/linux-memory-budget) | [Description](linux-memory-budget.md) | PR-ready; not yet submitted upstream |
 | POSIX model-container ownership | [`pr/posix-model-lock`](https://github.com/mccoyspace/waste-spark/tree/pr/posix-model-lock) | [Description](posix-model-lock.md) | PR-ready; not yet submitted upstream |
 | In-memory state snapshots | [`pr/in-memory-state-snapshots`](https://github.com/mccoyspace/waste-spark/tree/pr/in-memory-state-snapshots) | [Description](in-memory-state-snapshots.md) | PR-ready; not yet submitted upstream |
 | Exact server prefix cache | [`pr/server-prefix-cache`](https://github.com/mccoyspace/waste-spark/tree/pr/server-prefix-cache) | [Description](server-prefix-cache.md) | PR-ready; real-K3 miss-hit-hit acceptance complete |
-| Whole-expert scheduler | [`pr/whole-expert-scheduler`](https://github.com/mccoyspace/waste-spark/tree/pr/whole-expert-scheduler) | [Description](whole-expert-scheduler.md) | Complete experimental candidate; no GN100 gain, excluded from integration |
+
+The superseded Linux budgeting implementation is retained at
+[`archive/pre-063-linux-memory-budget`](https://github.com/mccoyspace/waste-spark/tree/archive/pre-063-linux-memory-budget);
+upstream 0.6.3 independently fixed its stable cgroup-capacity half. The
+no-gain whole-expert scheduler remains available at
+[`exp/whole-expert-scheduler`](https://github.com/mccoyspace/waste-spark/tree/exp/whole-expert-scheduler).
+Neither branch is an active PR candidate.
 
 The exact measured Sprint 5 source remains available at
 [`archive/sprint-5-measured`](https://github.com/mccoyspace/waste-spark/tree/archive/sprint-5-measured)

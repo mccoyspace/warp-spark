@@ -1,12 +1,15 @@
 # WASTE — Weight-Aware Streaming Tensor Engine
 
-> **NVIDIA GB10 / DGX Spark / Acer Veriton GN100:** this fork keeps its
-> portable upstream mirror on `main`, current GB10 work on
-> `spark/integration`, and immutable measured milestones under `archive/`.
-> See [docs/GN100.md](docs/GN100.md) for results and reproduction notes,
-> [docs/UPSTREAMING.md](docs/UPSTREAMING.md) for the small upstreamable change
-> series, and [docs/PREFIX_CACHE.md](docs/PREFIX_CACHE.md) for the exact-prefix
-> state cache. `tools/spark_serve.sh` is the single-user GN100 launch path.
+> **NVIDIA GB10 / DGX Spark / Acer Veriton GN100 lab fork.** `main` mirrors
+> upstream; green, combined GB10 work lives on `spark/integration`; measured
+> milestones and raw evidence stay immutable. The current qualified K3 profile
+> uses eight compute threads on pinned performance CPUs, child-scoped Q0, two
+> direct-I/O readers at depth two, Q8, and no router lookahead, and measures
+> **0.34–0.35 tok/s**.
+> Start with [GN100 results and reproduction notes](docs/GN100.md), then see
+> [the upstreaming map](docs/UPSTREAMING.md) and
+> [upstream issue #14](https://github.com/sqliteai/waste/issues/14).
+> `tools/spark_serve.sh` is the single-user GN100 launch path.
 
 WASTE is an embeddable inference engine written in C, with no third-party runtime dependencies. It keeps the model trunk in memory, streams selected experts directly from disk, and uses the remaining RAM as a bounded expert cache.
 

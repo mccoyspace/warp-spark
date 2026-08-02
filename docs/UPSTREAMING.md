@@ -13,6 +13,8 @@ The public fork uses these rules:
 - `main` tracks `sqliteai/waste:main` without local commits.
 - `pr/<topic>` starts from the current upstream commit, or an explicitly named
   prerequisite branch, and contains one reviewable concern.
+- `exp/<topic>` contains work that is still being measured or that produced a
+  useful negative result; it is not presented as ready for upstream review.
 - `spark/integration` combines accepted generic branches with documented
   GN100-only features.
 - `archive/*` and `gn100-*-results-*` tags identify measured source and never
@@ -44,7 +46,7 @@ The order below follows dependencies, not the historical sprint order.
 | 3 | Explicit Linux CPU-list affinity | Generic configuration | Keep the GN100 CPU choice outside core |
 | 4 | Final phase/layer trace and request-boundary flushing | Generic observability | Reconcile with upstream cache traces |
 | 5 | Transactional in-memory state export/import and caller-owned budget reservation | Generic engine API | PR-ready on `pr/in-memory-state-snapshots`; required before server prefix reuse |
-| 6 | Whole-expert scheduling through typed per-context configuration | Generic optimization | Complete experiment on `pr/whole-expert-scheduler`; no GN100 gain, excluded from integration |
+| 6 | Whole-expert scheduling through typed per-context configuration | Generic optimization | Complete experiment on `exp/whole-expert-scheduler`; no GN100 gain, excluded from integration |
 | 7 | Exact, renderer-delimited family-root server cache | Generic server feature | PR-ready on `pr/server-prefix-cache`; real-K3 miss-hit-hit acceptance complete; depends on state snapshots |
 | 8 | Mutable conversation-head reuse | Generic follow-on | Implemented on `spark/sprint7`; exact next-turn state/output, divergent-history, replacement, and shared-budget gates pass |
 
@@ -59,7 +61,7 @@ short failure mode and offer the patch; open the PR if they want that shape.
 
 Upstream 0.6.3 independently fixed the stable half of the Linux memory issue:
 `waste_usable_ram()` now respects finite cgroup-v2 max/high over the hierarchy.
-Do not submit the old `pr/linux-memory-budget` branch as written. The remaining
+Do not submit the archived pre-0.6.3 Linux memory branch as written. The remaining
 candidate was only the dynamic half (`MemAvailable`, `memory.current`, early
 under-floor refusal, and host reservations). Sprint 10's pressure row below
 does not support sending its current hard-ceiling shape upstream. The Spark
