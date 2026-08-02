@@ -37,7 +37,8 @@ from serve.qos import (PROTOCOL, QosError, RequestQos,            # noqa: E402
 from tools.pm_qos_exec import (HOLDER_SIGNALS, PMQosDevice,       # noqa: E402
                                RequestSupervisor, atomic_json, child_identity,
                                parse_args, redacted_command,
-                               restore_child_signal_state, run_scoped)
+                               restore_child_signal_state, run_scoped,
+                               validate_artifact_paths)
 
 
 class FakeDevice:
@@ -71,6 +72,22 @@ class FakeDevice:
         self.releases += 1
         self.released.set()
         return time.monotonic_ns()
+
+
+def close_error_device(message="injected close failure after close"):
+    closed = threading.Event()
+
+    def fail_after_close(_fd):
+        closed.set()
+        raise OSError(message)
+
+    device = PMQosDevice(
+        stat_fn=lambda path, follow_symlinks: SimpleNamespace(
+            st_mode=stat.S_IFCHR | 0o600),
+        open_fn=lambda path, flags: 73,
+        write_fn=lambda fd, value: len(value),
+        close_fn=fail_after_close)
+    return device, closed
 
 
 class BlockingAckSocket:
@@ -282,6 +299,16 @@ class TestInjectedDevice(unittest.TestCase):
         self.assertEqual(closed, [42])
         self.assertFalse(device.active)
 
+    def test_release_reports_close_error_after_logical_close(self):
+        device, closed = close_error_device()
+        device.acquire(0)
+        released_ns = device.release()
+        self.assertTrue(closed.is_set())
+        self.assertFalse(device.active)
+        self.assertIsInstance(released_ns, int)
+        self.assertIn("injected close failure", device.take_release_error())
+        self.assertIsNone(device.take_release_error())
+
     def test_status_write_does_not_follow_predictable_or_final_symlinks(self):
         with tempfile.TemporaryDirectory() as temporary:
             directory = Path(temporary).resolve()
@@ -298,6 +325,54 @@ class TestInjectedDevice(unittest.TestCase):
             self.assertFalse(status_path.is_symlink())
             self.assertEqual(json.loads(status_path.read_text()), {"safe": True})
             self.assertEqual(stat.S_IMODE(status_path.stat().st_mode), 0o600)
+
+    def test_artifact_paths_reject_normalized_and_inode_aliases(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            directory = Path(temporary).resolve()
+            status_path = directory / "status.json"
+            events_path = directory / "events.jsonl"
+            lock_path = directory / "holder.lock"
+
+            for status, events, lock in (
+                    (status_path, events_path, status_path),
+                    (status_path, status_path, lock_path),
+                    (status_path, directory / "nested" / ".." /
+                     "status.json", lock_path)):
+                with self.subTest(status=status, events=events, lock=lock), \
+                        self.assertRaisesRegex(ValueError, "collide"):
+                    validate_artifact_paths(status, events, lock)
+
+            status_path.write_text("sentinel\n")
+            os.link(status_path, events_path)
+            with self.assertRaisesRegex(ValueError, "share an inode"):
+                validate_artifact_paths(status_path, events_path, lock_path)
+            self.assertEqual(status_path.read_text(), "sentinel\n")
+            self.assertEqual(events_path.read_text(), "sentinel\n")
+
+    def test_colliding_artifacts_fail_before_any_path_mutation(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            directory = Path(temporary).resolve()
+            shared = directory / "shared"
+            with redirect_stderr(io.StringIO()):
+                result = run_scoped(
+                    ["must-not-start"], user="unused", latency_us=0,
+                    scope="requests", max_hold_seconds=1,
+                    device=FakeDevice(), status_path=shared,
+                    events_path=None, lock_path=shared)
+            self.assertEqual(result, 1)
+            self.assertFalse(shared.exists())
+
+            status_path = directory / "status.json"
+            lock_path = directory / "holder.lock"
+            with redirect_stderr(io.StringIO()):
+                result = run_scoped(
+                    ["must-not-start"], user="unused", latency_us=0,
+                    scope="requests", max_hold_seconds=1,
+                    device=FakeDevice(), status_path=status_path,
+                    events_path=status_path, lock_path=lock_path)
+            self.assertEqual(result, 1)
+            self.assertFalse(status_path.exists())
+            self.assertFalse(lock_path.exists())
 
 
 class TestHelperInputs(unittest.TestCase):
@@ -795,6 +870,112 @@ class TestRequestProtocol(unittest.TestCase):
         finally:
             client.close()
             supervisor_socket.close()
+
+    def test_active_eof_close_error_still_cleans_up_before_fatal_and_telemetry(self):
+        device, closed = close_error_device("EOF close failed after close")
+        events = []
+        supervisor_socket, client = socket.socketpair()
+
+        def observe(event, payload):
+            events.append((event, device.active, payload))
+
+        def terminate_child(reason):
+            events.append(("fatal_control", device.active,
+                           {"reason": reason}))
+
+        supervisor = RequestSupervisor(
+            supervisor_socket, device, latency_us=0, max_hold_seconds=1,
+            status_callback=observe,
+            fatal_control_callback=terminate_child)
+        thread = threading.Thread(target=supervisor.serve, daemon=True)
+        thread.start()
+
+        def request(value):
+            client.sendall(json.dumps(value).encode() + b"\n")
+            raw = b""
+            while b"\n" not in raw:
+                raw += client.recv(4096)
+            return json.loads(raw.partition(b"\n")[0])
+
+        try:
+            self.assertTrue(request({"op": "hello", "protocol": PROTOCOL})[
+                "ok"])
+            self.assertTrue(request({
+                "op": "begin", "request_id": "cmpl-eof-close-error"})[
+                    "ok"])
+            self.assertTrue(device.active)
+            client.close()
+            thread.join(timeout=1)
+            self.assertFalse(thread.is_alive())
+            self.assertTrue(closed.is_set())
+            self.assertFalse(device.active)
+            self.assertIsNone(supervisor.active_request)
+            self.assertEqual(supervisor.fd_open_count, 1)
+            self.assertEqual(supervisor.fd_close_count, 1)
+            self.assertEqual(supervisor.fd_close_errors, 1)
+            self.assertIn("EOF close failed", supervisor.last_close_error)
+            self.assertIn("EOF close failed", supervisor.last_error)
+            names = [event for event, _active, _payload in events]
+            self.assertLess(names.index("fatal_control"),
+                            names.index("acquire"))
+            fatal = next(payload for event, _active, payload in events
+                         if event == "fatal_control")
+            self.assertEqual(fatal["reason"], "eof")
+            release = next(payload for event, _active, payload in events
+                           if event == "release")
+            self.assertIn("EOF close failed", release["close_error"])
+            self.assertTrue(all(not active for _event, active, _ in events))
+        finally:
+            client.close()
+            supervisor_socket.close()
+
+    def test_ack_timeout_close_error_preserves_cleanup_order_and_both_errors(self):
+        device, closed = close_error_device("ACK close failed after close")
+        events = []
+        parent_socket, client_socket = socket.socketpair()
+        blocked_socket = BlockingAckSocket(parent_socket, "begin")
+
+        def observe(event, payload):
+            events.append((event, device.active, payload))
+
+        def terminate_child(reason):
+            events.append(("fatal_control", device.active,
+                           {"reason": reason}))
+
+        supervisor = RequestSupervisor(
+            blocked_socket, device, latency_us=0, max_hold_seconds=0.2,
+            send_timeout_seconds=0.03, status_callback=observe,
+            fatal_control_callback=terminate_child)
+        thread = threading.Thread(target=supervisor.serve, daemon=True)
+        thread.start()
+        client = RequestQos(
+            client_socket, timeout=0.15, require_root_peer=False)
+        try:
+            with self.assertRaises(QosError):
+                with client.scope("cmpl-ack-close-error"):
+                    self.fail("body ran without a BEGIN acknowledgement")
+            thread.join(timeout=0.5)
+            self.assertFalse(thread.is_alive())
+            self.assertTrue(blocked_socket.blocked.is_set())
+            self.assertTrue(closed.is_set())
+            self.assertFalse(device.active)
+            self.assertIsNone(supervisor.active_request)
+            self.assertEqual(supervisor.fd_open_count, 1)
+            self.assertEqual(supervisor.fd_close_count, 1)
+            self.assertEqual(supervisor.fd_close_errors, 1)
+            self.assertIn("ACK close failed", supervisor.last_close_error)
+            self.assertIn("ACK close failed", supervisor.last_error)
+            self.assertIn("send timed out", supervisor.last_error)
+            names = [event for event, _active, _payload in events]
+            self.assertLess(names.index("fatal_control"),
+                            names.index("acquire"))
+            fatal = next(payload for event, _active, payload in events
+                         if event == "fatal_control")
+            self.assertEqual(fatal["reason"], "control_send_timeout")
+            self.assertTrue(all(not active for _event, active, _ in events))
+        finally:
+            client.close()
+            parent_socket.close()
 
     def test_injected_acquire_failure_is_visible_and_not_active(self):
         harness = ProtocolHarness(device=FakeDevice(

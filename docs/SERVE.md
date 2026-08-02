@@ -219,6 +219,11 @@ needs a credential such as `HF_TOKEN`, put `--pass-env HF_TOKEN` before `--`.
 The status record stores only that variable's name, never its value, and
 redacts common secret-valued command options.
 
+The status path, optional event path, and singleton lock path must identify
+three distinct files. The holder rejects normalized-path, resolved-parent, and
+existing-inode aliases before creating or replacing any artifact, so a status
+rewrite cannot unlink the locked inode or erase the event stream.
+
 The profile refuses to start if its private root control socket is missing,
 the peer is not root, a fixed setting conflicts, or direct I/O fell back. A
 pre-existing engine/debug `WASTE_*` selector not fixed by the profile is also
