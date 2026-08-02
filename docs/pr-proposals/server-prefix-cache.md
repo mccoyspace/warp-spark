@@ -3,14 +3,15 @@
 Implementation commit:
 `39a23344d18cdb659d93b84c10902d0e5cdec9ab`
 
-Candidate status: implementation-complete and independently reviewed. Real K3
-performance measurement is still pending, so this proposal makes no K3 latency
-or throughput claim.
+Candidate status: implementation-complete, independently reviewed, and exercised
+with real K3 on this project's Acer GN100. The measurement below is one
+persistent-server acceptance sequence, not a general performance claim.
 
 ## Problem
 
-Recurring agent requests often repeat a large system prompt and tool schema, but
-the server currently evaluates that shared prefix from scratch on every request.
+Recurring agent requests often repeat a large system prompt and tool schema.
+Without this opt-in cache, the server evaluates that shared prefix from scratch
+on every request.
 Kimi K3 is a particularly useful target for exact reuse: its KDA-heavy recurrent
 state is independent of prompt length, while its interleaved MLA layers retain
 compressed latent KV rather than a conventional full KV cache.
@@ -98,20 +99,28 @@ tests are CPython-specific.
 
 - Implementation commit `39a2334` received a fresh independent review after
   the failure, promotion, and accounting fixes; no actionable findings remained.
-- Focused `39a2334` local server suite: 201 passed, 2 skipped.
+- Focused `39a2334` local server suite: 201 tests, OK (2 skipped).
 - Focused `39a2334` GN100 Linux ARM64 native suite: 26 passed, 0 failed,
   13 skipped.
-- Focused `39a2334` GN100 server suite: 201 passed, 2 skipped.
+- Focused `39a2334` GN100 server suite: 201 tests, OK (2 skipped).
 - The real synthetic-container acceptance test compares uncached generation,
   shallow restore plus promotion, and subsequent deep restore. Greedy output
   bytes and the complete post-generation state blob are identical on every
   path.
+- Real K3 acceptance on integrated commit `5ba76d2` produced the intended
+  miss-hit-hit sequence: one exact family root was admitted cold, then restored
+  for both a divergent user tail and an exact repeated request.
+- In that practical persistent-server sequence, restored requests were
+  3.44-3.46x faster by request wall time and read about 70.5% fewer expert bytes
+  than the cold request.
 
 Skip counts are reported rather than treated as passes; they cover optional
 environment-dependent checks, including unavailable external model/reference
-fixtures. K3 combined measurement on the GN100 is deliberately not listed as
-evidence yet: it remains to be run on the final integrated Q0-plus-prefix build
-with the same total memory budget.
+fixtures. The K3 timing and I/O deltas are not an isolated causal estimate of
+prefix caching: all three calls used one persistent process, so the expert cache
+warmed alongside prefix-state reuse. Relative to the measured tree, final
+integration code `9b5bfdb` changes only documentation, tests, and the PM-QoS
+helper; the prefix-cache implementation measured here is unchanged.
 
 ## Compatibility and scope
 

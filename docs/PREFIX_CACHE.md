@@ -115,3 +115,16 @@ contains both changes; this ordering describes the focused upstream proposals.
 The acceptance tests compare shallow restore plus promotion, deep restore, and
 ordinary unsplit generation on a real synthetic container. Greedy output
 tokens and the entire post-generation state blob must be byte-identical.
+
+## GN100 qualification
+
+On the project's Acer GN100, one persistent K3 server retained a 256-token
+system/tool root in 479,053,984 accounted bytes within a one-GiB reservation.
+Two requests restoring that root took 249.029 and 247.828 seconds of model work
+versus 857.309 seconds for the cold request, and read about 70.5% fewer bytes.
+All three requests used the same total engine budget and effective direct I/O.
+
+This is a practical combined result, not an isolated cache-only benchmark:
+the expert cache warmed in the persistent process. The run's single generated
+token checked cold/repeat output stability; the synthetic acceptance above is
+what establishes byte-identical state and logits.

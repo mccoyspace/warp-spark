@@ -5,6 +5,9 @@
 > `spark/integration`, and immutable measured milestones under `archive/`.
 > See [docs/GN100.md](docs/GN100.md) for results and reproduction notes, and
 > [docs/UPSTREAMING.md](docs/UPSTREAMING.md) for the pull-request plan.
+> The current integration has run the full 982 GiB K3 container and restored a
+> 256-token family root in two requests at 3.44x--3.46x the cold-request speed;
+> see the GN100 page for the persistent-server measurement caveat.
 
 **Kimi K3 — 2.78 trillion parameters — running on a consumer laptop.**
 
@@ -392,16 +395,16 @@ follows is the memory half of that story.
 ```bash
 git clone https://github.com/sqliteai/waste && cd waste
 make                          # libwaste.a, waste, libwastevq
-make check                    # 23 pass, 11 skip on a fresh clone
+make check                    # model-free suite; explicit skips need fixtures
 ```
 
 No configure step and no dependency resolution. `make check` needs no
 model: it builds a small synthetic container and runs the engine against
-it. The eleven skips are the checks that need something a clone does not
+it. The skips are checks that need something a clone does not
 carry — the PyTorch oracle, the round-trip against the source shards,
 anything driving the CLI with text, since the synthetic container carries
 no tokenizer, and the K3 checks, which want the container and the release
-on disk. With both containers present the suite is 36 checks.
+on disk. The summary reports the exact pass/fail/skip inventory for that tree.
 
 ### Converting Kimi K3
 
@@ -620,13 +623,12 @@ honest caveat is not a substitute for reading the file.
 
 | | build | model-free suite | backend |
 |---|---|---|---|
-| macOS arm64 | yes | 23 pass / 0 fail / 11 skip | NEON |
-| Linux arm64 | yes | 23 pass / 0 fail / 11 skip | NEON |
-| Linux x86_64 | yes | 23 pass / 0 fail / 11 skip | AVX2 |
+| macOS arm64 | yes | yes; fixture-dependent checks skip explicitly | NEON |
+| Linux arm64 | yes | yes; fixture-dependent checks skip explicitly | NEON |
+| Linux x86_64 | yes | yes; fixture-dependent checks skip explicitly | AVX2 |
 | Windows x86_64 | yes | container, CLI and forward pass — see below | AVX2 |
 
-The first three run the same suite and now agree check for check: same
-23 passes, same 11 skips, same list. CI has no container, so
+The first three run the same model-free suite. CI has no real container, so
 `tests/run.sh` builds a synthetic one and the checks that need real
 weights say SKIP rather than passing quietly. All three also pass the
 sanitizer suite and 400 fuzz cases.
@@ -670,8 +672,8 @@ serve/      the OpenAI-compatible server, the other client
   server.py   /v1/chat/completions and friends
 tools/      conversion and validation (Python, never at run time)
 docs/       format, engine, backends, and what was learned
-tests/      34 checks, and a diff against a PyTorch oracle given a model
-  serve/      149 more for the server, incl. a differential vs upstream
+tests/      engine checks, and a diff against a PyTorch oracle given a model
+  serve/      server checks, including a differential against upstream
 examples/   chat.json for K3 and ChatML, the format a container carries
 third_party/ stb_image.h, the single vendored header — see its README
 ```

@@ -45,8 +45,8 @@ The order below follows dependencies, not the historical sprint order.
 | 4 | Final phase/layer trace and request-boundary flushing | Generic observability | Reconcile with upstream cache traces |
 | 5 | Transactional in-memory state export/import and caller-owned budget reservation | Generic engine API | PR-ready on `pr/in-memory-state-snapshots`; required before server prefix reuse |
 | 6 | Whole-expert scheduling through typed per-context configuration | Generic optimization | Complete experiment on `pr/whole-expert-scheduler`; no GN100 gain, excluded from integration |
-| 7 | Exact, renderer-delimited family-root server cache | Generic server feature | Implementation-complete on `pr/server-prefix-cache`; depends on state snapshots |
-| 8 | Mutable conversation-head or block reuse | Generic follow-on | Only after current family-root behavior remains exact on K3 |
+| 7 | Exact, renderer-delimited family-root server cache | Generic server feature | PR-ready on `pr/server-prefix-cache`; real-K3 miss-hit-hit acceptance complete; depends on state snapshots |
+| 8 | Mutable conversation-head reuse | Generic follow-on | Next measured cache step; retain shared-budget and bit-exact gates |
 
 The old public `pread_batch` backend remains a diagnostic control, not a
 production API.  A raw `io_uring` PR is conditional: first show that it adds
