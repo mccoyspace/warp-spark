@@ -25,6 +25,10 @@
  * The one thing it still cannot vary is the context length, which sizes the
  * KV and KDA state at load.
  *
+ * Set WASTE_CAPTURE_DIR to an existing directory to retain every full logit
+ * row and routed expert id for tools/compare_gpu_runs.py. Capture is opt-in:
+ * a 64-token K3 arm writes about 41 MiB of logits.
+ *
  *   sweep CONTAINER ids,.. n_gen lookahead=0,6 [repeat]
  *   sweep CONTAINER ids,.. n_gen iodepth=2,4,8 [repeat]
  *   sweep CONTAINER ids,.. n_gen cache=3400,17736,23879 [repeat]
@@ -72,6 +76,86 @@ static uint64_t hash_bytes(uint64_t h, const void *data, size_t n)
         h *= UINT64_C(1099511628211);
     }
     return h;
+}
+
+static int write_capture(const char *dir, const char *key, int value, int rep,
+                         const waste_model *m, int prompt_tokens, int n_gen,
+                         const int *inputs, const int *routes,
+                         const float *logits, double seconds,
+                         uint64_t token_hash, uint64_t logit_hash,
+                         uint64_t route_hash)
+{
+    char stem[96], manifest_path[1024], logits_path[1024], logits_name[128];
+    snprintf(stem, sizeof stem, "%s-%d-rep%d", key, value, rep);
+    snprintf(logits_name, sizeof logits_name, "%s.logits.f32", stem);
+    snprintf(manifest_path, sizeof manifest_path, "%s/%s.json", dir, stem);
+    snprintf(logits_path, sizeof logits_path, "%s/%s", dir, logits_name);
+    FILE *raw = fopen(logits_path, "wb");
+    const size_t rows = (size_t)n_gen + 1;
+    const size_t count = rows * (size_t)m->cfg.vocab;
+    if (!raw) {
+        fprintf(stderr, "could not write capture logits %s\n", logits_path);
+        return -1;
+    }
+    const int write_failed = fwrite(logits, sizeof *logits, count, raw) != count;
+    const int close_failed = fclose(raw) != 0;
+    if (write_failed || close_failed) {
+        fprintf(stderr, "could not write capture logits %s\n", logits_path);
+        return -1;
+    }
+
+    FILE *json = fopen(manifest_path, "w");
+    if (!json) {
+        fprintf(stderr, "could not write capture manifest %s\n", manifest_path);
+        return -1;
+    }
+    fprintf(json,
+            "{\n  \"schema\": \"waste.gpu_capture.v1\",\n"
+            "  \"dtype\": \"float32-le\",\n"
+            "  \"logits_file\": \"%s\",\n"
+            "  \"vocab\": %d,\n  \"top_k\": %d,\n  \"greedy\": true,\n"
+            "  \"arm\": {\"key\": \"%s\", \"value\": %d, "
+            "\"repeat\": %d, \"effective\": %d, \"fallbacks\": %" PRIu64
+            ", \"seconds\": %.9f, \"token_hash\": \"0x%016" PRIx64
+            "\", \"logit_hash\": \"0x%016" PRIx64
+            "\", \"route_hash\": \"0x%016" PRIx64 "\"},\n"
+            "  \"steps\": [\n",
+            logits_name, m->cfg.vocab, m->cfg.top_k, key, value, rep,
+            waste_model_cuda_kda_effective(m),
+            waste_model_cuda_kda_fallbacks(m), seconds,
+            token_hash, logit_hash, route_hash);
+    const int route_layers = m->cfg.n_layers - m->cfg.first_dense;
+    const size_t route_stride = (size_t)route_layers * m->cfg.top_k;
+    for (int step = 0; step <= n_gen; step++) {
+        fprintf(json,
+                "    {\"index\": %d, \"position\": %d, \"input_token\": ",
+                step, prompt_tokens - 1 + step);
+        if (step == 0) fputs("null", json);
+        else fprintf(json, "%d", inputs[step - 1]);
+        fputs(", \"routes\": [", json);
+        if (step > 0) {
+            const int *row = routes + (size_t)(step - 1) * route_stride;
+            for (int layer = m->cfg.first_dense; layer < m->cfg.n_layers; layer++) {
+                if (layer > m->cfg.first_dense) fputs(", ", json);
+                fprintf(json, "{\"layer\": %d, \"experts\": [", layer);
+                const int *ids = row + (size_t)(layer - m->cfg.first_dense) *
+                                       m->cfg.top_k;
+                for (int k = 0; k < m->cfg.top_k; k++) {
+                    if (k) fputs(", ", json);
+                    fprintf(json, "%d", ids[k]);
+                }
+                fputs("]}", json);
+            }
+        }
+        fprintf(json, "]}%s\n", step == n_gen ? "" : ",");
+    }
+    fputs("  ]\n}\n", json);
+    if (fclose(json)) {
+        fprintf(stderr, "could not finish capture manifest %s\n", manifest_path);
+        return -1;
+    }
+    printf("capture %s\n", manifest_path);
+    return 0;
 }
 
 #define MAX_ARMS 16
@@ -149,6 +233,40 @@ int main(int argc, char **argv)
     }
     const char *usage = getenv("WASTE_USAGE");
     if (usage && !*usage) usage = NULL;
+    const char *capture_dir = getenv("WASTE_CAPTURE_DIR");
+    if (capture_dir && !*capture_dir) capture_dir = NULL;
+    float *capture_logits = NULL;
+    int *capture_inputs = NULL, *capture_routes = NULL;
+    const int route_layers = m.cfg.n_layers - m.cfg.first_dense;
+    size_t route_stride = 0;
+    if (capture_dir) {
+        if (route_layers <= 0 || m.cfg.top_k <= 0 || m.cfg.vocab <= 0 ||
+            (size_t)route_layers > SIZE_MAX / (size_t)m.cfg.top_k) {
+            fprintf(stderr, "correctness capture requires a valid MoE layout\n");
+            waste_model_free(&m);
+            return 1;
+        }
+        route_stride = (size_t)route_layers * (size_t)m.cfg.top_k;
+        const size_t logit_rows = (size_t)n_gen + 1;
+        if (logit_rows > SIZE_MAX / (size_t)m.cfg.vocab ||
+            (size_t)n_gen > SIZE_MAX / route_stride ||
+            (size_t)n_gen * route_stride > SIZE_MAX / sizeof(int)) {
+            fprintf(stderr, "correctness capture is too large\n");
+            waste_model_free(&m);
+            return 1;
+        }
+        const size_t logit_count = logit_rows * (size_t)m.cfg.vocab;
+        if (logit_count > SIZE_MAX / sizeof(float) ||
+            (size_t)n_gen > SIZE_MAX / sizeof(int) ||
+            !(capture_logits = malloc(logit_count * sizeof(float))) ||
+            !(capture_inputs = malloc((size_t)n_gen * sizeof(int))) ||
+            !(capture_routes = malloc((size_t)n_gen * route_stride * sizeof(int)))) {
+            fprintf(stderr, "could not allocate correctness capture\n");
+            free(capture_logits); free(capture_inputs); free(capture_routes);
+            waste_model_free(&m);
+            return 1;
+        }
+    }
     const char *io_env = getenv("WASTE_IO_THREADS");
     const int requested_readers = io_env ? atoi(io_env) : 2;
     printf("loaded in %.1fs — cache %d slots, direct I/O %d, readers %d, "
@@ -230,6 +348,9 @@ int main(int argc, char **argv)
 
             int cur = 0;
             for (int v = 1; v < m.cfg.vocab; v++) if (lg[v] > lg[cur]) cur = v;
+            if (capture_logits)
+                memcpy(capture_logits, lg,
+                       (size_t)m.cfg.vocab * sizeof *capture_logits);
             const uint64_t h0 = m.cache.hits, mi0 = m.cache.misses;
             const uint64_t b0 = m.cache.bytes_read;
             uint64_t token_hash = UINT64_C(14695981039346656037);
@@ -241,6 +362,7 @@ int main(int argc, char **argv)
             const double s = now();
             for (int i = 0; i < n_gen; i++) {
                 token_hash = hash_bytes(token_hash, &cur, sizeof cur);
+                if (capture_inputs) capture_inputs[i] = cur;
                 memset(routed, 0xff, sizeof routed);
                 lg = waste_model_step(&m, cur, n + i, routed);
                 if (!lg) {
@@ -250,6 +372,13 @@ int main(int argc, char **argv)
                 }
                 logit_hash = hash_bytes(logit_hash, lg,
                                         (size_t)m.cfg.vocab * sizeof *lg);
+                if (capture_logits)
+                    memcpy(capture_logits + (size_t)(i + 1) * m.cfg.vocab,
+                           lg, (size_t)m.cfg.vocab * sizeof *lg);
+                if (capture_routes)
+                    memcpy(capture_routes + (size_t)i * route_stride,
+                           routed + (size_t)m.cfg.first_dense * m.cfg.top_k,
+                           route_stride * sizeof *routed);
                 route_hash = hash_bytes(
                     route_hash,
                     routed + (size_t)m.cfg.first_dense * m.cfg.top_k,
@@ -276,8 +405,17 @@ int main(int argc, char **argv)
                    h, mi, 100.0 * (double)h / (double)(h + mi ? h + mi : 1),
                    bytes, token_hash, logit_hash, route_hash);
             fflush(stdout);
+            if (capture_dir && write_capture(
+                    capture_dir, key, value, r + 1, &m, n, n_gen,
+                    capture_inputs, capture_routes, capture_logits, dt,
+                    token_hash, logit_hash, route_hash)) {
+                free(capture_logits); free(capture_inputs); free(capture_routes);
+                waste_model_free(&m);
+                return 1;
+            }
         }
     }
+    free(capture_logits); free(capture_inputs); free(capture_routes);
     waste_model_free(&m);
     return 0;
 }

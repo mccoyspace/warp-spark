@@ -283,6 +283,7 @@ test_abi$(EXE): tests/test_abi.o libwaste.a
 
 clean:
 	rm -f $(OBJ) $(SHOBJ) cli/*.o tests/*.o $(OBJ:.o=.d) $(SHOBJ:.o=.d) \
+	      src/cuda.o src/cuda.pic.o src/cuda.d src/cuda.pic.d \
 	      cli/*.d tests/*.d libwaste.a waste waste.exe \
 	      $(TESTBINS) $(TESTNAMES) $(addsuffix .exe,$(TESTNAMES)) \
 	      libwaste.dylib libwaste.so libwaste.dll \

@@ -1138,5 +1138,13 @@ else
     sk "XTML vs encoding_k3.py" "no release at $K3_SRC (set K3_DIR)"
 fi
 
+if ! command -v python3 >/dev/null 2>&1; then
+    sk "GPU capture comparator" "python3 not installed"
+elif python3 -m unittest -q tests.test_compare_gpu_runs >/dev/null 2>&1; then
+    ok "GPU capture comparator (6 checks)"
+else
+    no "GPU capture comparator"
+fi
+
 printf "\n\033[1m%d passed, %d failed, %d skipped\033[0m\n" "$pass" "$fail" "$skip"
 [ "$fail" -eq 0 ]
