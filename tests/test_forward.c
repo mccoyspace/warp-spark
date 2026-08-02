@@ -115,6 +115,11 @@ int main(int argc, char **argv)
         cur = best;
     }
 
+    printf("cuda kda: requested %d, effective %d, fallbacks %llu\n",
+           waste_model_get_cuda_kda(&m),
+           waste_model_cuda_kda_effective(&m),
+           (unsigned long long)waste_model_cuda_kda_fallbacks(&m));
+
     extern double waste_prof[16];
     if (getenv("WASTE_PROFILE")) {
         /* indented names are sub-totals of the line above and are excluded
