@@ -66,7 +66,7 @@ static float run_kernel(const char *name, float *device_ptr, float *host_ptr,
     runtime_ok(cudaDeviceSynchronize(), "pre-benchmark synchronize");
     runtime_ok(cudaEventRecord(begin), "cudaEventRecord(begin)");
     for (int i = 0; i < iterations; i++)
-        state_pass<<<256, 256>>>(device_ptr, count, 0.999999f, 0.000001f);
+        state_pass<<<256, 256>>>(device_ptr, count, 1.000001f, 0.000001f);
     runtime_ok(cudaGetLastError(), "state_pass launch");
     runtime_ok(cudaEventRecord(end), "cudaEventRecord(end)");
     runtime_ok(cudaEventSynchronize(end), "cudaEventSynchronize(end)");
@@ -161,7 +161,7 @@ int main(int argc, char **argv)
     const auto t0 = std::chrono::steady_clock::now();
     for (int i = 0; i < 10; i++) {
         runtime_ok(cudaMemcpy(device, pageable, bytes, cudaMemcpyHostToDevice), "H2D");
-        state_pass<<<256, 256>>>(device, count, 0.999999f, 0.000001f);
+        state_pass<<<256, 256>>>(device, count, 1.000001f, 0.000001f);
         runtime_ok(cudaGetLastError(), "copy-roundtrip launch");
         runtime_ok(cudaMemcpy(pageable, device, bytes, cudaMemcpyDeviceToHost), "D2H");
     }
