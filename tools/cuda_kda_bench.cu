@@ -8,7 +8,7 @@
  *
  *   nvcc -O3 -std=c++17 -arch=native -fmad=false \
  *     -Xcompiler=-ffp-contract=off -Xcompiler=-pthread \
- *     -o cuda_kda_bench tools/cuda_kda_bench.cu -pthread
+ *     -o cuda_kda_bench tools/cuda_kda_bench.cu
  */
 
 #include <cuda_runtime.h>

@@ -39,7 +39,8 @@
 double waste_prof[16];
 uint64_t waste_prof_n[16];
 enum { P_LUTB, P_KDA, P_MLA, P_ROUTE, P_EDEQ, P_EMM, P_HEAD, P_LUTA, P_MM,
-       P_KDA_REC };
+       P_KDA_REC, P_KDA_QKV, P_KDA_CONV, P_KDA_AUX, P_KDA_GATE,
+       P_KDA_NORM, P_KDA_OUT };
 static int prof_on = -1;
 static pthread_mutex_t prof_mu = PTHREAD_MUTEX_INITIALIZER;
 static double pnow(void)
@@ -1889,24 +1890,36 @@ static void kda_layer(waste_model *m, int L, const float *in, float *out)
     for (int i = 0; i < 3; i++) {
         char b[128];
         snprintf(b, sizeof b, "%smodel.layers.%d.self_attn.%s_proj.weight", c->prefix, L, nm[i]);
-        matvec_t(m, dstv[i], waste_find(m, b), in, C, hid);
+        {
+            PROF_START(P_KDA_QKV);
+            matvec_t(m, dstv[i], waste_find(m, b), in, C, hid);
+            PROF_END(P_KDA_QKV);
+        }
         snprintf(b, sizeof b, "%smodel.layers.%d.self_attn.%s_conv1d.weight", c->prefix, L, nm[i]);
-        waste_k.short_conv_step(C, c->conv_k, waste_find(m, b)->data, NULL,
-                                m->conv[L] + (size_t)i * C * (c->conv_k - 1),
-                                dstv[i], dstv[i]);
+        {
+            PROF_START(P_KDA_CONV);
+            waste_k.short_conv_step(C, c->conv_k, waste_find(m, b)->data, NULL,
+                                    m->conv[L] + (size_t)i * C * (c->conv_k - 1),
+                                    dstv[i], dstv[i]);
+            PROF_END(P_KDA_CONV);
+        }
     }
 
-    matvec_t(m, lo, waste_find(m, tname("%smodel.layers.%d.self_attn.f_a_proj.weight", c->prefix, L)), in, D, hid);
-    matvec_t(m, g, waste_find(m, tname("%smodel.layers.%d.self_attn.f_b_proj.weight", c->prefix, L)), lo, C, D);
-    const waste_tensor *At = waste_find(m, tname("%smodel.layers.%d.self_attn.A_log",
-                                                 c->prefix, L));
-    const float *dt = T(m, "%smodel.layers.%d.self_attn.dt_bias", c->prefix, L);
-    /* A_log is per head, not per channel: the tech report's eq. 5 indexes it
-     * by h, and K3 ships it padded to head_dim (indices 96..127 are exactly
-     * zero on every layer we checked). */
-    waste_kda_decay_gate_ex(g, At->data, dt, H, D, c->gate_lower_bound, 0);
-    matvec_t(m, beta, waste_find(m, tname("%smodel.layers.%d.self_attn.b_proj.weight", c->prefix, L)), in, H, hid);
-    for (int h = 0; h < H; h++) beta[h] = 1.0f / (1.0f + expf(-beta[h]));
+    {
+        PROF_START(P_KDA_AUX);
+        matvec_t(m, lo, waste_find(m, tname("%smodel.layers.%d.self_attn.f_a_proj.weight", c->prefix, L)), in, D, hid);
+        matvec_t(m, g, waste_find(m, tname("%smodel.layers.%d.self_attn.f_b_proj.weight", c->prefix, L)), lo, C, D);
+        const waste_tensor *At = waste_find(m, tname("%smodel.layers.%d.self_attn.A_log",
+                                                     c->prefix, L));
+        const float *dt = T(m, "%smodel.layers.%d.self_attn.dt_bias", c->prefix, L);
+        /* A_log is per head, not per channel: the tech report's eq. 5 indexes it
+         * by h, and K3 ships it padded to head_dim (indices 96..127 are exactly
+         * zero on every layer we checked). */
+        waste_kda_decay_gate_ex(g, At->data, dt, H, D, c->gate_lower_bound, 0);
+        matvec_t(m, beta, waste_find(m, tname("%smodel.layers.%d.self_attn.b_proj.weight", c->prefix, L)), in, H, hid);
+        for (int h = 0; h < H; h++) beta[h] = 1.0f / (1.0f + expf(-beta[h]));
+        PROF_END(P_KDA_AUX);
+    }
 
     {
         /* Heads own disjoint K x V slices of the recurrent state, so the
@@ -1922,19 +1935,27 @@ static void kda_layer(waste_model *m, int L, const float *in, float *out)
     }
 
     if (c->full_rank_gate) {
+        PROF_START(P_KDA_GATE);
         matvec_t(m, gate, waste_find(m, tname("%smodel.layers.%d.self_attn.g_proj.weight",
                                               c->prefix, L)), in, C, hid);
+        PROF_END(P_KDA_GATE);
     } else {
+        PROF_START(P_KDA_GATE);
         matvec_t(m, lo, waste_find(m, tname("%smodel.layers.%d.self_attn.g_a_proj.weight",
                                             c->prefix, L)), in, D, hid);
         matvec_t(m, gate, waste_find(m, tname("%smodel.layers.%d.self_attn.g_b_proj.weight",
                                               c->prefix, L)), lo, C, D);
+        PROF_END(P_KDA_GATE);
     }
     const float *onw = T(m, "%smodel.layers.%d.self_attn.o_norm.weight", c->prefix, L);
+    PROF_START(P_KDA_NORM);
     for (int h = 0; h < H; h++)
         waste_k.rmsnorm_gated(D, o + h * D, gate + h * D, onw, c->eps, o + h * D);
+    PROF_END(P_KDA_NORM);
 
+    PROF_START(P_KDA_OUT);
     matvec_t(m, out, waste_find(m, tname("%smodel.layers.%d.self_attn.o_proj.weight", c->prefix, L)), o, hid, C);
+    PROF_END(P_KDA_OUT);
 }
 
 /* MLA with kv_b_proj absorbed into the query and the output.
