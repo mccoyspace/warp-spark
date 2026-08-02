@@ -12,7 +12,7 @@ next PR.
 | Linux available-memory budgeting | [`pr/linux-memory-budget`](https://github.com/mccoyspace/waste-spark/tree/pr/linux-memory-budget) | [Description](linux-memory-budget.md) | PR-ready; not yet submitted upstream |
 | POSIX model-container ownership | [`pr/posix-model-lock`](https://github.com/mccoyspace/waste-spark/tree/pr/posix-model-lock) | [Description](posix-model-lock.md) | PR-ready; not yet submitted upstream |
 | In-memory state snapshots | [`pr/in-memory-state-snapshots`](https://github.com/mccoyspace/waste-spark/tree/pr/in-memory-state-snapshots) | [Description](in-memory-state-snapshots.md) | PR-ready; not yet submitted upstream |
-| Whole-expert scheduler | `pr/whole-expert-scheduler` | Pending implementation/acceptance | In progress |
+| Whole-expert scheduler | [`pr/whole-expert-scheduler`](https://github.com/mccoyspace/waste-spark/tree/pr/whole-expert-scheduler) | [Description](whole-expert-scheduler.md) | Complete experimental candidate; no GN100 gain, excluded from integration |
 
 The exact measured Sprint 5 source remains available at
 [`archive/sprint-5-measured`](https://github.com/mccoyspace/waste-spark/tree/archive/sprint-5-measured)

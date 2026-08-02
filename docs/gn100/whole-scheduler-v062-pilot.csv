@@ -1,0 +1,3 @@
+condition,prompt_mode,commit,expert_schedule,io_threads,io_depth,lookahead,qos_us,budget_bytes,decode_seconds,tokens_per_second,wall_seconds,cache_hits,cache_misses,fs_inputs,max_rss_kib,major_faults,swaps,start_max_millic,end_max_millic,stdout_sha256
+row_final,raw,5e76aea6b75db4a846337e322300cceef41464f8,row,2,2,0,0,86583021568,2.97,0.34,67.87,695,777,355508408,83673148,0,0,44700,63800,bb9af6089119e3cd934e7dba08807efff93bbdb591e1b58706eece73c17f6d5b
+whole_final,raw,5e76aea6b75db4a846337e322300cceef41464f8,whole,2,2,0,0,86583021568,3.06,0.33,68.23,696,776,355484176,83678900,0,0,50000,63000,bb9af6089119e3cd934e7dba08807efff93bbdb591e1b58706eece73c17f6d5b
