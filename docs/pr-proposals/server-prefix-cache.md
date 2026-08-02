@@ -9,8 +9,9 @@ persistent-server acceptance sequence, not a general performance claim.
 
 ## Problem
 
-Recurring agent requests often repeat a large system prompt and tool schema, but
-the server currently evaluates that shared prefix from scratch on every request.
+Recurring agent requests often repeat a large system prompt and tool schema.
+Without this opt-in cache, the server evaluates that shared prefix from scratch
+on every request.
 Kimi K3 is a particularly useful target for exact reuse: its KDA-heavy recurrent
 state is independent of prompt length, while its interleaved MLA layers retain
 compressed latent KV rather than a conventional full KV cache.
@@ -98,9 +99,9 @@ tests are CPython-specific.
 
 - Implementation commit `39a2334` received a fresh independent review after
   the failure, promotion, and accounting fixes; no actionable findings remained.
-- Local server suite: 201 passed, 2 skipped.
+- Local server suite: 201 tests, OK (2 skipped).
 - GN100 Linux ARM64 native suite: 26 passed, 0 failed, 13 skipped.
-- GN100 server suite: 201 passed, 2 skipped.
+- GN100 server suite: 201 tests, OK (2 skipped).
 - The real synthetic-container acceptance test compares uncached generation,
   shallow restore plus promotion, and subsequent deep restore. Greedy output
   bytes and the complete post-generation state blob are identical on every
@@ -117,8 +118,8 @@ environment-dependent checks, including unavailable external model/reference
 fixtures. The K3 timing and I/O deltas are not an isolated causal estimate of
 prefix caching: all three calls used one persistent process, so the expert cache
 warmed alongside prefix-state reuse. Relative to the measured tree, the final
-personal integration tip `9b5bfdb` changes only documentation, tests, and the
-PM-QoS helper; the prefix-cache implementation measured here is unchanged.
+integration code at `9b5bfdb` changes only documentation, tests, and the PM-QoS
+helper; the prefix-cache implementation measured here is unchanged.
 
 ## Compatibility and scope
 
