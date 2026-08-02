@@ -39,8 +39,8 @@ The order below follows dependencies, not the historical sprint order.
 | Order | Proposed PR | Upstream boundary | Status on current base |
 | ---: | --- | --- | --- |
 | 0 | Linux 4 KiB `O_DIRECT` eligibility and transfer probing | Portable correctness | Already implemented upstream; no duplicate PR |
-| 1 | Auto-budget from Linux `MemAvailable` and cgroup-v2 headroom | Generic safety; preserve other platforms | Porting from the measured tree |
-| 2 | POSIX model-container ownership lock with explicit opt-out | Generic safety/policy | Port separately |
+| 1 | Auto-budget from Linux `MemAvailable` and cgroup-v2 headroom | Generic safety; preserve other platforms | PR-ready on `pr/linux-memory-budget` |
+| 2 | POSIX model-container ownership lock with explicit opt-out | Generic safety/policy | PR-ready on `pr/posix-model-lock` |
 | 3 | Explicit Linux CPU-list affinity | Generic configuration | Keep the GN100 CPU choice outside core |
 | 4 | Final phase/layer trace and request-boundary flushing | Generic observability | Reconcile with upstream cache traces |
 | 5 | Transactional in-memory state export/import and caller-owned budget reservation | Generic engine API | Required before server prefix reuse |
