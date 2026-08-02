@@ -1,5 +1,11 @@
 # WASTE — Weight-Aware Streaming Tensor Engine
 
+> **NVIDIA GB10 / DGX Spark / Acer Veriton GN100 work:** this fork keeps its
+> portable upstream mirror on `main`, the current GB10 integration on
+> `spark/integration`, and immutable measured milestones under `archive/`.
+> See [docs/GN100.md](docs/GN100.md) for results and reproduction notes, and
+> [docs/UPSTREAMING.md](docs/UPSTREAMING.md) for the pull-request plan.
+
 **Kimi K3 — 2.78 trillion parameters — running on a consumer laptop.**
 
 ```
