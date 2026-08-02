@@ -39,7 +39,7 @@ The order below follows dependencies, not the historical sprint order.
 | Order | Proposed PR | Upstream boundary | Status on current base |
 | ---: | --- | --- | --- |
 | 0 | Linux 4 KiB `O_DIRECT` eligibility and transfer probing | Portable correctness | Already implemented upstream; no duplicate PR |
-| 1 | Auto-budget from Linux `MemAvailable` and cgroup-v2 headroom | Generic safety; preserve other platforms | Upstream 0.6.3 has stable cgroup capacity; current-pressure layer is discuss-first |
+| 1 | Auto-budget from Linux `MemAvailable` and cgroup-v2 headroom | Generic safety; preserve other platforms | Upstream 0.6.3 has stable cgroup capacity; GN100 pressure row does not support upstreaming the current hard ceiling |
 | 2 | POSIX model-container ownership lock with explicit opt-out | Generic safety/policy | PR-ready on `pr/posix-model-lock` |
 | 3 | Explicit Linux CPU-list affinity | Generic configuration | Keep the GN100 CPU choice outside core |
 | 4 | Final phase/layer trace and request-boundary flushing | Generic observability | Reconcile with upstream cache traces |
@@ -60,11 +60,11 @@ short failure mode and offer the patch; open the PR if they want that shape.
 Upstream 0.6.3 independently fixed the stable half of the Linux memory issue:
 `waste_usable_ram()` now respects finite cgroup-v2 max/high over the hierarchy.
 Do not submit the old `pr/linux-memory-budget` branch as written. The remaining
-proposal is only the dynamic half (`MemAvailable`, `memory.current`, early
-under-floor refusal, and host reservations), reconstructed on current upstream
-and presented as a policy question before a PR. The Spark fork's API-2 ABI and
-host-reservation fields are integration dependencies, not changes to smuggle
-into that first discussion.
+candidate was only the dynamic half (`MemAvailable`, `memory.current`, early
+under-floor refusal, and host reservations). Sprint 10's pressure row below
+does not support sending its current hard-ceiling shape upstream. The Spark
+fork's API-2 ABI and host-reservation fields remain integration dependencies,
+not changes to smuggle into another memory-policy discussion.
 
 The old public `pread_batch` backend remains a diagnostic control, not a
 production API.  A raw `io_uring` PR is conditional: first show that it adds
@@ -76,6 +76,23 @@ not, retain it only in the archive.
 PM QoS, fixed CPU sets, thermal/CPPC/NVML/PMU collection, `bpftrace` sidecars,
 cooldown gates, and fixed K3 prompts/budgets are Spark integration and evidence
 tools.  They do not belong in the portable engine PRs.
+
+### Current-pressure decision
+
+Sprint 10 measured the remaining memory-policy question before proposing code.
+With a freshly faulted-in 31.3 GB host workload, every K3 open-time snapshot
+put the Spark ceiling near 77.18 GB: enough for `floor + 2x`, not the 86.58 GB
+`floor + 3x` recommendation. Three matched pressure arms at each budget found
+47.12 s median decode at 3x versus 48.31 s at 2x. The step-down reduced
+reclaim and retained roughly 18.5 GB more headroom, but cut the expert hit rate
+from 49% to 36% and raised median filesystem input from 342.62 to 396.73 GB.
+
+That is not evidence for an upstream default. Keep the Spark hard ceiling as
+fork safety policy while its tradeoff is intentional; do not send it as a
+performance optimization. A future generic proposal needs either an explicit
+safety contract or a deeper pressure sweep that measures the crossover where
+3x actually loses to 2x. Raw rows are in
+[gn100/sprint10-pressure.csv](gn100/sprint10-pressure.csv).
 
 ## Shape of one PR
 
