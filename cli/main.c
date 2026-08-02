@@ -484,12 +484,13 @@ static int cmd_plan(int argc, char **argv)
                (unsigned long long)p.min_expert_cache,
                (unsigned long long)p.floor_bytes,
                (unsigned long long)p.recommended_bytes);
-        /* The engine already owns both platform questions, so JSON clients
-         * should not reimplement GlobalMemoryStatusEx, /proc/meminfo and
-         * cgroup-v2 traversal. Either figure is 0 when it cannot be known;
-         * unlike physical RAM, the current ceiling can change. */
-        printf(",\"physical_ram_bytes\":%llu,\"memory_ceiling_bytes\":%llu",
+        /* Stable capacity and current safety are different questions. Report
+         * both beside physical RAM so clients do not duplicate platform and
+         * cgroup parsing or mistake host RAM for container capacity. */
+        printf(",\"physical_ram_bytes\":%llu,\"usable_ram_bytes\":%llu,"
+               "\"memory_ceiling_bytes\":%llu",
                (unsigned long long)waste_physical_ram(),
+               (unsigned long long)waste_usable_ram(),
                (unsigned long long)waste_memory_ceiling());
         if (p.vision_bytes)
             printf(",\"vision_bytes\":%llu", (unsigned long long)p.vision_bytes);
@@ -779,14 +780,24 @@ static void show_chosen_budget(waste_ctx *c, const opts *o)
      * this is what is held, not what was allowed. */
     const uint64_t used = u.trunk_bytes + u.state_bytes + u.scratch_bytes +
                           u.min_expert_cache + u.host_reserved_bytes;
-    const uint64_t phys = waste_physical_ram();
-    char ub[32], cb[32], pb[32];
+    /* Capacity is stable; the pressure ceiling is a fresh snapshot after
+     * open and may differ from the one used to choose this budget. Label
+     * both instead of claiming either fresh value was the exact input. */
+    const uint64_t stable = waste_usable_ram();
+    const uint64_t current = waste_memory_ceiling();
+    char ub[32], cb[32], sb[32], mb[32];
     human(used, ub, 32);
     human(u.min_expert_cache, cb, 32);
-    if (phys) {
-        human(phys, pb, 32);
-        fprintf(stderr, "waste: no --budget, using %s of %s (expert cache %s)\n",
-                ub, pb, cb);
+    if (stable && current) {
+        human(stable, sb, 32);
+        human(current, mb, 32);
+        fprintf(stderr, "waste: no --budget, using %s (expert cache %s); "
+                "stable capacity %s, current safe ceiling now %s\n",
+                ub, cb, sb, mb);
+    } else if (stable) {
+        human(stable, sb, 32);
+        fprintf(stderr, "waste: no --budget, using %s (expert cache %s); "
+                "stable capacity %s\n", ub, cb, sb);
     } else {
         fprintf(stderr, "waste: no --budget, using %s (expert cache %s)\n", ub, cb);
     }

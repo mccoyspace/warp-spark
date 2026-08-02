@@ -240,7 +240,7 @@ const char *waste_strerror(waste_status s)
     return "unknown error";
 }
 
-void waste_cfg_init(waste_cfg *cfg)
+void waste_cfg_init_v2(waste_cfg *cfg)
 {
     if (!cfg) return;
     memset(cfg, 0, sizeof *cfg);
@@ -301,21 +301,39 @@ uint64_t waste_physical_ram(void)
 #endif
 }
 
-static uint64_t current_memory_ceiling(uint64_t physical)
+/* What the budget is allowed to size against. Physical RAM is how big the
+ * machine is; this is how much of it this process may have, and on Linux
+ * the two differ by the whole ratio between a host and a container limit —
+ * sysconf reads host MemTotal from inside a cgroup. See src/memory.c. */
+static uint64_t usable_ram_from_physical(uint64_t physical)
+{
+    const uint64_t cg = waste_cgroup_limit("/proc/self/cgroup", "/sys/fs/cgroup");
+    if (!cg) return physical;
+    return (!physical || cg < physical) ? cg : physical;
+}
+
+uint64_t waste_usable_ram(void)
+{
+    return usable_ram_from_physical(waste_physical_ram());
+}
+
+static uint64_t current_memory_ceiling(uint64_t physical, uint64_t usable)
 {
     waste_memory_pressure pressure;
     waste_memory_pressure_read(&pressure, physical, "/proc/meminfo",
                                "/proc/self/cgroup", "/sys/fs/cgroup");
-    return waste_memory_safe_ceiling(physical, &pressure);
+    return waste_memory_safe_ceiling(usable, &pressure);
 }
 
 uint64_t waste_memory_ceiling(void)
 {
-    return current_memory_ceiling(waste_physical_ram());
+    const uint64_t physical = waste_physical_ram();
+    return current_memory_ceiling(physical,
+                                  usable_ram_from_physical(physical));
 }
 
-waste_status waste_plan_memory(const char *model_path, uint32_t ctx_tokens,
-                               waste_memplan *out)
+waste_status waste_plan_memory_v2(const char *model_path, uint32_t ctx_tokens,
+                                  waste_memplan *out)
 {
     if (!model_path || !out) return WASTE_E_ARG;
     char p[512];
@@ -510,8 +528,8 @@ waste_status waste_plan_memory(const char *model_path, uint32_t ctx_tokens,
 
 /* ---- lifecycle ---------------------------------------------------------- */
 
-waste_status waste_open(const char *model_path, const waste_cfg *cfg_in,
-                        waste_ctx **out)
+waste_status waste_open_v2(const char *model_path, const waste_cfg *cfg_in,
+                           waste_ctx **out)
 {
     if (!model_path || !out) return WASTE_E_ARG;
     *out = NULL;
@@ -566,11 +584,14 @@ waste_status waste_open(const char *model_path, const waste_cfg *cfg_in,
      * that fits. On 64 GB K3 gets floor + 1x = 46 GB, the measured
      * optimum; on an otherwise idle 128 GB host it still gets the full
      * floor + 3x; a model whose recommendation already fits, like
-     * Kimi-Linear, is unaffected. Linux also applies current MemAvailable
-     * and cgroup-v2 limits. If those cannot hold the floor plus a caller's
-     * host reservation, fail before making the model-sized allocation. */
-    const uint64_t phys = waste_physical_ram();
-    const uint64_t cap = current_memory_ceiling(phys);
+     * Kimi-Linear, is unaffected. "The machine" first means stable usable
+     * capacity, not host physical RAM: a finite cgroup max/high can be much
+     * smaller. Linux then applies current MemAvailable and cgroup headroom.
+     * If that dynamic ceiling cannot hold the floor plus a caller's host
+     * reservation, fail before making the model-sized allocation. */
+    const uint64_t physical = waste_physical_ram();
+    const uint64_t usable = usable_ram_from_physical(physical);
+    const uint64_t cap = current_memory_ceiling(physical, usable);
     uint64_t budget = cfg.ram_budget_bytes;
     if (cfg.host_reserved_bytes > UINT64_MAX - c->plan.floor_bytes) {
         model_lock_release(c->model_lock);
@@ -639,10 +660,10 @@ waste_status waste_open(const char *model_path, const waste_cfg *cfg_in,
                 budget / 1073741824.0, cap / 1073741824.0);
 #else
         fprintf(stderr,
-                "waste: budget %.1f GB leaves under 12%% of this machine's "
-                "%.1f GB free\n       the OS will page out the expert cache "
+                "waste: budget %.1f GB leaves under 12%% of the %.1f GB this "
+                "process may use\n       the OS will page out the expert cache "
                 "and throughput collapses\n",
-                budget / 1073741824.0, phys / 1073741824.0);
+                budget / 1073741824.0, usable / 1073741824.0);
 #endif
     }
 
@@ -705,7 +726,7 @@ void waste_close(waste_ctx *c)
     free(c);
 }
 
-waste_status waste_memory_used(const waste_ctx *c, waste_memplan *out)
+waste_status waste_memory_used_v2(const waste_ctx *c, waste_memplan *out)
 {
     if (!c || !out) return WASTE_E_ARG;
     *out = c->plan;

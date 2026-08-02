@@ -24,7 +24,7 @@ if __package__ in (None, ""):                    # python3 serve/__main__.py
 from . import api                                            # noqa: E402
 from .engine import (CACHE_LFRU, CACHE_LRU,                  # noqa: E402
                      Engine, EngineError, build_info, physical_ram,
-                     plan_memory)
+                     usable_ram, memory_ceiling, plan_memory)
 from .prefix_cache import CONTROLLER_OVERHEAD_BYTES          # noqa: E402
 from .profiles import (PROFILE_NAMES, ProfileError,          # noqa: E402
                        resolve_profile)
@@ -191,7 +191,9 @@ examples:
     try:
         if args.plan:
             plan = plan_memory(str(model), args.ctx)
-            ram = physical_ram()
+            physical = physical_ram()
+            usable = usable_ram()
+            ceiling = memory_ceiling()
             print(f"{build_info()}\n")
             print(f"  trunk        {human(plan.trunk_bytes)}")
             print(f"  state        {human(plan.state_bytes)}")
@@ -205,8 +207,12 @@ examples:
             if plan.vision_bytes:
                 print(f"  vision       {human(plan.vision_bytes)} "
                       f"(only with --vision)")
-            if ram:
-                print(f"\n  this machine has {human(ram)}")
+            if physical:
+                print(f"\n  host physical RAM           {human(physical)}")
+            if usable:
+                print(f"  stable process capacity     {human(usable)}")
+            if ceiling:
+                print(f"  automatic-open ceiling now  {human(ceiling)} (snapshot)")
             return 0
 
         # Adopt the private control channel before the expensive model load.

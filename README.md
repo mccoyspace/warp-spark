@@ -154,6 +154,9 @@ Conversion takes about 4.7 hours with three workers on the test machine. See [do
 
 Do not set `--budget` unless you have a reason to. By default WASTE chooses a
 safe memory budget, reports it, and refuses to start below the model's floor.
+Inside a container stable capacity comes from the cgroup limit rather than the
+host's RAM; this integration also caps automatic opens by current Linux
+headroom and caller-declared host reservation.
 Use `./waste --help` for the complete command list.
 
 More CLI examples, including evaluation, tokenization, saved sessions, and multimodal prompts, are in [examples/README.md](examples/README.md).

@@ -29,6 +29,7 @@ import subprocess
 import sys
 import tempfile
 import unittest
+from unittest import mock
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
@@ -99,18 +100,54 @@ class TestLibrary(EngineTestCase):
     def test_build_info_is_not_empty(self):
         self.assertIn("WASTE", E.build_info())
 
+    def test_api_identity_and_struct_sizes(self):
+        lib = self.engine.lib
+        self.assertEqual(lib.waste_api_version(), E.WASTE_API_VERSION)
+        self.assertEqual(lib.waste_sizeof_cfg(), E.C.sizeof(E.Cfg))
+        self.assertEqual(lib.waste_sizeof_memplan(), E.C.sizeof(E.MemPlan))
+
+    def test_layout_sensitive_api1_symbols_are_not_exported(self):
+        # An API-1 binary must fail symbol resolution, not call API-2 with
+        # its smaller structs and overwrite adjacent memory.
+        for name in ("waste_cfg_init", "waste_plan_memory", "waste_open",
+                     "waste_memory_used"):
+            with self.subTest(name=name):
+                self.assertFalse(hasattr(self.engine.lib, name))
+
+    def test_upstream_api1_library_is_rejected_cleanly(self):
+        # Stock upstream 0.6.3 has no API-2 identity symbols. Simulate that
+        # library at the loader boundary and prove no struct call is reached.
+        current = E._LIB
+        try:
+            E._LIB = None
+            with (mock.patch.object(E.C, "CDLL", return_value=object()),
+                  mock.patch.dict(os.environ,
+                                  {"WASTE_LIB": "/tmp/upstream-0.6.3.so"})):
+                with self.assertRaises(E.EngineError) as cm:
+                    E._lib()
+            self.assertIn("incompatible library", str(cm.exception))
+            self.assertIn("API-2 ABI identity", str(cm.exception))
+        finally:
+            E._LIB = current
+
     def test_physical_ram(self):
         # 0 means "could not determine", which is allowed; anything else
         # should be a plausible machine.
         ram = E.physical_ram()
         self.assertTrue(ram == 0 or ram > (1 << 28), ram)
 
+    def test_usable_ram(self):
+        usable, ram = E.usable_ram(), E.physical_ram()
+        self.assertTrue(usable == 0 or usable > (1 << 24), usable)
+        if usable and ram:
+            self.assertLessEqual(usable, ram)
+
     def test_memory_ceiling(self):
-        ceiling, ram = E.memory_ceiling(), E.physical_ram()
+        ceiling, usable = E.memory_ceiling(), E.usable_ram()
         self.assertIsInstance(ceiling, int)
         self.assertGreaterEqual(ceiling, 0)
-        if ceiling and ram:
-            self.assertLessEqual(ceiling, ram)
+        if ceiling and usable:
+            self.assertLessEqual(ceiling, usable)
 
     def test_plan_memory_without_loading(self):
         plan = E.plan_memory(str(self.model), 512)

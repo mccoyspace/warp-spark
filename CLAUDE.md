@@ -50,8 +50,8 @@ tests/run.sh /nonexistent             # forces the synthetic container (what CI 
 
 With no container it builds a few-MB synthetic one via
 `tools/make_test_container.py` and reports SKIP — loudly — for anything
-needing real weights. The current synthetic run is 32 pass / 12 skip; with
-both K3 and Kimi-Linear containers on disk the suite has 44 checks.
+needing real weights. Use the final summary from the current run as the test
+count; integration and upstream checks are both added over time.
 
 The download-script checks start `tests/range_server.py` on an ephemeral
 port and read the number back through `--port-file`. Keep it that way — a
@@ -167,7 +167,12 @@ minimum cache). A budget under the floor is **refused** with
 `WASTE_E_RAM_BUDGET` rather than swapping. A budget of 0 means the engine
 chooses: it starts from the container's recommendation and steps down a
 whole *token working set* at a time (`floor + 3x`, `2x`, `1x`, floor) until
-it fits under 7/8 of physical RAM, then says on stderr what it picked.
+it fits under the current safe ceiling. Stable capacity is the smaller of
+physical RAM and finite cgroup-v2 max/high; Linux then bounds it with
+`MemAvailable` and cgroup current headroom. An automatic open whose floor is
+above that known ceiling returns `WASTE_E_MEMORY`; explicit budgets remain the
+caller's contract and warn when they exceed current headroom. The CLI reports
+what it picked plus separately labeled capacity and current telemetry.
 
 Cache size is only meaningful in whole multiples of one token's working set
 (K3: 16 experts × 92 layers ≈ 17 GB). Below one multiple the hit rate is

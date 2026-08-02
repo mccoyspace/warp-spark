@@ -2278,3 +2278,78 @@ That does not erase §40 or §41. Their Mac cache sizes and storage path made
 lookahead's timing and byte economics different. It establishes the missing
 boundary: a prefetch policy is qualified together with its cache, reader,
 storage, and harness, not inherited from another machine's hit-rate table.
+
+## 43. The machine the resolver was sizing against was not ours (2026-08-02)
+
+The default budget has one machine number in it, and until now that number
+was `waste_physical_ram()`. On Linux it is `sysconf(_SC_PHYS_PAGES) *
+sysconf(_SC_PAGESIZE)`, which reads the host's `MemTotal` — and reads
+exactly the same thing from inside a cgroup that is allowed a fraction of
+it. Every containerized run has therefore been sizing against RAM it was
+never going to be given: K3 in a 32 GiB cgroup on a 256 GiB host resolves
+`floor + 3x`, asks for about 80 GB, and is killed.
+
+**This is not §16 and it does not behave like §16.** The cliff there is a
+performance failure with a shape — the hit rate climbs, the bytes read
+fall, throughput drops eightfold, and it is visible in a sweep. A cgroup
+limit is a kill. Nothing degrades first, no allocation policy softens it,
+and the sweep that found §16 could never have found this one, because the
+machine it was swept on was not in a cgroup. It is the same class of bug
+as §27: a platform path that every green run had avoided rather than
+exercised.
+
+Stable capacity is now `min(physical, cgroup limit)`. The reader takes the
+smallest finite `memory.max` or `memory.high` across this cgroup and its
+ancestors: the limit is
+hierarchical, so a leaf saying `max` does not cancel a finite parent, and
+`memory.high` belongs there because a group the kernel reclaims from is a
+group whose expert cache it takes back, which is §16's mechanism arriving
+by another road.
+
+**What deliberately did not go into `waste_usable_ram()` is current
+pressure.** `MemAvailable` and `memory.current` are a different kind of
+number: capacity is stable, while pressure moves between a read and an
+allocation. Portable upstream 0.6.3 stops at that stable API. The Spark
+integration composes it with §38's `waste_memory_ceiling()`, which takes one
+current snapshot for an automatic open and can refuse before a model-sized
+allocation. The distinction is now executable: capacity says what machine the
+process owns; the dynamic ceiling says what this open can safely add now.
+
+Measured in the only place it can be, which is a container. `docker run
+--memory=6g` on a host reporting 8,319,213,568 bytes of RAM:
+`waste plan --json` gives `physical_ram_bytes` 8,319,213,568 and
+`usable_ram_bytes` **6,442,450,944** — the limit exactly. The suite's own
+budget check, run inside that cgroup, reports `usable 6.00 GB`, which is
+the resolver consuming it rather than the reader merely reading it.
+24 passed, 0 failed, 16 skipped on Linux there.
+
+Both cgroup namespace modes were exercised, and they fail differently,
+which is why the walk has to end *on* the mounted root:
+
+| mode | `/proc/self/cgroup` | where the limit is | usable |
+|---|---|---|---|
+| private (default) | `0::/` | the mounted root itself | 5–6 GiB, exact |
+| `--cgroupns=host` | `0::/docker/<id>` | that path, on the host hierarchy | 5 GiB, exact |
+
+Under `--cgroupns=host` the composed path does exist, and
+`/sys/fs/cgroup/memory.max` does **not** — confirming the assumption the
+fallback rests on, that a real unified root carries no limit and an
+unconfined host therefore still reads 0.
+
+The choice changes, not just the reading. On the synthetic container
+(floor 8,844,904, recommended 9,139,816) a 12 MiB cgroup holds
+`floor + 3x` and opens silently. Upstream 0.6.3's capacity-only policy runs a
+9 MiB group at the floor and says so. The Spark integration's current-pressure
+layer is intentionally stricter: the same under-floor automatic open returns
+`WASTE_E_MEMORY` before a model-sized allocation. Before the upstream fix,
+both groups read 8.32 GB and saw nothing to say.
+
+What is *not* here is a throughput row. This is arithmetic on a number
+that was provably the wrong one, and the K3-in-a-cgroup case that motivates
+it — 80.64 GB asked of a 32 GiB allowance — is derived from the resolver's
+own rule, not run.
+
+The real-container result above belongs to the upstream capacity layer: 24
+passes, zero failures, and 16 skips in that container. It is not the combined
+Spark integration-suite count and it does not relabel the GN100 throughput
+campaign, whose explicit cache size bypasses automatic budget resolution.

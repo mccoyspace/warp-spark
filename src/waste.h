@@ -36,7 +36,7 @@
 extern "C" {
 #endif
 
-#define WASTE_API_VERSION 1
+#define WASTE_API_VERSION 2
 
 /* ---- engine version ----------------------------------------------------
  * Semantic versioning. The numeric form is MAJOR*10000 + MINOR*100 + PATCH,
@@ -47,15 +47,22 @@ extern "C" {
  * for an embeddable engine that may be updated independently.
  */
 #define WASTE_VERSION_MAJOR  0
-#define WASTE_VERSION_MINOR  6
-#define WASTE_VERSION_PATCH  2
-#define WASTE_VERSION_STRING "0.6.2"
+#define WASTE_VERSION_MINOR  7
+#define WASTE_VERSION_PATCH  0
+#define WASTE_VERSION_STRING "0.7.0-spark.1"
+#define WASTE_UPSTREAM_VERSION_STRING "0.6.3"
 #define WASTE_VERSION_NUMBER (WASTE_VERSION_MAJOR * 10000 + \
                               WASTE_VERSION_MINOR * 100 + \
                               WASTE_VERSION_PATCH)
 
-const char *waste_version(void);         /* e.g. "0.6.2"                    */
-int         waste_version_number(void);  /* e.g. 600                        */
+const char *waste_version(void);         /* e.g. "0.7.0-spark.1"            */
+int         waste_version_number(void);  /* e.g. 700                        */
+/* ABI identity and the two public structures whose layouts changed in API
+ * 2. A dynamic-language binding must check all three before passing either
+ * structure across the boundary. */
+int         waste_api_version(void);
+size_t      waste_sizeof_cfg(void);
+size_t      waste_sizeof_memplan(void);
 /* Build details: backend, SIMD, container format version. Never NULL. */
 const char *waste_build_info(void);
 
@@ -102,8 +109,9 @@ typedef struct {
 
 /* Compute the memory floor without loading weights. ctx_tokens sizes the
  * KV/state part. Cheap: reads the manifest and optional vision config. */
-waste_status waste_plan_memory(const char *model_path, uint32_t ctx_tokens,
-                               waste_memplan *out);
+waste_status waste_plan_memory_v2(const char *model_path, uint32_t ctx_tokens,
+                                  waste_memplan *out);
+#define waste_plan_memory waste_plan_memory_v2
 
 /* ---- configuration ----------------------------------------------------- */
 
@@ -123,8 +131,10 @@ typedef struct {
      * only useful in whole multiples of one token's working set, so it
      * starts from waste_memplan.recommended_bytes (floor + 3x that set)
      * and steps down a whole multiple at a time until the total fits under
-     * the smallest of 7/8 physical RAM, Linux MemAvailable minus the host
-     * reserve, and finite cgroup-v2 headroom minus that cgroup's reserve.
+     * the current safe ceiling. Stable capacity is 7/8 of
+     * waste_usable_ram(), which is physical RAM or a smaller finite cgroup
+     * max/high. Linux further bounds that by MemAvailable and cgroup
+     * headroom, each with a proportional reserve.
      * It does not spend the remainder up to that ceiling: the last fraction
      * buys a little hit rate and risks the OS paging the cache out. When a
      * known current ceiling cannot hold floor_bytes plus caller-owned
@@ -224,19 +234,22 @@ typedef struct {
 
 /* Fills cfg with defaults. Always call this before setting fields, so
  * new fields added in later versions stay sane. */
-void waste_cfg_init(waste_cfg *cfg);
+void waste_cfg_init_v2(waste_cfg *cfg);
+#define waste_cfg_init waste_cfg_init_v2
 
 /* ---- lifecycle --------------------------------------------------------- */
 
 typedef struct waste_ctx waste_ctx;
 
-waste_status waste_open(const char *model_path, const waste_cfg *cfg,
-                        waste_ctx **out);
+waste_status waste_open_v2(const char *model_path, const waste_cfg *cfg,
+                           waste_ctx **out);
+#define waste_open waste_open_v2
 void waste_close(waste_ctx *ctx);
 
 /* What the engine actually allocated, after open, plus the caller-owned
  * reservation charged to this context's hard budget. */
-waste_status waste_memory_used(const waste_ctx *ctx, waste_memplan *out);
+waste_status waste_memory_used_v2(const waste_ctx *ctx, waste_memplan *out);
+#define waste_memory_used waste_memory_used_v2
 
 /* What went wrong, specifically, when the status alone is too coarse to
  * act on: "expert 412 of layer 37: checksum mismatch" rather than "I/O
@@ -448,9 +461,16 @@ waste_status waste_get_reader_config(const waste_ctx *ctx,
  * expert cache, and a hit then costs a page fault. */
 uint64_t waste_physical_ram(void);
 
+/* How much RAM this process may use as stable capacity: physical RAM, or a
+ * smaller finite cgroup-v2 memory.max/memory.high across its ancestors.
+ * This can differ from physical RAM by the whole host/container ratio. 0 when
+ * neither figure can be determined. */
+uint64_t waste_usable_ram(void);
+
 /* Current ceiling used by automatic budgeting, or 0 when no memory figure
- * is available. On Linux this includes MemAvailable and cgroup-v2 pressure;
- * unlike physical RAM it can change between calls. */
+ * is available. It starts from reserved waste_usable_ram() capacity; on Linux
+ * it also includes MemAvailable and cgroup-v2 current headroom. Unlike stable
+ * usable capacity, this safety snapshot can change between calls. */
 uint64_t waste_memory_ceiling(void);
 
 #ifdef __cplusplus

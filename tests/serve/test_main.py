@@ -10,6 +10,7 @@ import tempfile
 import unittest
 from contextlib import redirect_stderr, redirect_stdout
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
@@ -36,6 +37,34 @@ class _StoppedServer:
 
 
 class TestMain(unittest.TestCase):
+    def test_plan_labels_physical_capacity_and_current_ceiling(self):
+        tmp = tempfile.mkdtemp(prefix="waste-main-test-")
+        model = Path(tmp) / "model.waste"
+        model.mkdir()
+        output = io.StringIO()
+        plan = SimpleNamespace(
+            trunk_bytes=1 << 20, state_bytes=2 << 20,
+            scratch_bytes=3 << 20, min_expert_cache=4 << 20,
+            floor_bytes=10 << 20, recommended_bytes=22 << 20,
+            vision_bytes=0)
+        try:
+            with (patch.object(MAIN, "Engine") as open_,
+                  patch.object(MAIN, "plan_memory", return_value=plan),
+                  patch.object(MAIN, "build_info", return_value="WASTE test"),
+                  patch.object(MAIN, "physical_ram", return_value=128 << 30),
+                  patch.object(MAIN, "usable_ram", return_value=6 << 30),
+                  patch.object(MAIN, "memory_ceiling", return_value=5 << 30),
+                  redirect_stdout(output), redirect_stderr(output)):
+                status = MAIN.main([str(model), "--plan"])
+            text = output.getvalue()
+            self.assertEqual(status, 0, text)
+            self.assertIn("host physical RAM           128.0 GB", text)
+            self.assertIn("stable process capacity     6.0 GB", text)
+            self.assertIn("automatic-open ceiling now  5.0 GB (snapshot)", text)
+            open_.assert_not_called()
+        finally:
+            shutil.rmtree(tmp, ignore_errors=True)
+
     def test_conversation_head_is_rejected_before_engine_open(self):
         tmp = tempfile.mkdtemp(prefix="waste-main-test-")
         model = Path(tmp) / "model.waste"

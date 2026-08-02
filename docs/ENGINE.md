@@ -55,7 +55,8 @@ shell, a host program can do from C.
 Shipped in 0.5.0, nine commands: `run`, `chat` (state kept across turns,
 `/reset`, `/stats`, `/save`, `/load`, `/image`), `eval`, `tokenize`,
 `detokenize`, `bench`, `plan`, `info`, `version` — the full surface is
-tabulated at the end of this document, and it is still those nine at 0.6.2.
+tabulated at the end of this document, and it is still those nine in the
+0.7.0-spark.1 integration.
 Still to come as *subcommands*: `serve` and `convert`.
 
 Both exist; neither is a `waste` subcommand, and for related reasons. The
@@ -154,24 +155,32 @@ paging, where a hit costs a page fault. Filling a 7/8 cap gave K3 a
 pre-read-ahead sweep; the ratios between them are the point and read-ahead
 does not change them — see [EFFICIENCY.md](EFFICIENCY.md).)
 
-So the default steps down a whole working set at a time and takes the
-largest that fits: `floor + 3x`, else `2x`, else `1x`, else the floor. A
-host reservation then displaces expert cache inside that same selected
-total. If the reservation is larger than all optional cache, the total rises
-only to the combined floor required to open, and only if that combined floor
-still fits a known Linux current-memory ceiling.
-K3 lands on `floor + 1x` here — a 46.24 GB budget, 17.56 GB of cache, and
-the top of the measured curve with no flag given. An otherwise idle 128 GB
-machine still gets the full `3x`, and a model whose recommendation already
-fits, like Kimi-Linear, is unaffected. On Linux, the ceiling is also bounded by
-current `MemAvailable` minus the host reserve and by finite cgroup-v2
-headroom minus one eighth of that cgroup's effective capacity. The engine
-walks cgroup ancestors because a leaf can say `memory.max=max` while its
-parent is finite. When the engine floor plus host reservation is above a
-known current ceiling, automatic sizing returns `WASTE_E_MEMORY` before a
-model-sized allocation.
-An explicit nonzero budget remains the caller's contract and is honored,
-with a warning when it is above the current safe ceiling.
+The default has two memory layers. Stable capacity is
+`waste_usable_ram()`: physical RAM or, when smaller, the least finite cgroup-v2
+`memory.max` or `memory.high` over the process and every ancestor. This fixes
+the container failure in upstream 0.6.3. Linux `sysconf(_SC_PHYS_PAGES)` reads
+host RAM from inside a cgroup, so without this layer a 32 GiB group on a large
+host could resolve K3 at roughly 80 GB and be killed rather than merely slowed.
+
+The Spark integration then takes one current-pressure snapshot at open.
+`waste_memory_ceiling()` is the smallest of 7/8 stable usable capacity,
+`MemAvailable` minus the same proportional reserve, and finite cgroup
+headroom (`limit - memory.current`) minus that limit's reserve. Stable capacity
+still binds when a current file is missing or malformed. These are deliberately
+separate APIs: capacity describes the process's machine; the ceiling describes
+what one automatic open can safely add now.
+
+Within that ceiling the resolver steps down a whole working set at a time and
+takes the largest of `floor + 3x`, `2x`, `1x`, or the floor. A host reservation
+displaces expert cache inside the selected total. If it is larger than all
+optional cache, the total rises only to the combined floor and only when that
+floor still fits the known Linux current ceiling. K3 lands on `floor + 1x` on
+the measured 64 GB Mac; an idle 128 GB GN100 still gets the full `3x`.
+
+When the engine floor plus caller reservation is above a known Linux ceiling,
+automatic sizing returns `WASTE_E_MEMORY` before a model-sized allocation. An
+explicit nonzero budget remains the caller's contract and is honored, with a
+warning when it exceeds current safe headroom.
 
 ### What the floor is made of
 
@@ -346,10 +355,10 @@ Four of those are bit-identity checks — cache, read-ahead, lookahead,
 purgeable — and they are the reason each of those mechanisms could ship:
 every one changes *when* bytes move and none may change what comes out.
 
-**44 checks** as of 2026-08-02. With both containers on disk: **43 pass, 0
+**45 checks** as of 2026-08-02. With both containers on disk: **44 pass, 0
 fail, 1 SKIP** — the one skip is image normalization against the release,
 which Kimi-Linear has no vision tower for. With no container at all the same
-run is **32 pass / 0 fail / 12 SKIP**: the synthetic container carries the
+run is **33 pass / 0 fail / 12 SKIP**: the synthetic container carries the
 engine checks, and everything needing real weights or a tokenizer says SKIP
 rather than passing quietly. Take the numbers from a run, not from here:
 they move as checks are added.
@@ -360,12 +369,13 @@ stale test binary. So it rebuilds first, and a missing prerequisite is
 reported as SKIP, never as a pass.
 
 
-## CLI surface (2026-07-28)
+## CLI surface (2026-08-02)
 
-Nine commands, and every public API function reachable from at least one
-of them — the single exception being `waste_version_number`, the integer
-form of the version, which exists for a host's `#if` and has nothing to
-print:
+Nine commands. This table maps the CLI-facing library calls; it is not a
+claim that every embedding API needs a shell command. The server also uses
+`waste_state_size/export/import` for in-memory prefix snapshots and
+`waste_prefill_chunk_size` for safe chunk boundaries. Version, API and
+structure-size functions exist for host compatibility checks.
 
 | command | uses |
 |---|---|
@@ -374,7 +384,7 @@ print:
 | `eval` | `waste_eval`, `waste_detokenize` |
 | `tokenize` / `detokenize` | `waste_tokenize`, `waste_detokenize` |
 | `bench` | `waste_get_stats` |
-| `plan` | `waste_plan_memory`, `waste_physical_ram`, `waste_memory_ceiling` |
+| `plan` | `waste_plan_memory`, `waste_physical_ram`, `waste_usable_ram`, `waste_memory_ceiling` |
 | `info` | `waste_model_get_info`, `waste_memory_used` |
 
 Images add four more, reachable from `run`, `chat` and `eval` via

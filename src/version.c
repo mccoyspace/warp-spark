@@ -12,6 +12,9 @@
 
 const char *waste_version(void) { return WASTE_VERSION_STRING; }
 int waste_version_number(void) { return WASTE_VERSION_NUMBER; }
+int waste_api_version(void) { return WASTE_API_VERSION; }
+size_t waste_sizeof_cfg(void) { return sizeof(waste_cfg); }
+size_t waste_sizeof_memplan(void) { return sizeof(waste_memplan); }
 
 const char *waste_build_info(void)
 {
@@ -24,8 +27,9 @@ const char *waste_build_info(void)
          * 12x on the read path — so which one a build got is not
          * something to guess at from the outside. */
         snprintf(buf, sizeof buf,
-                 "WASTE %s (container v%d, backend %s, crc32 %s, %s)",
-                 WASTE_VERSION_STRING, WASTE_FORMAT_VERSION,
+                 "WASTE %s (upstream %s, container v%d, backend %s, crc32 %s, %s)",
+                 WASTE_VERSION_STRING, WASTE_UPSTREAM_VERSION_STRING,
+                 WASTE_FORMAT_VERSION,
                  waste_backend_name(), waste_crc32_impl(),
 #if defined(__aarch64__)
                  "arm64"

@@ -67,10 +67,19 @@ fi
 # ---------------------------------------------------------------- unit ----
 head_ "kernels vs the reference implementations"
 
+# Stable cgroup capacity and dynamic pressure are both policy, not kernels,
+# but they decide every automatic open and run in milliseconds against
+# synthetic files on every platform.
 if ./test_memory "$TMP" 2>/dev/null | grep -q "^PASS"; then
-    ok "automatic memory budget arithmetic and host accounting"
+    ok "automatic memory budget, cgroup capacity and current headroom"
 else
-    no "automatic memory budget arithmetic or host accounting"
+    no "automatic memory budget or host accounting"
+fi
+
+if ./test_abi "$LOCK_MODEL" 2>/dev/null | grep -q "^ABI OK"; then
+    ok "API-2 struct identity and guarded plan/open round trips"
+else
+    no "API-2 identity or public struct bounds"
 fi
 
 if ./test_ecache 2>/dev/null | grep -q "^ECACHE OK"; then
@@ -428,11 +437,19 @@ for t in m.get("trunk", []):
 r = subprocess.run([WASTE, "plan", sys.argv[1], "--json"],
                    capture_output=True, text=True)
 try:
-    phys = json.loads(r.stdout)["physical_ram_bytes"]
+    # Respect both stable capacity and current pressure. This path calls the
+    # lower-level model loader directly, so waste_open cannot refuse it before
+    # a dangerous f32 allocation.
+    memory = json.loads(r.stdout)
+    bounds = [memory.get(k, 0) for k in
+              ("usable_ram_bytes", "memory_ceiling_bytes")]
+    bounds = [x for x in bounds if x]
+    safe = min(bounds) if bounds else 0
 except Exception:
-    phys = 0
-if phys and need > phys // 2:
-    print(f"an f32 trunk is {need / 2**30:.0f} GB of {phys / 2**30:.0f} GB of RAM")
+    safe = 0
+if safe and need > safe // 2:
+    print(f"an f32 trunk is {need / 2**30:.0f} GB; "
+          f"safe memory snapshot is {safe / 2**30:.0f} GB")
 PY
 )
     if [ -n "$q8_why" ]; then
@@ -658,11 +675,10 @@ head_ "RAM budget"
 # it always passes --budget. With no flag the engine chooses, and that
 # choice is all that stands between a model whose recommendation exceeds
 # the machine — K3 asks for 80.63 GB — and a swap storm. So assert the
-# rule, not a number, and it holds on any host: the engine steps down a
-# whole token working set at a time and takes the largest of
-# floor + 3x, 2x, 1x that fits under the engine's current memory ceiling,
-# or the floor when not even one multiple does, less at most one expert
-# record of slot rounding. Filling the cap instead is what put a 27 GB
+# shape, not a live number sampled by another process: the engine steps down
+# to one of floor + 3x, 2x, 1x, or the floor, less at most one expert record
+# of slot rounding. tests/test_memory.c separately proves largest-fitting
+# selection against fixed ceilings. Filling the cap instead is what put a 27 GB
 # cache on a 64 GB machine and cost 8x throughput — docs/LEARNED.md §16.
 default_budget() {
     python3 - "$1" <<'PY'
@@ -677,26 +693,34 @@ def j(*a):
     return json.loads(r.stdout)
 
 plan, info = j("plan", sys.argv[1]), j("info", sys.argv[1])
-# From the engine rather than duplicating Linux proc/cgroup parsing here.
-# This is the same snapshot the engine sizes itself against, so the check
-# tests floor + the largest whole working set under that ceiling.
-phys = plan["physical_ram_bytes"]
+# Read all three engine-owned figures. Stable usable capacity prevents a
+# container from sizing against host RAM; the dynamic ceiling is the snapshot
+# an automatic open uses after current pressure. It is diagnostic here: the
+# later `info` process takes its own snapshot, so comparing the two exactly
+# would make a working-set boundary crossing look like an engine failure.
+physical = plan["physical_ram_bytes"]
+usable = plan["usable_ram_bytes"]
 cap = plan["memory_ceiling_bytes"]
+if physical and usable and usable > physical:
+    raise SystemExit("usable RAM exceeds physical RAM")
+if usable and cap and cap > usable:
+    raise SystemExit("current ceiling exceeds usable RAM")
 # what the engine actually holds: the plan's mandatory parts plus the
 # cache it really allocated, which is what `info` reports
 held = plan["floor_bytes"] - plan["min_expert_cache"] + info["expert_cache_bytes"]
-# recommended_bytes is floor + 3 * one token's working set, by construction
+# recommended_bytes is floor + 3 * one token's working set, by construction.
 ws = (plan["recommended_bytes"] - plan["floor_bytes"]) // 3
-want = plan["floor_bytes"]
-for k in (3, 2, 1):
-    if not cap or plan["floor_bytes"] + ws * k <= cap:
-        want = plan["floor_bytes"] + ws * k
-        break
 rec = plan["min_expert_cache"] // (2 * info["top_k"]) if info["top_k"] else 0
+targets = {plan["floor_bytes"] + ws * k for k in (0, 1, 2, 3)}
+matches = [target for target in targets
+           if target - rec - 1 <= held <= target]
+if len(matches) != 1:
+    raise SystemExit(f"resolved budget {held} is not one whole-working-set tier")
+want = matches[0]
 G = 1 << 30
-print(f"{held/G:.2f} GB held, budget {want/G:.2f} GB, "
-      f"current ceiling {cap/G:.2f} GB, machine {phys/G:.2f} GB")
-sys.exit(0 if want - rec - 1 <= held <= want else 1)
+print(f"{held/G:.2f} GB held, legal tier {want/G:.2f} GB, "
+      f"plan-time ceiling snapshot {cap/G:.2f} GB, usable {usable/G:.2f} GB, "
+      f"physical {physical/G:.2f} GB")
 PY
 }
 

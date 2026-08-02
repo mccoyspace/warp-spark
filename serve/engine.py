@@ -46,6 +46,20 @@ WASTE_E_UNSUPPORTED = -6
 WASTE_E_CANCELLED = -7
 WASTE_E_BUSY = -8
 WASTE_E_MEMORY = -9
+WASTE_API_VERSION = 2
+
+_STATUS_NAMES = {
+    WASTE_OK: "not an error",
+    WASTE_E_IO: "I/O error",
+    WASTE_E_FORMAT: "bad container format",
+    WASTE_E_RAM_BUDGET: "RAM budget too small",
+    WASTE_E_OOM: "out of memory",
+    WASTE_E_ARG: "invalid argument",
+    WASTE_E_UNSUPPORTED: "unsupported operation",
+    WASTE_E_CANCELLED: "cancelled",
+    WASTE_E_BUSY: "container is already in use",
+    WASTE_E_MEMORY: "insufficient currently available memory",
+}
 
 # waste.h's waste_cache_policy. There is no third: a "pinned" policy was
 # listed there and never implemented, so it selected LFRU like everything
@@ -59,12 +73,17 @@ class EngineError(RuntimeError):
     def __init__(self, what: str, status: int, detail: str = ""):
         self.status = status
         self.what = what
-        name = _lib().waste_strerror(status).decode() if _LIB else str(status)
+        name = (_LIB.waste_strerror(status).decode() if _LIB else
+                _STATUS_NAMES.get(status, str(status)))
         super().__init__(f"{what}: {name}" + (f" ({detail})" if detail else ""))
 
 
 class Cancelled(Exception):
     """The token callback asked to stop. Not an error: a client hung up."""
+
+
+class LibraryCompatibilityError(RuntimeError):
+    """A shared library was found, but it is not this binding's ABI."""
 
 
 # ---- structs (waste.h) ---------------------------------------------------
@@ -162,7 +181,7 @@ def library_candidates() -> list[Path]:
     out: list[Path] = []
     env = os.environ.get("WASTE_LIB")
     if env:
-        out.append(Path(env))
+        return [Path(env)]
     here = Path(__file__).resolve().parent
     for base in (here.parent, here):          # repo root, then serve/
         out.append(base / f"libwaste.{soext}")
@@ -184,11 +203,15 @@ def _lib():
             except OSError as e:
                 tried.append(f"{path}: {e}")
                 continue
-            _bind(lib)
+            try:
+                _bind(lib)
+            except (AttributeError, LibraryCompatibilityError) as e:
+                tried.append(f"{path}: incompatible library: {e}")
+                continue
             _LIB = lib
             return _LIB
         raise EngineError(
-            "libwaste not found", WASTE_E_IO,
+            "compatible libwaste not found", WASTE_E_IO,
             f"build it with `make libwaste.{_soext()}`, or point WASTE_LIB "
             "at it.\n  " + "\n  ".join(tried))
 
@@ -201,6 +224,29 @@ def _bind(lib) -> None:
     argtypes a Python int passed where a pointer belongs is silently
     marshalled as 32 bits.
     """
+    # API 1 (upstream 0.6.3) has smaller Cfg and MemPlan structures. Calling
+    # its functions with the layouts above, or calling this fork through the
+    # old layouts, is an out-of-bounds read/write. Check identity and exact
+    # sizes before declaring or calling any structure-bearing function.
+    try:
+        lib.waste_api_version.restype = C.c_int
+        lib.waste_api_version.argtypes = []
+        lib.waste_sizeof_cfg.restype = C.c_size_t
+        lib.waste_sizeof_cfg.argtypes = []
+        lib.waste_sizeof_memplan.restype = C.c_size_t
+        lib.waste_sizeof_memplan.argtypes = []
+    except AttributeError as e:
+        raise LibraryCompatibilityError(
+            "missing API-2 ABI identity symbols") from e
+    api = int(lib.waste_api_version())
+    cfg_size = int(lib.waste_sizeof_cfg())
+    plan_size = int(lib.waste_sizeof_memplan())
+    expected = (WASTE_API_VERSION, C.sizeof(Cfg), C.sizeof(MemPlan))
+    actual = (api, cfg_size, plan_size)
+    if actual != expected:
+        raise LibraryCompatibilityError(
+            f"API/cfg/memplan {actual}, expected {expected}")
+
     lib.waste_version.restype = C.c_char_p
     lib.waste_version.argtypes = []
     lib.waste_version_number.restype = C.c_int
@@ -210,18 +256,18 @@ def _bind(lib) -> None:
     lib.waste_strerror.restype = C.c_char_p
     lib.waste_strerror.argtypes = [C.c_int]
 
-    lib.waste_plan_memory.restype = C.c_int
-    lib.waste_plan_memory.argtypes = [C.c_char_p, C.c_uint32,
-                                      C.POINTER(MemPlan)]
-    lib.waste_cfg_init.restype = None
-    lib.waste_cfg_init.argtypes = [C.POINTER(Cfg)]
-    lib.waste_open.restype = C.c_int
-    lib.waste_open.argtypes = [C.c_char_p, C.POINTER(Cfg),
-                               C.POINTER(C.c_void_p)]
+    lib.waste_plan_memory_v2.restype = C.c_int
+    lib.waste_plan_memory_v2.argtypes = [C.c_char_p, C.c_uint32,
+                                         C.POINTER(MemPlan)]
+    lib.waste_cfg_init_v2.restype = None
+    lib.waste_cfg_init_v2.argtypes = [C.POINTER(Cfg)]
+    lib.waste_open_v2.restype = C.c_int
+    lib.waste_open_v2.argtypes = [C.c_char_p, C.POINTER(Cfg),
+                                  C.POINTER(C.c_void_p)]
     lib.waste_close.restype = None
     lib.waste_close.argtypes = [C.c_void_p]
-    lib.waste_memory_used.restype = C.c_int
-    lib.waste_memory_used.argtypes = [C.c_void_p, C.POINTER(MemPlan)]
+    lib.waste_memory_used_v2.restype = C.c_int
+    lib.waste_memory_used_v2.argtypes = [C.c_void_p, C.POINTER(MemPlan)]
 
     for name in ("waste_tokenize", "waste_tokenize_markup"):
         fn = getattr(lib, name)
@@ -288,6 +334,8 @@ def _bind(lib) -> None:
         C.c_void_p, C.POINTER(C.c_int), C.POINTER(C.c_int)]
     lib.waste_physical_ram.restype = C.c_uint64
     lib.waste_physical_ram.argtypes = []
+    lib.waste_usable_ram.restype = C.c_uint64
+    lib.waste_usable_ram.argtypes = []
     lib.waste_memory_ceiling.restype = C.c_uint64
     lib.waste_memory_ceiling.argtypes = []
 
@@ -302,6 +350,11 @@ def build_info() -> str:
 
 def physical_ram() -> int:
     return int(_lib().waste_physical_ram())
+
+
+def usable_ram() -> int:
+    """Stable physical/cgroup capacity used before current pressure."""
+    return int(_lib().waste_usable_ram())
 
 
 def memory_ceiling() -> int:
@@ -319,8 +372,8 @@ def _bounded_int(name: str, value: int, lo: int, hi: int) -> int:
 def plan_memory(model_path: str, ctx_tokens: int = 0) -> MemPlan:
     ctx_tokens = _bounded_int("ctx_tokens", ctx_tokens, 0, (1 << 32) - 1)
     plan = MemPlan()
-    st = _lib().waste_plan_memory(str(model_path).encode(), ctx_tokens,
-                                  C.byref(plan))
+    st = _lib().waste_plan_memory_v2(str(model_path).encode(), ctx_tokens,
+                                     C.byref(plan))
     if st != WASTE_OK:
         raise EngineError("plan_memory", st, str(model_path))
     return plan
@@ -408,7 +461,7 @@ class Engine:
         self._closed = False
 
         cfg = Cfg()
-        self.lib.waste_cfg_init(C.byref(cfg))
+        self.lib.waste_cfg_init_v2(C.byref(cfg))
         cfg.ram_budget_bytes = ram_budget_bytes
         cfg.ctx_tokens = ctx_tokens
         cfg.n_threads = n_threads
@@ -423,8 +476,8 @@ class Engine:
         cfg.allow_concurrent_open = 1 if allow_concurrent_open else 0
         cfg.host_reserved_bytes = host_reserved_bytes
 
-        st = self.lib.waste_open(self.model_path.encode(), C.byref(cfg),
-                                 C.byref(self._ctx))
+        st = self.lib.waste_open_v2(self.model_path.encode(), C.byref(cfg),
+                                    C.byref(self._ctx))
         if st != WASTE_OK:
             raise EngineError("open", st, self.model_path)
 
@@ -486,7 +539,7 @@ class Engine:
     def memory_used(self) -> dict:
         self._check()
         plan = MemPlan()
-        st = self.lib.waste_memory_used(self._ctx, C.byref(plan))
+        st = self.lib.waste_memory_used_v2(self._ctx, C.byref(plan))
         if st != WASTE_OK:
             raise EngineError("memory_used", st)
         return {f: getattr(plan, f) for f, _ in MemPlan._fields_}
