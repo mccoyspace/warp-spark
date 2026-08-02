@@ -2247,3 +2247,34 @@ The method note is short. **§4 was right and stopped being the constraint,
 and nothing about §4 was wrong.** A measurement can be perfectly reproduced
 and still stop describing the system, when what changes is not the number
 but which mechanism the number was about.
+
+## 42. A sweep must reset state and time its speculative tail (2026-08-02)
+
+One model load removes a large source of process-to-process variance, but it
+does not make every arm equivalent by itself. The first version of the sweep
+stopped its clock while speculative reads could still be queued or in flight,
+then cleared a cache whose replacement RNG and prefetch generation still
+remembered the previous arm. The treatment could therefore leave work outside
+its timer and state inside the next control.
+
+The qualified harness drains all asynchronous expert I/O before stopping the
+timer or clearing the cache, resets every mutable cache field, restores the
+same learned hotlist after each clear, and uses the product's chunked prefill.
+It fails if direct I/O falls back or no requested reader remains, reports the
+effective reader count and depth, alternates arm order over an even repeat
+count, uses a monotonic clock, and reports decode-only counters. Token hashes
+and an all-step logits hash make "same output" an executable condition rather
+than a visual comparison.
+
+On the 128 GB GN100, four balanced width-zero/width-four pairs then told a less
+exciting and more useful story. Width four raised demand hits from 53.18% to
+57.61%, yet median latency rose 2.34% and expert traffic rose 6.11%. All hashes
+and per-condition counters were exact; the sweep had zero process major faults
+and no swap I/O. The pairwise timing effects were mixed, so the finding is not
+that lookahead is universally slower. It is that this configuration did not
+earn promotion on this hardware and workload; the Spark default remains zero.
+
+That does not erase §40 or §41. Their Mac cache sizes and storage path made
+lookahead's timing and byte economics different. It establishes the missing
+boundary: a prefetch policy is qualified together with its cache, reader,
+storage, and harness, not inherited from another machine's hit-rate table.

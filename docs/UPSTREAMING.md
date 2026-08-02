@@ -48,6 +48,15 @@ The order below follows dependencies, not the historical sprint order.
 | 7 | Exact, renderer-delimited family-root server cache | Generic server feature | PR-ready on `pr/server-prefix-cache`; real-K3 miss-hit-hit acceptance complete; depends on state snapshots |
 | 8 | Mutable conversation-head reuse | Generic follow-on | Implemented on `spark/sprint7`; exact next-turn state/output, divergent-history, replacement, and shared-budget gates pass |
 
+Sprint 9 produced one additional discuss-first candidate: measurement
+correctness for the one-load sweep. Keep it as one narrow patch that drains
+speculative reads before timing ends or cache state is cleared, resets all
+mutable cache state, reports effective direct-I/O and reader settings, and
+adds portable reset and race tests. The GN100 lookahead result and Spark launch
+policy are evidence for that patch, not behavior the portable PR should impose.
+Because upstream introduced the sweep recently, first send the maintainer the
+short failure mode and offer the patch; open the PR if they want that shape.
+
 The old public `pread_batch` backend remains a diagnostic control, not a
 production API.  A raw `io_uring` PR is conditional: first show that it adds
 value over the current two-thread/depth-two upstream reader on the GN100.  If
