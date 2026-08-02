@@ -147,7 +147,11 @@ int main(int argc, char **argv)
     float *managed = nullptr;
     runtime_ok(cudaMallocManaged(&managed, bytes), "cudaMallocManaged");
     for (size_t i = 0; i < count; i++) managed[i] = 1.0f;
-    runtime_ok(cudaMemPrefetchAsync(managed, bytes, 0), "managed prefetch to device");
+    cudaMemLocation device_location{};
+    device_location.type = cudaMemLocationTypeDevice;
+    device_location.id = 0;
+    runtime_ok(cudaMemPrefetchAsync(managed, bytes, device_location, 0, 0),
+               "managed prefetch to device");
     run_kernel("managed-prefetch", managed, managed, count, iterations);
 
     float *device = nullptr;
