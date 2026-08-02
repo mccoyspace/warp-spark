@@ -38,7 +38,8 @@
 #include <time.h>
 double waste_prof[16];
 uint64_t waste_prof_n[16];
-enum { P_LUTB, P_KDA, P_MLA, P_ROUTE, P_EDEQ, P_EMM, P_HEAD, P_LUTA, P_MM };
+enum { P_LUTB, P_KDA, P_MLA, P_ROUTE, P_EDEQ, P_EMM, P_HEAD, P_LUTA, P_MM,
+       P_KDA_REC };
 static int prof_on = -1;
 static pthread_mutex_t prof_mu = PTHREAD_MUTEX_INITIALIZER;
 static double pnow(void)
@@ -1915,7 +1916,9 @@ static void kda_layer(waste_model *m, int L, const float *in, float *out)
          * version. Worth doing: K3 spends 19% of a decode step in this call,
          * 69 layers x 96 heads, and it was running on one core. */
         kda_par a = { D, D, q, k, v, g, beta, m->S[L], o, m->att };
+        PROF_START(P_KDA_REC);
         waste_parallel_for(H, 1, kda_step_range, &a);
+        PROF_END(P_KDA_REC);
     }
 
     if (c->full_rank_gate) {
