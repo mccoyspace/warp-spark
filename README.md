@@ -518,6 +518,11 @@ make libwaste.dylib                     # or libwaste.so on Linux
 python3 -m serve ~/models/k3.waste --port 8000
 ```
 
+For recurring agent prompts, `--prefix-cache 2G --prefix-cache-entries 8`
+reserves a bounded in-process cache for exact system-prompt/tool-schema state.
+It restores the shared family root and replays only the divergent tail while
+keeping output and state bit-identical to an uncached request.
+
 ```bash
 curl localhost:8000/v1/chat/completions \
   -H 'Content-Type: application/json' \
@@ -535,7 +540,8 @@ the parser that reads the reply back into reasoning, answer and
 The prompt renderer is a port of `encoding_k3.py` from the release, and the
 test suite checks it against that file **segment for segment** on a corpus
 of 38 conversations whenever the weights directory is on disk.
-[docs/SERVE.md](docs/SERVE.md) is the reference.
+[docs/SERVE.md](docs/SERVE.md) is the reference; prefix policy and accounting
+are detailed in [docs/PREFIX_CACHE.md](docs/PREFIX_CACHE.md).
 
 ### Images
 

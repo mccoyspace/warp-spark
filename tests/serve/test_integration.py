@@ -53,6 +53,7 @@ class TestRealStack(unittest.TestCase):
     def setUpClass(cls):
         cls.tmp = tempfile.mkdtemp(prefix="waste-serve-e2e-")
         model = Path(cls.tmp) / "tiny.waste"
+        cls.model = model
         r = subprocess.run(
             [sys.executable, str(ROOT / "tools" / "make_test_container.py"),
              "--tokenizer", str(model)],
@@ -158,6 +159,94 @@ class TestRealStack(unittest.TestCase):
         _, a = self.post("/v1/chat/completions", body)
         _, b = self.post("/v1/chat/completions", body)
         self.assertEqual(a["choices"][0]["message"], b["choices"][0]["message"])
+
+    def test_prefix_restore_is_bit_exact_to_uncached_generation(self):
+        """Ancestor promotion and deep restore stay bit-exact to unsplit."""
+        first_system = "stable tool and agent policy " * 40
+        shallow_request = {
+            "model": "tiny", "max_tokens": 4, "temperature": 0,
+            "messages": [
+                {"role": "system", "content": first_system},
+                {"role": "user", "content": "answer briefly"},
+            ],
+        }
+        request = {
+            "model": "tiny", "max_tokens": 4, "temperature": 0,
+            "messages": [
+                {"role": "system", "content": first_system},
+                {"role": "system",
+                 "content": "second stable policy block " * 40},
+                {"role": "user", "content": "answer briefly"},
+            ],
+        }
+        status, baseline = self.post("/v1/chat/completions", request)
+        self.assertEqual(status, 200, baseline)
+        with self.engine.lock:
+            baseline_state = bytes(self.engine.state_export())
+
+        reserve = 8 << 20
+        cached_engine = E.Engine(str(self.model), ram_budget_bytes=1 << 30,
+                                 host_reserved_bytes=reserve)
+        cached_server = serve(
+            cached_engine, host="127.0.0.1", port=0, model_id="tiny",
+            default_max_tokens=16, log_requests=False,
+            prefix_cache_bytes=reserve, prefix_cache_entries=2)
+        port = cached_server.server_address[1]
+        thread = threading.Thread(target=cached_server.serve_forever,
+                                  daemon=True)
+        thread.start()
+
+        def cached_post(body):
+            req = urllib.request.Request(
+                f"http://127.0.0.1:{port}/v1/chat/completions",
+                data=json.dumps(body).encode(), method="POST",
+                headers={"Content-Type": "application/json"})
+            with urllib.request.urlopen(req, timeout=60) as response:
+                return response.status, json.loads(response.read())
+
+        try:
+            status, shallow = cached_post(shallow_request)
+            self.assertEqual(status, 200, shallow)
+            self.assertEqual(shallow["waste"]["prefix_cache"]["status"],
+                             "miss")
+
+            status, promoted = cached_post(request)
+            self.assertEqual(status, 200, promoted)
+            with cached_engine.lock:
+                promoted_state = bytes(cached_engine.state_export())
+            status, warm = cached_post(request)
+            self.assertEqual(status, 200, warm)
+            with cached_engine.lock:
+                warm_state = bytes(cached_engine.state_export())
+
+            promotion = promoted["waste"]["prefix_cache"]
+            self.assertEqual(promotion["status"], "hit")
+            self.assertGreater(promotion["restored_tokens"], 0)
+            self.assertGreater(promotion["promoted_tokens"], 0)
+            self.assertGreater(promotion["cached_tokens"],
+                               promotion["restored_tokens"])
+            hit = warm["waste"]["prefix_cache"]
+            self.assertEqual(hit["status"], "hit")
+            self.assertEqual(hit["restored_tokens"],
+                             promotion["cached_tokens"])
+            self.assertEqual(hit["promoted_tokens"], 0)
+            self.assertEqual(hit["restored_tokens"]
+                             % cached_engine.prefill_chunk_size(), 0)
+            self.assertEqual(hit["replayed_tokens"],
+                             warm["usage"]["prompt_tokens"]
+                             - hit["restored_tokens"])
+            self.assertEqual(baseline["choices"], promoted["choices"])
+            self.assertEqual(baseline["choices"], warm["choices"])
+            self.assertEqual(baseline_state, promoted_state)
+            self.assertEqual(baseline_state, warm_state)
+            stats = cached_server.prefix_cache.stats()
+            self.assertEqual(stats["admissions"], 2)
+            self.assertEqual(stats["promotions"], 1)
+        finally:
+            cached_server.shutdown()
+            cached_server.server_close()
+            thread.join(timeout=5)
+            cached_engine.close()
 
     def test_tools_render_and_run(self):
         """A tool declaration must survive rendering into a real prompt."""

@@ -373,6 +373,12 @@ waste_status waste_generate(waste_ctx *ctx, const int32_t *prompt, size_t n,
 waste_status waste_eval(waste_ctx *ctx, const int32_t *tokens, size_t n,
                         const float **logits_out, size_t *vocab_out);
 
+/* Number of prompt tokens waste_eval/waste_generate group into one prefill
+ * call. A host that checkpoints between prompt pieces must split only on a
+ * multiple of this value if it needs the cold and unsplit arithmetic order
+ * to remain bit-identical. Returns 0 for an invalid context. */
+uint32_t waste_prefill_chunk_size(const waste_ctx *ctx);
+
 /* ---- conversation state ------------------------------------------------ */
 
 /* KDA state is O(1) in context length and MLA KV is compressed, so a whole
