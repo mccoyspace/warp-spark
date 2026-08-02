@@ -208,9 +208,10 @@ minute and a wasted hour.
 
 `--performance-profile spark-q0` is an explicit, strict profile for the Acer
 Veriton GN100 / NVIDIA GB10 work. It fixes the in-process settings from the
-winning current-upstream qualification: eight compute threads, LFRU, effective
-direct I/O, stable arithmetic, two upstream read-ahead threads at depth two,
-router lookahead disabled, ordinary pageable/non-purgeable storage, and a
+selected single-run current-upstream qualification: eight compute threads,
+LFRU, effective direct I/O, stable arithmetic, requests two upstream read-ahead
+threads at depth two, disables router lookahead, uses ordinary
+pageable/non-purgeable storage, and places a
 zero-microsecond Linux CPU DMA-latency request around the complete model-work
 boundary: prefix-cache prepare (snapshot restore or cold prefill) followed by
 `engine.generate()` and decode. For streaming, acquisition happens before
@@ -323,7 +324,7 @@ Eight suites, in order of what they prove:
 | `test_regions.py` | round trip: anything the encoder can express, the parser reads back; every chunk split; malformed output | — |
 | `test_engine.py` | the ctypes binding against a **real engine** and a synthetic container | `libwaste` |
 | `test_main.py` | CLI validation and wiring for server, prefix-cache, and profile options | — |
-| `test_prefix_cache.py` | exact/family-root lookup, replay, promotion, accounting, eviction, and rollback behavior | `libwaste` for native snapshot cases |
+| `test_prefix_cache.py` | exact/family-root lookup, replay, promotion, accounting, eviction, and rollback behavior | — |
 | `test_qos.py` | exact profile resolution; fake-device/real-socket PM-QoS protocol, timeout, EOF, and privileged-artifact safety | — |
 | `test_server.py` | HTTP over real sockets against a scripted engine | — |
 | `test_integration.py` | the whole stack, no fakes | `libwaste` |

@@ -11,8 +11,8 @@ changes at once.
 The public fork uses these rules:
 
 - `main` tracks `sqliteai/waste:main` without local commits.
-- `pr/<topic>` starts from the current upstream commit and contains one
-  reviewable concern.
+- `pr/<topic>` starts from the current upstream commit, or an explicitly named
+  prerequisite branch, and contains one reviewable concern.
 - `spark/integration` combines accepted generic branches with documented
   GN100-only features.
 - `archive/*` and `gn100-*-results-*` tags identify measured source and never
@@ -43,10 +43,10 @@ The order below follows dependencies, not the historical sprint order.
 | 2 | POSIX model-container ownership lock with explicit opt-out | Generic safety/policy | PR-ready on `pr/posix-model-lock` |
 | 3 | Explicit Linux CPU-list affinity | Generic configuration | Keep the GN100 CPU choice outside core |
 | 4 | Final phase/layer trace and request-boundary flushing | Generic observability | Reconcile with upstream cache traces |
-| 5 | Transactional in-memory state export/import and caller-owned budget reservation | Generic engine API | Required before server prefix reuse |
-| 6 | Whole-expert scheduling through typed per-context configuration | Generic optimization | Integrate with upstream read-ahead/cache hints; no environment-only selector |
-| 7 | Exact-prefix server cache | Generic server feature | Depends on state snapshots |
-| 8 | Renderer-supplied semantic family-root cache | Generic server mechanism | Depends on exact-prefix semantics |
+| 5 | Transactional in-memory state export/import and caller-owned budget reservation | Generic engine API | PR-ready on `pr/in-memory-state-snapshots`; required before server prefix reuse |
+| 6 | Whole-expert scheduling through typed per-context configuration | Generic optimization | Complete experiment on `pr/whole-expert-scheduler`; no GN100 gain, excluded from integration |
+| 7 | Exact, renderer-delimited family-root server cache | Generic server feature | Implementation-complete on `pr/server-prefix-cache`; depends on state snapshots |
+| 8 | Mutable conversation-head or block reuse | Generic follow-on | Only after current family-root behavior remains exact on K3 |
 
 The old public `pread_batch` backend remains a diagnostic control, not a
 production API.  A raw `io_uring` PR is conditional: first show that it adds

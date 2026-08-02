@@ -23,7 +23,7 @@ limit larger than the engine reservation.
 
 Version 1 recognizes the stable beginning of a rendered chat prompt:
 
-- the sorted tool declaration;
+- the key-normalized tool declaration (tool-list order is preserved);
 - an explicit thinking-effort note; and
 - consecutive leading `system` / `developer` messages.
 
@@ -70,13 +70,14 @@ version. An identity change drops every entry. The state format currently has
 no model fingerprint, so the server never persists or shares these snapshots
 between processes or contexts.
 
-Import failure is fail-closed: the bad entry is removed, its large blob is
-released before replacement export, the engine is reset, and the complete
-prompt is evaluated normally. Snapshot validation or an allocation exception,
-including one raised while inserting, likewise resets and evaluates the
-unsplit prompt. An ordinary admission rejection retains no new entry but can
-safely continue from the valid prefilled root. None of these paths may change
-generated tokens or logits or turn an optional cache miss into an HTTP failure.
+Import failure invalidates the entry and falls back safely to uncached
+execution: the bad entry is removed, its large blob is released before
+replacement export, the engine is reset, and the complete prompt is evaluated
+normally. Snapshot validation or an allocation exception, including one raised
+while inserting, likewise resets and evaluates the unsplit prompt. An ordinary
+admission rejection retains no new entry but can safely continue from the valid
+prefilled root. None of these paths may change generated tokens or logits or
+turn an optional cache miss into an HTTP failure.
 
 ## Observability
 
@@ -102,13 +103,14 @@ admissions, promotions, rejects, evictions, invalidations, restore failures,
 snapshot/allocation failures, entries, controller bytes, entry bytes, and
 total accounted bytes.
 
-## Integration dependency
+## Upstream dependency
 
 This change is intentionally stacked on the transactional in-memory state
 API and host-memory reservation change (`pr/in-memory-state-snapshots`, commit
 `7cbb12d`). It requires `waste_state_size`, `waste_state_export`,
 `waste_state_import`, and `waste_cfg.host_reserved_bytes`; it should be
-reviewed or rebased only after that prerequisite.
+reviewed or rebased only after that prerequisite. `spark/integration` already
+contains both changes; this ordering describes the focused upstream proposals.
 
 The acceptance tests compare shallow restore plus promotion, deep restore, and
 ordinary unsplit generation on a real synthetic container. Greedy output
