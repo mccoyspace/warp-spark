@@ -2611,6 +2611,10 @@ static int state_add_bytes(uint64_t *total, uint64_t count, uint64_t width)
 int waste_model_state_size(const waste_model *m, int pos, size_t *bytes)
 {
     if (!m || !bytes) return -1;
+    /* A failed CUDA projection may have changed only part of the recurrent
+     * state. Never let that invalid intermediate state escape into a prefix
+     * cache or session file and become valid again in a fresh process. */
+    if (m->cuda_kda_state_dirty) return -1;
     const waste_config *c = &m->cfg;
     const int H = c->kda_heads, D = c->kda_dim, C = H * D;
     const int nb_max = c->attn_res_block

@@ -248,6 +248,15 @@ class CompareGpuRunsTest(unittest.TestCase):
         with self.assertRaises(COMPARE.CaptureError):
             self.compare(gpu_steps=gpu_steps)
 
+    def test_prompt_only_cuda_capture_is_rejected(self):
+        with self.assertRaises(COMPARE.CaptureError):
+            self.compare(
+                cpu_logits=base_logits()[:1],
+                gpu_logits=base_logits()[:1],
+                cpu_steps=base_steps()[:1],
+                gpu_steps=base_steps()[:1],
+            )
+
 
 if __name__ == "__main__":
     unittest.main()

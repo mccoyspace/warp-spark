@@ -243,6 +243,8 @@ def load_capture(path: str) -> Capture:
     raw_steps = raw.get("steps")
     if not isinstance(raw_steps, list) or not raw_steps:
         raise CaptureError(f"{path}: steps must be a non-empty list")
+    if arm is not None and arm.key == "cuda" and len(raw_steps) < 2:
+        raise CaptureError(f"{path}: CUDA capture must contain a decode step")
     steps = []
     for expected_index, item in enumerate(raw_steps):
         where = f"{path}: steps[{expected_index}]"
