@@ -120,6 +120,8 @@ int waste_wire(void *p, size_t n);          /* 1 on success */
 int  waste_ecache_init(waste_ecache *c, size_t budget_bytes, size_t rec_bytes,
                        int policy);
 void waste_ecache_free(waste_ecache *c);
+void waste_ecache_drain(waste_ecache *c);
+void waste_ecache_clear(waste_ecache *c);
 
 /* Returns a pointer to the expert's record bytes, reading it through
  * `fetch` on a miss, or waiting for the read a hint already started.

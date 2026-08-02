@@ -8,6 +8,16 @@ MoE, 1M context. Everything below is read off its `config.json` and
 validated *before* K3 lands. K3-specific numbers (layer count, head
 counts, KDA:MLA ratio) still get confirmed at Gate 1.
 
+> **Gate 1 answered it on 2026-07-27, and the kernel needed no change
+> (noted 2026-08-02).** The analysis below is Kimi-Linear's and is still
+> exactly what `src/kda.c` implements; K3 differs in two places, both of
+> which turned out to be config-detected rather than structural — a
+> full-rank output gate (`g_proj` instead of the `g_a`/`g_b` bottleneck in
+> §5 below) and a *different* decay-gate formula, `g_min·σ(e^{A_log}z)`
+> rather than `-e^{A_log}·softplus(z)`. Shapes, ratios and the four open
+> questions at the end are all settled in [K3.md](K3.md); the numbers in
+> this file that were predictions are annotated where they appear.
+
 ## Why this matters for WASTE
 
 KDA state is O(1) in sequence length: one matrix state per head plus a
@@ -94,6 +104,25 @@ engine stays NVMe-bound, as intended.
 - MLA latent KV: `(kv_lora + qk_rope) = 576` values/token/layer, only on
   the ~1/4 of layers that are MLA.
 
+> **Measured on the real shape (2026-08-02).** K3 is 69 KDA layers ×
+> 96 heads, not 45 × 32, so the recurrent state is **414 MiB**. All three
+> lines together are what `waste plan` reports as "KDA state + KV cache":
+> **659 MiB at 4K context** — 414 of recurrent state, 216 of MLA latent
+> (24 layers × 4096 × 576 × 4 B) and ~30 of conv rings. Only the middle
+> term grows with context, and the 1M floor of 83.22 GB in [K3.md](K3.md)
+> is almost entirely it.
+>
+> The 377 MB above is not what the shape beside it gives: 45 × 32 × 128 ×
+> 128 × 4 B is **90 MiB**, so that line was off by 4x in its own terms and
+> then landed near the right answer for a model with 4.6x more state than
+> it assumed. Two errors, opposite directions, and no way to tell from the
+> number alone — which is the argument for `waste plan` reading the figure
+> off the container rather than a document carrying one.
+>
+> The structural claim held, and it is the one that mattered: the
+> recurrence is O(1) in sequence length, which is what leaves the RAM to
+> the expert cache.
+
 ## C kernel plan
 
 ### Decode (batch 1): fused recurrent step
@@ -150,10 +179,29 @@ rented GPU session dumps per-layer KDA inputs/outputs *and* the batch-1
 routing trace (Gate 2) in the same run, then both are checked offline
 here. One rental, two gates.
 
+> **No rental was needed (2026-07-27, noted here 2026-08-02).** Step 3
+> passed the same day against `tools/kimi_ref.py` — a pure-PyTorch oracle
+> reading the WASTE container directly, which sidesteps `fla-core` and
+> Triton entirely because it never loads the HF modeling code. Kimi-Linear
+> end to end at rel 1.58e-06, and K3's 93 layers at ≤1.14e-05 with final
+> logits at 3.56e-06 once the weights landed. The routing trace came from
+> the same oracle, and later from `WASTE_DUMP_ROUTE` in the engine itself.
+> [GATES.md](GATES.md) Gate 4, [K3.md](K3.md).
+
 ## Remaining unknowns (Gate 1, from K3's own config)
 
+*(All four answered 2026-07-27 when the weights dropped. Kept as written
+with the answers beside them; the full read is in [K3.md](K3.md).)*
+
 - layer count and KDA:MLA ratio at K3 scale (expect 3:1).
+  → **93 layers, 69 KDA : 24 MLA**, about 2.9:1. The ratio held.
 - head counts / d_state (expect 128; memplan uses that).
+  → **96 heads × 128**. d_state right, head count 3x the estimate.
 - whether K3 keeps `mla_use_nope` and the null `q_lora_rank`.
+  → NoPE kept; `q_lora_rank` is **1536**, not null, so MLA's query is
+  factorized on K3 and the oracle had to learn about it.
 - MTP head presence (`num_nextn_predict_layers` is 0 in Kimi-Linear;
   K2 shipped one, and speculative decoding is a throughput lever for us).
+  → **none.** `num_nextn_predict_layers: 0` on K3 too, so there is no
+  cheap draft model. Speculative decoding was separately refused on
+  arithmetic anyway — [EFFICIENCY.md](EFFICIENCY.md) §4D.

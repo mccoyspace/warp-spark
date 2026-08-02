@@ -13,6 +13,15 @@ knee — and the shares move because the cache moves, not because one of
 them is wrong. When two figures disagree, take the one with the later
 date, and take the end-to-end numbers from the README.
 
+**Two numbers were used twice.** There are two §33s and two §37s, all four
+dated 2026-08-01, from sections that landed the same day. They are not
+renumbered because both members of each pair are already cited from outside
+this file — `CHANGELOG.md` cites the first of each (the oracle fixture, the
+divide-by-zero), `GATES.md` and `tests/sweep.c` the second (the 52 GiB row,
+the simulator) — and renumbering would silently redirect a released
+changelog. **Cite these four by title, not by number**, and read a bare §33
+or §37 as pointing at whichever one the surrounding sentence is about.
+
 ---
 
 ## 1. The model (see [K3.md](K3.md) for the full read)
@@ -2114,3 +2123,127 @@ rows were excluded before selection, the apparent winner was rerun in six
 exclusive-host alternating controls, and its exciting screen gain became a
 1.68% median gain with 2.76% extra input. A screen chooses what to confirm; it
 does not get promoted into evidence merely because it is the fastest row.
+## 40. One load, many arms, one machine (2026-08-01)
+
+The second half of the iteration problem. §37 removed the engine from
+questions that never needed it; this removes the *process* from questions
+that do.
+
+`tests/sweep.c` loads a container once and runs the arms back to back,
+interleaved, resetting the session and clearing the expert cache between
+each — because leaving the cache warm would hand the second configuration
+the first one's work and measure the order rather than the setting.
+`waste_model_reset` and `waste_ecache_clear` exist for it; the first was
+already in `waste.c` reaching into the model's fields and is now in one
+place.
+
+```
+$ WASTE_CACHE_MB=1024 ./sweep kimi-linear.waste 1008,6013,318,28288,17189 16 lookahead=0,6 3
+lookahead    rep     tok/s       hit   GB read
+       0      1    9.573     37.9%      6.7
+       6      1   10.713     72.2%      7.4
+       0      2    9.820     37.3%      6.8
+       6      2   10.686     72.5%      7.4
+       0      3    9.790     37.5%      6.8
+       6      3   10.743     72.6%      7.3
+```
+
+**Two arms, three repeats, spreads of 2.6% and 0.5%.** Nine paired runs of
+the same comparison across processes (§35) spanned 0.79x to 1.79x. That is
+the whole point: the variance was never the feature, it was the harness.
+
+On K3 it is honest about what it cannot fix:
+
+| lookahead | median tok/s | spread | hit | GB read |
+|---|---|---|---|---|
+| 0 | 0.506 | 7% | 7.2–7.7% | 204–205 |
+| 6 | 0.541 | 23% | 38.0–38.2% | **191** |
+
+The deterministic columns are exact to a tenth of a point. The clock is not:
+K3 still drifts inside a single process, because the drift is the machine's
+memory system and not the process's. **What the harness buys on K3 is that
+the noise is now visible as noise** rather than as a difference between two
+runs an hour apart.
+
+And it turned up something the cross-process measurements had wrong. §35
+reported the lookahead as reading the same bytes; measured with the cache
+cleared identically for both arms, it reads **6.6% fewer** — 191 GB against
+204. The speculative fill arrives before the demand, so the record is
+inserted early and its later hit raises its LFRU count, and records that
+were being evicted and re-read now are not. That effect was invisible when
+each arm started from whatever the previous process had left in the cache.
+
+**What it cannot sweep is the budget**, which sizes the cache at open. Those
+still need one process each and a quiet machine each, which §33 already
+established is the only design that works there.
+
+The method note: **a harness is part of the measurement.** Every conclusion
+in §30 through §36 was drawn through a harness that added more variance than
+the effects being measured, and two of them came out wrong. Building the
+harness first would have been cheaper than any of the re-runs.
+
+## 41. The cache floor was a property of a demand-only cache (2026-08-01)
+
+§4 is the oldest load-bearing measurement in this file, and §16 and the
+budget resolver are both built on it: **the cache floor is one token's
+working set**, 17.0 GB for K3, and below it the hit rate is not low, it is
+zero. Re-measured with `tests/sweep.c` — one process, four cache sizes
+interleaved, two repeats — it is still exactly true, and it no longer binds.
+
+The control first, at 287 slots, a fifth of the way to a token's 1472
+records:
+
+| 287 slots | hit | tok/s | GB read |
+|---|---|---|---|
+| lookahead off | **0.0%** | 0.507 | 153.1 |
+| lookahead on | **29.1%** | 0.585 | 165.2 |
+
+§4's zero is exactly reproduced. What breaks it is that **the lookahead does
+not need a record to survive from one token to the next, only from one layer
+to the next.** It fetches what layer L+1 wants while layer L is finishing, so
+the record is consumed a few milliseconds later instead of three seconds. A
+cache far too small to hold a token's working set is ample to hold six
+experts for the length of one attention.
+
+The whole sweep, with the lookahead on, which is the default:
+
+| budget | cache | slots | hit | decode |
+|---|---|---|---|---|
+| 32 GB | 3.32 GB | 287 | 29.1% | 0.56–0.58 |
+| 46 GB | 17.32 GB | 1498 | 36.2% | **0.63** |
+| 52 GB | 23.32 GB | 2018 | 38.4% | 0.07–0.09 |
+| 58 GB | 29.32 GB | 2537 | 41.3% | 0.07–0.08 |
+
+Hit rate and bytes read are **identical to the digit across both repeats** —
+29.1/29.1, 36.2/36.2, 38.4/38.4, 41.3/41.3 — which is what one process buys
+and what §33 could not get from four.
+
+**The useful window opens far lower than it did.** A 3.32 GB cache is within
+10% of a 17.32 GB one — which is a size the default budget resolver cannot
+choose, since it steps in whole multiples of a 16.2 GB working set and there
+is nothing on K3 between the floor and `floor + 1x`. Whether that rule's
+quantum should change is [GATES.md](GATES.md) Gate 7, open and not run: four
+generated tokens is exactly the length that flatters a small cache, and
+cross-token reuse is what a large one buys. The RAM above the resident trunk has stopped being
+the lever it was in §12 and §16; the trunk is now nearly the whole
+requirement.
+
+**The cliff is exactly where it was**, and the rows either side of it are
+the clearest statement of what it is: between 46 and 52 GB throughput falls
+eightfold while the hit rate *rises* and the bytes read *fall*, 137 GB to
+126. The engine does less work and takes ten times as long. Nothing about
+caching touches that — it is 27.3 GB of trunk plus 23.3 GB of cache on a
+64 GB machine, and §24 and §32 already established that no allocation policy
+conjures the difference.
+
+One more thing worth keeping, because it is not what §35 reported. **The
+lookahead's byte economics depend on the cache size.** At 287 slots it reads
+8% *more* — 165 GB against 153 — because speculative records are evicted
+before use often enough to be re-read. At 1498 slots it reads 6.6% *fewer*.
+It is a prefetch at small caches and a scheduling change at large ones, and
+§35 measured only the large end.
+
+The method note is short. **§4 was right and stopped being the constraint,
+and nothing about §4 was wrong.** A measurement can be perfectly reproduced
+and still stop describing the system, when what changes is not the number
+but which mechanism the number was about.

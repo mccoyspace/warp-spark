@@ -2,7 +2,10 @@
 
 K3 decoded at 0.33 tok/s when this was written and does **0.49–0.53** now;
 §4A is the one change that did it, and §4B–D and §5 are what was measured
-and refused. This document is the account of "what is left", started after
+and refused. *(A second change has landed since: the router lookahead of
+§4F, which takes the default budget to 0.56–0.63 — see the dated correction
+there, because this document refused it first.)* This document is the
+account of "what is left", started after
 an outside article
 ([AirLLM](https://github.com/lyogavin/airllm) running K3 at ~5 minutes per
 token) prompted a review of the streaming path. The article itself has
@@ -336,6 +339,39 @@ ceiling loses. [LEARNED.md](LEARNED.md) §29 has the arithmetic and the
 `WASTE_IO_DEPTH` sweep that shows there is nothing left to overlap within a
 layer either.
 
+**Refuted as written, and the lever is built (2026-08-01).** The heading is
+wrong and is kept because the mistake in it is the useful part: what was
+measured above is *one* cross-layer predictor, a co-occurrence table over
+the router's past answers, and its failure was read as the question's
+answer. Asking the router instead — running layer L+1's router weights on
+layer L's hidden state — recalls **59.0%** at 16, twice the number in the
+paragraph above, and the prediction is steeply ranked (92.2% at rank 1,
+81.4% cumulative at 6). Prefetching the top 6 into the layer boundary is
+right about four times in five.
+
+Built and on by default (`WASTE_LOOKAHEAD=0` disables it). The real router
+still decides, so logits are bit-identical and `tests/run.sh` checks that.
+Measured in one process with the cache cleared identically per arm:
+
+| lookahead | median decode | demand hit | data read |
+|---:|---:|---:|---:|
+| off | 0.506 tok/s | 7.2–7.7% | 204–205 GB |
+| top 6 | 0.541 tok/s | 38.0–38.2% | **191 GB** |
+
+Two consequences reach the rest of this document. It is **not** free the way
+§4A was: at the default cache it reads 6.6% *fewer* bytes, and at a 3.32 GB
+cache 8% *more*, because speculative records get evicted before use — it is
+a prefetch at small caches and a scheduling change at large ones. And it
+moves what §4B and the budget resolver rest on: a record now has to survive
+one attention rather than one token, so a cache far below a token's working
+set is no longer worth zero ([GATES.md](GATES.md) Gate 7).
+
+The same hook in `moe_chunk` was built and removed: a chunk layer claims
+~550 slots against a decode layer's 16, the speculative records are what
+LFRU evicts first, and reads went up 6.9% for no wall-clock change. There is
+no idle window in the chunk path to fill. [LEARNED.md](LEARNED.md) §34–36
+and §41.
+
 ### E. Where the bottleneck actually is
 
 This section used to argue from `max(0.85 I/O, 1.03 matmul)` that (A) and
@@ -363,6 +399,14 @@ been measured and refused for its own reason, and the arithmetic is not
 what is holding the clock either. On this machine the remaining headroom is
 hardware: a faster disk, or RAM that holds more than one token's working
 set.
+
+> **One I/O-side lever did survive, and it is not on this list (2026-08-01).**
+> §4F's correction: the router lookahead. Its primary win does not depend on
+> reading fewer bytes — it stops the reads from being *waited on*, the same
+> shape as §4A one layer further out. The one-process sweep later found that
+> it also reads 6.6% fewer bytes at the default cache (and 8% more at a small
+> one). Timing is the category this paragraph missed; byte count is a
+> cache-size-dependent secondary effect.
 
 ## 5. `vq_rows`, optimized against the wrong premise
 
@@ -420,6 +464,11 @@ is not in this file: it is a faster disk, or a machine whose RAM holds more
 than a token's working set. On this one, 0.49–0.54 tok/s is close to what
 the hardware gives.
 
+> **0.56–0.63 as of 2026-08-01**, from §4F's router lookahead — which this
+> paragraph had already refused under the wrong predictor. "Close to what
+> the hardware gives" was measured against a schedule, not against the
+> hardware.
+
 ## 6. Do not rebuild these
 
 Refuted with measurements, in this repo:
@@ -441,9 +490,19 @@ Refuted with measurements, in this repo:
    speedup: volatile memory is memory the kernel takes. Kept off by default
    as an escape hatch for an over-large `--budget`.
 4. ~~**Stage-major layout** (C)~~ — cancelled by 2.
+5. ~~**Re-measure the cross-layer predictor** (F)~~ — **done 2026-08-01**,
+   and it reopened what this document had closed: the refusal in (F) was of
+   a co-occurrence table, not of asking the next layer's router. Built,
+   shipped, on by default.
 
 **Where that leaves it.** One of the four levers survived contact. (A)
 shipped and is worth ~1.6x on K3 and 1.21x on Kimi-Linear; (B), (C) and (D)
 are all refuted, each by a measurement that cost hours rather than the days
 building them would have. §5 is the one that was built before it was
 measured, and §4E is the profile that would have said not to.
+
+**And then a fifth.** (F) was written as a refusal and is now the second
+thing that shipped, because the measurement behind it had answered a
+narrower question than the heading claimed. The working rule that produced
+this document — measure before building — does not protect against that;
+only asking what *else* the measurement could have meant does.

@@ -73,6 +73,42 @@ else
     no "automatic memory budget arithmetic or host accounting"
 fi
 
+if ./test_ecache 2>/dev/null | grep -q "^ECACHE OK"; then
+    ok "sweep cache reset drains readers and restores deterministic state"
+else
+    no "sweep cache reset or lookahead bounds"
+fi
+
+SWEEP_MODEL="$TMP/sweep-test.waste"
+if python3 tools/make_test_container.py "$SWEEP_MODEL" >/dev/null 2>&1; then
+    sweep_err="$TMP/sweep-test.err"
+    if sweep_out=$(WASTE_CACHE_MB=1 WASTE_IO_THREADS=1 WASTE_IO_DEPTH=1 \
+            ./sweep "$SWEEP_MODEL" 3,7,11,5 2 lookahead=0,65 2 \
+            2>"$sweep_err"); then
+      if printf '%s\n' "$sweep_out" | awk '
+        $1 == "0" || $1 == "64" {
+            n++; order = order $1 ","; token[$13] = 1; logits[$14] = 1
+        }
+        END {
+            nt = 0; for (x in token) nt++
+            nl = 0; for (x in logits) nl++
+            exit !(n == 4 && order == "0,64,64,0," && nt == 1 && nl == 1)
+        }' &&
+       printf '%s\n' "$sweep_out" |
+           grep -q 'direct I/O 1, readers 1, depth 1'; then
+        ok "one-load sweep is balanced, bounded, direct and bit-exact"
+      else
+        no "one-load sweep smoke test"
+      fi
+    elif grep -q 'direct I/O fell back' "$sweep_err"; then
+        sk "one-load sweep smoke test" "temporary filesystem lacks direct I/O"
+    else
+        no "one-load sweep smoke test"
+    fi
+else
+    no "one-load sweep synthetic container"
+fi
+
 if command -v uv >/dev/null 2>&1; then
     ./test_k3parts "$TMP/k3parts.bin" >/dev/null 2>&1
     if uv run --quiet --with torch --no-project python tools/k3parts_ref.py \

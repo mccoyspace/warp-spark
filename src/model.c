@@ -196,7 +196,7 @@ static void model_opts_init(void)
     { const char *e2 = getenv("WASTE_LOOKAHEAD");
       lookahead_n = e2 ? atoi(e2) : 6;
       if (lookahead_n < 0) lookahead_n = 0;
-      if (lookahead_n > 64) lookahead_n = 64; }
+      if (lookahead_n > WASTE_PF_MAX) lookahead_n = WASTE_PF_MAX; }
 }
 
 /* One weight from a 3-bit stream: values sit LSB-first at bit offset 3*i,
@@ -878,6 +878,7 @@ static void cfg_from_json(waste_config *c, const js_doc *d, int cfg)
 
 /* Defined below, next to record_check; the cache needs it at load. */
 static int bank_fetch(void *user, int layer, int expert, uint8_t *dst);
+static void start_readers(waste_model *m);
 
 /* Wire the resident trunk. The cache is the cold part of this engine —
  * 19 to 30% hit — and this is the hot one: 27.5 GB on K3, read in full
@@ -1280,19 +1281,7 @@ int waste_model_load(waste_model *m, const char *dir, int kv_cap,
         m->miss_buf = (uint8_t *)waste_dio_alloc((size_t)rec);
         if (!m->miss_buf) return -1;
 
-        /* Read-ahead. The internal SSD reaches 12.89 GB/s at queue depth 2
-         * against 10.73 at depth 1, so two readers is the whole of the
-         * bandwidth story; the rest of the win is that a pread no longer
-         * blocks the matmuls. WASTE_IO_THREADS=0 restores the synchronous
-         * path exactly, which is what the cache-vs-no-cache checks compare
-         * against. */
-        int nio = 2, depth = 2;
-        const char *e = getenv("WASTE_IO_THREADS");
-        if (e) nio = atoi(e);
-        e = getenv("WASTE_IO_DEPTH");
-        if (e) depth = atoi(e);
-        if (depth < nio) depth = nio;
-        waste_ecache_io_start(&m->cache, bank_fetch, m, nio, depth);
+        start_readers(m);
     }
     if (waste_mlock_mode() & WASTE_WIRE_TRUNK) wire_trunk(m);
 
@@ -2275,7 +2264,7 @@ static void moe_layer(waste_model *m, int L, const float *in, float *out, int *r
      * layer's attention. Issuing it earlier would put speculative reads in
      * front of demand ones on a queue that is the bottleneck. */
     if (lookahead_n) {
-        int nxt[64];
+        int nxt[WASTE_PF_MAX];
         const int nn = predict_next_moe(m, L, in, nxt, lookahead_n);
         if (nn) waste_ecache_prefetch(&m->cache, L + 1, nxt, nn);
     }
@@ -2541,6 +2530,82 @@ int waste_model_state_import(waste_model *m, const void *src, size_t bytes,
     }
     memcpy(m->x, p, (size_t)c->hidden * sizeof(float));
     if (pos) *pos = h.pos;
+    return 0;
+}
+
+/* Every buffer a session accumulates into, back to the state of a fresh
+ * open. Lived in waste.c reaching into the model's fields; it is here so
+ * there is one copy, and so a measurement harness that drives the model
+ * directly can start each arm from the same place the last one did. */
+void waste_model_reset(waste_model *m)
+{
+    const waste_config *c = &m->cfg;
+    for (int L = 0; L < c->n_layers; L++) {
+        if (m->S[L])
+            memset(m->S[L], 0, (size_t)c->kda_heads * c->kda_dim * c->kda_dim * sizeof(float));
+        if (m->conv[L])
+            memset(m->conv[L], 0,
+                   (size_t)3 * c->kda_heads * c->kda_dim * (c->conv_k - 1) * sizeof(float));
+        m->n_kv[L] = 0;
+    }
+    m->n_blockres = 0;
+    if (m->x) memset(m->x, 0, (size_t)c->hidden * sizeof(float));
+    if (m->blockres && c->attn_res_block) {
+        const int nb = c->n_layers / c->attn_res_block + 2;
+        memset(m->blockres, 0, (size_t)nb * c->hidden * sizeof(float));
+    }
+}
+
+/* The one tuning knob a sweep varies between arms in a single process.
+ * WASTE_LOOKAHEAD still sets the default; this changes it after load, which
+ * is the whole point — a new process costs 48 seconds of model load on K3
+ * and, worse, a different machine state. */
+void waste_model_set_lookahead(int n)
+{
+    if (n < 0) n = 0;
+    if (n > WASTE_PF_MAX) n = WASTE_PF_MAX;
+    lookahead_n = n;
+}
+int  waste_model_get_lookahead(void)  { return lookahead_n; }
+
+/* Read-ahead. The internal SSD reaches 12.89 GB/s at queue depth 2 against
+ * 10.73 at depth 1, so two readers is the whole of the bandwidth story; the
+ * rest of the win is that a pread no longer blocks the matmuls.
+ * WASTE_IO_THREADS=0 restores the synchronous path exactly, which is what
+ * the cache-vs-no-cache checks compare against.
+ *
+ * A function rather than a block because waste_model_resize_cache has to
+ * start them again on the same terms, and two copies of a policy is one
+ * copy too many. */
+static void start_readers(waste_model *m)
+{
+    int nio = 2, depth = 2;
+    const char *e = getenv("WASTE_IO_THREADS");
+    if (e) nio = atoi(e);
+    e = getenv("WASTE_IO_DEPTH");
+    if (e) depth = atoi(e);
+    if (depth < nio) depth = nio;
+    waste_ecache_io_start(&m->cache, bank_fetch, m, nio, depth);
+}
+
+/* Give the cache a different size without touching the trunk.
+ *
+ * A budget sweep used to need one process per budget, because the cache is
+ * sized at open — and that is what made docs/LEARNED.md §32 and §33 come out
+ * wrong, since each process met a machine the previous one had changed. The
+ * trunk is the expensive part of a load, not the cache; re-making only the
+ * cache keeps the 27 GB where it is and leaves the footprint at exactly what
+ * the budget would have made it. */
+int waste_model_resize_cache(waste_model *m, size_t cache_bytes)
+{
+    const int policy = m->cache.policy;
+    int64_t rec = 0;
+    for (int L = 0; L < m->cfg.n_layers; L++)
+        if (m->bank[L].rec_bytes > rec) rec = m->bank[L].rec_bytes;
+    if (rec <= 0) return -1;
+    waste_ecache_free(&m->cache);          /* stops the readers first */
+    if (waste_ecache_init(&m->cache, cache_bytes, (size_t)rec, policy)) return -1;
+    start_readers(m);
     return 0;
 }
 

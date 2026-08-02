@@ -6,8 +6,8 @@ expensive step it protects, the test, and the recorded verdict.
 
 **Read this as a log, not as a status page.** The gates are dated and kept
 as they were written, including the projections that the finished engine
-went on to beat or miss. Every gate has now run; where one carries a
-forecast, a note says what actually happened. The measured end-to-end
+went on to beat or miss. Every gate below has run except Gate 7, which is
+open; where one carries a forecast, a note says what actually happened. The measured end-to-end
 numbers live in [LEARNED.md](LEARNED.md) §12 and §16 and in the README —
 those are the ones to quote.
 
@@ -21,6 +21,7 @@ those are the ones to quote.
 | 3 | quantization quality at 2–3 bit | ✅ run 2026-07-27, repeated on real K3 experts |
 | 4 | engine correctness | ✅ all three steps passed 2026-07-27 |
 | 6 | is per-expert bit allocation a real lever? | ❌ run 2026-07-29 — refuted, nothing to allocate |
+| 7 | is the budget resolver's quantum still a working set? | ⏳ **open** — opened 2026-08-01 |
 
 ## Gate 0 — does the trace→simulate methodology work, and what does real
 ## batch-1 routing look like? ✅ PASSED (with a sobering data point)
@@ -139,6 +140,15 @@ useful hit rates start at 2-3x that. For K3 that floor is ~960 experts x
 16.5 MB = **~16 GB**, which a 64 GB machine clears with room for 3x — but a
 32 GB machine would not, and that is now a measured statement rather than a
 guess.
+
+> **Still exactly true, and no longer binding (2026-08-01).** Re-measured on
+> K3 in one process at 287 slots — a fifth of a token's 1472 records —
+> [LEARNED.md](LEARNED.md) §41 reproduces the zero: **0.0% hit** with the
+> router lookahead off. With it on the same 287 slots measure **29.1%**,
+> because a prefetched record has to survive from one layer to the next
+> rather than from one token to the next. The floor is a property of a
+> demand-only cache, which was the only kind that existed when this gate
+> ran. Whether the budget resolver's quantum should follow is Gate 7.
 
 Correctness: cache on vs cache off is **bit-identical**, and both match the
 oracle at rel 1.50e-06. Placement decides speed, never precision.
@@ -304,3 +314,62 @@ does not rescue the idea: demoting the cold tail buys disk, which is not
 scarce, and 0–2% of the reads, which are. The table is in
 [LEARNED.md](LEARNED.md) §20, with the activation-weighted measurement
 that would revive it.
+
+## Gate 7 — is the budget resolver's quantum still one token's working set?
+## ⏳ OPEN, raised 2026-08-01. Not run
+
+*Protects:* redesigning the rule that picks the default memory budget, and
+with it what every user of this engine gets when they pass no `--budget`.
+Also protects against the opposite mistake — shipping a smaller default
+because a four-token measurement liked it, and finding it worse on the
+sessions people actually run.
+
+*Why it is open.* [LEARNED.md](LEARNED.md) §4 established that a cache below
+one token's working set keeps nothing alive from one token to the next, and
+the hit rate is not low but zero. The resolver is built on it: it steps down
+in whole multiples of that working set and takes the largest that fits under
+seven eighths of RAM.
+
+```c
+ws = one token's working set;             /* 16.2 GB on K3 */
+for (k = 3; k >= 1; k--)
+    if (floor + ws*k <= cap) { budget = floor + ws*k; break; }
+```
+
+That number is still exact. §41 reproduced it: 287 slots, lookahead off,
+**0.0% hit**. What changed is that the router lookahead needs a record to
+survive *one attention* rather than one token, so the same 287 slots measure
+**29.1%** with it on, and a 3.32 GB cache lands within 10% of a 17.32 GB one.
+
+The rule's quantum is the thing to question, not its constant. On K3 there
+is nothing between `floor` — cache effectively zero — and `floor + 1x`, a
+16.2 GB cache. **It cannot express the size that now works.**
+
+*Test:* `tests/sweep.c` with `cache=`, a fine grid between 287 and 1498
+slots, over a **long generation — 200 tokens or more**. §41 used four.
+Cross-token reuse is what a large cache buys and it accumulates over a
+session, so a short run is precisely the condition that flatters a small
+one. One process, interleaved arms, as §40.
+
+*Kill criterion:* if at 200+ tokens a 3–4 GB cache is no longer within ~10%
+of `floor + 1x`, the rule stands as written and §41 becomes a note about
+short sessions. Only a gap that survives the long run justifies touching the
+resolver.
+
+*What acting on it would mean, if it survives.* A smaller default trades
+peak throughput for machine margin: on this laptop about 10% of tok/s to
+leave the OS ~32 GB instead of ~18. §16, §32 and §33 all identify that
+margin as what decides whether the engine meets the paging cliff at all, and
+§33 found a budget whose throughput spanned 15x across identical runs
+because it sat on the edge of it. Whether 10% of peak is worth roughly
+doubling the distance from that edge is a product decision and not a
+measurement, so this gate stops at the number and does not recommend one.
+
+*Cost of running it:* one process, no code change, and **45 to 50 minutes**
+of K3 time — 200 tokens is about 330 s an arm at 0.6 tok/s, and a four-point
+grid twice over is eight of them. An earlier draft of this line said half an
+hour, which was arithmetic done hopefully.
+
+The collapsed budgets are deliberately not in the grid: at 0.075 tok/s two
+hundred tokens is forty-four minutes *each*, and there is nothing left to
+learn there — §41 and §33 have both already refused them.

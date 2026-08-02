@@ -613,6 +613,7 @@ const uint8_t *waste_ecache_get(waste_ecache *c, int layer, int expert,
     ec_lock(c);
     if (rc != 0) {
         ec_drop(c, vi);
+        if (c->io) pthread_cond_broadcast(&c->io->done);
         ec_unlock(c);
         return NULL;
     }
@@ -622,6 +623,63 @@ const uint8_t *waste_ecache_get(waste_ecache *c, int layer, int expert,
     ec_issue_next(c);
     ec_unlock(c);
     return dst;
+}
+
+/* Caller holds the cache lock. Every queued asynchronous job owns an
+ * EC_INFLIGHT slot, and every completion broadcasts `done` under this same
+ * mutex, so slot state is the queue-drained predicate. */
+static void ec_wait_idle(waste_ecache *c)
+{
+    if (c->io) {
+        for (;;) {
+            int inflight = 0;
+            for (int i = 0; i < c->n_slots; i++)
+                if (c->slot[i].state == EC_INFLIGHT) { inflight = 1; break; }
+            if (!inflight) break;
+            pthread_cond_wait(&c->io->done, &c->io->mu);
+        }
+    }
+}
+
+/* Complete asynchronous work without changing cache contents or counters.
+ * A measurement arm uses this before stopping its timer so speculative tail
+ * reads are charged to the configuration that issued them. */
+void waste_ecache_drain(waste_ecache *c)
+{
+    ec_lock(c);
+    ec_wait_idle(c);
+    ec_unlock(c);
+}
+
+/* Back to a freshly-opened cache: no records, no counters. A sweep needs it
+ * between arms — leaving the cache warm would hand the second configuration
+ * the first one's work and measure the order instead of the setting. */
+void waste_ecache_clear(waste_ecache *c)
+{
+    ec_lock(c);
+    /* Clearing before a speculative tail read completes lets its worker mark
+     * an empty slot READY afterward. Drain before rebuilding metadata. */
+    ec_wait_idle(c);
+    for (int i = 0; i < c->n_slots; i++) {
+        if (c->slot[i].state == EC_READY) ec_volatile(c, i);
+        c->slot[i].key = -1;
+        c->slot[i].state = EC_EMPTY;
+        c->slot[i].fresh = 0;
+        c->slot[i].pin = 0;
+        c->slot[i].hits = 0;
+        c->slot[i].last = 0;
+    }
+    if (c->hash) memset(c->hash, 0xff, ((size_t)c->hash_mask + 1) * sizeof *c->hash);
+    c->clock = c->hits = c->misses = c->bytes_read = 0;
+    c->evictions = c->prefetched = c->spec_issued = 0;
+    c->rng = 0x9e3779b9u;
+    c->pf_gen = 1;
+    c->pf_layer = 0;
+    c->pf_n = c->pf_issued = 0;
+    memset(c->pf_ids, 0, sizeof c->pf_ids);
+    c->last_used = -1;
+    c->purged = 0;
+    ec_unlock(c);
 }
 
 /* ---- learned hotlist ---------------------------------------------------- */

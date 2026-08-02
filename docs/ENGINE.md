@@ -55,9 +55,17 @@ shell, a host program can do from C.
 Shipped in 0.5.0, nine commands: `run`, `chat` (state kept across turns,
 `/reset`, `/stats`, `/save`, `/load`, `/image`), `eval`, `tokenize`,
 `detokenize`, `bench`, `plan`, `info`, `version` — the full surface is
-tabulated at the end of this document. Still to come: `serve` (an HTTP
-endpoint; there is no server mode today) and `convert` (the converter is
-Python for now).
+tabulated at the end of this document, and it is still those nine at 0.6.2.
+Still to come as *subcommands*: `serve` and `convert`.
+
+Both exist; neither is a `waste` subcommand, and for related reasons. The
+OpenAI-compatible server shipped in 0.6.0 as `serve/`
+(`python3 -m serve MODEL`) — stdlib-only Python reaching this same header
+through ctypes, and the second client the rule above is meant to produce.
+It lives there because the parts that change are the chat format and the
+OpenAI schema, neither of which belongs in a C engine trying to stay small.
+[SERVE.md](SERVE.md). The converter is Python for the same shape of reason:
+it needs torch and safetensors, which the inference path never does.
 
 Every one of them goes through `waste.h`. `plan` is the CLI face of
 `waste_plan_memory`, `bench` of `waste_get_stats`, `run`/`chat` of
@@ -66,19 +74,25 @@ embedding host would use to draw a progress UI.
 
 ```
 $ waste plan kimi-linear.waste --budget 4G
-  resident trunk             1.55 GB
+  resident trunk              988 MB
   KDA state + KV cache        106 MB
   scratch                     178 MB
   minimum expert cache         41 MB
   ---------------------------------
-  FLOOR                      1.87 GB
-  recommended                3.48 GB
-  budget 4.00 GB -> expert cache 2.17 GB
+  FLOOR                      1.28 GB
+  recommended                2.89 GB
+  budget 4.00 GB -> expert cache 2.76 GB
 
 $ waste run kimi-linear.waste "The capital of France is" -n 16 --budget 8G
-The capital of France is Paris, and the capital of Italy is Rome. ...
-[16 tokens, 1.49 s, 10.72 tok/s | experts 2605 hit / 723 miss = 78%]
+The capital of France is Paris. The capital of Italy is Rome. ...
+[16 tokens, 1.50 s, 10.65 tok/s | experts 2965 hit / 363 miss = 89%]
 ```
+
+*(Re-measured 2026-08-02 on a **default** `tools/convert.py` container, i.e.
+a 4-bit trunk. This block previously showed 1.55 GB resident and a 1.87 GB
+floor, which is a `--trunk8` container — a shape nobody ships, and 46% more
+floor than what a default conversion gives. The engine did not change; the
+container being quoted did.)*
 
 A budget under the floor fails at open with `WASTE_E_RAM_BUDGET` and a
 pointer to `waste plan`, rather than swapping the machine.
@@ -125,7 +139,7 @@ reports the reservation applied at open.
 
 A budget of 0 asks the engine to choose, and the choice has to know the
 machine as well as the model. `recommended_bytes` is derived from the
-model alone — 80.63 GB on K3 — so taking it literally on a 64 GB laptop
+model alone — 80.64 GB on K3 — so taking it literally on a 64 GB laptop
 would have sized a 51.95 GB expert cache and swapped, which is precisely
 what the budget exists to prevent.
 
@@ -171,6 +185,13 @@ with a warning when it is above the current safe ceiling.
 
 Everything above the floor is expert cache, and that is the only knob
 that buys speed.
+
+> **Superseded in part (2026-08-01).** That was true of a cache which only
+> fills on demand. The router lookahead fetches a layer ahead, so a record
+> has to survive one attention rather than one token, and a 3.32 GB cache
+> now measures 29.1% hit against 0.0% without it — within 10% of a 17.32 GB
+> one on throughput. The floor is still exactly where §4 put it; it is no
+> longer what limits the engine. [LEARNED.md](LEARNED.md) §41.
 
 ### Estimated for a K3-shaped config (60L, H=7168, 896 experts, top_k=16,
 ### experts @2.12 bit, trunk @4.25 bit, ctx 32k — `tools/memplan.py`)
@@ -309,16 +330,29 @@ allocation path that can exceed the budget is a bug, not a tuning issue.
 
 `make check` runs everything: kernels against their reference
 implementations, the shard downloader's resume and skip paths against a
-local server, the image loader, the container round-trip, chunked prefill
-against token-at-a-time, int8 storage against f32, the SIMD backend
-against the CPU baseline, the cache against no cache, the engine against
-the PyTorch oracle, session round-trip, hotlist effect, budget
-enforcement including peak RSS on both models, the derived `info` and
-parameter counts, and the tokenizer against Python tiktoken.
-**38 checks** as of 2026-07-31, with both containers present. On a fresh
-clone with no model it is 29 items — 19 pass against the synthetic
-container and 10 say SKIP rather than passing quietly. Take the numbers
-from a run, not from here: they move as checks are added.
+local server, the image loader, the container round-trip and its damaged-
+record paths, chunked prefill against token-at-a-time, int8 storage against
+f32, the SIMD backend against the CPU baseline, the cache against no cache,
+read-ahead against synchronous reads, the router lookahead against no
+lookahead, purgeable slots against ordinary ones, the trace simulator
+against the engine's own cache, the engine against the PyTorch oracle,
+session round-trip, hotlist effect, budget enforcement including peak RSS
+on both models, the derived `info` and parameter counts, the converter's
+resume, image normalization against the release's own preprocessor config,
+the markup/content split against a forged control token, the tokenizer
+against Python tiktoken, and the server suite.
+
+Four of those are bit-identity checks — cache, read-ahead, lookahead,
+purgeable — and they are the reason each of those mechanisms could ship:
+every one changes *when* bytes move and none may change what comes out.
+
+**44 checks** as of 2026-08-02. With both containers on disk: **43 pass, 0
+fail, 1 SKIP** — the one skip is image normalization against the release,
+which Kimi-Linear has no vision tower for. With no container at all the same
+run is **32 pass / 0 fail / 12 SKIP**: the synthetic container carries the
+engine checks, and everything needing real weights or a tokenizer says SKIP
+rather than passing quietly. Take the numbers from a run, not from here:
+they move as checks are added.
 
 It exists because this project twice lost hours to checks that silently
 did not run — once to objects compiled against a stale header, once to a
@@ -343,8 +377,9 @@ print:
 | `plan` | `waste_plan_memory`, `waste_physical_ram`, `waste_memory_ceiling` |
 | `info` | `waste_model_get_info`, `waste_memory_used` |
 
-Images add three more, reachable from `run`, `chat` and `eval` via
-`--image`: `waste_image_add`, `waste_image_expand`, `waste_image_clear`.
+Images add four more, reachable from `run`, `chat` and `eval` via
+`--image`: `waste_image_add`, `waste_image_dimensions`,
+`waste_image_expand`, `waste_image_clear`.
 
 `eval` is the one worth knowing about: it runs the prompt and prints the
 next-token distribution without generating, which is how you get a logit

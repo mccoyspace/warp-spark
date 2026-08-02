@@ -209,10 +209,14 @@ def quantize_vq(W, books, dev):
         n, st = X.shape[0], len(books)
         out = torch.empty(n * st, dtype=torch.uint8)
         fp = ctypes.POINTER(ctypes.c_float)
+        # nthreads=0 means "every core", capped at 64 — right on a laptop,
+        # thrash on a many-core box with --jobs > 1. Size the native pool to
+        # the same per-worker share as torch's intra-op pool (set in main()).
+        nthreads = int(os.environ.get("OMP_NUM_THREADS") or 0)
         lib.waste_vq_encode(
             ctypes.cast(X.data_ptr(), fp), n,
             ctypes.cast(B.data_ptr(), fp), st, CB_ENTRIES, VEC_DIM,
-            ctypes.cast(out.data_ptr(), ctypes.POINTER(ctypes.c_uint8)), 0)
+            ctypes.cast(out.data_ptr(), ctypes.POINTER(ctypes.c_uint8)), nthreads)
         return out.view(n, st).T.contiguous(), scale.half().flatten().cpu()
 
     X = (W / scale).to(dev).reshape(-1, VEC_DIM)
@@ -457,6 +461,16 @@ def main():
         ap.error("--jobs must be at least 1")
     if args.cb_sample < 1:
         ap.error("--cb-sample must be at least 1")
+
+    # torch sizes its intra-op pool from os.cpu_count() by default, so N
+    # worker processes would otherwise spawn N*cpus threads and thrash each
+    # other off the machine. Cap each worker at its fair share of the cores;
+    # the env is inherited by the spawn'd workers before they import torch,
+    # which is the only point the setting is read. setdefault leaves an
+    # explicit OMP_NUM_THREADS the caller's to control.
+    per = max(1, (os.cpu_count() or 1) // args.jobs)
+    os.environ.setdefault("OMP_NUM_THREADS", str(per))
+    os.environ.setdefault("MKL_NUM_THREADS", str(per))
 
     os.makedirs(args.out, exist_ok=True)
     cfg = json.load(open(os.path.join(args.src, "config.json")))

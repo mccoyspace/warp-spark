@@ -1159,21 +1159,7 @@ void waste_state_reset(waste_ctx *c)
 {
     if (!c) return;
     c->pos = 0;
-    const waste_config *cf = &c->m.cfg;
-    for (int L = 0; L < cf->n_layers; L++) {
-        if (c->m.S[L])
-            memset(c->m.S[L], 0, (size_t)cf->kda_heads * cf->kda_dim * cf->kda_dim * sizeof(float));
-        if (c->m.conv[L])
-            memset(c->m.conv[L], 0,
-                   (size_t)3 * cf->kda_heads * cf->kda_dim * (cf->conv_k - 1) * sizeof(float));
-        c->m.n_kv[L] = 0;
-    }
-    c->m.n_blockres = 0;
-    if (c->m.x) memset(c->m.x, 0, (size_t)cf->hidden * sizeof(float));
-    if (c->m.blockres && cf->attn_res_block) {
-        const int nb = cf->n_layers / cf->attn_res_block + 2;
-        memset(c->m.blockres, 0, (size_t)nb * cf->hidden * sizeof(float));
-    }
+    waste_model_reset(&c->m);
 }
 
 waste_status waste_state_save(waste_ctx *c, const char *path)

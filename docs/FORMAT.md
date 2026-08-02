@@ -152,8 +152,8 @@ built.
 |---|---|---|---|
 | 0 | F32 | 32 | norms, router, `e_score_correction_bias` |
 | 1 | F16/BF16 | 16 | codebooks; low-rank factors if they ever land |
-| 2 | Q8G | 8 (+f16 scale /g128) | Kimi-Linear's whole trunk; on K3, the vision tower and anything `--trunk-bits 8` |
-| 3 | Q4G | 4 (+f16 scale /g128) | K3's trunk default |
+| 2 | Q8G | 8 (+f16 scale /g128) | the embedding table and the LM head on every container, the vision tower on K3, and anything under `--trunk8` / `--trunk-bits 8` |
+| 3 | Q4G | 4 (+f16 scale /g128) | the trunk default, on every model |
 | 4 | **VQ3R** | 3.00 (3 stages x 256 entries, dim 8) | default for experts (Gate 3) |
 | 5 | **VQ2R** | 2.00 (2 stages x 256 entries, dim 8) | only where Gate 3 quality allows |
 | 6 | **SUB1** | ~1.0 direct VQ | cache-miss substitutes — specified, not written |
@@ -280,7 +280,7 @@ counted, all of it otherwise straight out of the
 expert cache. Everything else is touched in full on every token, so
 streaming it would cost more I/O than the freed cache could save.
 
-Measured on K3: 27.28 GB resident out of a 29.05 GB floor at 4K context.
+Measured on K3: 27.28 GB resident out of a 29.06 GB floor at 4K context.
 The pre-release target was ≤ 25 GB; the real trunk missed it, and that
 overshoot is most of why decode sits at 0.5 tok/s rather than 1.5. (0.3
 before read-ahead — [EFFICIENCY.md](EFFICIENCY.md).)

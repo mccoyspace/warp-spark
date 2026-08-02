@@ -1,5 +1,192 @@
 # Examples
 
+This directory contains runnable examples for the CLI, the public C API, and
+the OpenAI-compatible server. Commands below assume they are run from the
+repository root after `make`.
+
+## CLI examples
+
+### Text
+
+```bash
+# Inspect the model and the memory budget before loading it.
+./waste info ~/models/k3.waste
+./waste plan ~/models/k3.waste
+
+# Generate a completion from an argument, stdin, or a file.
+./waste run ~/models/k3.waste "Write a small C function that swaps two ints" -n 64
+printf '%s\n' "The capital of Italy is" | ./waste run ~/models/k3.waste - -n 16
+./waste run ~/models/k3.waste --file prompt.txt -n 64
+
+# Inspect tokenization and the next-token distribution.
+./waste tokenize ~/models/k3.waste "Hello, world"
+./waste eval ~/models/k3.waste "The capital of France is" --top-k 5
+
+# Keep a conversation state and inspect its cumulative I/O statistics.
+./waste chat ~/models/k3.waste
+> /stats
+> /save session.waste
+> /load session.waste
+```
+
+`-n` limits generated tokens. `--budget` is normally unnecessary because the
+engine selects a conservative default. Use `--verify` after copying or
+downloading a container to check expert-record checksums as they are read.
+
+### Multimodal
+
+Kimi K3 can combine text with one or more images:
+
+```bash
+./waste run ~/models/k3.waste "Describe this photograph" \
+    --image photo.jpg -n 64
+
+./waste run ~/models/k3.waste "List the differences" \
+    --image before.png --image after.png -n 96
+
+./waste eval ~/models/k3.waste "A photograph of a" \
+    --image coast.jpg --top-k 10
+```
+
+Images are placed before the text in CLI prompts. In a chat, attach an image
+to the next turn and then ask the question:
+
+```text
+$ ./waste chat ~/models/k3.waste
+> /image diagram.png
+(diagram.png attached to the next message)
+> Explain the data flow in this diagram.
+```
+
+Repeat `/image` before the message to attach several images. Once an image has
+been consumed, later turns can discuss it without encoding it again because
+its positions remain in the conversation state. `/reset` clears both text and
+image state.
+
+An image expands into many prompt positions. At K3's default patch budget, an
+896×896 image becomes 256 positions, and each costs approximately as much as a
+text position during prefill. See [K3.md](../docs/K3.md) and
+[TECHNICAL.md](../docs/TECHNICAL.md) for measurements.
+
+## C API examples
+
+The examples include only the public header, [waste.h](../src/waste.h):
+
+- [api_plan.c](api_plan.c) reads the memory plan without loading weights;
+- [api_text.c](api_text.c) tokenizes a raw prompt and generates text;
+- [api_vision.c](api_vision.c) builds a K3 image turn, expands the image
+  placeholder, and generates a response.
+
+Build and run them against the static library:
+
+```bash
+make libwaste.a
+
+cc -O2 -std=gnu11 -Isrc examples/api_plan.c libwaste.a \
+    -lm -lpthread -o example-plan
+cc -O2 -std=gnu11 -Isrc examples/api_text.c libwaste.a \
+    -lm -lpthread -o example-text
+cc -O2 -std=gnu11 -Isrc examples/api_vision.c libwaste.a \
+    -lm -lpthread -o example-vision
+
+./example-plan ~/models/k3.waste 4096
+./example-text ~/models/k3.waste "The capital of Italy is"
+./example-vision ~/models/k3.waste photo.jpg "What is in this image?"
+```
+
+The vision example sets `cfg.vision = 1`, calls `waste_image_add`, keeps K3
+markup separate from untrusted user text, expands `<|media_pad|>` with
+`waste_image_expand`, and only then calls `waste_generate`. That ordering is
+required: one placeholder represents every embedding produced by the tower.
+
+Conversation state can be persisted independently of generation:
+
+```c
+waste_state_save(ctx, "session.waste");
+waste_state_reset(ctx);
+waste_state_load(ctx, "session.waste");
+```
+
+See [ENGINE.md](../docs/ENGINE.md) for lifecycle and threading details.
+
+## Server examples
+
+Start the server with the vision tower when image requests are needed:
+
+```bash
+make libwaste.dylib                     # libwaste.so on Linux
+python3 -m serve ~/models/k3.waste --port 8000 --vision
+```
+
+### Chat and streaming
+
+```bash
+curl localhost:8000/v1/chat/completions \
+  -H 'Content-Type: application/json' \
+  -d '{"model":"k3","messages":[{"role":"user","content":"Why is the sky blue?"}],"reasoning_effort":"off"}'
+
+curl -N localhost:8000/v1/chat/completions \
+  -H 'Content-Type: application/json' \
+  -d '{"model":"k3","stream":true,"stream_options":{"include_usage":true},"messages":[{"role":"user","content":"Write a haiku about local inference"}]}'
+
+curl localhost:8000/v1/completions \
+  -H 'Content-Type: application/json' \
+  -d '{"model":"k3","prompt":"The capital of Italy is","max_tokens":16}'
+```
+
+The last request is a raw continuation and does not use the chat renderer.
+
+### Images
+
+The server accepts base64 `data:` URLs. It deliberately does not fetch remote
+HTTP URLs. Local paths require the explicit `--allow-local-images` server flag.
+
+```bash
+IMAGE_B64="$(base64 < photo.jpg | tr -d '\n')"
+
+curl localhost:8000/v1/chat/completions \
+  -H 'Content-Type: application/json' \
+  --data-binary "{\"model\":\"k3\",\"messages\":[{\"role\":\"user\",\"content\":[{\"type\":\"image_url\",\"image_url\":{\"url\":\"data:image/jpeg;base64,${IMAGE_B64}\"}},{\"type\":\"text\",\"text\":\"Describe this image\"}]}],\"reasoning_effort\":\"off\"}"
+```
+
+### Tools and structured output
+
+```bash
+curl localhost:8000/v1/chat/completions \
+  -H 'Content-Type: application/json' \
+  -d '{"model":"k3","messages":[{"role":"user","content":"What is the weather in Rome?"}],"tools":[{"type":"function","function":{"name":"weather","description":"Get current weather","parameters":{"type":"object","properties":{"city":{"type":"string"}},"required":["city"]}}}],"tool_choice":"required"}'
+
+curl localhost:8000/v1/chat/completions \
+  -H 'Content-Type: application/json' \
+  -d '{"model":"k3","messages":[{"role":"user","content":"Return the capital of Italy"}],"response_format":{"type":"json_schema","json_schema":{"name":"capital","schema":{"type":"object","properties":{"country":{"type":"string"},"capital":{"type":"string"}},"required":["country","capital"],"additionalProperties":false}}}}'
+```
+
+## How server prompts are rendered
+
+The HTTP server is stateless between requests. Under one engine lock it resets
+the conversation, resolves and encodes images, renders the request into XTML
+segments, tokenizes those segments, expands image placeholders, and starts
+generation. Requests queue because a `waste_ctx` is not thread-safe.
+
+Prompt structure and user content take different tokenizer paths. XTML control
+segments use `waste_tokenize_markup`; message text uses `waste_tokenize`, where
+control-looking strings remain ordinary text. Segments are never concatenated
+or merged before tokenization: doing so would both permit prompt-structure
+injection and change BPE boundaries relative to K3's reference encoder.
+
+The renderer emits, in order, tool declarations, thinking controls, messages,
+tool-choice and response-format instructions, then an open `think` or
+`response` element. Images become XTML media blocks whose `<|media_pad|>` token
+expands to the number of embeddings produced by the tower.
+
+On output, `serve/regions.py` parses structural token IDs rather than scanning
+text. It incrementally separates `reasoning_content`, answer content, and tool
+calls, which allows the same parser to produce blocking responses and SSE
+deltas. A disconnected streaming client cancels generation immediately.
+
+See [SERVE.md](../docs/SERVE.md) for supported fields, endpoint behavior,
+security constraints, differential tests, and the full rendering protocol.
+
 ## chat.json — the conversation format
 
 `waste chat` addresses an instruct model in the format it was trained on.

@@ -134,3 +134,8 @@ workload-driven expert pruning (drop the cold tail of 896 experts).
 > overlapping the reads with the arithmetic is ~1.6x on K3, and it took no
 > format change at all. [EFFICIENCY.md](EFFICIENCY.md) is the ledger,
 > [LEARNED.md](LEARNED.md) §22–25 the account.
+>
+> *(And again on 2026-08-01: the router lookahead is the same lever one
+> layer further out — start the next layer's reads from a prediction made
+> by its own router, during the boundary the disk would otherwise spend
+> idle. Also no format change, also not about bytes. §34–36.)*
