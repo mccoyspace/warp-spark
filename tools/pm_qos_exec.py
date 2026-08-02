@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# SPDX-License-Identifier: Apache-2.0
 """Run a command with a root-held Linux CPU DMA-latency request.
 
 ``--scope child`` preserves the simple acceptance-run behavior: Q0 is held for
