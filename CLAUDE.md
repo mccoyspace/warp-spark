@@ -15,8 +15,9 @@ Three things follow from that and shape everything else:
   expert reads. Optimizations are judged on bytes read per token and on
   cache hit rate, not on FLOPs.
 - **RAM is a hard ceiling, not a hint.** `waste_cfg.ram_budget_bytes`
-  bounds *everything* the engine allocates. Exceeding it means the OS
-  pages, and a paged "cache hit" is slower than the disk read it replaced.
+  bounds *everything* the engine allocates plus caller memory declared in
+  `host_reserved_bytes`. Exceeding it means the OS pages, and a paged
+  "cache hit" is slower than the disk read it replaced.
 - **Correctness is measured against an oracle**, not asserted. Every layer
   is diffed against a PyTorch reference (`tools/kimi_ref.py`,
   `tools/vision_ref.py`, `tools/k3parts_ref.py`, `tools/kda_ref.py`).

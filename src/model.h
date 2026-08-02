@@ -309,6 +309,11 @@ int waste_model_save_usage(const waste_model *m, const char *path);
 
 int waste_model_state_save(const waste_model *m, const char *path, int pos);
 int waste_model_state_load(waste_model *m, const char *path, int *pos);
+int waste_model_state_size(const waste_model *m, int pos, size_t *bytes);
+int waste_model_state_export(const waste_model *m, int pos, void *dst,
+                             size_t capacity, size_t *written);
+int waste_model_state_import(waste_model *m, const void *src, size_t bytes,
+                             int *pos);
 const waste_tensor *waste_find(const waste_model *m, const char *name);
 
 /* Internal primitives the vision tower reuses: same numerics, same
