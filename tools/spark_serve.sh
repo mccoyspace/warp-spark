@@ -49,6 +49,14 @@ max_hold=${WASTE_SPARK_MAX_HOLD_SECONDS:-3600}
 startup_timeout=${WASTE_SPARK_STARTUP_TIMEOUT_SECONDS:-900}
 artifact_dir=${WASTE_SPARK_QOS_DIR:-/var/tmp/waste-spark-qos-$(id -u)}
 
+# These configure this wrapper, not the engine. The strict profile rejects
+# undeclared WASTE_* selectors, so do not let exported launcher knobs leak
+# through the holder's deliberately broad WASTE_* allowlist.
+unset WASTE_SPARK_CPU_LIST WASTE_SPARK_BUDGET WASTE_SPARK_PREFIX_CACHE
+unset WASTE_SPARK_PREFIX_ENTRIES WASTE_SPARK_HOST WASTE_SPARK_PORT
+unset WASTE_SPARK_MAX_HOLD_SECONDS WASTE_SPARK_STARTUP_TIMEOUT_SECONDS
+unset WASTE_SPARK_QOS_DIR
+
 status_path=$artifact_dir/status.json
 events_path=$artifact_dir/events.jsonl
 
