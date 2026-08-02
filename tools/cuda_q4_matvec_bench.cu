@@ -223,29 +223,26 @@ __global__ static void q4_neon_order_kernel(const uint8_t *weights,
     const int groups = (in + GROUP - 1) / GROUP;
     const uint8_t *row = weights + (size_t)row_index * rowbytes;
     const uint16_t *row_scales = scales + (size_t)row_index * groups;
-    extern __shared__ float partial[];       /* [group][four NEON lanes] */
+    __shared__ float partial[4];
+    __shared__ float total;
+    if (lane == 0) total = 0.0f;
+    __syncwarp(0x0fu);
     for (int group = 0; group < groups; group++) {
         const int begin = group * GROUP;
         const int limit = min(GROUP, in - begin);
         float sum = 0.0f;
         for (int i = lane; i < limit; i += 4)
             sum = fmaf((float)q4_device(row, begin + i), x[begin + i], sum);
-        partial[group * 4 + lane] = sum;
-    }
-    /* One rendezvous instead of two per group. Lane zero then performs the
-     * original group's pairwise vaddvq reduction and advances the scalar
-     * accumulator in group order, so association is unchanged. */
-    __syncwarp(0x0fu);
-    if (lane == 0) {
-        float total = 0.0f;
-        for (int group = 0; group < groups; group++) {
-            const float *part4 = partial + group * 4;
-            const float part = (part4[0] + part4[1]) +
-                               (part4[2] + part4[3]);
+        partial[lane] = sum;
+        __syncwarp(0x0fu);
+        if (lane == 0) {
+            const float part = (partial[0] + partial[1]) +
+                               (partial[2] + partial[3]);
             total += half_to_float_device(row_scales[group]) * part;
         }
-        y[row_index] = total;
+        __syncwarp(0x0fu);
     }
+    if (lane == 0) y[row_index] = total;
 }
 
 __global__ static void signal_kernel(volatile unsigned *flag)
@@ -266,9 +263,8 @@ static void launch(Kernel kernel, const uint8_t *weights,
         q4_fast_kernel<<<out, THREADS, 0, stream>>>(weights, scales, x, y,
                                                     out, in, rowbytes);
     else
-        q4_neon_order_kernel<<<out, 32,
-          (size_t)((in + GROUP - 1) / GROUP) * 4 * sizeof(float), stream>>>(
-              weights, scales, x, y, out, in, rowbytes);
+        q4_neon_order_kernel<<<out, 32, 0, stream>>>(weights, scales, x, y,
+                                                     out, in, rowbytes);
 }
 
 static double event_bench(Kernel kernel, int iterations,
