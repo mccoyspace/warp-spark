@@ -487,11 +487,31 @@ PY
         fi
     fi
 
-    WASTE_CACHE_MB=512 ./test_forward "$MODEL" "$IDS" "$TMP/cache.bin" 0 >/dev/null 2>&1
+    MARGIN_TRACE="$TMP/route-margins.csv"
+    rm -f "$MARGIN_TRACE"
+    WASTE_DUMP_ROUTE_MARGIN="$MARGIN_TRACE" WASTE_CACHE_MB=512 \
+        ./test_forward "$MODEL" "$IDS" "$TMP/cache.bin" 0 >/dev/null 2>&1
     if cmp -s "$TMP/seq.bin" "$TMP/cache.bin"; then
         ok "expert cache is bit-identical to no cache"
     else
         no "expert cache changes results"
+    fi
+
+    if ! command -v python3 >/dev/null 2>&1; then
+        sk "router boundary-margin trace" "python3 not installed"
+    elif python3 tools/route_margins.py --json "$MARGIN_TRACE" \
+             > "$TMP/route-margins.json" 2>/dev/null &&
+         python3 - "$TMP/route-margins.json" <<'PY'
+import json, sys
+s = json.load(open(sys.argv[1]))
+assert s["rows"] > 0 and s["positions"] > 0 and s["layers"] > 0
+assert 0 <= s["margin"]["min"] <= s["margin"]["max"]
+assert len(s["score_error_risk"]) > 0
+PY
+    then
+        ok "router boundary-margin trace is parseable and nonnegative"
+    else
+        no "router boundary-margin trace"
     fi
 
     # Read-ahead is on by default, so the synchronous path — the fallback,

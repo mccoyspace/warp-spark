@@ -164,6 +164,7 @@ static int q8_off = 1;     /* 1 = keep the trunk stored as int8          */
 static int sdot_on = 0;    /* 1 = also quantize activations (SDOT path)  */
 static int i8mm_on = 0;    /* SMMLA batched matmul; costs activation int8 */
 static const char *dump_route = NULL;  /* WASTE_DUMP_ROUTE, see moe_layer */
+static const char *dump_route_margin = NULL; /* WASTE_DUMP_ROUTE_MARGIN */
 /* Absolute position of the first token of the pass being routed. The dump
  * names each row by the token it belongs to rather than leaving a reader
  * to infer it from where the layer index wraps — which is a heuristic
@@ -190,6 +191,7 @@ static void model_opts_init(void)
     /* Read once rather than per layer per token: moe_layer runs 92
      * times a token and getenv is not free. */
     dump_route = getenv("WASTE_DUMP_ROUTE");
+    dump_route_margin = getenv("WASTE_DUMP_ROUTE_MARGIN");
     /* How many of the next layer's experts to fetch on the router's guess.
      * The layer boundary holds about six reads and the prediction's
      * precision falls off past there, so that is the default. 0 is off. */
@@ -2127,6 +2129,72 @@ static int predict_next_moe(waste_model *m, int L, const float *in, int *out, in
     return n;
 }
 
+/* Record the decision boundary the real router used, not the renormalized
+ * weights applied after selection. K3 selects on sigmoid(logit) plus its
+ * correction bias, so that is the only score-space margin that can prove a
+ * top-K route is stable under a bounded score perturbation.
+ *
+ * This has its own CSV rather than extending WASTE_DUMP_ROUTE: the native
+ * route trace has a deliberately fixed 3*K shape consumed by
+ * tools/routing_stats.py and by archived campaign scripts. */
+static void route_margin_row(char phase, int pos, int L, int is_kda,
+                             const float *in, int hid,
+                             const float *logit, const float *prob,
+                             const float *bias, int E,
+                             const int *idx, int K)
+{
+    if (!dump_route_margin || !*dump_route_margin || K <= 0 || K >= E) return;
+
+    const int kth = idx[K - 1];
+    int next = -1;
+    float next_score = -INFINITY;
+    for (int e = 0; e < E; e++) {
+        int selected = 0;
+        for (int j = 0; j < K; j++) {
+            if (idx[j] == e) { selected = 1; break; }
+        }
+        if (selected) continue;
+        const float v = prob[e] + (bias ? bias[e] : 0.0f);
+        if (v > next_score) { next_score = v; next = e; }
+    }
+    if (next < 0) return;
+
+    const float kth_bias = bias ? bias[kth] : 0.0f;
+    const float next_bias = bias ? bias[next] : 0.0f;
+    const float kth_score = prob[kth] + kth_bias;
+    int boundary_ties = 0, nonfinite_scores = 0;
+    double score_sum = 0.0, score_sq = 0.0;
+    for (int e = 0; e < E; e++) {
+        const float v = prob[e] + (bias ? bias[e] : 0.0f);
+        if (!isfinite(v)) { nonfinite_scores++; continue; }
+        if (v == kth_score) boundary_ties++;
+        score_sum += v;
+        score_sq += (double)v * (double)v;
+    }
+    const double score_mean = score_sum / (double)(E ? E : 1);
+    double score_var = score_sq / (double)(E ? E : 1) - score_mean * score_mean;
+    if (score_var < 0.0) score_var = 0.0;
+    double ss = 0.0;
+    for (int i = 0; i < hid; i++) ss += (double)in[i] * (double)in[i];
+    const double input_rms = sqrt(ss / (double)(hid ? hid : 1));
+
+    FILE *df = fopen(dump_route_margin, "a");
+    if (!df) return;
+    if (ftell(df) == 0)
+        fputs("schema,phase,pos,layer,attention,top_k,n_experts,"
+              "kth_id,next_id,kth_score,next_score,margin,"
+              "kth_logit,next_logit,kth_prob,next_prob,kth_bias,next_bias,"
+              "boundary_ties,nonfinite_scores,score_std,input_rms\n", df);
+    fprintf(df, "1,%c,%d,%d,%s,%d,%d,%d,%d,%.9g,%.9g,%.9g,%.9g,%.9g,"
+                "%.9g,%.9g,%.9g,%.9g,%d,%d,%.9g,%.9g\n",
+            phase, pos, L, is_kda ? "KDA" : "MLA", K, E, kth, next,
+            kth_score, next_score,
+            kth_score - next_score, logit[kth], logit[next],
+            prob[kth], prob[next], kth_bias, next_bias,
+            boundary_ties, nonfinite_scores, sqrt(score_var), input_rms);
+    fclose(df);
+}
+
 static void moe_layer(waste_model *m, int L, const float *in, float *out, int *routed)
 {
     const waste_config *c = &m->cfg;
@@ -2155,6 +2223,8 @@ static void moe_layer(waste_model *m, int L, const float *in, float *out, int *r
         idx[j] = best;
         w[j] = score[best];
     }
+    route_margin_row('D', dump_pos0, L, c->kda_layer[L], in, hid,
+                     sc, score, bias, E, idx, K);
     if (c->renorm && K > 1) {
         float s = 0;
         for (int j = 0; j < K; j++) s += w[j];
@@ -3045,6 +3115,9 @@ static void moe_chunk(waste_model *m, int L, const float *in, float *out, int nT
             }
             idx[j] = best; w[j] = score[best];
         }
+        route_margin_row('P', dump_pos0 + t, L, c->kda_layer[L],
+                         in + (size_t)t * hid, hid,
+                         sc, score, bias, E, idx, K);
         if (c->renorm && K > 1) {
             float s = 0;
             for (int j = 0; j < K; j++) s += w[j];
