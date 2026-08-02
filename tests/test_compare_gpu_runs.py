@@ -19,6 +19,7 @@ import compare_gpu_runs as COMPARE  # noqa: E402
 
 VOCAB = 12
 TOP_K = 2
+DEFAULT_ARM = object()
 
 
 def base_logits():
@@ -99,13 +100,15 @@ class CompareGpuRunsTest(unittest.TestCase):
         gpu_logits=None,
         cpu_steps=None,
         gpu_steps=None,
-        cpu_arm=None,
-        gpu_arm=None,
+        cpu_arm=DEFAULT_ARM,
+        gpu_arm=DEFAULT_ARM,
     ):
         cpu_logits = copy.deepcopy(cpu_logits if cpu_logits is not None else base_logits())
         gpu_logits = copy.deepcopy(gpu_logits if gpu_logits is not None else base_logits())
         cpu_steps = copy.deepcopy(cpu_steps if cpu_steps is not None else base_steps())
         gpu_steps = copy.deepcopy(gpu_steps if gpu_steps is not None else base_steps())
+        if cpu_arm is DEFAULT_ARM and gpu_arm is DEFAULT_ARM:
+            cpu_arm, gpu_arm = self.arms()
         cpu = write_capture(
             self.temp.name, "cpu", cpu_logits, cpu_steps, arm=cpu_arm
         )
@@ -183,6 +186,8 @@ class CompareGpuRunsTest(unittest.TestCase):
         self.assertEqual(logits["top10_changed_steps"], 0)
         self.assertEqual(logits["max_abs_step"], 1)
         self.assertAlmostEqual(logits["max_abs"], 0.25)
+        self.assertEqual(logits["max_step_mean_abs_step"], 1)
+        self.assertAlmostEqual(logits["max_step_mean_abs"], 0.25 / VOCAB)
         self.assertAlmostEqual(logits["mean_abs"], 0.25 / (3 * VOCAB))
         step = result["steps"][1]["logits"]
         self.assertFalse(step["byte_exact"])
@@ -232,6 +237,16 @@ class CompareGpuRunsTest(unittest.TestCase):
                 bad.update(mutation)
                 with self.assertRaises(COMPARE.CaptureError):
                     self.compare(cpu_arm=cpu_arm, gpu_arm=bad)
+
+    def test_missing_arm_metadata_is_rejected(self):
+        with self.assertRaises(COMPARE.CaptureError):
+            self.compare(cpu_arm=None, gpu_arm=None)
+
+    def test_missing_decode_routes_are_rejected(self):
+        gpu_steps = base_steps()
+        gpu_steps[1]["routes"] = []
+        with self.assertRaises(COMPARE.CaptureError):
+            self.compare(gpu_steps=gpu_steps)
 
 
 if __name__ == "__main__":

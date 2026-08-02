@@ -286,6 +286,8 @@ def load_capture(path: str) -> Capture:
             if len(set(ids)) != len(ids):
                 raise CaptureError(f"{rwhere}.experts contains duplicate ids")
             routes.append(RouteRow(layer, ids))
+        if arm is not None and arm.key == "cuda" and expected_index > 0 and not routes:
+            raise CaptureError(f"{where}.routes must contain decode route rows")
         steps.append(Step(index, position, input_token, tuple(routes)))
 
     return Capture(
@@ -311,10 +313,8 @@ def _arm_dict(arm: Arm) -> dict[str, Any]:
 
 
 def _validate_cuda_arms(cpu: Capture, gpu: Capture) -> dict[str, Any] | None:
-    if cpu.arm is None and gpu.arm is None:
-        return None
     if cpu.arm is None or gpu.arm is None:
-        raise CaptureError("only one capture has arm metadata")
+        raise CaptureError("both captures must have arm metadata")
     if cpu.arm.key != gpu.arm.key:
         raise CaptureError(
             f"captures have different arm keys: {cpu.arm.key!r} vs {gpu.arm.key!r}"
@@ -326,22 +326,20 @@ def _validate_cuda_arms(cpu: Capture, gpu: Capture) -> dict[str, Any] | None:
         raise CaptureError(
             "CPU control arm must have value=0, effective=0, fallbacks=0"
         )
-    if cpu.arm.calls not in (None, 0):
-        raise CaptureError("CPU control arm executed CUDA calls")
+    if cpu.arm.calls != 0 or cpu.arm.expected_calls != 0:
+        raise CaptureError("CPU control arm must declare calls=expected_calls=0")
     if gpu.arm.value not in (1, 2) or gpu.arm.effective != gpu.arm.value:
         raise CaptureError(
             "GPU arm must have value 1 or 2 and matching effective mode"
         )
     if gpu.arm.fallbacks != 0:
         raise CaptureError("GPU arm reported a CUDA fallback/failure")
-    if gpu.arm.calls is not None:
-        if gpu.arm.expected_calls is None:
-            raise CaptureError("GPU arm has calls but no expected_calls")
-        if gpu.arm.calls != gpu.arm.expected_calls or gpu.arm.calls == 0:
-            raise CaptureError(
-                f"GPU arm executed {gpu.arm.calls} CUDA calls; "
-                f"expected {gpu.arm.expected_calls}"
-            )
+    if (gpu.arm.calls is None or gpu.arm.expected_calls is None or
+            gpu.arm.calls != gpu.arm.expected_calls or gpu.arm.calls == 0):
+        raise CaptureError(
+            f"GPU arm executed {gpu.arm.calls} CUDA calls; "
+            f"expected {gpu.arm.expected_calls}"
+        )
     return {"cpu": _arm_dict(cpu.arm), "gpu": _arm_dict(gpu.arm)}
 
 
@@ -503,6 +501,8 @@ def compare_captures(cpu_path: str, gpu_path: str) -> dict[str, Any]:
         "top10_changed_steps": 0,
         "max_abs": 0.0,
         "max_abs_step": None,
+        "max_step_mean_abs": 0.0,
+        "max_step_mean_abs_step": None,
         "mean_abs": 0.0,
         "finite_pairs": 0,
         "cpu_nonfinite": 0,
@@ -634,6 +634,16 @@ def compare_captures(cpu_path: str, gpu_path: str) -> dict[str, Any]:
             ):
                 logit_summary["max_abs"] = logit_result["max_abs"]
                 logit_summary["max_abs_step"] = index
+            if (
+                logit_result["mean_abs"] is not None
+                and (
+                    logit_summary["max_step_mean_abs_step"] is None
+                    or logit_result["mean_abs"] >
+                    logit_summary["max_step_mean_abs"]
+                )
+            ):
+                logit_summary["max_step_mean_abs"] = logit_result["mean_abs"]
+                logit_summary["max_step_mean_abs_step"] = index
 
             previous_cpu_argmax = logit_result["cpu_argmax"]
             previous_gpu_argmax = logit_result["gpu_argmax"]
@@ -688,6 +698,7 @@ def print_human(result: dict[str, Any]) -> None:
         f"argmax-changed={logits['argmax_changed_steps']} "
         f"top10-changed={logits['top10_changed_steps']} "
         f"max-abs={max_abs if max_abs is not None else 'n/a'} "
+        f"max-step-mean={logits['max_step_mean_abs']} "
         f"mean-abs={mean_abs if mean_abs is not None else 'n/a'} "
         f"nonfinite={logits['cpu_nonfinite']}/{logits['gpu_nonfinite']} "
         f"all={logits['all_cpu_nonfinite']}/{logits['all_gpu_nonfinite']}"

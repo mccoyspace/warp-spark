@@ -392,6 +392,7 @@ static int kda_matvec_t(waste_model *m, float *y, const waste_tensor *t,
             fprintf(stderr,
                     "waste: CUDA KDA requires Q4G/group-128 projections\n");
             m->cuda_kda_failed = 1;
+            m->cuda_kda_state_dirty = 1;
             m->cuda_kda_effective = 0;
             m->cuda_kda_fallbacks++;
             return -1;
@@ -406,6 +407,7 @@ static int kda_matvec_t(waste_model *m, float *y, const waste_tensor *t,
          * token, so make the failure sticky and abort this step. Reset may
          * continue in CPU mode; CUDA itself requires a model reload. */
         m->cuda_kda_failed = 1;
+        m->cuda_kda_state_dirty = 1;
         m->cuda_kda_effective = 0;
         m->cuda_kda_fallbacks++;
         return -1;
@@ -2796,6 +2798,7 @@ void waste_model_reset(waste_model *m)
      * CUDA. CPU mode can still be selected for a reset model. */
     m->cuda_kda_effective = 0;
     m->cuda_kda_calls = 0;
+    m->cuda_kda_state_dirty = 0;
     if (!m->cuda_kda_failed) m->cuda_kda_fallbacks = 0;
 }
 
@@ -3493,6 +3496,8 @@ const float *waste_model_prefill(waste_model *m, const int *tokens, int n,
 {
     const waste_config *c = &m->cfg;
     const int hid = c->hidden;
+    if (m->cuda_kda_state_dirty ||
+        (m->cuda_kda_mode && m->cuda_kda_failed)) return NULL;
     if (n <= 0) return m->logits;
     if (n == 1) return waste_model_step(m, tokens[0], pos0, NULL);
     dump_pos0 = pos0;
@@ -3639,7 +3644,8 @@ const float *waste_model_step(waste_model *m, int token, int pos, int *routed)
     dump_pos0 = pos;
     const waste_config *c = &m->cfg;
     const int hid = c->hidden;
-    if (m->cuda_kda_mode && m->cuda_kda_failed) return NULL;
+    if (m->cuda_kda_state_dirty ||
+        (m->cuda_kda_mode && m->cuda_kda_failed)) return NULL;
     {   /* see waste_model_prefill */
         const int cm = waste_model_ctx_max(m);
         if (cm && (pos < 0 || pos >= cm)) { m->ctx_full = 1; return NULL; }

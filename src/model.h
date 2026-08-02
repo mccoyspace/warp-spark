@@ -151,6 +151,7 @@ typedef struct {
      * CPU, 1 is the fast reduction, and 2 uses a four-lane/group reduction. */
     void    *cuda_kda_ctx;
     int      cuda_kda_mode, cuda_kda_effective, cuda_kda_failed;
+    int      cuda_kda_state_dirty;
     uint64_t cuda_kda_fallbacks, cuda_kda_calls;
     int      trunk_fd;              /* stays open for the on-disk tensors  */
     int8_t  *embrow;                /* one embedding row, read per token   */

@@ -352,6 +352,11 @@ int main(int argc, char **argv)
                 }
             }
 
+            /* CUDA is a decode-only experiment. Force even a one-token
+             * prompt or a one-token final chunk through CPU so the timed
+             * call target and both arms begin from the same prompt state. */
+            const int decode_cuda_mode = is_cuda ? value : 0;
+            if (decode_cuda_mode) m.cuda_kda_mode = 0;
             const float *lg = NULL;
             for (int done = 0; done < n; ) {
                 int k = n - done;
@@ -362,6 +367,7 @@ int main(int argc, char **argv)
                 if (!lg) break;
                 done += k;
             }
+            if (decode_cuda_mode) m.cuda_kda_mode = decode_cuda_mode;
             if (!lg) {
                 fprintf(stderr, "prompt failed\n");
                 waste_model_free(&m);

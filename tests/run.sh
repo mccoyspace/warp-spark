@@ -1141,7 +1141,7 @@ fi
 if ! command -v python3 >/dev/null 2>&1; then
     sk "GPU capture comparator" "python3 not installed"
 elif python3 -m unittest -q tests.test_compare_gpu_runs >/dev/null 2>&1; then
-    ok "GPU capture comparator (8 checks)"
+    ok "GPU capture comparator (10 checks)"
 else
     no "GPU capture comparator"
 fi
