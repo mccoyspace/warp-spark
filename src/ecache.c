@@ -259,6 +259,16 @@ void waste_ecache_io_stop(waste_ecache *c)
     free(io);
 }
 
+int waste_ecache_io_threads(const waste_ecache *c)
+{
+    return c && c->io ? c->io->nthreads : 0;
+}
+
+int waste_ecache_io_depth(const waste_ecache *c)
+{
+    return c && c->io ? c->depth : 0;
+}
+
 /* ---- cache -------------------------------------------------------------- */
 
 int waste_ecache_init(waste_ecache *c, size_t budget_bytes, size_t rec_bytes,

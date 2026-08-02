@@ -168,7 +168,9 @@ class TestProfiles(unittest.TestCase):
             "requested_read_ahead_threads": 3,
             "requested_read_ahead_depth": 7,
             "requested_router_lookahead": 17,
-            "effective_configuration_reported": False})
+            "effective_configuration_reported": False,
+            "effective_read_ahead_threads": None,
+            "effective_read_ahead_depth": None})
 
     def test_default_profile_reports_malformed_and_clamped_storage_env(self):
         profile = resolve_profile(
@@ -181,7 +183,9 @@ class TestProfiles(unittest.TestCase):
             "requested_read_ahead_threads": 0,
             "requested_read_ahead_depth": 0,
             "requested_router_lookahead": 0,
-            "effective_configuration_reported": False})
+            "effective_configuration_reported": False,
+            "effective_read_ahead_threads": None,
+            "effective_read_ahead_depth": None})
 
         clamped = resolve_profile(
             None, threads=None, cache="lfru", no_direct_io=False,
@@ -193,7 +197,9 @@ class TestProfiles(unittest.TestCase):
             "requested_read_ahead_threads": 7,
             "requested_read_ahead_depth": 7,
             "requested_router_lookahead": 64,
-            "effective_configuration_reported": False})
+            "effective_configuration_reported": False,
+            "effective_read_ahead_threads": None,
+            "effective_read_ahead_depth": None})
 
     def test_spark_q0_is_an_exact_current_upstream_configuration(self):
         environment = {"UNRELATED": "kept"}
@@ -212,7 +218,9 @@ class TestProfiles(unittest.TestCase):
             "requested_read_ahead_threads": 2,
             "requested_read_ahead_depth": 2,
             "requested_router_lookahead": 0,
-            "effective_configuration_reported": False})
+            "effective_configuration_reported": False,
+            "effective_read_ahead_threads": None,
+            "effective_read_ahead_depth": None})
         self.assertEqual(public["cpu_affinity"], {
             "managed": False, "effective_cpu_list": None})
 

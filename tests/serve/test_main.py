@@ -36,6 +36,21 @@ class _StoppedServer:
 
 
 class TestMain(unittest.TestCase):
+    def test_conversation_head_is_rejected_before_engine_open(self):
+        tmp = tempfile.mkdtemp(prefix="waste-main-test-")
+        model = Path(tmp) / "model.waste"
+        model.mkdir()
+        output = io.StringIO()
+        try:
+            with (patch.object(MAIN, "Engine") as open_,
+                  redirect_stdout(output), redirect_stderr(output)):
+                status = MAIN.main([str(model), "--conversation-head"])
+            self.assertEqual(status, 2, output.getvalue())
+            self.assertIn("requires --prefix-cache", output.getvalue())
+            open_.assert_not_called()
+        finally:
+            shutil.rmtree(tmp, ignore_errors=True)
+
     def test_too_small_prefix_cache_is_rejected_before_engine_open(self):
         tmp = tempfile.mkdtemp(prefix="waste-main-test-")
         model = Path(tmp) / "model.waste"
@@ -78,12 +93,42 @@ class TestMain(unittest.TestCase):
                              4096)
             self.assertEqual(serve_.call_args.kwargs["prefix_cache_entries"],
                              3)
+            self.assertFalse(serve_.call_args.kwargs["conversation_head"])
             self.assertTrue(engine.closed)
             self.assertTrue(stopped.shutdown_called)
             self.assertTrue(stopped.close_called)
         finally:
             shutil.rmtree(tmp, ignore_errors=True)
             shutil.rmtree(server_tmp, ignore_errors=True)
+
+    def test_strict_profile_rejects_effective_reader_mismatch(self):
+        tmp = tempfile.mkdtemp(prefix="waste-main-test-")
+        model = Path(tmp) / "model.waste"
+        model.mkdir()
+        engine = FakeEngine()
+        engine.stats = lambda: {
+            "tokens_generated": 0, "experts_hit": 0, "experts_missed": 0,
+            "bytes_read": 0, "sec_total": 0.0, "sec_io": 0.0,
+            "direct_io": 1, "read_ahead_threads": 1,
+            "read_ahead_depth": 2,
+        }
+        output = io.StringIO()
+        try:
+            with (patch.dict(MAIN.os.environ, {}, clear=True),
+                  patch.object(MAIN, "Engine", return_value=engine),
+                  patch.object(MAIN.RequestQos, "from_env",
+                               return_value=MAIN.DisabledRequestQos()),
+                  patch.object(MAIN, "serve") as serve_,
+                  redirect_stdout(output), redirect_stderr(output)):
+                status = MAIN.main([
+                    str(model), "--performance-profile", "spark-q0",
+                ])
+            self.assertEqual(status, 1, output.getvalue())
+            self.assertIn("engine reported 1/2", output.getvalue())
+            serve_.assert_not_called()
+            self.assertTrue(engine.closed)
+        finally:
+            shutil.rmtree(tmp, ignore_errors=True)
 
 
 if __name__ == "__main__":

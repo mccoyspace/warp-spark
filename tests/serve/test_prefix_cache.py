@@ -66,6 +66,88 @@ class TestPrefixCachePolicy(unittest.TestCase):
         self.assertEqual(use.status, "miss")
         self.assertEqual(engine.imports, 0)
 
+    def test_mutable_head_restores_exact_history_and_replaces_one_branch(self):
+        identity = ("one engine",)
+        cache = PrefixCache(1 << 20, 2, identity, conversation_head=True)
+        engine = FakeEngine(host_reserved_bytes=1 << 20, prefill_chunk=4)
+        first = list(range(1, 22))
+
+        engine.state_reset()
+        suffix, cold = cache.prepare(engine, first, [8], identity)
+        _, cold_state = self.finish(engine, suffix)
+        self.assertEqual(cold.status, "miss")
+        self.assertEqual(cold.cached_tokens, 20)
+        self.assertEqual(cold.head_cached_tokens, 20)
+        self.assertEqual(cache.stats()["root_entries"], 1)
+        self.assertEqual(cache.stats()["head_entries"], 1)
+
+        # A real next chat request contains the exact old request followed by
+        # the assistant response and next user turn. The mutable checkpoint
+        # should win over the stable family root, then move forward once.
+        extended = first + list(range(101, 113))
+        engine.state_reset()
+        suffix, warm = cache.prepare(engine, extended, [8], identity)
+        _, warm_state = self.finish(engine, suffix)
+        self.assertEqual(warm.status, "hit")
+        self.assertEqual(warm.restored_kind, "head")
+        self.assertEqual(warm.restored_tokens, 20)
+        self.assertEqual(warm.head_cached_tokens, 32)
+        self.assertEqual(suffix, extended[32:])
+        stats = cache.stats()
+        self.assertEqual(stats["root_entries"], 1)
+        self.assertEqual(stats["head_entries"], 1)
+        self.assertEqual(stats["head_hits"], 1)
+        self.assertEqual(stats["head_replacements"], 1)
+
+        baseline = FakeEngine(prefill_chunk=4)
+        baseline.state_reset()
+        _, expected_state = self.finish(baseline, extended)
+        self.assertNotEqual(cold_state, warm_state)
+        self.assertEqual(warm_state, expected_state)
+
+    def test_divergent_history_falls_back_to_root_without_losing_it(self):
+        identity = ("one engine",)
+        cache = PrefixCache(1 << 20, 2, identity, conversation_head=True)
+        engine = FakeEngine(host_reserved_bytes=1 << 20, prefill_chunk=4)
+        original = list(range(1, 22))
+        changed = list(original)
+        changed[12] = 999
+
+        engine.state_reset()
+        cache.prepare(engine, original, [8], identity)
+        engine.state_reset()
+        suffix, use = cache.prepare(engine, changed, [8], identity)
+        self.assertEqual(use.status, "hit")
+        self.assertEqual(use.restored_kind, "root")
+        self.assertEqual(use.restored_tokens, 8)
+        self.assertEqual(suffix, changed[20:])
+        stats = cache.stats()
+        self.assertEqual(stats["root_entries"], 1)
+        self.assertEqual(stats["head_entries"], 1)
+        self.assertEqual(stats["root_hits"], 1)
+
+    def test_head_budget_rejection_preserves_stable_root(self):
+        identity = ("one engine",)
+        engine = FakeEngine(prefill_chunk=4)
+        tokens = list(range(1, 22))
+        # The root snapshot fits exactly; a second snapshot cannot. Head
+        # acceleration is optional and must never evict this stable root.
+        root_snapshot = 8 + 4 * 8
+        root_charge = root_snapshot + 4 * 8 + ENTRY_OVERHEAD_BYTES
+        limit = CONTROLLER_OVERHEAD_BYTES + root_charge
+        engine.host_reserved_bytes = limit
+        cache = PrefixCache(limit, 2, identity, conversation_head=True)
+
+        engine.state_reset()
+        suffix, use = cache.prepare(engine, tokens, [8], identity)
+        self.assertEqual(suffix, tokens[20:])
+        self.assertEqual(use.cached_tokens, 8)
+        self.assertEqual(use.head_cached_tokens, 0)
+        stats = cache.stats()
+        self.assertEqual(stats["root_entries"], 1)
+        self.assertEqual(stats["head_entries"], 0)
+        self.assertEqual(stats["admission_rejects"], 1)
+
     def test_shallow_hit_promotes_deeper_root_and_preserves_full_state(self):
         identity = ("one engine",)
         cache = PrefixCache(1 << 20, 4, identity)
@@ -194,11 +276,12 @@ class TestPrefixCachePolicy(unittest.TestCase):
     def test_metadata_charges_cover_retained_cpython_objects(self):
         key = bytes(17)
         blob = bytearray(19)
-        entry = _Entry(key, 12345, blob, 67890, 2, 3)
+        entry = _Entry(key, 12345, "root", blob, 67890, 2, 3)
         entry_meta = (sys.getsizeof(entry)
                       + sys.getsizeof(key) - len(key)
                       + sys.getsizeof(blob) - len(blob)
                       + sys.getsizeof([entry]) - sys.getsizeof([]))
+        entry_meta += sys.getsizeof(entry.kind)
         for value in (entry.n_tokens, entry.charge,
                       entry.created, entry.last_used):
             entry_meta += sys.getsizeof(value)

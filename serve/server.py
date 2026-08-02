@@ -86,12 +86,18 @@ class ChatServer(ThreadingHTTPServer):
                  tmpdir: Optional[str] = None,
                  prefix_cache_bytes: int = 0,
                  prefix_cache_entries: int = 8,
+                 conversation_head: bool = False,
                  request_qos=None,
                  performance_profile: Optional[dict] = None):
         if prefix_cache_bytes < 0 or prefix_cache_entries < 0:
             raise ValueError("prefix cache limits must be non-negative")
         if prefix_cache_bytes and not prefix_cache_entries:
             raise ValueError("a non-empty prefix cache needs at least one entry")
+        if conversation_head and (
+                not prefix_cache_bytes or prefix_cache_entries < 2):
+            raise ValueError(
+                "conversation head needs an enabled prefix cache and at "
+                "least two entries")
         if (prefix_cache_bytes and
                 prefix_cache_bytes < CONTROLLER_OVERHEAD_BYTES):
             raise ValueError(
@@ -130,7 +136,8 @@ class ChatServer(ThreadingHTTPServer):
             engine, model_id, self.model_info, self.markers)
         self.prefix_cache = PrefixCache(
             prefix_cache_bytes, prefix_cache_entries,
-            self.prefix_cache_identity)
+            self.prefix_cache_identity,
+            conversation_head=conversation_head)
 
     def server_close(self):
         try:
@@ -644,6 +651,7 @@ def serve(engine: Engine, *, host: str = "127.0.0.1", port: int = 8000,
           ready: Optional[threading.Event] = None,
           prefix_cache_bytes: int = 0,
           prefix_cache_entries: int = 8,
+          conversation_head: bool = False,
           request_qos=None,
           performance_profile: Optional[dict] = None) -> ChatServer:
     """Build the server. The caller decides whether to serve_forever."""
@@ -658,6 +666,7 @@ def serve(engine: Engine, *, host: str = "127.0.0.1", port: int = 8000,
                      log_requests=log_requests,
                      prefix_cache_bytes=prefix_cache_bytes,
                      prefix_cache_entries=prefix_cache_entries,
+                     conversation_head=conversation_head,
                      request_qos=request_qos,
                      performance_profile=performance_profile)
     if ready is not None:

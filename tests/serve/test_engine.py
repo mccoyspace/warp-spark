@@ -236,6 +236,11 @@ class TestIntrospection(EngineTestCase):
 
     def test_stats_start_at_zero_and_move(self):
         before = self.engine.stats()
+        self.assertIn("read_ahead_threads", before)
+        self.assertIn("read_ahead_depth", before)
+        self.assertGreaterEqual(before["read_ahead_threads"], 0)
+        self.assertGreaterEqual(before["read_ahead_depth"],
+                                before["read_ahead_threads"])
         self.engine.generate(self.engine.tokenize("hello"),
                              lambda *a: True, max_tokens=4)
         after = self.engine.stats()

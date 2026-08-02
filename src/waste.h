@@ -437,6 +437,12 @@ typedef struct {
 
 waste_status waste_get_stats(const waste_ctx *ctx, waste_stats *out);
 
+/* Runtime-effective read-ahead, after thread creation and cache-depth limits.
+ * Both outputs are zero on the synchronous fallback. This is separate from
+ * waste_stats so adding the query does not change that public struct's ABI. */
+waste_status waste_get_reader_config(const waste_ctx *ctx,
+                                     int *threads, int *depth);
+
 /* Physical RAM of this machine, or 0 if it cannot be determined. A budget
  * near this number is counterproductive: the OS pages out the engine's own
  * expert cache, and a hit then costs a page fault. */

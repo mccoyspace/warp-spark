@@ -148,6 +148,10 @@ examples:
                    type=bounded_int(1, (1 << 31) - 1), default=8,
                    metavar="N",
                    help="hard snapshot entry limit (default 8)")
+    s.add_argument("--conversation-head", action="store_true",
+                   help="retain one exact mutable conversation checkpoint in "
+                        "addition to stable family roots; requires a prefix "
+                        "cache and at least two entries")
     s.add_argument("--plan", action="store_true",
                    help="print the memory plan and exit without loading")
 
@@ -160,6 +164,11 @@ examples:
             args.prefix_cache < CONTROLLER_OVERHEAD_BYTES):
         print(f"prefix cache must be 0 (disabled) or at least "
               f"{CONTROLLER_OVERHEAD_BYTES} bytes", file=sys.stderr)
+        return 2
+    if args.conversation_head and (
+            not args.prefix_cache or args.prefix_cache_entries < 2):
+        print("--conversation-head requires --prefix-cache and at least two "
+              "prefix-cache entries", file=sys.stderr)
         return 2
 
     model = Path(args.model).expanduser()
@@ -227,6 +236,21 @@ examples:
                 "filesystem fell back to buffered reads")
         public_profile = profile.public()
         public_profile["engine"]["direct_io_effective"] = effective_direct_io
+        engine_stats = engine.stats()
+        effective_threads = int(engine_stats["read_ahead_threads"])
+        effective_depth = int(engine_stats["read_ahead_depth"])
+        storage = public_profile["storage"]
+        storage["effective_configuration_reported"] = True
+        storage["effective_read_ahead_threads"] = effective_threads
+        storage["effective_read_ahead_depth"] = effective_depth
+        if profile.request_qos_required and (
+                effective_threads != storage["requested_read_ahead_threads"] or
+                effective_depth != storage["requested_read_ahead_depth"]):
+            raise ProfileError(
+                "spark-q0 requires effective read-ahead "
+                f"{storage['requested_read_ahead_threads']}/"
+                f"{storage['requested_read_ahead_depth']}; engine reported "
+                f"{effective_threads}/{effective_depth}")
     except (EngineError, ProfileError, QosError, ValueError) as e:
         request_qos.close()
         if engine is not None:
@@ -245,8 +269,12 @@ examples:
         print(f"memory   {human(used['floor_bytes'])} resident, "
               f"expert cache {human(used['min_expert_cache'])}")
         if args.prefix_cache:
+            entry_kind = ("snapshots" if args.conversation_head
+                          else "family roots")
             print(f"prefix   {human(args.prefix_cache)} reserved, "
-                  f"at most {args.prefix_cache_entries} family roots")
+                  f"at most {args.prefix_cache_entries} {entry_kind}")
+            if args.conversation_head:
+                print("head     one exact mutable conversation checkpoint")
         print(f"thinking {'off by default' if args.no_thinking else 'on'}"
               f" — reasoning_effort per request")
         profile_note = (" — bounded request-scoped Q0"
@@ -267,6 +295,7 @@ examples:
                     allow_local_images=args.allow_local_images,
                     prefix_cache_bytes=args.prefix_cache,
                     prefix_cache_entries=args.prefix_cache_entries,
+                    conversation_head=args.conversation_head,
                     request_qos=request_qos,
                     performance_profile=public_profile)
     except (EngineError, OSError, QosError, ValueError) as e:

@@ -533,6 +533,8 @@ def engine_extra(stats: dict, *, ms: float,
         "expert_hit_rate": (stats["experts_hit"] / accesses) if accesses else None,
         "bytes_read": stats["bytes_read"],
         "direct_io": bool(stats["direct_io"]),
+        "read_ahead_threads": stats.get("read_ahead_threads"),
+        "read_ahead_depth": stats.get("read_ahead_depth"),
         "ms": round(ms, 1),
     }
     if prefix_cache is not None:

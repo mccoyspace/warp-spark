@@ -108,7 +108,8 @@ class FakeEngine:
     def stats(self) -> dict:
         return {"tokens_generated": 0, "experts_hit": 3, "experts_missed": 1,
                 "bytes_read": 4096, "sec_total": 0.1, "sec_io": 0.01,
-                "direct_io": 0}
+                "direct_io": 0, "read_ahead_threads": 2,
+                "read_ahead_depth": 2}
 
     def memory_used(self) -> dict:
         return {"trunk_bytes": 1, "state_bytes": 1, "scratch_bytes": 1,

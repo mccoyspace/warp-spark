@@ -550,14 +550,18 @@ static int cmd_info(int argc, char **argv)
     waste_memplan used;
     waste_memory_used(c, &used);
     if (o.json) {
+        int read_ahead_threads, read_ahead_depth;
+        waste_get_reader_config(c, &read_ahead_threads, &read_ahead_depth);
         printf("{\"engine\":\"%s\",\"arch\":\"%s\",\"layers\":%u,"
                "\"experts\":%u,\"top_k\":%u,\"hidden\":%u,"
                "\"params_total\":%llu,\"params_active\":%llu,"
-               "\"quantization\":\"%s\",\"expert_cache_bytes\":%llu}\n",
+               "\"quantization\":\"%s\",\"expert_cache_bytes\":%llu,"
+               "\"read_ahead_threads\":%d,\"read_ahead_depth\":%d}\n",
                waste_version(), mi.arch, mi.n_layers, mi.n_experts, mi.top_k,
                mi.hidden, (unsigned long long)mi.params_total,
                (unsigned long long)mi.params_active, mi.quant_summary,
-               (unsigned long long)used.min_expert_cache);
+               (unsigned long long)used.min_expert_cache,
+               read_ahead_threads, read_ahead_depth);
         waste_close(c);
         return 0;
     }
@@ -574,6 +578,11 @@ static int cmd_info(int argc, char **argv)
     printf("  parameters    %s total, %s active/token\n", pt, pa);
     printf("  quantization  %s\n", mi.quant_summary);
     printf("  expert cache  %s\n", cb);
+    int read_ahead_threads, read_ahead_depth;
+    waste_get_reader_config(c, &read_ahead_threads, &read_ahead_depth);
+    printf("  read-ahead    %d threads, depth %d%s\n",
+           read_ahead_threads, read_ahead_depth,
+           read_ahead_threads ? "" : " (synchronous)");
     waste_close(c);
     return 0;
 }
@@ -1009,17 +1018,21 @@ static int cmd_bench(int argc, char **argv)
 
     waste_stats s;
     waste_get_stats(c, &s);
+    int read_ahead_threads, read_ahead_depth;
+    waste_get_reader_config(c, &read_ahead_threads, &read_ahead_depth);
     const double tps = s.sec_total > 0 ? s.tokens_generated / s.sec_total : 0;
     const uint64_t acc = s.experts_hit + s.experts_missed;
     if (o.json) {
         printf("{\"tokens\":%llu,\"tok_per_s\":%.4f,\"experts_hit\":%llu,"
                "\"experts_missed\":%llu,\"bytes_read\":%llu,"
-               "\"direct_io\":%s}\n",
+               "\"direct_io\":%s,\"read_ahead_threads\":%d,"
+               "\"read_ahead_depth\":%d}\n",
                (unsigned long long)s.tokens_generated, tps,
                (unsigned long long)s.experts_hit,
                (unsigned long long)s.experts_missed,
                (unsigned long long)s.bytes_read,
-               s.direct_io ? "true" : "false");
+               s.direct_io ? "true" : "false",
+               read_ahead_threads, read_ahead_depth);
         waste_close(c);
         return 0;
     }

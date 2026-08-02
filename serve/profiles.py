@@ -111,6 +111,8 @@ class ResolvedProfile:
                 "requested_read_ahead_depth": io_depth,
                 "requested_router_lookahead": lookahead,
                 "effective_configuration_reported": False,
+                "effective_read_ahead_threads": None,
+                "effective_read_ahead_depth": None,
             },
             "cpu_affinity": {"managed": False, "effective_cpu_list": None},
             "pm_qos": {

@@ -503,6 +503,60 @@ class TestPrefixCache(ServerTestCase):
         self.assertEqual(reports[0]["status"], "hit")
 
 
+class TestConversationHead(ServerTestCase):
+    """One exact mutable checkpoint follows a single chat branch."""
+
+    engine_kwargs = {"host_reserved_bytes": 1 << 20, "prefill_chunk": 4}
+    server_kwargs = {"prefix_cache_bytes": 1 << 20,
+                     "prefix_cache_entries": 2,
+                     "conversation_head": True}
+
+    def test_next_turn_restores_head_and_altered_history_restores_root(self):
+        system = {"role": "system", "content": "stable policy " * 10}
+        turn_one = [system, {"role": "user", "content": "first question"}]
+        _, first = self.chat(messages=turn_one)
+        first_cache = first["waste"]["prefix_cache"]
+        self.assertEqual(first_cache["status"], "miss")
+        self.assertGreater(first_cache["head_cached_tokens"],
+                           first_cache["restored_tokens"])
+
+        turn_two = turn_one + [
+            {"role": "assistant", "content": "Hello!"},
+            {"role": "user", "content": "follow-up question"},
+        ]
+        _, second = self.chat(messages=turn_two)
+        second_cache = second["waste"]["prefix_cache"]
+        self.assertEqual(second_cache["status"], "hit")
+        self.assertEqual(second_cache["restored_kind"], "head")
+        self.assertGreater(second_cache["restored_tokens"],
+                           first_cache["restored_tokens"])
+
+        altered = [system,
+                   {"role": "user", "content": "different first question"},
+                   {"role": "assistant", "content": "Hello!"},
+                   {"role": "user", "content": "follow-up question"}]
+        _, divergent = self.chat(messages=altered)
+        divergent_cache = divergent["waste"]["prefix_cache"]
+        self.assertEqual(divergent_cache["status"], "hit")
+        self.assertEqual(divergent_cache["restored_kind"], "root")
+        health = self.get("/health")[1]["prefix_cache"]
+        self.assertEqual(health["root_entries"], 1)
+        self.assertEqual(health["head_entries"], 1)
+
+
+class TestConversationHeadLimits(unittest.TestCase):
+    def test_head_requires_cache_and_two_entries(self):
+        engine = FakeEngine(host_reserved_bytes=1 << 20)
+        with self.assertRaises(ValueError):
+            serve(engine, host="127.0.0.1", port=0,
+                  conversation_head=True)
+        with self.assertRaises(ValueError):
+            serve(engine, host="127.0.0.1", port=0,
+                  prefix_cache_bytes=1 << 20,
+                  prefix_cache_entries=1,
+                  conversation_head=True)
+
+
 class TestPrefixCacheLimits(unittest.TestCase):
     def test_cache_must_be_precharged_to_the_engine(self):
         engine = FakeEngine(host_reserved_bytes=CONTROLLER_OVERHEAD_BYTES)

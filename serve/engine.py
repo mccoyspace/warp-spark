@@ -283,6 +283,9 @@ def _bind(lib) -> None:
     lib.waste_save_usage.argtypes = [C.c_void_p]
     lib.waste_get_stats.restype = C.c_int
     lib.waste_get_stats.argtypes = [C.c_void_p, C.POINTER(Stats)]
+    lib.waste_get_reader_config.restype = C.c_int
+    lib.waste_get_reader_config.argtypes = [
+        C.c_void_p, C.POINTER(C.c_int), C.POINTER(C.c_int)]
     lib.waste_physical_ram.restype = C.c_uint64
     lib.waste_physical_ram.argtypes = []
     lib.waste_memory_ceiling.restype = C.c_uint64
@@ -494,7 +497,16 @@ class Engine:
         st = self.lib.waste_get_stats(self._ctx, C.byref(s))
         if st != WASTE_OK:
             raise EngineError("get_stats", st)
-        return {f: getattr(s, f) for f, _ in Stats._fields_}
+        out = {f: getattr(s, f) for f, _ in Stats._fields_}
+        threads = C.c_int()
+        depth = C.c_int()
+        st = self.lib.waste_get_reader_config(
+            self._ctx, C.byref(threads), C.byref(depth))
+        if st != WASTE_OK:
+            raise EngineError("get_reader_config", st)
+        out["read_ahead_threads"] = threads.value
+        out["read_ahead_depth"] = depth.value
+        return out
 
     def save_usage(self) -> None:
         self._check()

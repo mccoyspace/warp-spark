@@ -142,6 +142,12 @@ int  waste_ecache_io_start(waste_ecache *c, waste_fetch_fn fetch, void *user,
                            int nthreads, int depth);
 void waste_ecache_io_stop(waste_ecache *c);
 
+/* Runtime-effective reader state. Thread creation may stop before the
+ * requested count, and cache geometry may clamp depth; strict hosts must be
+ * able to distinguish that from the requested environment. */
+int waste_ecache_io_threads(const waste_ecache *c);
+int waste_ecache_io_depth(const waste_ecache *c);
+
 /* Name the records this layer is about to ask for, in the order it will ask.
  * Reads for the first `depth` of them that are not resident start now, and
  * each waste_ecache_get releases one more into the pipe. Calling it with a

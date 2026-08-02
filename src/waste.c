@@ -1288,3 +1288,12 @@ waste_status waste_get_stats(const waste_ctx *c, waste_stats *out)
     out->direct_io = c->m.direct_io;
     return WASTE_OK;
 }
+
+waste_status waste_get_reader_config(const waste_ctx *c,
+                                     int *threads, int *depth)
+{
+    if (!c || !threads || !depth) return WASTE_E_ARG;
+    *threads = waste_ecache_io_threads(&c->m.cache);
+    *depth = waste_ecache_io_depth(&c->m.cache);
+    return WASTE_OK;
+}
