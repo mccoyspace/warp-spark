@@ -25,6 +25,10 @@ from . import api                                            # noqa: E402
 from .engine import (CACHE_LFRU, CACHE_LRU,                  # noqa: E402
                      Engine, EngineError, build_info, physical_ram,
                      plan_memory)
+from .profiles import (PROFILE_NAMES, ProfileError,          # noqa: E402
+                       resolve_profile)
+from .qos import (DisabledRequestQos, QosError, RequestQos,  # noqa: E402
+                  discard_control_from_env)
 from .server import serve                                    # noqa: E402
 
 POLICIES = {"lfru": CACHE_LFRU, "lru": CACHE_LRU}
@@ -99,7 +103,7 @@ examples:
                    default=0, metavar="N",
                    help="context tokens (0 = container default)")
     g.add_argument("--threads", type=bounded_int(0, (1 << 31) - 1),
-                   default=0, metavar="N",
+                   default=None, metavar="N",
                    help="compute threads (0 = one per core)")
     g.add_argument("--cache", choices=sorted(POLICIES), default="lfru")
     g.add_argument("--no-direct-io", action="store_true",
@@ -114,6 +118,10 @@ examples:
                         "since. Costs ~5%% on Kimi-Linear, ~1%% on K3")
     g.add_argument("--usage", default=None, metavar="PATH",
                    help="learned hotlist (default <model>/usage.waste)")
+    g.add_argument("--performance-profile", choices=PROFILE_NAMES,
+                   default=None, metavar="NAME",
+                   help="explicit opt-in operating profile; spark-q0 "
+                        "requires the request-scoped PM-QoS launcher")
 
     s = ap.add_argument_group("serving")
     s.add_argument("--max-tokens", type=bounded_int(1, (1 << 32) - 1),
@@ -140,6 +148,17 @@ examples:
     model_id = args.model_id or model.name.removesuffix(".waste")
 
     try:
+        profile = resolve_profile(
+            args.performance_profile, threads=args.threads,
+            cache=args.cache, no_direct_io=args.no_direct_io,
+            verify=args.verify, environ=os.environ)
+    except ProfileError as e:
+        print(f"{e}", file=sys.stderr)
+        return 2
+
+    request_qos = DisabledRequestQos()
+    engine = None
+    try:
         if args.plan:
             plan = plan_memory(str(model), args.ctx)
             ram = physical_ram()
@@ -157,17 +176,35 @@ examples:
                 print(f"\n  this machine has {human(ram)}")
             return 0
 
+        # Adopt the private control channel before the expensive model load.
+        # A strict profile must never start and silently omit its Q0 lease.
+        if profile.request_qos_required:
+            request_qos = RequestQos.from_env(required=True)
+        else:
+            # Merely inheriting a descriptor must never enable a machine-wide
+            # policy under the default profile.
+            discard_control_from_env()
         engine = Engine(
             str(model),
             ram_budget_bytes=args.budget,
             ctx_tokens=args.ctx,
-            n_threads=args.threads,
-            cache_policy=POLICIES[args.cache],
-            direct_io=not args.no_direct_io,
+            n_threads=profile.threads,
+            cache_policy=POLICIES[profile.cache],
+            direct_io=profile.direct_io,
             vision=args.vision,
-            verify_records=args.verify,
+            verify_records=profile.verify_records,
             usage_path=args.usage)
-    except EngineError as e:
+        effective_direct_io = bool(engine.stats()["direct_io"])
+        if profile.request_qos_required and not effective_direct_io:
+            raise ProfileError(
+                "spark-q0 requires effective direct I/O; the model or "
+                "filesystem fell back to buffered reads")
+        public_profile = profile.public()
+        public_profile["engine"]["direct_io_effective"] = effective_direct_io
+    except (EngineError, ProfileError, QosError) as e:
+        request_qos.close()
+        if engine is not None:
+            engine.close()
         print(f"{e}", file=sys.stderr)
         return 1
 
@@ -183,6 +220,9 @@ examples:
               f"expert cache {human(used['min_expert_cache'])}")
         print(f"thinking {'off by default' if args.no_thinking else 'on'}"
               f" — reasoning_effort per request")
+        profile_note = (" — bounded request-scoped Q0"
+                        if profile.request_qos_required else "")
+        print(f"profile  {profile.name}{profile_note}")
         if args.vision:
             print("vision   on — requests may carry base64 images")
         if not args.api_key and args.host not in ("127.0.0.1", "localhost",
@@ -195,8 +235,11 @@ examples:
                     api_key=args.api_key,
                     default_max_tokens=args.max_tokens,
                     default_thinking=not args.no_thinking,
-                    allow_local_images=args.allow_local_images)
+                    allow_local_images=args.allow_local_images,
+                    request_qos=request_qos,
+                    performance_profile=public_profile)
     except (EngineError, OSError) as e:
+        request_qos.close()
         engine.close()
         print(f"{e}", file=sys.stderr)
         return 1
