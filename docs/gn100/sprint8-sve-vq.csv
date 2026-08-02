@@ -1,0 +1,5 @@
+threads,fixture,n,median_cpu_seconds,median_sve_seconds,median_sve_over_cpu,median_phase_reduction_percent,status
+1,k3-gate-up,3,0.000590960,0.000842224,1.425098,-42.51,rejected
+1,k3-down,3,0.000583952,0.000839713,1.436336,-43.63,rejected
+8,k3-gate-up,3,0.000092240,0.000122832,1.329355,-32.94,rejected
+8,k3-down,3,0.000105008,0.000140113,1.338563,-33.86,rejected

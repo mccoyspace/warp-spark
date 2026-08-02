@@ -1,0 +1,6 @@
+family,condition,n,median_decode_seconds,median_tokens_per_second,median_fs_input_bytes,speed_vs_control_percent,fs_input_vs_control_percent,status
+isa,portable-sdot0,2,47.060,0.340133,377824169984,0.000,0.000,retained
+isa,armv86-dotprod-i8mm-sdot0,2,47.140,0.339512,378072266752,-0.170,0.066,rejected-no-speed
+isa,armv86-dotprod-i8mm-sdot1,2,47.015,0.340371,379485403136,0.266,0.374,rejected-quality-and-speed
+lookahead,validate-width0,3,47.310,0.338195,377824169984,0.000,0.000,retained
+lookahead,validate-width4,3,46.530,0.343864,388245868544,1.676,2.758,rejected-gates

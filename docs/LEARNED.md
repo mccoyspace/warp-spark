@@ -2081,3 +2081,36 @@ has 6 GiB; a 16 GiB parent at 13 GiB current narrows that to 1 GiB; and a
 known ceiling below the model floor refuses the automatic open before any
 model-sized allocation. Explicit budgets remain explicit and receive a
 warning rather than being silently rewritten.
+
+## 39. An ISA name is not an instruction, and a vector is not a win (2026-08-02)
+
+The Cortex-X925 says it supports dotprod, i8mm, and SVE. None of those facts
+is a performance result, and the first two were not even enough to make GCC
+13 emit the corresponding feature macros under `-mcpu=native`. The only
+honest integer experiment needed three arms: portable arithmetic, an explicit
+`armv8.6+dotprod+i8mm` compile control with the treatment off, and that exact
+binary with SDOT on. Disassembly then proved `sdot` and `smmla` existed.
+
+The compile control was byte-exact and 0.17% slower. SDOT was 0.27% faster,
+kept the same generated text and top ten, but moved one logit by 0.05897
+against a 0.01 gate. That separates a compiler effect, a precision change,
+and a runtime effect instead of crediting all three to a label called
+"native." i8mm was not promoted into a decode claim: its reachable path is
+batched prefill, where profiling already prices its entire opportunity below
+the campaign's gate.
+
+SVE had a larger-looking target. LUT application was 21.1% of accounted time,
+so a kernel confined there needed a 13.8% phase reduction for a 3% engine
+gain. A bit-exact three-gather implementation instead lost 42--44% to scalar
+at one thread and 33--34% at eight. The machine's SVE width is 128 bits, and
+the existing scalar loop already exposes several independent gather chains;
+vector syntax did not create more memory-level parallelism. The prototype is
+useful because it closes that design at its break-even boundary, not because
+it should be polished until the negative number disappears.
+
+The campaign also caught its own contamination. Short SVE builds and
+microbenchmarks overlapped three one-pass router-lookahead screen rows. Those
+rows were excluded before selection, the apparent winner was rerun in six
+exclusive-host alternating controls, and its exciting screen gain became a
+1.68% median gain with 2.76% extra input. A screen chooses what to confirm; it
+does not get promoted into evidence merely because it is the fastest row.
