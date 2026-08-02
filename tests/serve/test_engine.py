@@ -122,6 +122,7 @@ class TestLibrary(EngineTestCase):
             plan.trunk_bytes + plan.state_bytes + plan.scratch_bytes
             + plan.min_expert_cache,
             "floor_bytes is documented as the sum of the parts")
+        self.assertEqual(plan.host_reserved_bytes, 0)
 
     def test_plan_uses_manifest_vq_geometry(self):
         variant = Path(self.tmp) / "vq-plan.waste"
@@ -142,6 +143,8 @@ class TestLibrary(EngineTestCase):
             E.Engine(str(self.model), ram_budget_bytes=-1)
         with self.assertRaises(ValueError):
             E.Engine(str(self.model), ctx_tokens=1 << 40)
+        with self.assertRaises(ValueError):
+            E.Engine(str(self.model), host_reserved_bytes=-1)
 
     def test_size_parser_rejects_wraparound_values(self):
         self.assertEqual(parse_size("1.5G"), 3 << 29)
@@ -178,6 +181,38 @@ class TestLibrary(EngineTestCase):
         plan = E.plan_memory(str(self.model), 0)
         with self.assertRaises(E.EngineError) as cm:
             E.Engine(str(self.model), ram_budget_bytes=plan.floor_bytes // 2)
+        self.assertEqual(cm.exception.status, E.WASTE_E_RAM_BUDGET)
+
+    def test_host_reservation_is_inside_the_hard_budget(self):
+        plan = E.plan_memory(str(self.model), 4096)
+        reserve = plan.min_expert_cache
+        self.assertGreater(reserve, 0)
+        budget = plan.floor_bytes + reserve
+        baseline = E.Engine(str(self.model), ram_budget_bytes=budget)
+        reserved = E.Engine(str(self.model), ram_budget_bytes=budget,
+                            host_reserved_bytes=reserve)
+        try:
+            a = baseline.memory_used()
+            b = reserved.memory_used()
+            self.assertEqual(b["host_reserved_bytes"], reserve)
+            self.assertLess(b["min_expert_cache"], a["min_expert_cache"])
+            total = (b["trunk_bytes"] + b["state_bytes"] +
+                     b["scratch_bytes"] + b["min_expert_cache"] +
+                     b["host_reserved_bytes"])
+            self.assertLessEqual(total, budget)
+        finally:
+            reserved.close()
+            baseline.close()
+
+    def test_host_reservation_underfloor_and_overflow_are_refused(self):
+        plan = E.plan_memory(str(self.model), 4096)
+        with self.assertRaises(E.EngineError) as cm:
+            E.Engine(str(self.model), ram_budget_bytes=plan.floor_bytes,
+                     host_reserved_bytes=1)
+        self.assertEqual(cm.exception.status, E.WASTE_E_RAM_BUDGET)
+        with self.assertRaises(E.EngineError) as cm:
+            E.Engine(str(self.model), ram_budget_bytes=(1 << 64) - 1,
+                     host_reserved_bytes=(1 << 64) - 1)
         self.assertEqual(cm.exception.status, E.WASTE_E_RAM_BUDGET)
 
 
@@ -431,6 +466,38 @@ class TestGeneration(EngineTestCase):
 
 
 class TestState(EngineTestCase):
+    def test_memory_snapshot_round_trip_is_byte_exact(self):
+        self.engine.generate(self.engine.tokenize("hello world"),
+                             lambda *a: True, max_tokens=2)
+        original = self.engine.state_export()
+        self.assertIsInstance(original, bytearray)
+        self.assertEqual(len(original), self.engine.state_size())
+        self.engine.state_reset()
+        self.engine.state_import(bytes(original))
+        self.assertEqual(self.engine.state_export(), original)
+
+    def test_bad_memory_snapshot_does_not_modify_live_state(self):
+        self.engine.generate(self.engine.tokenize("hello world"),
+                             lambda *a: True, max_tokens=2)
+        original = self.engine.state_export()
+        for bad in (original[:-1], bytearray(original)):
+            if len(bad) == len(original):
+                bad[0] ^= 1
+            with (self.subTest(kind="truncated" if len(bad) < len(original)
+                               else "corrupt"),
+                  self.assertRaises(E.EngineError) as cm):
+                self.engine.state_import(bad)
+            self.assertEqual(cm.exception.status, E.WASTE_E_FORMAT)
+            self.assertEqual(self.engine.state_export(), original)
+
+    def test_memory_and_file_snapshots_share_the_wire_format(self):
+        path = Path(self.tmp) / "canonical.state"
+        self.engine.generate(self.engine.tokenize("hello"),
+                             lambda *a: True, max_tokens=1)
+        blob = self.engine.state_export()
+        self.engine.state_save(str(path))
+        self.assertEqual(path.read_bytes(), blob)
+
     def test_save_and_load(self):
         path = Path(self.tmp) / "session.state"
         self.engine.generate(self.engine.tokenize("hello"),

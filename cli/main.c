@@ -784,7 +784,7 @@ static void show_chosen_budget(waste_ctx *c, const opts *o)
     /* waste_memory_used reports the cache the engine really allocated, so
      * this is what is held, not what was allowed. */
     const uint64_t used = u.trunk_bytes + u.state_bytes + u.scratch_bytes +
-                          u.min_expert_cache;
+                          u.min_expert_cache + u.host_reserved_bytes;
     /* Usable, not physical: inside a cgroup "using 20 GB of 256 GB" names a
      * machine this process does not have, and the number that explains the
      * choice is the one the choice was made from. */
