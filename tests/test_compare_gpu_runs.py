@@ -63,7 +63,7 @@ def base_steps():
     ]
 
 
-def write_capture(directory, name, logits, steps, *, greedy=True):
+def write_capture(directory, name, logits, steps, *, greedy=True, arm=None):
     raw_name = name + ".logits.f32"
     raw_path = os.path.join(directory, raw_name)
     with open(raw_path, "wb") as stream:
@@ -80,6 +80,8 @@ def write_capture(directory, name, logits, steps, *, greedy=True):
         "greedy": greedy,
         "steps": steps,
     }
+    if arm is not None:
+        manifest["arm"] = arm
     manifest_path = os.path.join(directory, name + ".json")
     with open(manifest_path, "w", encoding="utf-8") as stream:
         json.dump(manifest, stream)
@@ -91,14 +93,38 @@ class CompareGpuRunsTest(unittest.TestCase):
         self.temp = tempfile.TemporaryDirectory()
         self.addCleanup(self.temp.cleanup)
 
-    def compare(self, cpu_logits=None, gpu_logits=None, cpu_steps=None, gpu_steps=None):
+    def compare(
+        self,
+        cpu_logits=None,
+        gpu_logits=None,
+        cpu_steps=None,
+        gpu_steps=None,
+        cpu_arm=None,
+        gpu_arm=None,
+    ):
         cpu_logits = copy.deepcopy(cpu_logits if cpu_logits is not None else base_logits())
         gpu_logits = copy.deepcopy(gpu_logits if gpu_logits is not None else base_logits())
         cpu_steps = copy.deepcopy(cpu_steps if cpu_steps is not None else base_steps())
         gpu_steps = copy.deepcopy(gpu_steps if gpu_steps is not None else base_steps())
-        cpu = write_capture(self.temp.name, "cpu", cpu_logits, cpu_steps)
-        gpu = write_capture(self.temp.name, "gpu", gpu_logits, gpu_steps)
+        cpu = write_capture(
+            self.temp.name, "cpu", cpu_logits, cpu_steps, arm=cpu_arm
+        )
+        gpu = write_capture(
+            self.temp.name, "gpu", gpu_logits, gpu_steps, arm=gpu_arm
+        )
         return COMPARE.compare_captures(cpu, gpu)
+
+    @staticmethod
+    def arms():
+        cpu = {
+            "key": "cuda", "value": 0, "effective": 0,
+            "fallbacks": 0, "calls": 0, "expected_calls": 0,
+        }
+        gpu = {
+            "key": "cuda", "value": 1, "effective": 1,
+            "fallbacks": 0, "calls": 24, "expected_calls": 24,
+        }
+        return cpu, gpu
 
     def test_self_compare_is_exact(self):
         result = self.compare()
@@ -191,6 +217,21 @@ class CompareGpuRunsTest(unittest.TestCase):
         self.assertEqual(result["logits"]["gpu_nonfinite"], 1)
         self.assertIsNone(result["steps"][2]["logits"]["gpu_argmax"])
         self.assertFalse(result["steps"][2]["logits"]["top10_set_equal"])
+
+    def test_valid_cuda_arm_metadata_is_retained(self):
+        cpu_arm, gpu_arm = self.arms()
+        result = self.compare(cpu_arm=cpu_arm, gpu_arm=gpu_arm)
+        self.assertEqual(result["arms"]["cpu"]["calls"], 0)
+        self.assertEqual(result["arms"]["gpu"]["calls"], 24)
+
+    def test_cuda_fallback_or_call_shortfall_is_rejected(self):
+        cpu_arm, gpu_arm = self.arms()
+        for mutation in ({"fallbacks": 1}, {"calls": 23}):
+            with self.subTest(mutation=mutation):
+                bad = copy.deepcopy(gpu_arm)
+                bad.update(mutation)
+                with self.assertRaises(COMPARE.CaptureError):
+                    self.compare(cpu_arm=cpu_arm, gpu_arm=bad)
 
 
 if __name__ == "__main__":

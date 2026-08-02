@@ -96,7 +96,7 @@ if python3 tools/make_test_container.py "$SWEEP_MODEL" >/dev/null 2>&1; then
             2>"$sweep_err"); then
       if printf '%s\n' "$sweep_out" | awk '
         $1 == "0" || $1 == "64" {
-            n++; order = order $1 ","; token[$13] = 1; logits[$14] = 1
+            n++; order = order $1 ","; token[$16] = 1; logits[$17] = 1
         }
         END {
             nt = 0; for (x in token) nt++
@@ -1141,7 +1141,7 @@ fi
 if ! command -v python3 >/dev/null 2>&1; then
     sk "GPU capture comparator" "python3 not installed"
 elif python3 -m unittest -q tests.test_compare_gpu_runs >/dev/null 2>&1; then
-    ok "GPU capture comparator (6 checks)"
+    ok "GPU capture comparator (8 checks)"
 else
     no "GPU capture comparator"
 fi

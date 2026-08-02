@@ -53,7 +53,8 @@ of this section can stay about the mechanism:
 | AVX2 | `simd_avx2.c` | verified on Linux/x86_64 |
 | AVX-512 | `simd_avx512.c` | compiled and dispatched, never executed — CI runner is Zen 3, confirmed 2026-07-29 |
 | Metal | `metal.m` | correct, off by default, 22% slower |
-| CUDA, BLAS, ROCm | — | not implemented; the flag refuses to build |
+| CUDA | `cuda.cu` | experimental GB10 decode-KDA Q4 path, off by default |
+| BLAS, ROCm | — | not implemented; the flag refuses to build |
 | SVE, RVV | — | not implemented |
 
 Details for each are in the dated sections below. The rest of this one
@@ -68,11 +69,9 @@ picks at runtime — that is what lets a single x86 binary use AVX-512 on a
 machine that has it and AVX2 on one that does not.
 
 **Accelerators** (CUDA, Metal, BLAS, ROCm): build-time options, each
-needing a source file that registers it. `src/metal.m` exists; `src/cuda.cu`
-and `src/blas.c` do not, and setting their flag stops the build with a
-message saying so rather than failing at link time on an undefined
-`waste_register_*`. Deleting that check is the last step of adding the
-backend it guards.
+needing a source file that registers it. `src/metal.m` and the experimental
+`src/cuda.cu` exist; `src/blas.c` does not, and setting its flag stops the
+build with a message rather than failing at link time on an undefined symbol.
 
 ```
 make                     # CPU + SIMD only, zero extra dependencies
@@ -81,11 +80,14 @@ make WASTE_ENABLE_CUDA=1
 ```
 
 A build without `WASTE_ENABLE_CUDA` contains no CUDA code and no link
-dependency — which is the whole reason dlopen looked tempting, solved more
-simply by not linking it. A build *with* it still calls
-`waste_register_cuda()` at init, which probes for a usable device and
-**returns NULL to decline** if there is none; the engine then keeps the
-backend it already had. Declining is normal, not an error.
+dependency. The current CUDA experiment deliberately declines the global
+kernel table: `WASTE_CUDA_KDA=1` selects only decode-time KDA Q4 projections
+on a per-model context, while prefill, MLA, MoE, and the language head remain
+on CPU. Mode `2` is the slower four-lane/group reduction used as a numerical
+screen. See [GPU_GB10.md](GPU_GB10.md) for its hardware requirements,
+acceptance contract, and results. Switching a worktree between CUDA and
+non-CUDA builds requires `make clean`; this experiment does not add a second
+build system for one personal target.
 
 Metal deserves a note: it is present on every Mac that can run this engine,
 so on macOS it is a plain `#ifdef __APPLE__` decision with no runtime
@@ -319,9 +321,10 @@ no warning prints, while `WASTE_DIRECT=0` produces the fallback and the
 "hit rate is partly the kernel's" note. Both directions of that path are
 now exercised, which is more than the macOS-only build could do.
 
-CUDA remains untested and untestable here on two counts: there is no
-NVIDIA GPU on this machine, and there is still no CUDA source to compile
-— `WASTE_ENABLE_CUDA=1` stops the build with a message saying so.
+CUDA cannot execute in this container because it has no NVIDIA GPU or toolkit.
+CI dry-runs the CUDA build wiring; the real CUDA 13 build and numerical/
+performance campaign run on the GB10 Spark and are recorded in
+[GPU_GB10.md](GPU_GB10.md).
 
 ## AVX2 and AVX-512 (2026-07-28)
 
@@ -466,8 +469,8 @@ ever stops being bandwidth-bound.
 `.github/workflows/ci.yml` builds on linux-x86_64, linux-arm64 and
 macos-arm64, plus two jobs the matrix does not cover: a Metal build (off
 by default, so otherwise never compiled anywhere) and a guards job that
-checks the unimplemented accelerator flags still refuse with a message
-and that every source file carries its SPDX header.
+checks the unimplemented BLAS flag, dry-runs CUDA source wiring, and checks
+that every source file carries its SPDX header.
 
 It exists because of what the first Linux run found. Both defects — the
 Makefile missing `aarch64`, and a peak-RSS check using a BSD-only flag of

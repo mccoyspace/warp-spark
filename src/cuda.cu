@@ -13,6 +13,7 @@
 
 #include <cuda_runtime.h>
 
+#include <pthread.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -110,11 +111,27 @@ static void cuda_problem(const char *where, cudaError_t status)
             cudaGetErrorString(status));
 }
 
+static pthread_once_t cuda_device_once = PTHREAD_ONCE_INIT;
+static cudaError_t cuda_device_status = cudaSuccess;
+
+static void cuda_device_init(void)
+{
+    /* cudaHostGetDevicePointer requires mapped-host support to be selected
+     * before this module creates the device's primary context. */
+    cuda_device_status = cudaSetDeviceFlags(cudaDeviceMapHost);
+    if (cuda_device_status == cudaSuccess)
+        cuda_device_status = cudaSetDevice(0);
+}
+
 static waste_cuda_kda *cuda_create(const waste_model *m)
 {
     int pageable = 0, host_tables = 0;
-    cudaError_t status = cudaSetDevice(0);
-    if (status != cudaSuccess) { cuda_problem("device", status); return NULL; }
+    pthread_once(&cuda_device_once, cuda_device_init);
+    cudaError_t status = cuda_device_status;
+    if (status != cudaSuccess) {
+        cuda_problem("mapped-host device initialization", status);
+        return NULL;
+    }
     status = cudaDeviceGetAttribute(&pageable,
                                     cudaDevAttrPageableMemoryAccess, 0);
     if (status == cudaSuccess)

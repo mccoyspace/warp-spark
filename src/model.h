@@ -148,10 +148,10 @@ typedef struct {
     size_t   mmx_cap, mms_cap;
     /* Experimental decode-only KDA Q4 offload. The context is opaque so a
      * normal build has no CUDA headers or runtime dependency. Mode 0 is
-     * CPU, 1 is the fast reduction, and 2 preserves ARM NEON association. */
+     * CPU, 1 is the fast reduction, and 2 uses a four-lane/group reduction. */
     void    *cuda_kda_ctx;
     int      cuda_kda_mode, cuda_kda_effective, cuda_kda_failed;
-    uint64_t cuda_kda_fallbacks;
+    uint64_t cuda_kda_fallbacks, cuda_kda_calls;
     int      trunk_fd;              /* stays open for the on-disk tensors  */
     int8_t  *embrow;                /* one embedding row, read per token   */
     uint16_t *embsc;
@@ -211,10 +211,11 @@ void        waste_model_reset(waste_model *m);
 int         waste_model_resize_cache(waste_model *m, size_t cache_bytes);
 void        waste_model_set_lookahead(int n);
 int         waste_model_get_lookahead(void);
-void        waste_model_set_cuda_kda(waste_model *m, int mode);
+int         waste_model_set_cuda_kda(waste_model *m, int mode);
 int         waste_model_get_cuda_kda(const waste_model *m);
 int         waste_model_cuda_kda_effective(const waste_model *m);
 uint64_t    waste_model_cuda_kda_fallbacks(const waste_model *m);
+uint64_t    waste_model_cuda_kda_calls(const waste_model *m);
 const char *waste_model_read_error(const waste_model *m, int *layer, int *expert);
 /* Clears both sticky per-call flags: the record error and the context
  * one. Called to arm a fresh eval or generate. */

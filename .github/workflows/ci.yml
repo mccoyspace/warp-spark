@@ -271,23 +271,27 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      # Accelerator flags with no implementation behind them must fail
-      # early with an explanation, not at link time on an undefined symbol.
-      - name: Unimplemented backends refuse to build
+      # Flags with no implementation must fail early. CUDA is implemented
+      # experimentally but this runner has no toolkit/GPU, so dry-run its
+      # wiring instead of pretending the source should not exist.
+      - name: Backend build guards
         run: |
-          for flag in WASTE_ENABLE_CUDA WASTE_ENABLE_BLAS; do
-            if make "$flag=1" 2>&1 | grep -q "is not implemented"; then
-              echo "ok: $flag stops with a message"
-            else
-              echo "FAIL: $flag did not refuse cleanly"; exit 1
-            fi
-            make clean >/dev/null
-          done
+          if make WASTE_ENABLE_BLAS=1 2>&1 | grep -q "is not implemented"; then
+            echo "ok: WASTE_ENABLE_BLAS stops with a message"
+          else
+            echo "FAIL: WASTE_ENABLE_BLAS did not refuse cleanly"; exit 1
+          fi
+          make clean >/dev/null
+          if make -n WASTE_ENABLE_CUDA=1 test_forward | grep -q 'src/cuda.cu'; then
+            echo "ok: WASTE_ENABLE_CUDA wires the CUDA translation unit"
+          else
+            echo "FAIL: CUDA source is not wired into the build"; exit 1
+          fi
 
       # Every source file carries the licence header.
       - name: SPDX headers
         run: |
-          missing=$(git ls-files 'src/*.c' 'src/*.h' 'src/*.m' 'cli/*.c' \
+          missing=$(git ls-files 'src/*.c' 'src/*.cu' 'src/*.h' 'src/*.m' 'cli/*.c' \
                                 'tests/*.c' 'tools/*.py' 'tools/*.sh' \
                     | xargs grep -L 'SPDX-License-Identifier' || true)
           if [ -n "$missing" ]; then

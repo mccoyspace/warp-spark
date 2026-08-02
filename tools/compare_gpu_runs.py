@@ -16,6 +16,10 @@ Manifest schema::
       "vocab": 163840,
       "top_k": 16,
       "greedy": true,
+      "arm": {
+        "key": "cuda", "value": 1, "effective": 1,
+        "fallbacks": 0, "calls": 35328, "expected_calls": 35328
+      },
       "steps": [
         {
           "index": 0,
@@ -85,12 +89,23 @@ class Step:
 
 
 @dataclass(frozen=True)
+class Arm:
+    key: str
+    value: int
+    effective: int
+    fallbacks: int
+    calls: int | None
+    expected_calls: int | None
+
+
+@dataclass(frozen=True)
 class Capture:
     manifest_path: str
     logits_path: str
     vocab: int
     top_k: int
     greedy: bool
+    arm: Arm | None
     steps: tuple[Step, ...]
 
 
@@ -192,6 +207,39 @@ def load_capture(path: str) -> Capture:
         else os.path.join(os.path.dirname(os.path.abspath(path)), logits_name)
     )
 
+    arm = None
+    raw_arm = raw.get("arm")
+    if raw_arm is not None:
+        if not isinstance(raw_arm, dict):
+            raise CaptureError(f"{path}: arm must be an object")
+        key = raw_arm.get("key")
+        if not isinstance(key, str) or not key:
+            raise CaptureError(f"{path}: arm.key must be a non-empty string")
+        calls = raw_arm.get("calls")
+        expected_calls = raw_arm.get("expected_calls")
+        arm = Arm(
+            key=key,
+            value=_integer(raw_arm.get("value"), f"{path}: arm.value"),
+            effective=_integer(
+                raw_arm.get("effective"), f"{path}: arm.effective"
+            ),
+            fallbacks=_integer(
+                raw_arm.get("fallbacks"), f"{path}: arm.fallbacks"
+            ),
+            calls=(
+                None
+                if calls is None
+                else _integer(calls, f"{path}: arm.calls")
+            ),
+            expected_calls=(
+                None
+                if expected_calls is None
+                else _integer(
+                    expected_calls, f"{path}: arm.expected_calls"
+                )
+            ),
+        )
+
     raw_steps = raw.get("steps")
     if not isinstance(raw_steps, list) or not raw_steps:
         raise CaptureError(f"{path}: steps must be a non-empty list")
@@ -246,8 +294,55 @@ def load_capture(path: str) -> Capture:
         vocab=vocab,
         top_k=top_k,
         greedy=greedy,
+        arm=arm,
         steps=tuple(steps),
     )
+
+
+def _arm_dict(arm: Arm) -> dict[str, Any]:
+    return {
+        "key": arm.key,
+        "value": arm.value,
+        "effective": arm.effective,
+        "fallbacks": arm.fallbacks,
+        "calls": arm.calls,
+        "expected_calls": arm.expected_calls,
+    }
+
+
+def _validate_cuda_arms(cpu: Capture, gpu: Capture) -> dict[str, Any] | None:
+    if cpu.arm is None and gpu.arm is None:
+        return None
+    if cpu.arm is None or gpu.arm is None:
+        raise CaptureError("only one capture has arm metadata")
+    if cpu.arm.key != gpu.arm.key:
+        raise CaptureError(
+            f"captures have different arm keys: {cpu.arm.key!r} vs {gpu.arm.key!r}"
+        )
+    if cpu.arm.key != "cuda":
+        return {"cpu": _arm_dict(cpu.arm), "gpu": _arm_dict(gpu.arm)}
+
+    if cpu.arm.value != 0 or cpu.arm.effective != 0 or cpu.arm.fallbacks != 0:
+        raise CaptureError(
+            "CPU control arm must have value=0, effective=0, fallbacks=0"
+        )
+    if cpu.arm.calls not in (None, 0):
+        raise CaptureError("CPU control arm executed CUDA calls")
+    if gpu.arm.value not in (1, 2) or gpu.arm.effective != gpu.arm.value:
+        raise CaptureError(
+            "GPU arm must have value 1 or 2 and matching effective mode"
+        )
+    if gpu.arm.fallbacks != 0:
+        raise CaptureError("GPU arm reported a CUDA fallback/failure")
+    if gpu.arm.calls is not None:
+        if gpu.arm.expected_calls is None:
+            raise CaptureError("GPU arm has calls but no expected_calls")
+        if gpu.arm.calls != gpu.arm.expected_calls or gpu.arm.calls == 0:
+            raise CaptureError(
+                f"GPU arm executed {gpu.arm.calls} CUDA calls; "
+                f"expected {gpu.arm.expected_calls}"
+            )
+    return {"cpu": _arm_dict(cpu.arm), "gpu": _arm_dict(gpu.arm)}
 
 
 def _ranked_tokens(logits: tuple[float, ...], count: int) -> list[int] | None:
@@ -386,6 +481,7 @@ def compare_captures(cpu_path: str, gpu_path: str) -> dict[str, Any]:
             f"captures disagree on greedy mode: {cpu.greedy} vs {gpu.greedy}"
         )
 
+    arms = _validate_cuda_arms(cpu, gpu)
     route_summary: dict[str, Any] = {
         "compared_rows": 0,
         "selected_slots": 0,
@@ -424,6 +520,7 @@ def compare_captures(cpu_path: str, gpu_path: str) -> dict[str, Any]:
         "causally_compared_steps": 0,
         "noncausal_steps": 0,
         "first_token_divergence": None,
+        "arms": arms,
         "routes": route_summary,
         "logits": logit_summary,
         "steps": [],
@@ -565,6 +662,14 @@ def compare_captures(cpu_path: str, gpu_path: str) -> dict[str, Any]:
 def print_human(result: dict[str, Any]) -> None:
     routes = result["routes"]
     logits = result["logits"]
+    arms = result.get("arms")
+    if arms is not None:
+        gpu = arms["gpu"]
+        print(
+            f"arm={gpu['key']} requested={gpu['value']} "
+            f"effective={gpu['effective']} fallbacks={gpu['fallbacks']} "
+            f"calls={gpu['calls']}/{gpu['expected_calls']}"
+        )
     print(
         f"steps={result['total_steps']} causal={result['causally_compared_steps']} "
         f"noncausal={result['noncausal_steps']}"
