@@ -246,9 +246,11 @@ The status record stores only that variable's name, never its value, and
 redacts common secret-valued command options.
 
 The status path, optional event path, and singleton lock path must identify
-three distinct files. The holder rejects normalized-path, resolved-parent, and
-existing-inode aliases before creating or replacing any artifact, so a status
-rewrite cannot unlink the locked inode or erase the event stream.
+three distinct files. A launch-time preflight rejects static lexical,
+canonical-prefix, and existing-inode aliases before creating or replacing an
+artifact, so a status rewrite cannot unlink the locked inode or erase the event
+stream. This is a snapshot check: place all three paths in trusted artifact
+directories that are not concurrently renamed or modified by other users.
 
 The profile refuses to start if its private root control socket is missing,
 the peer is not root, a fixed setting conflicts, or direct I/O fell back. A
