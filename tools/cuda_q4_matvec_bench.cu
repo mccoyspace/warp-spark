@@ -16,6 +16,9 @@
  *   ./cuda_q4_matvec_bench trunk.bin 3226180096 3270220288 12288 7168 40 5
  *
  * Arguments are TRUNK Q_OFFSET SCALE_OFFSET OUT IN [ITERATIONS] [WARMUP].
+ * Set WASTE_CUDA_Q4_STRESS_SECONDS to run the fast kernel continuously for
+ * that many seconds and exit. This is the controlled GPU-memory load used
+ * while fio measures the shared LPDDR/SSD path.
  */
 
 #include <cuda_runtime.h>
@@ -343,6 +346,17 @@ int main(int argc, char **argv)
     const int in = (int)number(argv[5], "IN");
     const int iterations = argc > 6 ? (int)number(argv[6], "ITERATIONS") : 40;
     const int warmup = argc > 7 ? (int)number(argv[7], "WARMUP") : 5;
+    double stress_seconds = 0.0;
+    if (const char *text = std::getenv("WASTE_CUDA_Q4_STRESS_SECONDS")) {
+        char *end = nullptr;
+        stress_seconds = std::strtod(text, &end);
+        if (!text[0] || !end || *end || !std::isfinite(stress_seconds) ||
+            stress_seconds <= 0.0) {
+            std::fprintf(stderr,
+                         "invalid WASTE_CUDA_Q4_STRESS_SECONDS: %s\n", text);
+            return 2;
+        }
+    }
     if (out <= 0 || in <= 0 || iterations <= 0 || warmup < 0) {
         std::fprintf(stderr, "dimensions and iteration count must be positive\n");
         return 2;
@@ -437,6 +451,38 @@ int main(int argc, char **argv)
                out, in, rowbytes, stream);
     }
     ok(cudaStreamSynchronize(stream), "warmup synchronize");
+
+    if (stress_seconds > 0.0) {
+        constexpr int batch = 256;
+        uint64_t launches = 0;
+        std::printf("stress_ready requested_seconds=%.3f traffic_bytes=%zu\n",
+                    stress_seconds, traffic);
+        std::fflush(stdout);
+        const auto begin = std::chrono::steady_clock::now();
+        double elapsed = 0.0;
+        do {
+            for (int i = 0; i < batch; i++)
+                launch(Kernel::Fast, weights, scales, device_x, device_y,
+                       out, in, rowbytes, stream);
+            ok(cudaGetLastError(), "Q4 stress launch");
+            ok(cudaStreamSynchronize(stream), "Q4 stress synchronize");
+            launches += batch;
+            elapsed = std::chrono::duration<double>(
+                std::chrono::steady_clock::now() - begin).count();
+        } while (elapsed < stress_seconds);
+        const double milliseconds = elapsed * 1000.0 / (double)launches;
+        std::printf("path=pageable-fast-stress seconds=%.6f launches=%llu "
+                    "wall_ms_per_launch=%.6f model_GiB_s=%.3f\n",
+                    elapsed, (unsigned long long)launches, milliseconds,
+                    gib_per_second(traffic, milliseconds));
+        cudaStreamDestroy(stream);
+        cudaFreeHost((void *)host_flag);
+        cudaFreeHost(gpu_y);
+        cudaFreeHost(x);
+        std::free(scales);
+        std::free(weights);
+        return 0;
+    }
 
     const double cpu_ms = cpu_bench(iterations, 8, weights, scales, x,
                                     cpu_bench_y.data(), out, in, rowbytes);
