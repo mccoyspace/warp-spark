@@ -45,6 +45,9 @@ security boundary.
 
 - Portable suite: 29 passed, 0 failed, 12 skipped; server: 167 passed.
 - ASan/UBSan suite: 28 passed, 0 failed, 13 skipped.
+- The combined integration branch on the GN100 passed 28 Linux ARM64 native
+  engine checks and 168 server checks; skips were limited to missing `uv` and
+  external model/reference fixtures.
 - The lock is acquired once per context lifetime and is not present in the
   token path; no throughput claim is needed.
 
