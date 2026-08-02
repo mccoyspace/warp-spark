@@ -71,6 +71,7 @@ typedef enum {
     WASTE_E_UNSUPPORTED = -6,  /* arch/quant combination not built in      */
     WASTE_E_CANCELLED = -7,    /* callback asked to stop                   */
     WASTE_E_BUSY = -8,         /* another process owns this container      */
+    WASTE_E_MEMORY = -9,       /* current available/cgroup RAM is too low  */
 } waste_status;
 
 /* Human-readable, static storage; never NULL. A coarse answer by design:
@@ -117,14 +118,17 @@ typedef struct {
      * 0 = the engine picks, and it picks conservatively: expert cache is
      * only useful in whole multiples of one token's working set, so it
      * starts from waste_memplan.recommended_bytes (floor + 3x that set)
-     * and steps down a whole multiple at a time until the total fits
-     * under 7/8 of physical RAM. It does not spend the remainder up to
-     * that ceiling: the last fraction buys a little hit rate and risks
-     * the OS paging the cache out, which costs far more than it gains.
-     * When not even floor + 1x fits, it runs at floor_bytes.
+     * and steps down a whole multiple at a time until the total fits under
+     * the smallest of 7/8 physical RAM, Linux MemAvailable minus the host
+     * reserve, and finite cgroup-v2 headroom minus that cgroup's reserve.
+     * It does not spend the remainder up to that ceiling: the last fraction
+     * buys a little hit rate and risks the OS paging the cache out. When a
+     * known current ceiling cannot hold floor_bytes, loading fails with
+     * WASTE_E_MEMORY before a model-sized allocation.
      *
-     * Loading fails with WASTE_E_RAM_BUDGET if the value given is below
-     * floor_bytes. waste_memory_used reports what was actually resolved. */
+     * An explicit nonzero value remains the caller's contract. Loading
+     * fails with WASTE_E_RAM_BUDGET if it is below floor_bytes.
+     * waste_memory_used reports what was actually resolved. */
     uint64_t ram_budget_bytes;
 
     /* Longest sequence a context holds — prompt plus generation — and a
@@ -401,6 +405,11 @@ waste_status waste_get_stats(const waste_ctx *ctx, waste_stats *out);
  * near this number is counterproductive: the OS pages out the engine's own
  * expert cache, and a hit then costs a page fault. */
 uint64_t waste_physical_ram(void);
+
+/* Current ceiling used by automatic budgeting, or 0 when no memory figure
+ * is available. On Linux this includes MemAvailable and cgroup-v2 pressure;
+ * unlike physical RAM it can change between calls. */
+uint64_t waste_memory_ceiling(void);
 
 #ifdef __cplusplus
 }

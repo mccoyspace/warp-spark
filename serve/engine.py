@@ -45,6 +45,7 @@ WASTE_E_ARG = -5
 WASTE_E_UNSUPPORTED = -6
 WASTE_E_CANCELLED = -7
 WASTE_E_BUSY = -8
+WASTE_E_MEMORY = -9
 
 # waste.h's waste_cache_policy. There is no third: a "pinned" policy was
 # listed there and never implemented, so it selected LFRU like everything
@@ -273,6 +274,8 @@ def _bind(lib) -> None:
     lib.waste_get_stats.argtypes = [C.c_void_p, C.POINTER(Stats)]
     lib.waste_physical_ram.restype = C.c_uint64
     lib.waste_physical_ram.argtypes = []
+    lib.waste_memory_ceiling.restype = C.c_uint64
+    lib.waste_memory_ceiling.argtypes = []
 
 
 def version() -> str:
@@ -285,6 +288,11 @@ def build_info() -> str:
 
 def physical_ram() -> int:
     return int(_lib().waste_physical_ram())
+
+
+def memory_ceiling() -> int:
+    """Current ceiling used by automatic budgeting (0 if unknown)."""
+    return int(_lib().waste_memory_ceiling())
 
 
 def _bounded_int(name: str, value: int, lo: int, hi: int) -> int:

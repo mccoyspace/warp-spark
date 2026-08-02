@@ -478,10 +478,11 @@ first. The examples pass it because 128 tokens of K3 is six minutes.
 `--budget` is optional, and leaving it out is the right default rather
 than a fallback: the engine takes the container's recommendation, steps it
 down a whole token working set at a time until it fits under seven eighths
-of physical RAM, and never goes below the floor — a budget you set
-explicitly under the floor is refused rather than swapped into. It then
-says on stderr what it landed on, so the same command on two machines is
-not silently two different runs:
+of physical RAM and, on Linux, current available and cgroup memory. Linux
+refuses an automatic open when current capacity cannot hold the floor; a
+budget you set explicitly under the floor is refused rather than swapped
+into. It then says on stderr what it landed on, so the same command on two
+machines is not silently two different runs:
 
 ```
 waste: no --budget, using 46.24 GB of 64.00 GB (expert cache 17.56 GB)
