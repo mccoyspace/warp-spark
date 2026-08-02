@@ -43,6 +43,7 @@ from typing import Optional
 from . import api
 from .engine import Cancelled, Engine, EngineError
 from .prefix_cache import CONTROLLER_OVERHEAD_BYTES, PrefixCache
+from .qos import DisabledRequestQos, QosError
 from .regions import RegionParser
 
 SERVER_NAME = "waste"
@@ -84,7 +85,9 @@ class ChatServer(ThreadingHTTPServer):
                  log_requests: bool = True,
                  tmpdir: Optional[str] = None,
                  prefix_cache_bytes: int = 0,
-                 prefix_cache_entries: int = 8):
+                 prefix_cache_entries: int = 8,
+                 request_qos=None,
+                 performance_profile: Optional[dict] = None):
         if prefix_cache_bytes < 0 or prefix_cache_entries < 0:
             raise ValueError("prefix cache limits must be non-negative")
         if prefix_cache_bytes and not prefix_cache_entries:
@@ -109,6 +112,8 @@ class ChatServer(ThreadingHTTPServer):
         self.default_thinking = default_thinking
         self.allow_local_images = allow_local_images
         self.log_requests = log_requests
+        self.request_qos = request_qos or DisabledRequestQos()
+        self.performance_profile = performance_profile or {"name": "default"}
         self.started = api.now()
         self._tmp = tmpdir or tempfile.mkdtemp(prefix="waste-serve-")
         self.tmpdir = self._tmp
@@ -126,6 +131,12 @@ class ChatServer(ThreadingHTTPServer):
         self.prefix_cache = PrefixCache(
             prefix_cache_bytes, prefix_cache_entries,
             self.prefix_cache_identity)
+
+    def server_close(self):
+        try:
+            self.request_qos.close()
+        finally:
+            super().server_close()
 
     def handle_error(self, request, client_address):
         """A client hanging up is not an error worth a traceback.
@@ -253,6 +264,9 @@ class Handler(BaseHTTPRequestHandler):
         except EngineError as e:
             self._send_error(api.APIError(str(e), status=500,
                                           type="engine_error"))
+        except QosError as e:
+            self._send_error(api.APIError(str(e), status=503,
+                                          type="performance_profile_error"))
 
     # ---- endpoints ------------------------------------------------------
 
@@ -264,6 +278,8 @@ class Handler(BaseHTTPRequestHandler):
             "engine": engine_mod.build_info(),
             "uptime_s": api.now() - self.server.started,
             "prefix_cache": self.server.prefix_cache.stats(),
+            "performance_profile": self.server.performance_profile,
+            "pm_qos": self.server.request_qos.stats(),
         })
 
     def _models(self):
@@ -320,15 +336,6 @@ class Handler(BaseHTTPRequestHandler):
                 prompt_len=len(prompt.tokens))
             stops = api.stop_strings(body)
 
-            # Keep the existing meaning of waste.ms: model work for this
-            # request, including prompt evaluation. A cold cache miss moves
-            # part of that prefill into prepare(), so timing only generate()
-            # would make misses look artificially fast.
-            run_started = time.time()
-            run_tokens, cache_use = srv.prefix_cache.prepare(
-                engine, prompt.tokens, prompt.cache_boundaries,
-                srv.prefix_cache_identity)
-
             request_id = api.new_id("chatcmpl")
             created = api.now()
             parser = RegionParser(in_think=prompt.thinking,
@@ -336,16 +343,19 @@ class Handler(BaseHTTPRequestHandler):
                                   markers=srv.markers)
 
             if stream:
-                self._chat_stream(body, prompt, run_tokens, cache_use,
-                                  opts, stops, parser,
-                                  request_id, created, run_started)
+                self._chat_stream(body, prompt, opts, stops, parser,
+                                  request_id, created)
             else:
-                self._chat_blocking(body, prompt, run_tokens, cache_use,
-                                    opts, stops, parser,
-                                    request_id, created, run_started)
+                self._chat_blocking(body, prompt, opts, stops, parser,
+                                    request_id, created)
 
-    def _run(self, prompt_tokens, opts, stops, parser, on_delta):
-        """Drive one generation. Returns (n_tokens, hit_limit, stopped).
+    def _run(self, prompt, opts, stops, parser, on_delta, request_id,
+             before_generate=None):
+        """Drive one generation inside one request-scoped PM-QoS lease.
+
+        Prefix restore or cold-root prefill occurs after lease acquisition and
+        before streaming headers. The same lease then remains active through
+        ``engine.generate()`` and releases before response finalization.
 
         `on_delta(delta)` is called on the engine thread for each token, and
         may raise Cancelled to stop — which is how a disconnected streaming
@@ -394,50 +404,71 @@ class Handler(BaseHTTPRequestHandler):
                 return False
             return True
 
-        completed = engine.generate(
-            prompt_tokens, on_token,
-            temperature=opts["temperature"], top_p=opts["top_p"],
-            top_k=opts["top_k"], seed=opts["seed"],
-            max_tokens=opts["max_tokens"],
-            stop_tokens=self.server.stop_tokens or None)
+        with self.server.request_qos.scope(request_id) as qos_lease:
+            run_tokens, cache_use = self.server.prefix_cache.prepare(
+                engine, prompt.tokens, prompt.cache_boundaries,
+                self.server.prefix_cache_identity)
+            if before_generate is not None:
+                before_generate()
+            completed = engine.generate(
+                run_tokens, on_token,
+                temperature=opts["temperature"], top_p=opts["top_p"],
+                top_k=opts["top_k"], seed=opts["seed"],
+                max_tokens=opts["max_tokens"],
+                stop_tokens=self.server.stop_tokens or None)
+        qos_report = qos_lease.report()
         tail = parser.finish()
         if not state["stopped"]:
             if deliver(tail, final=True):
                 state["stopped"] = True
         hit_limit = completed and state["n"] >= opts["max_tokens"]
-        return state["n"], hit_limit, state["stopped"]
+        return (state["n"], hit_limit, state["stopped"], qos_report,
+                cache_use)
 
-    def _chat_blocking(self, body, prompt, run_tokens, cache_use,
-                       opts, stops, parser,
-                       request_id, created, run_started):
-        n, hit_limit, stopped = self._run(run_tokens, opts, stops, parser,
-                                          lambda d: None)
+    def _engine_extra(self, t0: float, qos_report: dict,
+                      cache_use=None) -> dict:
+        extra = api.engine_extra(self.server.engine.stats(),
+                                 ms=(time.time() - t0) * 1000,
+                                 prefix_cache=(cache_use.response()
+                                               if cache_use is not None
+                                               else None))
+        extra["performance_profile"] = self.server.performance_profile
+        extra["pm_qos"] = qos_report
+        return extra
+
+    def _chat_blocking(self, body, prompt, opts, stops, parser,
+                       request_id, created):
+        # Include lease acquisition, prefix restore/prefill and generation in
+        # the existing request-side model-work timing.
+        t0 = time.time()
+        n, hit_limit, stopped, qos_report, cache_use = self._run(
+            prompt, opts, stops, parser, lambda d: None, request_id)
         reason = api.finish_reason(parser, hit_limit=hit_limit, stopped=stopped)
         usage = api.usage_block(len(prompt.tokens), n)
         payload = api.chat_completion(
             parser, model=self.server.model_id, request_id=request_id,
             created=created, reason=reason, usage=usage,
-            extra=api.engine_extra(self.server.engine.stats(),
-                                   ms=(time.time() - run_started) * 1000,
-                                   prefix_cache=cache_use.response()))
+            extra=self._engine_extra(t0, qos_report, cache_use))
         self._send_json(200, payload)
 
-    def _chat_stream(self, body, prompt, run_tokens, cache_use,
-                     opts, stops, parser,
-                     request_id, created, run_started):
+    def _chat_stream(self, body, prompt, opts, stops, parser,
+                     request_id, created):
         model = self.server.model_id
-        self.send_response(200)
-        self.send_header("Content-Type", "text/event-stream")
-        self.send_header("Cache-Control", "no-cache")
-        self.send_header("Connection", "keep-alive")
-        # Chunked, because the length is unknown until the model stops. With
-        # HTTP/1.1 and no Content-Length the alternative is closing the
-        # socket to signal the end, which costs the client its keep-alive.
-        self.send_header("Transfer-Encoding", "chunked")
-        self.end_headers()
-
+        t0 = time.time()
         sent_role = False
         named: set[int] = set()
+        stream_started = False
+
+        def start_stream() -> None:
+            nonlocal stream_started
+            self.send_response(200)
+            self.send_header("Content-Type", "text/event-stream")
+            self.send_header("Cache-Control", "no-cache")
+            self.send_header("Connection", "keep-alive")
+            # Chunked, because the length is unknown until the model stops.
+            self.send_header("Transfer-Encoding", "chunked")
+            self.end_headers()
+            stream_started = True
 
         def write(payload) -> None:
             data = api.sse(payload)
@@ -478,10 +509,25 @@ class Handler(BaseHTTPRequestHandler):
                 raise Cancelled()
 
         try:
-            n, hit_limit, stopped = self._run(run_tokens, opts, stops, parser,
-                                              on_delta)
+            n, hit_limit, stopped, qos_report, cache_use = self._run(
+                prompt, opts, stops, parser, on_delta, request_id,
+                before_generate=start_stream)
         except Cancelled:
             # The client is gone. Nothing left to write to.
+            return
+        except QosError:
+            if not stream_started:
+                raise
+            # Headers are already committed, so a JSON 503 would corrupt the
+            # SSE stream.  Close it; /health retains the supervisor error.
+            self.close_connection = True
+            return
+        except EngineError:
+            if not stream_started:
+                raise
+            # As above, a second HTTP response cannot follow committed SSE
+            # headers. The lease has already unwound; close the partial stream.
+            self.close_connection = True
             return
 
         try:
@@ -514,9 +560,7 @@ class Handler(BaseHTTPRequestHandler):
                        "usage": usage})
             write({"id": request_id, "object": "chat.completion.chunk",
                    "created": created, "model": model, "choices": [],
-                   "waste": api.engine_extra(self.server.engine.stats(),
-                                             ms=(time.time() - run_started) * 1000,
-                                             prefix_cache=cache_use.response())})
+                   "waste": self._engine_extra(t0, qos_report, cache_use)})
             write("[DONE]")
             self.wfile.write(b"0\r\n\r\n")
             self.wfile.flush()
@@ -534,6 +578,7 @@ class Handler(BaseHTTPRequestHandler):
         """
         body = self._read_body()
         srv = self.server
+        request_id = api.new_id("cmpl")
         prompt_text = body.get("prompt")
         if isinstance(prompt_text, list):
             if len(prompt_text) != 1 or not isinstance(prompt_text[0], str):
@@ -566,11 +611,14 @@ class Handler(BaseHTTPRequestHandler):
                         return False
                 return True
 
-            completed = srv.engine.generate(
-                tokens, on_token, temperature=opts["temperature"],
-                top_p=opts["top_p"], top_k=opts["top_k"], seed=opts["seed"],
-                max_tokens=opts["max_tokens"],
-                stop_tokens=srv.stop_tokens or None)
+            t0 = time.time()
+            with srv.request_qos.scope(request_id) as qos_lease:
+                completed = srv.engine.generate(
+                    tokens, on_token, temperature=opts["temperature"],
+                    top_p=opts["top_p"], top_k=opts["top_k"], seed=opts["seed"],
+                    max_tokens=opts["max_tokens"],
+                    stop_tokens=srv.stop_tokens or None)
+            qos_report = qos_lease.report()
 
         text = "".join(pieces)
         for s in stops:
@@ -578,13 +626,14 @@ class Handler(BaseHTTPRequestHandler):
                 text = text.split(s, 1)[0]
         hit_limit = completed and len(pieces) >= opts["max_tokens"]
         self._send_json(200, {
-            "id": api.new_id("cmpl"),
+            "id": request_id,
             "object": "text_completion",
             "created": api.now(),
             "model": srv.model_id,
             "choices": [{"index": 0, "text": text, "logprobs": None,
                          "finish_reason": "length" if hit_limit else "stop"}],
             "usage": api.usage_block(len(tokens), len(pieces)),
+            "waste": self._engine_extra(t0, qos_report),
         })
 
 
@@ -594,7 +643,9 @@ def serve(engine: Engine, *, host: str = "127.0.0.1", port: int = 8000,
           allow_local_images: bool = False, log_requests: bool = True,
           ready: Optional[threading.Event] = None,
           prefix_cache_bytes: int = 0,
-          prefix_cache_entries: int = 8) -> ChatServer:
+          prefix_cache_entries: int = 8,
+          request_qos=None,
+          performance_profile: Optional[dict] = None) -> ChatServer:
     """Build the server. The caller decides whether to serve_forever."""
     # IPv6-capable when the host asks for it, without forcing it: binding
     # :: on a host with IPv6 disabled fails outright.
@@ -606,7 +657,9 @@ def serve(engine: Engine, *, host: str = "127.0.0.1", port: int = 8000,
                      allow_local_images=allow_local_images,
                      log_requests=log_requests,
                      prefix_cache_bytes=prefix_cache_bytes,
-                     prefix_cache_entries=prefix_cache_entries)
+                     prefix_cache_entries=prefix_cache_entries,
+                     request_qos=request_qos,
+                     performance_profile=performance_profile)
     if ready is not None:
         ready.set()
     return srv

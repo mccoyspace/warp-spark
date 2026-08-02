@@ -138,6 +138,9 @@ Supported request fields: `messages`, `tools`, `tool_choice`,
 Responses carry an extra `waste` object with the numbers that actually
 matter for an expert-streaming engine — hit rate, bytes read, whether the
 page cache was bypassed — because the OpenAI schema has nowhere to put them.
+It also names the selected performance profile and reports whether its
+request-scoped PM-QoS lease was acquired and released. `GET /health` exposes
+the same profile plus aggregate control-channel state.
 
 ### reasoning_effort
 
@@ -156,13 +159,14 @@ override either way.
 
 ### Statelessness
 
-Each HTTP request resets the engine's conversation state before it is
-prefilled. A `waste_ctx` keeps its KDA state and MLA KV across calls —
-that is what makes `waste chat` a conversation — and carrying that into a
-stateless server means request N is prefilled on top of request N-1: the
-same request gets different answers depending on what came before, and one
-client's turn conditions another's. The lock spans prompt building *and*
-generation, so the image queue cannot be crossed between requests either.
+Each HTTP request starts from clean logical conversation state: the server
+either resets and prefills it from the beginning, or resets and restores an
+exact matching prefix snapshot before replaying the suffix. A `waste_ctx`
+otherwise keeps its KDA state and MLA KV across calls — that is what makes
+`waste chat` a conversation — and carrying arbitrary prior state into a
+stateless server would make one client's turn condition another's. The lock
+spans prompt building, cache prepare, and generation, so neither conversation
+state nor the image queue can cross between requests.
 
 ### Exact prefix caching
 
@@ -200,6 +204,83 @@ next request starts. A disconnected client stops costing tokens
 immediately, which on a model this slow is the difference between a wasted
 minute and a wasted hour.
 
+### Acer GN100 `spark-q0` profile
+
+`--performance-profile spark-q0` is an explicit, strict profile for the Acer
+Veriton GN100 / NVIDIA GB10 work. It fixes the in-process settings from the
+winning current-upstream qualification: eight compute threads, LFRU, effective
+direct I/O, stable arithmetic, two upstream read-ahead threads at depth two,
+router lookahead disabled, ordinary pageable/non-purgeable storage, and a
+zero-microsecond Linux CPU DMA-latency request around the complete model-work
+boundary: prefix-cache prepare (snapshot restore or cold prefill) followed by
+`engine.generate()` and decode. For streaming, acquisition happens before
+cache prepare and before the SSE headers; the headers are emitted only after
+prepare succeeds, so the first token callback can write safely. The profile
+does not change the default server.
+
+The server is never privileged and never receives the
+`/dev/cpu_dma_latency` descriptor. Launch it through the root holder, which
+opens that exact character device on `BEGIN`, closes it on `END`, and drops the
+child to the named ordinary account:
+
+```bash
+sudo python3 tools/pm_qos_exec.py \
+  --scope requests --max-hold-seconds 1800 \
+  --status /var/lib/waste-qos/status.json \
+  --events /var/lib/waste-qos/events.jsonl \
+  --user "$USER" -- \
+  taskset -c 5-9,15-19 python3 -m serve /path/to/k3.waste \
+    --performance-profile spark-q0 --port 8000
+```
+
+All accepted GN100 Q0 measurements used CPU set `5-9,15-19`. `taskset` above
+reproduces that external condition, but this profile neither sets nor verifies
+affinity on the current upstream base. Omitting it is a different run condition
+and health/response profile evidence does not certify the CPU set.
+
+The holder's artifacts are mode `0600`; use `sudo` to inspect them. It filters
+the root environment before dropping privileges. If a command deliberately
+needs a credential such as `HF_TOKEN`, put `--pass-env HF_TOKEN` before `--`.
+The status record stores only that variable's name, never its value, and
+redacts common secret-valued command options.
+
+The profile refuses to start if its private root control socket is missing,
+the peer is not root, a fixed setting conflicts, or direct I/O fell back. A
+pre-existing engine/debug `WASTE_*` selector not fixed by the profile is also
+an error; this includes dump/instrumentation switches and `WASTE_LIB`, whose
+effective binary identity current upstream cannot attest. `WASTE_API_KEY` and
+the private control descriptor are service plumbing, remain allowed, and are
+never included in public profile evidence.
+
+A lost or malformed acknowledgement permanently closes the channel so EOF
+makes the root holder release Q0; it is never guessed successful. The holder also
+releases on inference errors, disconnects, child or holder death, signals,
+protocol errors, and a bounded hold timeout. Timeout or loss of the required
+control plane terminates the strict-profile child rather than leaving a server
+running under a false label. Root-to-child acknowledgements are nonblocking and
+bounded by both a control timeout and, while Q0 is active, the lease deadline.
+
+Status and event files are delayed, best-effort telemetry, outside the Q0
+safety boundary: the holder records the true boundary timestamp and actual
+open/close counters in memory, closes the device, acknowledges `END`, and only
+then performs potentially blocking filesystem writes. Event records include
+both occurrence and delivery monotonic timestamps. Consequently the status
+file may lag an in-flight request, but it is never written as active after the
+descriptor has actually been released. On fatal acknowledgement, EOF, or
+protocol/control failure, strict-child termination is also issued before those
+writes. Response lease evidence comes from the acknowledged control protocol
+rather than the files.
+
+The current server streams socket writes synchronously from the engine's token
+callback. Consequently a slow streaming client can extend the lease even
+though the intended boundary is model work; the maximum hold is the safety
+bound. CPU affinity, whole-expert scheduling, and effective read-ahead
+reporting do not exist on this upstream base and are not implied by the profile
+name. Prefix snapshots remain an independent opt-in, but when enabled they
+share the engine budget and the same request lease. The integration test
+asserts acquisition, cache prepare, streaming-header, generation, and release
+ordering.
+
 ### Images
 
 `--vision` loads the tower (434 MB of weights on K3, and 1.12 GB reserved
@@ -234,13 +315,16 @@ make serve-check                                  # everything
 K3_DIR=/Volumes/WasteDisk/k3 make serve-check     # plus the differential
 ```
 
-Four suites, in order of what they prove:
+Eight suites, in order of what they prove:
 
 | file | what it checks | needs |
 |---|---|---|
 | `test_xtml.py` | every corpus case rendered **segment for segment against the release's own `encoding_k3.py`**, plus frozen goldens | the release, for the differential |
 | `test_regions.py` | round trip: anything the encoder can express, the parser reads back; every chunk split; malformed output | — |
 | `test_engine.py` | the ctypes binding against a **real engine** and a synthetic container | `libwaste` |
+| `test_main.py` | CLI validation and wiring for server, prefix-cache, and profile options | — |
+| `test_prefix_cache.py` | exact/family-root lookup, replay, promotion, accounting, eviction, and rollback behavior | `libwaste` for native snapshot cases |
+| `test_qos.py` | exact profile resolution; fake-device/real-socket PM-QoS protocol, timeout, EOF, and privileged-artifact safety | — |
 | `test_server.py` | HTTP over real sockets against a scripted engine | — |
 | `test_integration.py` | the whole stack, no fakes | `libwaste` |
 
@@ -272,6 +356,8 @@ python3 -m serve MODEL [options]
   --usage PATH       learned hotlist (default <model>/usage.waste)
   --allow-concurrent-open
                      opt out of the POSIX per-container process lock
+  --performance-profile spark-q0
+                     strict GN100 request-scoped Q0 profile
   --max-tokens N     default cap when a request does not set one
   --no-thinking      answer without the think channel unless asked
   --allow-local-images

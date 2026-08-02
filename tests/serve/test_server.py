@@ -16,11 +16,13 @@ a tool call to assert about.
     python3 tests/serve/test_server.py
 """
 
-import json
+from contextlib import contextmanager
 import http.client
+import json
 import socket
 import sys
 import threading
+import time
 import unittest
 import urllib.error
 import urllib.request
@@ -31,6 +33,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 from serve import xtml                                      # noqa: E402
 from serve.engine import EngineError, WASTE_E_IO            # noqa: E402
 from serve.prefix_cache import CONTROLLER_OVERHEAD_BYTES    # noqa: E402
+from serve.qos import QosError, QosLease                     # noqa: E402
 from serve.server import serve                              # noqa: E402
 from tests.serve.fake_engine import (FakeEngine, reply_plain,   # noqa: E402
                                      reply_tool_call)
@@ -867,6 +870,233 @@ class TestCompletions(ServerTestCase):
                   {"model": "test-model", "prompt": "<|sep|>"})
         markers = set(self.engine.marker_ids())
         self.assertFalse(set(self.engine.prompts[-1]) & markers)
+
+
+class RecordingQos:
+    """A non-privileged boundary recorder for HTTP integration tests."""
+
+    def __init__(self, timeline=None):
+        self.events = []
+        self.timeline = timeline
+        self.active = False
+        self.closed = False
+
+    @contextmanager
+    def scope(self, request_id):
+        acquired = time.monotonic_ns()
+        lease = QosLease(
+            request_id=request_id, acquired=True, latency_us=0,
+            acquired_monotonic_ns=acquired)
+        self.active = True
+        self.events.append(("begin", request_id))
+        if self.timeline is not None:
+            self.timeline.append("qos_begin")
+        try:
+            yield lease
+        finally:
+            released = time.monotonic_ns()
+            self.active = False
+            lease.released = True
+            lease.released_monotonic_ns = released
+            lease.hold_ms = (released - acquired) / 1e6
+            self.events.append(("end", request_id))
+            if self.timeline is not None:
+                self.timeline.append("qos_end")
+
+    def stats(self):
+        return {
+            "enabled": True, "required": True, "connected": not self.closed,
+            "active": self.active, "latency_us": 0,
+            "leases_started": sum(e[0] == "begin" for e in self.events),
+            "leases_completed": sum(e[0] == "end" for e in self.events),
+            "lease_errors": 0, "last_error": None,
+        }
+
+    def close(self):
+        self.closed = True
+
+
+class RejectingQos(RecordingQos):
+    @contextmanager
+    def scope(self, request_id):
+        del request_id
+        raise QosError("injected Q0 acquisition failure")
+        yield  # pragma: no cover - makes this a context-manager generator
+
+
+class TestRequestQosEvidence(ServerTestCase):
+    def setUp(self):
+        self.qos = RecordingQos()
+        self.server_kwargs = {
+            "request_qos": self.qos,
+            "performance_profile": {
+                "name": "spark-q0",
+                "pm_qos": {"required": True, "scope": "request",
+                           "latency_us": 0},
+            },
+        }
+        super().setUp()
+
+    def test_chat_scope_and_response_evidence(self):
+        self.engine.reply = reply_plain("q0")
+        status, body = self.chat()
+        self.assertEqual(status, 200)
+        request_id = body["id"]
+        self.assertEqual(self.qos.events,
+                         [("begin", request_id), ("end", request_id)])
+        evidence = body["waste"]
+        self.assertEqual(evidence["performance_profile"]["name"], "spark-q0")
+        self.assertTrue(evidence["pm_qos"]["acquired"])
+        self.assertTrue(evidence["pm_qos"]["released"])
+        self.assertEqual(evidence["pm_qos"]["latency_us"], 0)
+
+    def test_raw_completion_has_the_same_scope_and_evidence(self):
+        self.engine.reply = "continued"
+        status, body = self.post(
+            "/v1/completions", {"model": "test-model", "prompt": "start"})
+        self.assertEqual(status, 200)
+        self.assertEqual(self.qos.events,
+                         [("begin", body["id"]), ("end", body["id"])])
+        self.assertTrue(body["waste"]["pm_qos"]["released"])
+
+    def test_stream_final_event_carries_released_lease_evidence(self):
+        self.engine.reply = reply_plain("streamed")
+        events = self.stream()
+        waste = [event["waste"] for event in events[:-1]
+                 if isinstance(event, dict) and "waste" in event]
+        self.assertEqual(len(waste), 1)
+        self.assertTrue(waste[0]["pm_qos"]["released"])
+        self.assertEqual(self.qos.events[0][0], "begin")
+        self.assertEqual(self.qos.events[-1][0], "end")
+
+    def test_health_reports_selected_profile_and_live_control_state(self):
+        status, body = self.get("/health")
+        self.assertEqual(status, 200)
+        self.assertEqual(body["performance_profile"]["name"], "spark-q0")
+        self.assertTrue(body["pm_qos"]["enabled"])
+        self.assertTrue(body["pm_qos"]["connected"])
+
+    def test_engine_error_still_ends_the_lease(self):
+        self.engine.fail_with = EngineError("generate", WASTE_E_IO)
+        status, _ = self.chat()
+        self.assertEqual(status, 500)
+        self.assertEqual([event for event, _ in self.qos.events],
+                         ["begin", "end"])
+        self.assertFalse(self.qos.active)
+
+    def test_stream_engine_error_closes_without_writing_a_second_response(self):
+        self.engine.fail_with = EngineError("generate", WASTE_E_IO)
+        conn = http.client.HTTPConnection("127.0.0.1", self.port, timeout=5)
+        payload = json.dumps({
+            "model": "test-model", "stream": True,
+            "messages": [{"role": "user", "content": "hi"}],
+        })
+        conn.request("POST", "/v1/chat/completions", payload,
+                     {"Content-Type": "application/json"})
+        response = conn.getresponse()
+        self.assertEqual(response.status, 200)
+        try:
+            response.read()
+        except (http.client.IncompleteRead, ConnectionResetError):
+            pass
+        conn.close()
+        self.assertEqual([event for event, _ in self.qos.events],
+                         ["begin", "end"])
+        status, _ = self.get("/health")
+        self.assertEqual(status, 200)
+
+    def test_stream_disconnect_still_ends_the_lease(self):
+        self.engine.reply = reply_plain("word " * 400)
+        self.engine.delay = 0.002
+        req = urllib.request.Request(
+            self.url("/v1/chat/completions"),
+            data=json.dumps({
+                "model": "test-model", "stream": True,
+                "messages": [{"role": "user", "content": "hi"}],
+                "max_tokens": 2000,
+            }).encode(), headers={"Content-Type": "application/json"},
+            method="POST")
+        response = urllib.request.urlopen(req, timeout=20)
+        response.read(64)
+        response.close()
+        deadline = time.time() + 5
+        while [event for event, _ in self.qos.events] != ["begin", "end"]:
+            if time.time() >= deadline:
+                self.fail("Q0 lease stayed active after stream disconnect")
+            time.sleep(0.01)
+        self.assertFalse(self.qos.active)
+
+
+class TestRequestQosFailure(ServerTestCase):
+    server_kwargs = {
+        "request_qos": RejectingQos(),
+        "performance_profile": {"name": "spark-q0"},
+    }
+
+    def test_blocking_acquire_failure_is_a_503(self):
+        status, body = self.chat()
+        self.assertEqual(status, 503)
+        self.assertEqual(body["error"]["type"], "performance_profile_error")
+
+    def test_stream_acquire_failure_is_a_clean_503_before_headers(self):
+        status, body = self.chat(stream=True)
+        self.assertEqual(status, 503)
+        self.assertEqual(body["error"]["type"], "performance_profile_error")
+
+
+class TestQosPrefixOrdering(ServerTestCase):
+    """The integrated lease must cover cache work and streaming generation."""
+
+    engine_kwargs = {"host_reserved_bytes": 1 << 20, "prefill_chunk": 4}
+
+    def setUp(self):
+        self.timeline = []
+        self.qos = RecordingQos(self.timeline)
+        self.server_kwargs = {
+            "request_qos": self.qos,
+            "performance_profile": {"name": "spark-q0"},
+            "prefix_cache_bytes": 1 << 20,
+            "prefix_cache_entries": 2,
+        }
+        super().setUp()
+
+    def test_stream_orders_qos_prefix_headers_generate_and_release(self):
+        original_prepare = self.server.prefix_cache.prepare
+        original_generate = self.engine.generate
+        original_end_headers = self.server.RequestHandlerClass.end_headers
+
+        def prepare(*args, **kwargs):
+            self.timeline.append("prefix_prepare")
+            return original_prepare(*args, **kwargs)
+
+        def generate(*args, **kwargs):
+            self.timeline.append("generate")
+            return original_generate(*args, **kwargs)
+
+        def end_headers(handler):
+            self.timeline.append("stream_headers")
+            return original_end_headers(handler)
+
+        self.server.prefix_cache.prepare = prepare
+        self.engine.generate = generate
+        self.server.RequestHandlerClass.end_headers = end_headers
+        try:
+            events = self.stream(messages=[
+                {"role": "system", "content": "stable root " * 12},
+                {"role": "user", "content": "question"},
+            ])
+        finally:
+            self.server.RequestHandlerClass.end_headers = original_end_headers
+
+        self.assertEqual(self.timeline, [
+            "qos_begin", "prefix_prepare", "stream_headers", "generate",
+            "qos_end",
+        ])
+        reports = [event["waste"] for event in events[:-1]
+                   if isinstance(event, dict) and "waste" in event]
+        self.assertEqual(len(reports), 1)
+        self.assertTrue(reports[0]["pm_qos"]["released"])
+        self.assertEqual(reports[0]["prefix_cache"]["status"], "miss")
 
 
 class TestAuth(ServerTestCase):
