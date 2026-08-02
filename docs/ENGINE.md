@@ -109,10 +109,19 @@ scripts outside those ranges are not yet exact.
 ## 3. RAM budget: the floor, then the ceiling
 
 `waste_cfg.ram_budget_bytes` is a hard ceiling on **everything** the
-engine allocates — trunk, state, scratch, expert cache. The engine sizes
-its expert cache to fit inside what remains after the mandatory parts, and
-refuses to open with `WASTE_E_RAM_BUDGET` if the budget is under the
-floor, rather than thrashing the machine into swap.
+engine allocates — trunk, state, scratch, expert cache — plus caller-owned
+memory declared in `host_reserved_bytes`. The engine sizes its expert cache
+to fit inside what remains after both the mandatory engine parts and that
+reservation, and refuses to open with `WASTE_E_RAM_BUDGET` if the budget is
+under the combined floor, rather than thrashing the machine into swap.
+
+`host_reserved_bytes` is for memory a host keeps beside a context, such as
+in-memory state snapshots. It is accounting, not an allocation: WASTE gives
+those bytes up from its expert cache and the host enforces the reservation on
+its own cache. Addition overflow and an explicit budget below
+`floor_bytes + host_reserved_bytes` are rejected. `waste_plan_memory` reports
+zero for the field because it has no configuration; `waste_memory_used`
+reports the reservation applied at open.
 
 A budget of 0 asks the engine to choose, and the choice has to know the
 machine as well as the model. `recommended_bytes` is derived from the
@@ -132,7 +141,11 @@ pre-read-ahead sweep; the ratios between them are the point and read-ahead
 does not change them — see [EFFICIENCY.md](EFFICIENCY.md).)
 
 So the default steps down a whole working set at a time and takes the
-largest that fits: `floor + 3x`, else `2x`, else `1x`, else the floor.
+largest that fits: `floor + 3x`, else `2x`, else `1x`, else the floor. A
+host reservation then displaces expert cache inside that same selected
+total. If the reservation is larger than all optional cache, the total rises
+only to the combined floor required to open, and only if that combined floor
+still fits a known Linux current-memory ceiling.
 K3 lands on `floor + 1x` here — a 46.24 GB budget, 17.56 GB of cache, and
 the top of the measured curve with no flag given. An otherwise idle 128 GB
 machine still gets the full `3x`, and a model whose recommendation already
@@ -140,8 +153,9 @@ fits, like Kimi-Linear, is unaffected. On Linux, the ceiling is also bounded by
 current `MemAvailable` minus the host reserve and by finite cgroup-v2
 headroom minus one eighth of that cgroup's effective capacity. The engine
 walks cgroup ancestors because a leaf can say `memory.max=max` while its
-parent is finite. When even the floor is above a known current ceiling,
-automatic sizing returns `WASTE_E_MEMORY` before a model-sized allocation.
+parent is finite. When the engine floor plus host reservation is above a
+known current ceiling, automatic sizing returns `WASTE_E_MEMORY` before a
+model-sized allocation.
 An explicit nonzero budget remains the caller's contract and is honored,
 with a warning when it is above the current safe ceiling.
 
@@ -244,11 +258,26 @@ history and the position. The file records every shape it depends on, so
 a state built for a different model is rejected with `WASTE_E_FORMAT`
 rather than silently producing nonsense.
 
+`waste_state_size` / `waste_state_export` / `waste_state_import` expose the
+same versioned bytes without a filesystem round trip. Size is exact for the
+live prefix (MLA contributes only populated latent rows), a short export does
+not touch its destination, and import preflights the complete blob before it
+modifies the context. Structurally corrupt and truncated blobs therefore
+leave the live conversation unchanged. (Version 1 has no payload checksum.)
+This is the primitive a server can use for an exact prefix cache; cache policy
+and prefix matching deliberately remain host concerns.
+
+Version 1 validates layout and bounds but has no model/manifest identity
+fingerprint. Snapshots are opaque, context/model-local values. A host must not
+reuse one across containers merely because their shapes match; durable or
+cross-model caches need an identity digest in a later format version.
+
 This matters more here than in a conventional engine. At K3's streaming
 speeds re-prefilling a long agent transcript is minutes; restoring it is a
 file read. `waste chat` exposes it as `/save FILE` and `/load FILE`, and
-`tests/test_state.c` asserts that a reloaded session continues with
-exactly the same tokens.
+`tests/test_state.c` asserts that restore and replay reproduce logits and the
+complete post-step state bit-for-bit, that malformed imports are
+transactional, and that file and memory snapshots use identical bytes.
 
 ## Learned hotlist
 

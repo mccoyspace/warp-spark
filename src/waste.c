@@ -567,11 +567,22 @@ waste_status waste_open(const char *model_path, const waste_cfg *cfg_in,
      * optimum; on an otherwise idle 128 GB host it still gets the full
      * floor + 3x; a model whose recommendation already fits, like
      * Kimi-Linear, is unaffected. Linux also applies current MemAvailable
-     * and cgroup-v2 limits. If those cannot hold even the floor, fail before
-     * making the model-sized allocation. */
+     * and cgroup-v2 limits. If those cannot hold the floor plus a caller's
+     * host reservation, fail before making the model-sized allocation. */
     const uint64_t phys = waste_physical_ram();
     const uint64_t cap = current_memory_ceiling(phys);
     uint64_t budget = cfg.ram_budget_bytes;
+    if (cfg.host_reserved_bytes > UINT64_MAX - c->plan.floor_bytes) {
+        model_lock_release(c->model_lock);
+        free(c);
+        return WASTE_E_RAM_BUDGET;
+    }
+    /* State blobs and other host-owned caches live outside waste_ctx but in
+     * the same physical pool. Reserve them before sizing the expert cache,
+     * so the two caches cannot overcommit the host and meet later through
+     * reclaim. */
+    const uint64_t engine_base = c->plan.floor_bytes +
+                                 cfg.host_reserved_bytes;
 
     if (!budget) {
         budget = waste_memory_auto_budget(c->plan.floor_bytes,
@@ -588,8 +599,22 @@ waste_status waste_open(const char *model_path, const waste_cfg *cfg_in,
             budget = c->plan.floor_bytes;
 #endif
         }
+        /* Keep the same automatically selected total so ordinary host
+         * reservations displace expert cache. If the reservation itself is
+         * larger than all optional cache, grow only to the combined floor.
+         * Linux has a current-pressure ceiling: do not grow through it. */
+        if (budget < engine_base) {
+#if defined(__linux__)
+            if (cap && engine_base > cap) {
+                model_lock_release(c->model_lock);
+                free(c);
+                return WASTE_E_MEMORY;
+            }
+#endif
+            budget = engine_base;
+        }
     }
-    if (budget < c->plan.floor_bytes) {
+    if (budget < engine_base) {
         model_lock_release(c->model_lock);
         free(c);
         return WASTE_E_RAM_BUDGET;
@@ -622,9 +647,15 @@ waste_status waste_open(const char *model_path, const waste_cfg *cfg_in,
     }
 
     c->cfg.ram_budget_bytes = budget;   /* what we actually run under */
+    c->plan.host_reserved_bytes = cfg.host_reserved_bytes;
 
-    const uint64_t cache_bytes = budget - c->plan.floor_bytes +
+    const uint64_t cache_bytes = budget - engine_base +
                                  c->plan.min_expert_cache;
+    if (cache_bytes > SIZE_MAX) {
+        model_lock_release(c->model_lock);
+        free(c);
+        return WASTE_E_RAM_BUDGET;
+    }
     {
         waste_load_opts opt;
         memset(&opt, 0, sizeof opt);
@@ -1154,6 +1185,35 @@ waste_status waste_state_load(waste_ctx *c, const char *path)
         if (rc == -3) waste_state_reset(c);
         return WASTE_E_IO;
     }
+    c->pos = pos;
+    return WASTE_OK;
+}
+
+waste_status waste_state_size(const waste_ctx *c, size_t *bytes)
+{
+    if (!c || !bytes) return WASTE_E_ARG;
+    return waste_model_state_size(&c->m, c->pos, bytes) == 0
+         ? WASTE_OK : WASTE_E_FORMAT;
+}
+
+waste_status waste_state_export(const waste_ctx *c, void *dst,
+                                size_t capacity, size_t *written)
+{
+    if (!c || !dst || !written) return WASTE_E_ARG;
+    size_t need = 0;
+    if (waste_model_state_size(&c->m, c->pos, &need)) return WASTE_E_FORMAT;
+    *written = need;
+    if (capacity < need) return WASTE_E_ARG;
+    return waste_model_state_export(&c->m, c->pos, dst, capacity, written) == 0
+         ? WASTE_OK : WASTE_E_FORMAT;
+}
+
+waste_status waste_state_import(waste_ctx *c, const void *src, size_t bytes)
+{
+    if (!c || !src || !bytes) return WASTE_E_ARG;
+    int pos = 0;
+    if (waste_model_state_import(&c->m, src, bytes, &pos))
+        return WASTE_E_FORMAT;
     c->pos = pos;
     return WASTE_OK;
 }
