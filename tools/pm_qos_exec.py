@@ -51,7 +51,7 @@ SECRET_OPTIONS = {
 HOLDER_SIGNALS = (signal.SIGINT, signal.SIGTERM, signal.SIGHUP)
 FATAL_CONTROL_REASONS = {
     "control_send_timeout", "eof", "protocol_error", "control_error",
-    "holder_exit",
+    "device_close_error", "holder_exit",
 }
 
 
@@ -110,6 +110,64 @@ def _require_private_regular(fd: int, description: str) -> None:
     if info.st_uid != os.geteuid() or info.st_nlink != 1:
         raise PermissionError(
             f"{description} must be owned by the holder with one link")
+
+
+def validate_artifact_paths(status_path: Path,
+                            events_path: Optional[Path],
+                            lock_path: Path) -> None:
+    """Reject artifact aliases before any of the paths can be mutated.
+
+    Lexical normalization catches equal and ``.``/``..`` spellings even when
+    the destination does not exist.  Existing inode and parent-directory
+    identities additionally catch hard links and equivalent paths reached
+    through different names.  The secure openat walkers remain the authority
+    for later no-symlink creation; this preflight prevents the three holder
+    roles from ever targeting one object.
+    """
+    paths = [("status", Path(status_path)), ("lock", Path(lock_path))]
+    if events_path is not None:
+        paths.append(("events", Path(events_path)))
+
+    normalized: dict[str, str] = {}
+    inode_owner: dict[tuple[int, int], str] = {}
+    parent_owner: dict[tuple[int, int, str], str] = {}
+    for label, path in paths:
+        if not path.name:
+            raise ValueError(f"{label} path must name a file")
+        absolute = os.path.abspath(os.path.normpath(os.fspath(path)))
+        key = os.path.normcase(absolute)
+        previous = normalized.get(key)
+        if previous is not None:
+            raise ValueError(
+                f"PM-QoS artifact paths collide: {previous} and {label}")
+        normalized[key] = label
+
+        try:
+            info = os.stat(path, follow_symlinks=True)
+        except FileNotFoundError:
+            info = None
+        if info is not None:
+            identity = (info.st_dev, info.st_ino)
+            previous = inode_owner.get(identity)
+            if previous is not None:
+                raise ValueError(
+                    f"PM-QoS artifact paths share an inode: "
+                    f"{previous} and {label}")
+            inode_owner[identity] = label
+
+        try:
+            parent = os.stat(path.parent, follow_symlinks=True)
+        except FileNotFoundError:
+            parent = None
+        if parent is not None:
+            destination = (parent.st_dev, parent.st_ino,
+                           os.path.normcase(path.name))
+            previous = parent_owner.get(destination)
+            if previous is not None:
+                raise ValueError(
+                    f"PM-QoS artifact paths resolve to one destination: "
+                    f"{previous} and {label}")
+            parent_owner[destination] = label
 
 
 def atomic_json(path: Path, value: dict[str, Any]) -> None:
@@ -195,6 +253,7 @@ class PMQosDevice:
         self._require_exact_path = require_exact_path
         self.fd = -1
         self.opened_monotonic_ns: Optional[int] = None
+        self.last_release_error: Optional[str] = None
 
     @property
     def active(self) -> bool:
@@ -212,6 +271,7 @@ class PMQosDevice:
             raise ValueError("this helper permits only a 0 us request")
         if self.active:
             raise RuntimeError("PM-QoS descriptor is already active")
+        self.last_release_error = None
         self.validate()
         flags = (os.O_RDWR | getattr(os, "O_CLOEXEC", 0) |
                  getattr(os, "O_NOFOLLOW", 0))
@@ -231,8 +291,20 @@ class PMQosDevice:
         if not self.active:
             return None
         fd, self.fd = self.fd, -1
-        self._close(fd)
+        self.last_release_error = None
+        try:
+            self._close(fd)
+        except OSError as exc:
+            # On Linux a close error must not be retried: the numeric fd may
+            # already have been reused.  The PM-QoS request is logically no
+            # longer owned once ``fd`` is cleared, so preserve that transition
+            # and surface the syscall error separately to the supervisor.
+            self.last_release_error = f"{type(exc).__name__}: {exc}"
         return time.monotonic_ns()
+
+    def take_release_error(self) -> Optional[str]:
+        error, self.last_release_error = self.last_release_error, None
+        return error
 
 
 class RequestSupervisor:
@@ -279,6 +351,8 @@ class RequestSupervisor:
         self.lease_expirations = 0
         self.fd_open_count = 0
         self.fd_close_count = 0
+        self.fd_close_errors = 0
+        self.last_close_error: Optional[str] = None
         self.protocol_errors = 0
         self.last_error: Optional[str] = None
         self.closed_reason: Optional[str] = None
@@ -300,6 +374,8 @@ class RequestSupervisor:
             "fd_active": bool(self.device.active),
             "fd_open_count": self.fd_open_count,
             "fd_close_count": self.fd_close_count,
+            "fd_close_errors": self.fd_close_errors,
+            "last_close_error": self.last_close_error,
             "leases_started": self.leases_started,
             "leases_completed": self.leases_completed,
             "lease_expirations": self.lease_expirations,
@@ -412,9 +488,7 @@ class RequestSupervisor:
             # that opens successfully and then raises before returning.
             if not was_active and self.device.active:
                 self.fd_open_count += 1
-                self.device.release()
-                if not self.device.active:
-                    self.fd_close_count += 1
+                self._release_device()
             raise
         if was_active or not self.device.active:
             raise RuntimeError(
@@ -423,19 +497,38 @@ class RequestSupervisor:
         try:
             return int(raw_acquired_ns)
         except (TypeError, ValueError, OverflowError):
-            self.device.release()
-            if not self.device.active:
-                self.fd_close_count += 1
+            self._release_device()
             raise ValueError("PM-QoS acquire returned an invalid timestamp")
+
+    def _release_device(self) -> tuple[Optional[int], Optional[str]]:
+        """Release/account a device even if close reports a late error."""
+        was_active = bool(self.device.active)
+        close_error: Optional[str] = None
+        try:
+            released_ns = self.device.release()
+        except OSError as exc:
+            # Injectable devices may retain the older raising contract.  If
+            # they cleared their logical active state first, cleanup and
+            # accounting must still advance exactly once.
+            released_ns = time.monotonic_ns()
+            close_error = f"{type(exc).__name__}: {exc}"
+        take_error = getattr(self.device, "take_release_error", None)
+        if callable(take_error):
+            stored_error = take_error()
+            if stored_error:
+                close_error = stored_error
+        if was_active and not self.device.active:
+            self.fd_close_count += 1
+        if close_error is not None:
+            self.fd_close_errors += 1
+            self.last_close_error = close_error
+        return released_ns, close_error
 
     def _release(self, reason: str, *, expired: bool = False,
                  notify: bool = True) -> dict:
         request_id = self.active_request
         acquired_ns = self.acquired_ns
-        was_active = bool(self.device.active)
-        released_ns = self.device.release()
-        if was_active and not self.device.active:
-            self.fd_close_count += 1
+        released_ns, close_error = self._release_device()
         if released_ns is None:
             released_ns = time.monotonic_ns()
         hold_ms = ((released_ns - acquired_ns) / 1e6
@@ -447,14 +540,22 @@ class RequestSupervisor:
             self.lease_expirations += 1
             self.last_expired_request = request_id
             self.last_error = "lease expired at maximum hold"
+            if close_error is not None:
+                self.last_error += f"; descriptor close reported {close_error}"
+        elif close_error is not None:
+            self.last_error = (
+                f"PM-QoS descriptor close failed after logical release: "
+                f"{close_error}")
         elif reason == "end":
             self.leases_completed += 1
         released = {"request_id": request_id,
                     "released_monotonic_ns": released_ns, "hold_ms": hold_ms}
+        if close_error is not None:
+            released["close_error"] = close_error
         self._queue_telemetry(
             "release", request_id=request_id, reason=reason,
             expired=expired, released_monotonic_ns=released_ns,
-            hold_ms=hold_ms)
+            hold_ms=hold_ms, close_error=close_error)
         if expired:
             try:
                 self.expiration_callback(request_id or "", released)
@@ -474,13 +575,11 @@ class RequestSupervisor:
             # Outer holder cleanup is the final safety net.  Account an
             # orphaned descriptor here as well so a later final persist cannot
             # overwrite the real close with a stale supervisor count.
-            released_ns = self.device.release()
-            if not self.device.active:
-                self.fd_close_count += 1
+            released_ns, close_error = self._release_device()
             self._queue_telemetry(
                 "release", request_id=None, reason=reason, expired=False,
                 released_monotonic_ns=(released_ns or time.monotonic_ns()),
-                hold_ms=0.0)
+                hold_ms=0.0, close_error=close_error)
         self._terminate_on_fatal_control(reason)
         self._flush_telemetry()
 
@@ -559,6 +658,16 @@ class RequestSupervisor:
             if request_id != self.active_request:
                 return self._protocol_failure("PM-QoS END request id mismatch")
             released = self._release("end", notify=False)
+            close_error = released.get("close_error")
+            if close_error is not None:
+                self._terminate_on_fatal_control("device_close_error")
+                try:
+                    self._send({
+                        "ok": False, "op": "end", "request_id": request_id,
+                        "error": self.last_error})
+                finally:
+                    self._flush_telemetry()
+                return True
             self._send({"ok": True, "op": "end", **released})
             self._flush_telemetry()
             return True
@@ -609,7 +718,11 @@ class RequestSupervisor:
                         reason = "protocol_error"
                         return reason
         except OSError as exc:
-            self.last_error = f"PM-QoS control I/O failed: {exc}"
+            control_error = f"PM-QoS control I/O failed: {exc}"
+            if self.last_close_error is not None and self.last_error:
+                self.last_error = f"{self.last_error}; {control_error}"
+            else:
+                self.last_error = control_error
             reason = "control_error"
         finally:
             self.abort(reason)
@@ -729,6 +842,14 @@ def run_scoped(command: Sequence[str], *, user: str, latency_us: int,
                status_path: Path, events_path: Optional[Path],
                lock_path: Path = DEFAULT_LOCK,
                pass_env: Sequence[str] = ()) -> int:
+    try:
+        validate_artifact_paths(status_path, events_path, lock_path)
+    except (OSError, ValueError) as exc:
+        # There is deliberately no status write here: until the three roles
+        # are known distinct, writing an error could corrupt the lock or event
+        # destination that this check exists to protect.
+        print(f"pm_qos_exec: invalid artifact paths: {exc}", file=sys.stderr)
+        return 1
     status: dict[str, Any] = {
         "schema": "waste.pm_qos_exec.v2", "started_utc": utc_now(),
         "started_monotonic_ns": time.monotonic_ns(),
@@ -740,6 +861,7 @@ def run_scoped(command: Sequence[str], *, user: str, latency_us: int,
         "passed_environment_names": sorted(set(pass_env)),
         "child_started": False,
         "fd_active": False, "fd_open_count": 0, "fd_close_count": 0,
+        "fd_close_errors": 0, "last_close_error": None,
     }
     child: Optional[subprocess.Popen[bytes]] = None
     lock_fd = -1
@@ -762,6 +884,8 @@ def run_scoped(command: Sequence[str], *, user: str, latency_us: int,
             # independent of delayed, failed, or lost telemetry callbacks.
             status["fd_open_count"] = snapshot["fd_open_count"]
             status["fd_close_count"] = snapshot["fd_close_count"]
+            status["fd_close_errors"] = snapshot["fd_close_errors"]
+            status["last_close_error"] = snapshot["last_close_error"]
         atomic_json(status_path, status)
         if event is not None:
             append_jsonl(events_path, {
@@ -905,12 +1029,26 @@ def run_scoped(command: Sequence[str], *, user: str, latency_us: int,
             supervisor.abort("holder_exit")
         if device.active:
             was_active = bool(device.active)
-            device.release()
+            fallback_error: Optional[str] = None
+            try:
+                device.release()
+            except OSError as exc:
+                fallback_error = f"{type(exc).__name__}: {exc}"
+            take_error = getattr(device, "take_release_error", None)
+            if callable(take_error):
+                fallback_error = take_error() or fallback_error
             if was_active and not device.active:
                 if supervisor is not None:
                     supervisor.fd_close_count += 1
                 else:
                     status["fd_close_count"] += 1
+            if fallback_error is not None:
+                if supervisor is not None:
+                    supervisor.fd_close_errors += 1
+                    supervisor.last_close_error = fallback_error
+                else:
+                    status["fd_close_errors"] += 1
+                    status["last_close_error"] = fallback_error
         status["fd_active"] = False
         if parent_control is not None:
             parent_control.close()
