@@ -28,6 +28,9 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
 
+if os.name != "posix":
+    raise unittest.SkipTest("the PM-QoS holder requires POSIX APIs")
+
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
 from serve.profiles import (ProfileError, SPARK_Q0_ENVIRONMENT,  # noqa: E402
