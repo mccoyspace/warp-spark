@@ -127,7 +127,9 @@ static void ec_release_last(waste_ecache *c)
      * reclaimed for another expert may have a reader writing into it, and
      * a volatile object under an in-flight write is how a purged page
      * becomes a silently zeroed weight. */
-    if (c->slot[c->last_used].state == EC_READY) ec_volatile(c, c->last_used);
+    if (c->slot[c->last_used].state == EC_READY &&
+        c->slot[c->last_used].refs == 0)
+        ec_volatile(c, c->last_used);
     c->last_used = -1;
 }
 
@@ -372,7 +374,7 @@ static int ec_pinned(const waste_ecache *c, int i)
      * the synchronous fallback inside get() does not, and that is the hole
      * this closes. */
     return c->slot[i].state == EC_INFLIGHT || c->slot[i].pin == c->pf_gen ||
-           i == c->last_used;
+           c->slot[i].refs != 0 || i == c->last_used;
 }
 
 static int ec_victim(waste_ecache *c)
@@ -433,6 +435,7 @@ static void ec_claim_spec(waste_ecache *c, int vi, int32_t key)
     c->slot[vi].state = EC_INFLIGHT;
     c->slot[vi].fresh = 0;              /* a demand hit on it is a real hit */
     c->slot[vi].pin = 0;                /* belongs to no hint generation    */
+    c->slot[vi].refs = 0;
     c->slot[vi].hits = 1;
     c->slot[vi].last = c->clock;
     if (had) { c->evictions++; ec_rehash(c); }
@@ -452,6 +455,7 @@ static void ec_claim(waste_ecache *c, int vi, int32_t key, int fresh)
     c->slot[vi].state = EC_INFLIGHT;
     c->slot[vi].fresh = (uint8_t)fresh;
     c->slot[vi].pin = fresh ? c->pf_gen : 0;
+    c->slot[vi].refs = 0;
     c->slot[vi].hits = 1;
     c->slot[vi].last = c->clock;
     if (had) { c->evictions++; ec_rehash(c); }
@@ -466,6 +470,7 @@ static void ec_drop(waste_ecache *c, int vi)
     c->slot[vi].state = EC_EMPTY;
     c->slot[vi].fresh = 0;
     c->slot[vi].pin = 0;
+    c->slot[vi].refs = 0;
     ec_rehash(c);
 }
 
@@ -612,6 +617,62 @@ const uint8_t *waste_ecache_get(waste_ecache *c, int layer, int expert,
     ec_issue_next(c);
     ec_unlock(c);
     return dst;
+}
+
+int waste_ecache_can_acquire_many(const waste_ecache *c, int n)
+{
+    return c && c->io && n > 1 && n <= WASTE_PF_MAX &&
+           n <= c->n_slots / 4;
+}
+
+int waste_ecache_acquire_many(waste_ecache *c, int layer, const int *experts,
+                              int n, waste_fetch_fn fetch, void *user,
+                              const uint8_t **out)
+{
+    if (!waste_ecache_can_acquire_many(c, n) || !experts || !fetch || !out)
+        return -1;
+    for (int j = 0; j < n; j++) {
+        out[j] = waste_ecache_get(c, layer, experts[j], fetch, user);
+        if (!out[j]) {
+            waste_ecache_release_many(c, layer, experts, j);
+            return -1;
+        }
+
+        /* get() keeps this slot as last_used until the next get. Convert
+         * that transient protection into an explicit reference before the
+         * next record is allowed to advance the pipeline. */
+        ec_lock(c);
+        const int si = ec_lookup(c, ec_key(layer, experts[j]));
+        if (si < 0 || c->slot[si].state != EC_READY ||
+            c->slot[si].data != out[j]) {
+            ec_unlock(c);
+            waste_ecache_release_many(c, layer, experts, j);
+            return -1;
+        }
+        c->slot[si].refs++;
+        ec_unlock(c);
+    }
+    return 0;
+}
+
+void waste_ecache_release_many(waste_ecache *c, int layer,
+                               const int *experts, int n)
+{
+    if (!c || !experts || n <= 0) return;
+    ec_lock(c);
+    for (int j = 0; j < n; j++) {
+        const int si = ec_lookup(c, ec_key(layer, experts[j]));
+        if (si >= 0 && c->slot[si].refs) {
+            c->slot[si].refs--;
+            /* Match the state ordinary sequential get() leaves behind:
+             * every consumed record except the final last_used pointer is
+             * idle/purgeable once arithmetic has finished. */
+            if (!c->slot[si].refs && si != c->last_used &&
+                c->slot[si].state == EC_READY)
+                ec_volatile(c, si);
+        }
+    }
+    ec_unlock(c);
 }
 
 /* ---- learned hotlist ---------------------------------------------------- */

@@ -190,6 +190,20 @@ claims 16 cache slots so the speculative records survive; a chunk layer
 claims about 550, evicts them before use, and reads them twice — 6.9% more
 bytes for no time saved. [docs/LEARNED.md](docs/LEARNED.md) §34–36.
 
+Decode also has an opt-in expert-granular compute schedule:
+`--expert-schedule whole`. It stages and pins the complete routed set, gives
+each pool job whole experts, and reduces their outputs in the original route
+order. That removes the nested row barriers without changing logits, routes,
+state, or the ordered demand-access stream. With router lookahead disabled,
+the acceptance test also requires identical hits, misses, evictions and bytes
+read. Default lookahead is speculative: its completed traffic depends on
+timing, so measure those counters rather than treating them as an invariant.
+The schedule becomes effective only when read-ahead is active and the cache
+can pin all top-k records; `waste info` and `waste bench` report `whole` or the
+safe `row` fallback. `waste plan --expert-schedule whole` includes its
+per-expert scratch in the floor, as does the typed
+`waste_cfg.expert_schedule` library setting.
+
 ### Three bits per expert weight
 
 Experts are stored as residual vector quantization — three stages of

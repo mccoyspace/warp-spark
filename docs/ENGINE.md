@@ -20,6 +20,13 @@ cache hit/miss and I/O timing so a host can draw a real progress UI),
 lower-level `waste_eval` for hosts that do their own sampling, session
 state save/load, model introspection and aggregate stats.
 
+The pre-1.0 C surface is source-level, not a stable binary ABI. Public option
+structures may grow between releases — `waste_cfg.expert_schedule` is one
+such addition — so C hosts and hand-written bindings must be rebuilt against
+the `waste.h` shipped with the library. `WASTE_API_VERSION` is not a runtime
+structure-size guard. A stable post-1.0 ABI will need size-versioned options
+or a new entry point before old and new binaries can safely mix.
+
 Deliberately *not* in the API: logging to stdout, signal handlers, config
 files, argument parsing. Those belong to the host — the CLI included.
 

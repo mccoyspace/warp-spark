@@ -248,8 +248,24 @@ python3 -m serve MODEL [options]
   --vision           load the vision tower
   --verify           check every expert record's crc32 as it is read
   --usage PATH       learned hotlist (default <model>/usage.waste)
+  --expert-schedule {row,whole}
+                     assign complete experts to workers when the full routed
+                     set can be read ahead and pinned (otherwise uses row)
   --max-tokens N     default cap when a request does not set one
   --no-thinking      answer without the think channel unless asked
   --allow-local-images
   --plan             print the memory plan and exit
 ```
+
+`--expert-schedule whole` reserves one disjoint gate/up/down-LUT/output
+slice per routed expert and includes those bytes in the printed floor. At
+open, the effective schedule is `whole` only when reader threads are active
+and the expert cache can pin the complete top-k set; otherwise the server
+opens with `row` and prints that fallback. The reserved scratch remains part
+of the budget in either case, so a reader-thread startup failure cannot make
+the planner and allocator disagree. Logits, routes, state and the ordered
+demand-access stream remain exact. The default router lookahead is
+speculative, however, so timing may change how much of that traffic completes
+before demand; compare its reported bytes and hit counters as measurements,
+not as a scheduler invariant. The test that requires identical cache traffic
+runs with `WASTE_LOOKAHEAD=0` for that reason.

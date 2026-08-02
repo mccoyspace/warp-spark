@@ -50,6 +50,13 @@ WASTE_E_CANCELLED = -7
 # else that was not 1.
 CACHE_LFRU, CACHE_LRU = 0, 1
 
+EXPERT_SCHEDULE_ROW, EXPERT_SCHEDULE_WHOLE = 0, 1
+EXPERT_SCHEDULES = {
+    "row": EXPERT_SCHEDULE_ROW,
+    "whole": EXPERT_SCHEDULE_WHOLE,
+}
+EXPERT_SCHEDULE_NAMES = {value: name for name, value in EXPERT_SCHEDULES.items()}
+
 
 class EngineError(RuntimeError):
     """A non-OK waste_status, with the engine's own name for it."""
@@ -86,7 +93,8 @@ class Cfg(C.Structure):
                 ("use_direct_io", C.c_int),
                 ("vision", C.c_int),
                 ("verify_records", C.c_int),
-                ("usage_path", C.c_char_p)]
+                ("usage_path", C.c_char_p),
+                ("expert_schedule", C.c_int)]
 
 
 class GenParams(C.Structure):
@@ -208,6 +216,9 @@ def _bind(lib) -> None:
     lib.waste_plan_memory.restype = C.c_int
     lib.waste_plan_memory.argtypes = [C.c_char_p, C.c_uint32,
                                       C.POINTER(MemPlan)]
+    lib.waste_plan_memory_for_schedule.restype = C.c_int
+    lib.waste_plan_memory_for_schedule.argtypes = [
+        C.c_char_p, C.c_uint32, C.c_int, C.POINTER(MemPlan)]
     lib.waste_cfg_init.restype = None
     lib.waste_cfg_init.argtypes = [C.POINTER(Cfg)]
     lib.waste_open.restype = C.c_int
@@ -265,6 +276,8 @@ def _bind(lib) -> None:
 
     lib.waste_model_get_info.restype = C.c_int
     lib.waste_model_get_info.argtypes = [C.c_void_p, C.POINTER(ModelInfo)]
+    lib.waste_get_expert_schedule.restype = C.c_int
+    lib.waste_get_expert_schedule.argtypes = [C.c_void_p, C.POINTER(C.c_int)]
     lib.waste_save_usage.restype = C.c_int
     lib.waste_save_usage.argtypes = [C.c_void_p]
     lib.waste_get_stats.restype = C.c_int
@@ -292,11 +305,19 @@ def _bounded_int(name: str, value: int, lo: int, hi: int) -> int:
     return value
 
 
-def plan_memory(model_path: str, ctx_tokens: int = 0) -> MemPlan:
+def _expert_schedule_value(value: str) -> int:
+    if not isinstance(value, str) or value not in EXPERT_SCHEDULES:
+        raise ValueError("expert_schedule must be 'row' or 'whole'")
+    return EXPERT_SCHEDULES[value]
+
+
+def plan_memory(model_path: str, ctx_tokens: int = 0, *,
+                expert_schedule: str = "row") -> MemPlan:
     ctx_tokens = _bounded_int("ctx_tokens", ctx_tokens, 0, (1 << 32) - 1)
+    schedule = _expert_schedule_value(expert_schedule)
     plan = MemPlan()
-    st = _lib().waste_plan_memory(str(model_path).encode(), ctx_tokens,
-                                  C.byref(plan))
+    st = _lib().waste_plan_memory_for_schedule(
+        str(model_path).encode(), ctx_tokens, schedule, C.byref(plan))
     if st != WASTE_OK:
         raise EngineError("plan_memory", st, str(model_path))
     return plan
@@ -368,11 +389,13 @@ class Engine:
                  direct_io: bool = True,
                  vision: bool = False,
                  verify_records: bool = False,
-                 usage_path: Optional[str] = None):
+                 usage_path: Optional[str] = None,
+                 expert_schedule: str = "row"):
         ram_budget_bytes = _bounded_int(
             "ram_budget_bytes", ram_budget_bytes, 0, (1 << 64) - 1)
         ctx_tokens = _bounded_int("ctx_tokens", ctx_tokens, 0, (1 << 32) - 1)
         n_threads = _bounded_int("n_threads", n_threads, 0, (1 << 31) - 1)
+        schedule = _expert_schedule_value(expert_schedule)
         self.lib = _lib()
         self.model_path = str(model_path)
         self._lock = threading.RLock()
@@ -388,6 +411,7 @@ class Engine:
         cfg.use_direct_io = 1 if direct_io else 0
         cfg.vision = 1 if vision else 0
         cfg.verify_records = 1 if verify_records else 0
+        cfg.expert_schedule = schedule
         # Keep the encoded bytes alive: c_char_p stores a borrowed pointer,
         # and a temporary would be freed before waste_open reads it.
         self._usage = usage_path.encode() if usage_path else None
@@ -442,7 +466,7 @@ class Engine:
         st = self.lib.waste_model_get_info(self._ctx, C.byref(info))
         if st != WASTE_OK:
             raise EngineError("model_get_info", st)
-        return {
+        result = {
             "n_layers": info.n_layers, "n_experts": info.n_experts,
             "top_k": info.top_k, "hidden": info.hidden,
             "ctx_max": info.ctx_max,
@@ -452,6 +476,17 @@ class Engine:
             "quant_summary": (info.quant_summary.decode()
                               if info.quant_summary else ""),
         }
+        result["expert_schedule"] = self.expert_schedule()
+        return result
+
+    def expert_schedule(self) -> str:
+        """Effective routed-expert schedule after runtime fallbacks."""
+        self._check()
+        value = C.c_int()
+        st = self.lib.waste_get_expert_schedule(self._ctx, C.byref(value))
+        if st != WASTE_OK:
+            raise EngineError("get_expert_schedule", st)
+        return EXPERT_SCHEDULE_NAMES.get(value.value, "unknown")
 
     def memory_used(self) -> dict:
         self._check()
@@ -467,7 +502,9 @@ class Engine:
         st = self.lib.waste_get_stats(self._ctx, C.byref(s))
         if st != WASTE_OK:
             raise EngineError("get_stats", st)
-        return {f: getattr(s, f) for f, _ in Stats._fields_}
+        result = {f: getattr(s, f) for f, _ in Stats._fields_}
+        result["expert_schedule"] = self.expert_schedule()
+        return result
 
     def save_usage(self) -> None:
         self._check()

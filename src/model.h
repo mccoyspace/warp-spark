@@ -17,6 +17,7 @@
 #include <stdio.h>
 
 #include "ecache.h"
+#include "waste.h"
 
 /* Public image requests are decoded before resize.  Keep the source-image
  * allocation finite so the memory planner can include its true worst case. */
@@ -151,6 +152,13 @@ typedef struct {
     uint16_t *embsc;
     float *qabs, *cacc, *mrow;      /* MLA absorption scratch, per head    */
     float *e_gate, *e_up, *e_down, *ff, *lut, *xs;
+    /* WHOLE scheduling owns one contiguous allocation. The derived slices
+     * are disjoint per routed expert, so the outer pool job never nests a
+     * row-parallel job and never races another expert. */
+    float *whole_scratch, *whole_gate, *whole_up, *whole_down_lut, *whole_out;
+    size_t whole_down_lut_stride;
+    waste_expert_schedule expert_schedule_requested;
+    waste_expert_schedule expert_schedule_effective;
     int8_t *xq;
     uint64_t expert_reads;
     waste_ecache cache;
@@ -180,6 +188,7 @@ typedef struct {
  *   n_threads    compute pool size; 0 = WASTE_THREADS, else hardware
  *   policy       waste_cache_policy: 0 = LFRU, 1 = LRU
  *   direct_io    ask for the page-cache bypass on the expert banks
+ *   expert_schedule  waste_expert_schedule: 0 = row, 1 = whole
  */
 typedef struct {
     size_t cache_bytes;
@@ -187,11 +196,17 @@ typedef struct {
     int    n_threads;
     int    policy;
     int    direct_io;
+    waste_expert_schedule expert_schedule;
 } waste_load_opts;
 
 int  waste_model_load(waste_model *m, const char *dir, int kv_cap,
                       const waste_load_opts *opt);
 void waste_model_free(waste_model *m);
+/* Extra scratch for the WHOLE schedule. Planner and allocator call this
+ * same helper. UINT64_MAX means invalid geometry or arithmetic overflow. */
+uint64_t waste_model_whole_expert_scratch_bytes(int top_k, int inter, int lat,
+                                                int vec_dim, int stages,
+                                                int entries);
 /* Runs one token; returns logits (vocab floats, owned by the model), or
  * NULL when an expert record failed to read or failed verification —
  * waste_model_read_error then says which one and why.

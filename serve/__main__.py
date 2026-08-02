@@ -114,6 +114,10 @@ examples:
                         "since. Costs ~5%% on Kimi-Linear, ~1%% on K3")
     g.add_argument("--usage", default=None, metavar="PATH",
                    help="learned hotlist (default <model>/usage.waste)")
+    g.add_argument("--expert-schedule", choices=("row", "whole"),
+                   default="row",
+                   help="routed-expert scheduler; whole falls back to row "
+                        "unless read-ahead/cache geometry can pin top-k")
 
     s = ap.add_argument_group("serving")
     s.add_argument("--max-tokens", type=bounded_int(1, (1 << 32) - 1),
@@ -141,7 +145,8 @@ examples:
 
     try:
         if args.plan:
-            plan = plan_memory(str(model), args.ctx)
+            plan = plan_memory(str(model), args.ctx,
+                               expert_schedule=args.expert_schedule)
             ram = physical_ram()
             print(f"{build_info()}\n")
             print(f"  trunk        {human(plan.trunk_bytes)}")
@@ -150,6 +155,7 @@ examples:
             print(f"  min cache    {human(plan.min_expert_cache)}")
             print(f"  floor        {human(plan.floor_bytes)}")
             print(f"  recommended  {human(plan.recommended_bytes)}")
+            print(f"  exp schedule {args.expert_schedule} (requested)")
             if plan.vision_bytes:
                 print(f"  vision       {human(plan.vision_bytes)} "
                       f"(only with --vision)")
@@ -166,7 +172,8 @@ examples:
             direct_io=not args.no_direct_io,
             vision=args.vision,
             verify_records=args.verify,
-            usage_path=args.usage)
+            usage_path=args.usage,
+            expert_schedule=args.expert_schedule)
     except EngineError as e:
         print(f"{e}", file=sys.stderr)
         return 1
@@ -181,6 +188,7 @@ examples:
             print(f"quant    {info['quant_summary']}")
         print(f"memory   {human(used['floor_bytes'])} resident, "
               f"expert cache {human(used['min_expert_cache'])}")
+        print(f"schedule {info['expert_schedule']} (effective)")
         print(f"thinking {'off by default' if args.no_thinking else 'on'}"
               f" — reasoning_effort per request")
         if args.vision:

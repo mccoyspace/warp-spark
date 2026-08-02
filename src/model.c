@@ -172,6 +172,27 @@ static int dump_pos0 = 0;
 static int lookahead_n = 0;            /* WASTE_LOOKAHEAD, see moe_layer  */
 static pthread_once_t model_opts_once = PTHREAD_ONCE_INIT;
 
+uint64_t waste_model_whole_expert_scratch_bytes(int top_k, int inter, int lat,
+                                                int vec_dim, int stages,
+                                                int entries)
+{
+    if (top_k <= 0 || inter <= 0 || lat <= 0 || vec_dim <= 0 ||
+        stages <= 0 || entries <= 0)
+        return UINT64_MAX;
+    uint64_t down_lut = (uint64_t)(inter / vec_dim);
+    if (down_lut > UINT64_MAX / (uint64_t)stages) return UINT64_MAX;
+    down_lut *= (uint64_t)stages;
+    if (down_lut > UINT64_MAX / (uint64_t)entries) return UINT64_MAX;
+    down_lut *= (uint64_t)entries;
+    const uint64_t ordinary = 2u * (uint64_t)inter + (uint64_t)lat;
+    if (down_lut > UINT64_MAX - ordinary) return UINT64_MAX;
+    const uint64_t per_expert = ordinary + down_lut;
+    if (per_expert > UINT64_MAX / (uint64_t)top_k) return UINT64_MAX;
+    const uint64_t floats = per_expert * (uint64_t)top_k;
+    return floats > UINT64_MAX / sizeof(float)
+             ? UINT64_MAX : floats * sizeof(float);
+}
+
 static void model_opts_init(void)
 {
     const char *e = getenv("WASTE_PROFILE");
@@ -918,15 +939,22 @@ static void wire_trunk(waste_model *m)
 int waste_model_load(waste_model *m, const char *dir, int kv_cap,
                      const waste_load_opts *opt)
 {
-    static const waste_load_opts defaults = { 0, 0, 0, 0, 1 };
+    static const waste_load_opts defaults = {
+        .direct_io = 1,
+        .expert_schedule = WASTE_EXPERT_SCHEDULE_ROW,
+    };
     if (!opt) opt = &defaults;
     const size_t cache_bytes = opt->cache_bytes;
     memset(m, 0, sizeof *m);
     pthread_mutex_init(&m->fetch_mu, NULL);
     m->trunk_fd = -1;
     for (int L = 0; L < WASTE_MAX_LAYERS; L++) m->bank[L].fd = -1;
+    if (opt->expert_schedule != WASTE_EXPERT_SCHEDULE_ROW &&
+        opt->expert_schedule != WASTE_EXPERT_SCHEDULE_WHOLE)
+        return -2;
     m->want_vision = opt->want_vision;
     m->want_direct = opt->direct_io;
+    m->expert_schedule_requested = opt->expert_schedule;
     pthread_once(&model_opts_once, model_opts_init);
     m->kv_cap = kv_cap;
     m->direct_io = 1;
@@ -1098,8 +1126,11 @@ int waste_model_load(waste_model *m, const char *dir, int kv_cap,
     if (!cb) { js_free(&d); free(src); return -1; }
     const size_t rec = 16 + (size_t)m->cb_entries * m->vec_dim * 2;
     m->n_books = (int)(cblen / rec);
-    m->codebooks = (float *)malloc((size_t)m->n_books * m->cb_entries * m->vec_dim * sizeof(float));
-    if (!m->codebooks) { free(cb); js_free(&d); free(src); return -1; }
+    if (m->n_books) {
+        m->codebooks = (float *)malloc((size_t)m->n_books * m->cb_entries *
+                                       m->vec_dim * sizeof(float));
+        if (!m->codebooks) { free(cb); js_free(&d); free(src); return -1; }
+    }
     for (int b = 0; b < m->n_books; b++) {
         const uint16_t *h = (const uint16_t *)(cb + b * rec + 16);
         for (int i = 0; i < m->cb_entries * m->vec_dim; i++) {
@@ -1117,8 +1148,11 @@ int waste_model_load(waste_model *m, const char *dir, int kv_cap,
      * dot products each ending in a cross-lane reduction. 6.5 MB on K3. */
     {
         const size_t per = (size_t)m->cb_entries * m->vec_dim;
-        m->codebooksT = (float *)malloc((size_t)m->n_books * per * sizeof(float));
-        if (!m->codebooksT) { js_free(&d); free(src); return -1; }
+        if (m->n_books) {
+            m->codebooksT = (float *)malloc((size_t)m->n_books * per *
+                                            sizeof(float));
+            if (!m->codebooksT) { js_free(&d); free(src); return -1; }
+        }
         for (int b = 0; b < m->n_books; b++) {
             const float *src_b = m->codebooks + (size_t)b * per;
             float *dst_b = m->codebooksT + (size_t)b * per;
@@ -1271,14 +1305,51 @@ int waste_model_load(waste_model *m, const char *dir, int kv_cap,
         m->lut = (float *)malloc((size_t)3 * (nmax / m->vec_dim + 1) *
                                  m->stages * m->cb_entries * sizeof(float));
     }
+    const int has_routed_experts = c->n_experts > 0 && c->top_k > 0 &&
+                                   c->moe_inter > 0 &&
+                                   c->first_dense < c->n_layers;
+    if (m->expert_schedule_requested == WASTE_EXPERT_SCHEDULE_WHOLE &&
+        has_routed_experts) {
+        /* One allocation makes the planner's delta exact and makes failure
+         * cleanup atomic. Slices are one per routed expert. Scratch remains
+         * reserved even if read-ahead startup later forces ROW, because a
+         * runtime fallback must not change the caller's budget accounting. */
+        const int lat = c->latent_dim ? c->latent_dim : c->hidden;
+        const uint64_t bytes = waste_model_whole_expert_scratch_bytes(
+            c->top_k, c->moe_inter, lat, m->vec_dim, m->stages,
+            m->cb_entries);
+        if (bytes == UINT64_MAX || bytes > SIZE_MAX) return -3;
+        m->whole_scratch = (float *)malloc((size_t)bytes);
+        if (!m->whole_scratch) return -3;
+
+        const size_t k = (size_t)c->top_k;
+        const size_t inter = (size_t)c->moe_inter;
+        const size_t latz = (size_t)lat;
+        size_t off = 0;
+        m->whole_gate = m->whole_scratch + off;
+        off += k * inter;
+        m->whole_up = m->whole_scratch + off;
+        off += k * inter;
+        m->whole_down_lut_stride =
+            (inter / (size_t)m->vec_dim) * (size_t)m->stages *
+            (size_t)m->cb_entries;
+        m->whole_down_lut = m->whole_scratch + off;
+        off += k * m->whole_down_lut_stride;
+        m->whole_out = m->whole_scratch + off;
+        off += k * latz;
+        if (off != (size_t)(bytes / sizeof(float))) return -3;
+    }
     {   /* expert cache, sized by the caller's budget */
         int64_t rec = 0;
         for (int L = 0; L < c->n_layers; L++)
             if (m->bank[L].rec_bytes > rec) rec = m->bank[L].rec_bytes;
-        if (waste_ecache_init(&m->cache, cache_bytes, (size_t)rec, opt->policy))
-            return -1;
-        m->miss_buf = (uint8_t *)waste_dio_alloc((size_t)rec);
-        if (!m->miss_buf) return -1;
+        if (rec > 0) {
+            if (waste_ecache_init(&m->cache, cache_bytes, (size_t)rec,
+                                  opt->policy))
+                return -1;
+            m->miss_buf = (uint8_t *)waste_dio_alloc((size_t)rec);
+            if (!m->miss_buf) return -1;
+        }
 
         /* Read-ahead. The internal SSD reaches 12.89 GB/s at queue depth 2
          * against 10.73 at depth 1, so two readers is the whole of the
@@ -1292,7 +1363,13 @@ int waste_model_load(waste_model *m, const char *dir, int kv_cap,
         e = getenv("WASTE_IO_DEPTH");
         if (e) depth = atoi(e);
         if (depth < nio) depth = nio;
-        waste_ecache_io_start(&m->cache, bank_fetch, m, nio, depth);
+        if (rec > 0)
+            waste_ecache_io_start(&m->cache, bank_fetch, m, nio, depth);
+        m->expert_schedule_effective =
+            m->expert_schedule_requested == WASTE_EXPERT_SCHEDULE_WHOLE &&
+            waste_ecache_can_acquire_many(&m->cache, c->top_k)
+              ? WASTE_EXPERT_SCHEDULE_WHOLE
+              : WASTE_EXPERT_SCHEDULE_ROW;
     }
     if (waste_mlock_mode() & WASTE_WIRE_TRUNK) wire_trunk(m);
 
@@ -1345,6 +1422,7 @@ void waste_model_free(waste_model *m)
     }
     free(m->x); free(m->h); free(m->tmp); free(m->att); free(m->logits);
     free(m->ff); free(m->e_gate); free(m->e_up); free(m->e_down); free(m->lut);
+    free(m->whole_scratch);
     free(m->xq); free(m->xs); waste_dio_free(m->miss_buf);
     free(m->blockres); free(m->prefix_sum); free(m->ares);
     free(m->cx); free(m->cnorm); free(m->cresid); free(m->cq); free(m->ckv);
@@ -1826,6 +1904,70 @@ static void vq_matvec(waste_model *m, float *y, const uint8_t *idx,
     vq_apply(m, y, idx, scale, M, N, lut);
 }
 
+/* WHOLE scheduling is itself one process-pool job. Calling either wrapper
+ * above from a worker would submit a nested job to that same pool while its
+ * descriptor is still occupied. These helpers run the unchanged range
+ * kernels over the full range on the worker that owns the expert. */
+static void vq_build_lut_serial(waste_model *m, float *lut, int cb_base,
+                                const float *x, int N)
+{
+    PROF_START(P_LUTB);
+    lutb_arg a = { lut, m->codebooksT, x, cb_base, m->stages,
+                   m->cb_entries, m->vec_dim };
+    waste_k.lutb_range(0, N / m->vec_dim, &a);
+    PROF_END(P_LUTB);
+}
+
+static void vq_apply_serial(waste_model *m, float *y, const uint8_t *idx,
+                            const uint16_t *scale, int M, int N,
+                            const float *lut)
+{
+    PROF_START(P_LUTA);
+    vq_arg a = { y, idx, scale, lut, N / m->vec_dim,
+                 m->stages, m->cb_entries };
+    vq_rows(0, M, &a);
+    PROF_END(P_LUTA);
+}
+
+typedef struct {
+    waste_model *m;
+    const uint8_t *const *records;
+    const float *lut_gate, *lut_up;
+    int inter, lat;
+} whole_expert_arg;
+
+static void whole_expert_range(int begin, int end, void *p)
+{
+    whole_expert_arg *a = (whole_expert_arg *)p;
+    waste_model *m = a->m;
+    const waste_config *c = &m->cfg;
+    for (int j = begin; j < end; j++) {
+        const uint8_t *rec = a->records[j];
+        const waste_expert_hdr *h = (const waste_expert_hdr *)rec;
+        const uint16_t *sc = (const uint16_t *)(rec + h->chan_corr_off);
+        float *ga = m->whole_gate + (size_t)j * a->inter;
+        float *ub = m->whole_up + (size_t)j * a->inter;
+        float *lut_down = m->whole_down_lut +
+                          (size_t)j * m->whole_down_lut_stride;
+        float *acc = m->whole_out + (size_t)j * a->lat;
+
+        vq_apply_serial(m, ga, rec + h->gate_off, sc,
+                        a->inter, a->lat, a->lut_gate);
+        vq_apply_serial(m, ub, rec + h->up_off, sc + a->inter,
+                        a->inter, a->lat, a->lut_up);
+        if (c->act_situ)
+            for (int i = 0; i < a->inter; i++)
+                ga[i] = waste_situ_pair(ga[i], ub[i], c->situ_beta,
+                                        c->situ_linear_beta);
+        else
+            for (int i = 0; i < a->inter; i++) ga[i] = silu(ga[i]) * ub[i];
+        vq_build_lut_serial(m, lut_down,
+                            h->codebook_id + 2 * m->stages, ga, a->inter);
+        vq_apply_serial(m, acc, rec + h->down_off, sc + 2 * a->inter,
+                        a->lat, a->inter, lut_down);
+    }
+}
+
 /* ---- layers ------------------------------------------------------------ */
 
 /* Log-space decay gate, in place over [H][D].
@@ -2225,40 +2367,78 @@ static void moe_layer(waste_model *m, int L, const float *in, float *out, int *r
     memset(ysum, 0, (size_t)lat * sizeof(float));
     const int lut_sz = ((hid > lat ? hid : lat) / m->vec_dim) * m->stages * m->cb_entries;
     float *lut_gate = m->lut, *lut_up = lut_gate + lut_sz, *lut_down = lut_up + lut_sz;
-    int lut_ready = 0;
-    for (int j = 0; j < K; j++) {
+    if (m->expert_schedule_effective == WASTE_EXPERT_SCHEDULE_WHOLE) {
+        const uint8_t *records[64] = { 0 };
         PROF_START(P_EDEQ);
-        const uint8_t *rec = read_expert(m, L, idx[j]);
+        const int acquired = waste_ecache_acquire_many(
+            &m->cache, L, idx, K, bank_fetch, m, records) == 0;
         PROF_END(P_EDEQ);
-        /* This token is already wrong — the expert it needed is not
-         * readable. Stop rather than sum the ones that were, and let the
-         * step report it; m->read_error is what carries the reason out. */
-        if (!rec) break;
-        const waste_expert_hdr *h = (const waste_expert_hdr *)rec;
-        const uint16_t *sc = (const uint16_t *)(rec + h->chan_corr_off);
-
-        PROF_START(P_EMM);
-        /* gate/up see the same input and the same per-layer codebooks for
-         * every routed expert, so their tables are built once per token. */
-        if (!lut_ready) {
+        if (!acquired && !m->read_error)
+            bank_fail(m, REC_E_NOSLOT, L, idx[0]);
+        if (acquired) {
+            const waste_expert_hdr *h =
+                (const waste_expert_hdr *)records[0];
+            PROF_START(P_EMM);
+            /* All records are now staged and explicitly held. gate/up see
+             * the same input and per-layer codebooks for every expert, so
+             * their tables are built once before the outer pool job. */
             vq_build_lut(m, lut_gate, h->codebook_id + 0 * m->stages,
                          xin, lat, m->stages, m->cb_entries, m->vec_dim);
             vq_build_lut(m, lut_up, h->codebook_id + 1 * m->stages,
                          xin, lat, m->stages, m->cb_entries, m->vec_dim);
-            lut_ready = 1;
+            whole_expert_arg a = {
+                m, records, lut_gate, lut_up, inter, lat
+            };
+            /* Each job owns complete experts and calls only serial range
+             * kernels; there is no nested submission to the shared pool. */
+            waste_parallel_for(K, 1, whole_expert_range, &a);
+            /* Jobs never touch the shared sum. Original route order keeps
+             * the floating-point accumulation bit-identical to ROW. */
+            for (int j = 0; j < K; j++) {
+                const float *expert_out = m->whole_out + (size_t)j * lat;
+                const float wj = w[j];
+                for (int i = 0; i < lat; i++) ysum[i] += wj * expert_out[i];
+            }
+            PROF_END(P_EMM);
+            waste_ecache_release_many(&m->cache, L, idx, K);
         }
-        vq_apply(m, ga, rec + h->gate_off, sc, inter, lat, lut_gate);
-        vq_apply(m, ub, rec + h->up_off, sc + inter, inter, lat, lut_up);
-        if (c->act_situ)
-            for (int i = 0; i < inter; i++)
-                ga[i] = waste_situ_pair(ga[i], ub[i], c->situ_beta, c->situ_linear_beta);
-        else
-            for (int i = 0; i < inter; i++) ga[i] = silu(ga[i]) * ub[i];
-        vq_matvec(m, acc, rec + h->down_off, sc + 2 * inter, ga, lat, inter,
-                  h->codebook_id + 2 * m->stages, lut_down);
-        const float wj = w[j];
-        for (int i = 0; i < lat; i++) ysum[i] += wj * acc[i];
-        PROF_END(P_EMM);
+    } else {
+        int lut_ready = 0;
+        for (int j = 0; j < K; j++) {
+            PROF_START(P_EDEQ);
+            const uint8_t *rec = read_expert(m, L, idx[j]);
+            PROF_END(P_EDEQ);
+            /* This token is already wrong — the expert it needed is not
+             * readable. Stop rather than sum the ones that were, and let the
+             * step report it; m->read_error is what carries the reason out. */
+            if (!rec) break;
+            const waste_expert_hdr *h = (const waste_expert_hdr *)rec;
+            const uint16_t *sc = (const uint16_t *)(rec + h->chan_corr_off);
+
+            PROF_START(P_EMM);
+            /* gate/up see the same input and the same per-layer codebooks for
+             * every routed expert, so their tables are built once per token. */
+            if (!lut_ready) {
+                vq_build_lut(m, lut_gate, h->codebook_id + 0 * m->stages,
+                             xin, lat, m->stages, m->cb_entries, m->vec_dim);
+                vq_build_lut(m, lut_up, h->codebook_id + 1 * m->stages,
+                             xin, lat, m->stages, m->cb_entries, m->vec_dim);
+                lut_ready = 1;
+            }
+            vq_apply(m, ga, rec + h->gate_off, sc, inter, lat, lut_gate);
+            vq_apply(m, ub, rec + h->up_off, sc + inter, inter, lat, lut_up);
+            if (c->act_situ)
+                for (int i = 0; i < inter; i++)
+                    ga[i] = waste_situ_pair(ga[i], ub[i], c->situ_beta,
+                                            c->situ_linear_beta);
+            else
+                for (int i = 0; i < inter; i++) ga[i] = silu(ga[i]) * ub[i];
+            vq_matvec(m, acc, rec + h->down_off, sc + 2 * inter, ga, lat, inter,
+                      h->codebook_id + 2 * m->stages, lut_down);
+            const float wj = w[j];
+            for (int i = 0; i < lat; i++) ysum[i] += wj * acc[i];
+            PROF_END(P_EMM);
+        }
     }
     if (c->latent_dim) {
         if (c->latent_norm)

@@ -151,10 +151,15 @@ uint64_t waste_physical_ram(void)
 #endif
 }
 
-waste_status waste_plan_memory(const char *model_path, uint32_t ctx_tokens,
-                               waste_memplan *out)
+static waste_status plan_memory_impl(const char *model_path,
+                                     uint32_t ctx_tokens,
+                                     waste_expert_schedule expert_schedule,
+                                     waste_memplan *out)
 {
     if (!model_path || !out) return WASTE_E_ARG;
+    if (expert_schedule != WASTE_EXPERT_SCHEDULE_ROW &&
+        expert_schedule != WASTE_EXPERT_SCHEDULE_WHOLE)
+        return WASTE_E_ARG;
     char p[512];
     snprintf(p, sizeof p, "%s/manifest.json", model_path);
     char *src = slurp_all(p);
@@ -276,6 +281,13 @@ waste_status waste_plan_memory(const char *model_path, uint32_t ctx_tokens,
     const int stages = (int)js_int(&d, js_get(&d, eq, "stages"), 3);
     const int vec_dim = (int)js_int(&d, js_get(&d, eq, "vec_dim"), 8);
     const int entries = (int)js_int(&d, js_get(&d, eq, "entries"), 256);
+    const int top_k = (int)js_int(&d,
+        js_get(&d, cfg, "num_experts_per_token"), 8);
+    const int n_exp = (int)js_int(&d, js_get(&d, cfg, "num_experts"), 0);
+    const int first_dense = (int)js_int(&d,
+        js_get(&d, cfg, "first_k_dense_replace"), 0);
+    const int has_routed_experts = n_exp > 0 && top_k > 0 &&
+                                   moe_inter > 0 && first_dense < layers;
     if (stages < 1 || stages > 8 || vec_dim < 1 || vec_dim > 64 ||
         entries < 1 || entries > 256) {
         js_free(&d); free(src); return WASTE_E_FORMAT;
@@ -293,7 +305,6 @@ waste_status waste_plan_memory(const char *model_path, uint32_t ctx_tokens,
          * allocation in waste_model_load takes, so the plan reports the
          * buffer that is really allocated rather than the smallest of its
          * four users. */
-        const int n_exp = (int)js_int(&d, js_get(&d, cfg, "num_experts"), 0);
         uint64_t att = (uint64_t)ctx_tokens * (uint64_t)nheads;
         const uint64_t kda = (uint64_t)kh * (uint64_t)kd;
         const uint64_t route = WASTE_ATT_ROUTER_OFF + 2ull * (uint64_t)n_exp;
@@ -320,10 +331,21 @@ waste_status waste_plan_memory(const char *model_path, uint32_t ctx_tokens,
     sc += (uint64_t)3 * moe_inter * lat * 4;                /* one expert      */
     sc += (uint64_t)T * nb * hidden * 4 + (uint64_t)T * hidden * 4;
     sc += (uint64_t)T * 64 * 12;    /* croute + crw + cused */
+    /* A dense-only container has no routed work to schedule. Treat WHOLE as
+     * an inert request: its effective mode is ROW and, importantly, it does
+     * not reserve scratch that can never be used. */
+    if (expert_schedule == WASTE_EXPERT_SCHEDULE_WHOLE &&
+        has_routed_experts) {
+        const uint64_t whole = waste_model_whole_expert_scratch_bytes(
+            top_k, moe_inter, lat, vec_dim, stages, entries);
+        if (whole == UINT64_MAX || sc > UINT64_MAX - whole) {
+            js_free(&d); free(src); return WASTE_E_FORMAT;
+        }
+        sc += whole;
+    }
     out->scratch_bytes = sc;
 
     /* one layer's top-k experts, double buffered */
-    const int top_k = (int)js_int(&d, js_get(&d, cfg, "num_experts_per_token"), 8);
     const int lyr = js_get(&d, 0, "layers");
     uint64_t rec = 0;
     if (js_size(&d, lyr) > 0) {
@@ -345,6 +367,20 @@ waste_status waste_plan_memory(const char *model_path, uint32_t ctx_tokens,
     return WASTE_OK;
 }
 
+waste_status waste_plan_memory_for_schedule(
+    const char *model_path, uint32_t ctx_tokens,
+    waste_expert_schedule expert_schedule, waste_memplan *out)
+{
+    return plan_memory_impl(model_path, ctx_tokens, expert_schedule, out);
+}
+
+waste_status waste_plan_memory(const char *model_path, uint32_t ctx_tokens,
+                               waste_memplan *out)
+{
+    return plan_memory_impl(model_path, ctx_tokens,
+                            WASTE_EXPERT_SCHEDULE_ROW, out);
+}
+
 /* ---- lifecycle ---------------------------------------------------------- */
 
 waste_status waste_open(const char *model_path, const waste_cfg *cfg_in,
@@ -357,13 +393,17 @@ waste_status waste_open(const char *model_path, const waste_cfg *cfg_in,
     if (cfg_in) cfg = *cfg_in;
     else waste_cfg_init(&cfg);
     if (!cfg.ctx_tokens) cfg.ctx_tokens = 4096;
+    if (cfg.expert_schedule != WASTE_EXPERT_SCHEDULE_ROW &&
+        cfg.expert_schedule != WASTE_EXPERT_SCHEDULE_WHOLE)
+        return WASTE_E_ARG;
 
     waste_ctx *c = (waste_ctx *)calloc(1, sizeof *c);
     if (!c) return WASTE_E_OOM;
     c->cfg = cfg;
     snprintf(c->path, sizeof c->path, "%s", model_path);
 
-    waste_status st = waste_plan_memory(model_path, cfg.ctx_tokens, &c->plan);
+    waste_status st = waste_plan_memory_for_schedule(
+        model_path, cfg.ctx_tokens, cfg.expert_schedule, &c->plan);
     if (st != WASTE_OK) { free(c); return st; }
 
     /* Optional vision weights, decode buffers, tower activations and queued
@@ -438,6 +478,7 @@ waste_status waste_open(const char *model_path, const waste_cfg *cfg_in,
         opt.n_threads = cfg.n_threads;
         opt.policy = (int)cfg.cache_policy;
         opt.direct_io = cfg.use_direct_io;
+        opt.expert_schedule = cfg.expert_schedule;
         const int rc = waste_model_load(&c->m, model_path, (int)cfg.ctx_tokens,
                                         &opt);
         if (rc) {
@@ -446,7 +487,9 @@ waste_status waste_open(const char *model_path, const waste_cfg *cfg_in,
              * on K3 that is tens of gigabytes lost to one bad manifest. */
             waste_model_free(&c->m);
             free(c);
-            return rc == -2 ? WASTE_E_FORMAT : WASTE_E_IO;
+            return rc == -2 ? WASTE_E_FORMAT
+                 : rc == -3 ? WASTE_E_OOM
+                            : WASTE_E_IO;
         }
     }
     /* Before the warm, which reads records too. The load already applied
@@ -1005,6 +1048,23 @@ waste_status waste_model_get_info(const waste_ctx *c, waste_model_info *out)
               : cf->arch[0]                    ? cf->arch
                                                : "unknown";
     out->quant_summary = c->quant;
+    return WASTE_OK;
+}
+
+const char *waste_expert_schedule_name(waste_expert_schedule schedule)
+{
+    switch (schedule) {
+    case WASTE_EXPERT_SCHEDULE_ROW:   return "row";
+    case WASTE_EXPERT_SCHEDULE_WHOLE: return "whole";
+    }
+    return "unknown";
+}
+
+waste_status waste_get_expert_schedule(const waste_ctx *c,
+                                       waste_expert_schedule *out)
+{
+    if (!c || !out) return WASTE_E_ARG;
+    *out = c->m.expert_schedule_effective;
     return WASTE_OK;
 }
 

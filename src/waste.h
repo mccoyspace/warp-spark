@@ -110,6 +110,30 @@ typedef enum {
     WASTE_CACHE_LRU = 1,
 } waste_cache_policy;
 
+/* How routed-expert arithmetic is divided across the compute pool.
+ *
+ * ROW is the established path: each expert's matrix rows are split across
+ * the pool in route order. WHOLE gives each worker complete experts, after
+ * the full routed set has been read and pinned. The engine falls back to
+ * ROW when the active read-ahead/cache geometry cannot keep every staged
+ * record pointer valid; waste_get_expert_schedule reports what is actually
+ * in use. Requesting WHOLE still reserves its scratch in the memory plan,
+ * so a runtime fallback cannot make the hard budget dishonest. */
+typedef enum {
+    WASTE_EXPERT_SCHEDULE_ROW = 0,
+    WASTE_EXPERT_SCHEDULE_WHOLE = 1,
+} waste_expert_schedule;
+
+/* Schedule-aware form of waste_plan_memory. The original function remains
+ * the row-schedule convenience wrapper. */
+waste_status waste_plan_memory_for_schedule(
+    const char *model_path, uint32_t ctx_tokens,
+    waste_expert_schedule expert_schedule, waste_memplan *out);
+
+/* Pre-1.0 ABI note: this public options struct is not size-versioned. Rebuild
+ * C clients and foreign-function bindings against the waste.h shipped with
+ * the library whenever it changes; an older binary must not pass its smaller
+ * allocation to a newer waste_cfg_init. */
 typedef struct {
     /* Hard ceiling on all engine allocations, used exactly as given.
      *
@@ -185,6 +209,11 @@ typedef struct {
      * expert this container does not have are skipped, because it is one
      * of the few files the engine reads that nobody asked it to. */
     const char *usage_path;
+
+    /* Requested routed-expert scheduler. WHOLE is effective only when
+     * read-ahead is active and the cache can pin the complete top-k set;
+     * otherwise the model opens successfully with ROW. */
+    waste_expert_schedule expert_schedule;
 } waste_cfg;
 
 /* Removed in 0.6.0, having never done anything: `io_threads` (there is no
@@ -371,6 +400,11 @@ typedef struct {
 } waste_model_info;
 
 waste_status waste_model_get_info(const waste_ctx *ctx, waste_model_info *out);
+
+/* Effective scheduler after all runtime fallbacks have been resolved. */
+waste_status waste_get_expert_schedule(const waste_ctx *ctx,
+                                       waste_expert_schedule *out);
+const char  *waste_expert_schedule_name(waste_expert_schedule schedule);
 
 /* Persist which experts this workload used, so the next open can warm the
  * cache instead of starting cold. Written next to the container. */

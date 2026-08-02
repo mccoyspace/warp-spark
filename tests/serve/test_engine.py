@@ -115,6 +115,42 @@ class TestLibrary(EngineTestCase):
             + plan.min_expert_cache,
             "floor_bytes is documented as the sum of the parts")
 
+    def test_whole_schedule_plan_and_ctypes_round_trip(self):
+        row = E.plan_memory(str(self.model), 64)
+        whole = E.plan_memory(str(self.model), 64,
+                              expert_schedule="whole")
+        delta = whole.scratch_bytes - row.scratch_bytes
+        self.assertGreater(delta, 0)
+        self.assertEqual(whole.floor_bytes - row.floor_bytes, delta)
+        self.assertEqual(whole.recommended_bytes - row.recommended_bytes,
+                         delta)
+
+        old = os.environ.get("WASTE_IO_THREADS")
+        os.environ["WASTE_IO_THREADS"] = "2"
+        try:
+            engine = E.Engine(
+                str(self.model),
+                ram_budget_bytes=whole.floor_bytes + whole.min_expert_cache,
+                ctx_tokens=64, expert_schedule="whole")
+            try:
+                self.assertEqual(engine.expert_schedule(), "whole")
+                self.assertEqual(engine.model_info()["expert_schedule"],
+                                 "whole")
+                self.assertEqual(engine.stats()["expert_schedule"],
+                                 "whole")
+            finally:
+                engine.close()
+        finally:
+            if old is None:
+                os.environ.pop("WASTE_IO_THREADS", None)
+            else:
+                os.environ["WASTE_IO_THREADS"] = old
+
+        with self.assertRaises(ValueError):
+            E.plan_memory(str(self.model), 64, expert_schedule="other")
+        with self.assertRaises(ValueError):
+            E.Engine(str(self.model), expert_schedule="other")
+
     def test_plan_uses_manifest_vq_geometry(self):
         variant = Path(self.tmp) / "vq-plan.waste"
         shutil.copytree(self.model, variant)
@@ -186,6 +222,7 @@ class TestIntrospection(EngineTestCase):
         # The engine reports a normalized name; the manifest says
         # "kimi_linear" and waste_model_get_info hyphenates it.
         self.assertEqual(info["arch"], "kimi-linear")
+        self.assertEqual(info["expert_schedule"], "row")
 
     def test_memory_used_is_within_the_budget(self):
         used = self.engine.memory_used()

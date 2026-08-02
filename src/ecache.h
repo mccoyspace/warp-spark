@@ -48,6 +48,7 @@ typedef struct {
     int32_t  key;        /* layer<<16 | expert, or -1 when empty            */
     uint8_t  state;      /* one of the EC_* above                           */
     uint8_t  fresh;      /* read was issued for this batch: not a hit yet   */
+    uint16_t refs;       /* staged pointers held by acquire_many             */
     uint32_t hits;       /* LFRU frequency term                             */
     uint64_t last;       /* LFRU recency term                               */
     uint64_t pin;        /* hint generation holding it; 0 = evictable       */
@@ -126,6 +127,17 @@ void waste_ecache_free(waste_ecache *c);
  * NULL on failure. */
 const uint8_t *waste_ecache_get(waste_ecache *c, int layer, int expert,
                                 waste_fetch_fn fetch, void *user);
+
+/* True only when one hint generation can pin all `n` records and reader
+ * threads are active. acquire_many consumes ordinary gets in order, so hit,
+ * miss and byte accounting is exactly the same as the row path, then adds
+ * explicit references until release_many. */
+int waste_ecache_can_acquire_many(const waste_ecache *c, int n);
+int waste_ecache_acquire_many(waste_ecache *c, int layer, const int *experts,
+                              int n, waste_fetch_fn fetch, void *user,
+                              const uint8_t **out);
+void waste_ecache_release_many(waste_ecache *c, int layer,
+                               const int *experts, int n);
 
 /* ---- read-ahead ---------------------------------------------------------
  *

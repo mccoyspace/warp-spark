@@ -53,6 +53,20 @@ else
     exit 1
 fi
 
+# Always use a dedicated tiny container for the scheduler pair: opening two
+# real trunks at once is neither a unit test nor CI-sized, while the exact
+# route/logit/cache/state invariants do not depend on meaningful weights.
+SCHED_MODEL="$TMP/scheduler.waste"
+SCHED_DENSE="$TMP/scheduler-dense.waste"
+if python3 tools/make_test_container.py "$SCHED_MODEL" >/dev/null 2>&1 &&
+   python3 tools/make_test_container.py --dense "$SCHED_DENSE" >/dev/null 2>&1 &&
+   ./test_expert_schedule "$SCHED_MODEL" "$SCHED_DENSE" "$TMP" 2>/dev/null |
+       grep -q "^EXPERT SCHEDULE OK"; then
+    ok "typed whole-expert scheduler (budget, fallback, identity, LA0 traffic)"
+else
+    no "typed whole-expert scheduler"
+fi
+
 # ---------------------------------------------------------------- unit ----
 head_ "kernels vs the reference implementations"
 

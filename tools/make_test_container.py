@@ -258,6 +258,9 @@ def main():
                     help="also write a small tiktoken-style vocabulary with "
                          "K3's XTML specials, so the container can be driven "
                          "with text instead of raw ids")
+    ap.add_argument("--dense", action="store_true",
+                    help="write dense FFNs in every layer and no routed "
+                         "experts (for scheduler fallback coverage)")
     ap.add_argument("--prefix", default="", metavar="PFX",
                     help="put the text tensors under a tensor_prefix, e.g. "
                          "language_model., and add one tensor outside it — "
@@ -267,6 +270,11 @@ def main():
     os.makedirs(args.out, exist_ok=True)
 
     cfg = dict(CFG)
+    if args.dense:
+        cfg["first_k_dense_replace"] = cfg["num_hidden_layers"]
+        cfg["num_experts"] = 0
+        cfg["num_experts_per_token"] = 0
+        cfg["num_shared_experts"] = 0
     if args.tokenizer:
         # Every special has to be a real row of the embedding table and the
         # head: a container whose vocab_size stops short of its own specials

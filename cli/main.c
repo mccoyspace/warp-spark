@@ -85,6 +85,14 @@ static int parse_float(const char *s, float *out)
     return 0;
 }
 
+static int parse_expert_schedule(const char *s, waste_expert_schedule *out)
+{
+    if (!strcmp(s, "row")) *out = WASTE_EXPERT_SCHEDULE_ROW;
+    else if (!strcmp(s, "whole")) *out = WASTE_EXPERT_SCHEDULE_WHOLE;
+    else return -1;
+    return 0;
+}
+
 static void human(uint64_t b, char *out, size_t cap)
 {
     const double g = (double)b / (1ULL << 30);
@@ -121,6 +129,7 @@ typedef struct {
     int n_image;
     int raw;
     int verify;                     /* --verify: check every record's crc32 */
+    waste_expert_schedule expert_schedule;
     const char *pos[MAX_POS];      /* MODEL, then the command's argument */
     int n_pos;
 } opts;
@@ -150,7 +159,8 @@ static int parse_opts(int argc, char **argv, int from, opts *o)
             !strcmp(a, "--temp") || !strcmp(a, "--top-p") || !strcmp(a, "--top-k") ||
             !strcmp(a, "--seed") || !strcmp(a, "--threads") ||
             !strcmp(a, "--file") || !strcmp(a, "--stop") ||
-            !strcmp(a, "--system") || !strcmp(a, "--image")) {
+            !strcmp(a, "--system") || !strcmp(a, "--image") ||
+            !strcmp(a, "--expert-schedule")) {
             need = 1;
             /* `--temp --budget 8G` used to make "--budget" the temperature
              * and then complain about 8G. A value that looks like an option
@@ -172,6 +182,8 @@ static int parse_opts(int argc, char **argv, int from, opts *o)
         else if (!strcmp(a, "--top-k")) bad = parse_nonnegative_int(v, &o->top_k);
         else if (!strcmp(a, "--seed")) bad = parse_u64(v, &o->seed);
         else if (!strcmp(a, "--threads")) bad = parse_nonnegative_int(v, &o->threads);
+        else if (!strcmp(a, "--expert-schedule"))
+            bad = parse_expert_schedule(v, &o->expert_schedule);
         else if (!strcmp(a, "--file")) o->file = v;
         else if (!strcmp(a, "--stop")) o->stop = v;
         else if (!strcmp(a, "--system")) o->system = v;
@@ -269,6 +281,7 @@ static waste_status open_model(const char *path, const opts *o, waste_ctx **ctx)
      * Kimi-Linear. Worth it for a container that was copied or downloaded
      * and has not been read since. */
     cfg.verify_records = o->verify;
+    cfg.expert_schedule = o->expert_schedule;
     return waste_open(path, &cfg, ctx);
 }
 
@@ -466,14 +479,17 @@ static int cmd_plan(int argc, char **argv)
     if (o.n_pos < 1) { fprintf(stderr, "usage: waste plan MODEL [options]\n"); return 2; }
 
     waste_memplan p;
-    const waste_status st = waste_plan_memory(o.pos[0], o.ctx, &p);
+    const waste_status st = waste_plan_memory_for_schedule(
+        o.pos[0], o.ctx, o.expert_schedule, &p);
     if (st != WASTE_OK) return fail("plan", st);
 
     if (o.json) {
-        printf("{\"ctx\":%u,\"trunk_bytes\":%llu,\"state_bytes\":%llu,"
+        printf("{\"ctx\":%u,\"expert_schedule\":\"%s\","
+               "\"trunk_bytes\":%llu,\"state_bytes\":%llu,"
                "\"scratch_bytes\":%llu,\"min_expert_cache\":%llu,"
                "\"floor_bytes\":%llu,\"recommended_bytes\":%llu",
-               o.ctx, (unsigned long long)p.trunk_bytes,
+               o.ctx, waste_expert_schedule_name(o.expert_schedule),
+               (unsigned long long)p.trunk_bytes,
                (unsigned long long)p.state_bytes,
                (unsigned long long)p.scratch_bytes,
                (unsigned long long)p.min_expert_cache,
@@ -501,7 +517,9 @@ static int cmd_plan(int argc, char **argv)
     human(p.trunk_bytes, b[0], 32); human(p.state_bytes, b[1], 32);
     human(p.scratch_bytes, b[2], 32); human(p.min_expert_cache, b[3], 32);
     human(p.floor_bytes, b[4], 32);
-    printf("memory plan for %s (ctx %u)\n\n", o.pos[0], o.ctx);
+    printf("memory plan for %s (ctx %u, expert schedule %s)\n\n",
+           o.pos[0], o.ctx,
+           waste_expert_schedule_name(o.expert_schedule));
     printf("  resident trunk        %12s\n", b[0]);
     printf("  KDA state + KV cache  %12s\n", b[1]);
     printf("  scratch               %12s\n", b[2]);
@@ -544,15 +562,19 @@ static int cmd_info(int argc, char **argv)
     waste_model_get_info(c, &mi);
     waste_memplan used;
     waste_memory_used(c, &used);
+    waste_expert_schedule schedule;
+    waste_get_expert_schedule(c, &schedule);
     if (o.json) {
         printf("{\"engine\":\"%s\",\"arch\":\"%s\",\"layers\":%u,"
                "\"experts\":%u,\"top_k\":%u,\"hidden\":%u,"
                "\"params_total\":%llu,\"params_active\":%llu,"
-               "\"quantization\":\"%s\",\"expert_cache_bytes\":%llu}\n",
+               "\"quantization\":\"%s\",\"expert_cache_bytes\":%llu,"
+               "\"expert_schedule\":\"%s\"}\n",
                waste_version(), mi.arch, mi.n_layers, mi.n_experts, mi.top_k,
                mi.hidden, (unsigned long long)mi.params_total,
                (unsigned long long)mi.params_active, mi.quant_summary,
-               (unsigned long long)used.min_expert_cache);
+               (unsigned long long)used.min_expert_cache,
+               waste_expert_schedule_name(schedule));
         waste_close(c);
         return 0;
     }
@@ -569,6 +591,7 @@ static int cmd_info(int argc, char **argv)
     printf("  parameters    %s total, %s active/token\n", pt, pa);
     printf("  quantization  %s\n", mi.quant_summary);
     printf("  expert cache  %s\n", cb);
+    printf("  expert sched  %s\n", waste_expert_schedule_name(schedule));
     waste_close(c);
     return 0;
 }
@@ -993,9 +1016,13 @@ static int cmd_bench(int argc, char **argv)
 
     waste_memplan used;
     waste_memory_used(c, &used);
+    waste_expert_schedule schedule;
+    waste_get_expert_schedule(c, &schedule);
     char cb[32];
     human(used.min_expert_cache, cb, 32);
-    printf("%s\n  expert cache %s, %u tokens\n\n", waste_build_info(), cb, o.max_tokens);
+    printf("%s\n  expert cache %s, expert schedule %s, %u tokens\n\n",
+           waste_build_info(), cb, waste_expert_schedule_name(schedule),
+           o.max_tokens);
 
     opts q = o;
     q.quiet = 1;
@@ -1009,12 +1036,13 @@ static int cmd_bench(int argc, char **argv)
     if (o.json) {
         printf("{\"tokens\":%llu,\"tok_per_s\":%.4f,\"experts_hit\":%llu,"
                "\"experts_missed\":%llu,\"bytes_read\":%llu,"
-               "\"direct_io\":%s}\n",
+               "\"direct_io\":%s,\"expert_schedule\":\"%s\"}\n",
                (unsigned long long)s.tokens_generated, tps,
                (unsigned long long)s.experts_hit,
                (unsigned long long)s.experts_missed,
                (unsigned long long)s.bytes_read,
-               s.direct_io ? "true" : "false");
+               s.direct_io ? "true" : "false",
+               waste_expert_schedule_name(schedule));
         waste_close(c);
         return 0;
     }
@@ -1196,6 +1224,7 @@ int main(int argc, char **argv)
                "given as - or simply piped in.\n\n"
                "options: --budget 8G  --ctx N  -n N  --temp F  --top-p F\n"
                "         --top-k N  --seed N  --threads N  --stop STR\n"
+               "         --expert-schedule row|whole\n"
                "         --file F  --json  -q  --learn  --verify\n"
          "  --stop  ends generation when the text appears\n"
          "  --json  machine-readable output for eval, tokenize, plan,\n"
@@ -1203,6 +1232,9 @@ int main(int argc, char **argv)
          "  --learn records which experts the run used, so the next open\n"
          "  starts with a warm cache instead of an empty one\n"
          "  --threads sets the compute pool; 0 (default) is one per core\n"
+         "  --expert-schedule whole assigns complete routed experts to\n"
+         "  workers when read-ahead/cache geometry can pin the full set;\n"
+         "  otherwise it reports and uses row\n"
          "  --verify checks each expert record's checksum as it is read,\n"
          "  for a container you have not read since copying it. Costs ~5%%\n"
          "  on Kimi-Linear, ~1%% on K3; off otherwise\n",
