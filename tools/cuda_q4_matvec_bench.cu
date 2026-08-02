@@ -33,10 +33,6 @@
 #include <unistd.h>
 #include <vector>
 
-#if defined(__aarch64__)
-#include <arm_neon.h>
-#endif
-
 constexpr int GROUP = 128;
 constexpr int THREADS = 128;
 
@@ -125,25 +121,11 @@ static float cpu_row(const uint8_t *row, const uint16_t *scale,
     for (int group = 0; group < groups; group++) {
         const int begin = group * GROUP;
         const int limit = std::min(GROUP, in - begin);
-#if defined(__aarch64__)
-        float32x4_t sum = vdupq_n_f32(0.0f);
-        int i = 0;
-        for (; i + 8 <= limit; i += 8) {
-            int8_t unpacked[8];
-            for (int j = 0; j < 8; j++)
-                unpacked[j] = (int8_t)q4_value(row, begin + i + j);
-            const int16x8_t w16 = vmovl_s8(vld1_s8(unpacked));
-            sum = vfmaq_f32(sum,
-                            vcvtq_f32_s32(vmovl_s16(vget_low_s16(w16))),
-                            vld1q_f32(x + begin + i));
-            sum = vfmaq_f32(sum,
-                            vcvtq_f32_s32(vmovl_s16(vget_high_s16(w16))),
-                            vld1q_f32(x + begin + i + 4));
-        }
-        float part = vaddvq_f32(sum);
-        for (; i < limit; i++)
-            part += (float)q4_value(row, begin + i) * x[begin + i];
-#else
+        /* NVCC cannot parse GCC's full arm_neon.h. Four scalar accumulators
+         * reproduce the engine's vfmaq lane order and pairwise vaddvq
+         * reduction without including that header in a CUDA translation
+         * unit. The engine profile, not this emulation, is the performance
+         * control used by the whole-layer gate. */
         float lane[4] = {};
         int i = 0;
         for (; i + 8 <= limit; i += 8) {
@@ -157,7 +139,6 @@ static float cpu_row(const uint8_t *row, const uint16_t *scale,
         float part = (lane[0] + lane[1]) + (lane[2] + lane[3]);
         for (; i < limit; i++)
             part += (float)q4_value(row, begin + i) * x[begin + i];
-#endif
         total += half_to_float_cpu(scale[group]) * part;
     }
     return total;
@@ -468,7 +449,8 @@ int main(int argc, char **argv)
     const double host_ms = host_sync_bench(iterations, weights, scales,
                                            device_x, device_y, out, in,
                                            rowbytes, stream);
-    std::printf("path=cpu-8thread kernel_ms=%.6f effective_GiB_s=%.3f\n",
+    std::printf("path=cpu-8thread-neon-order-emulation kernel_ms=%.6f "
+                "effective_GiB_s=%.3f\n",
                 cpu_ms, gib_per_second(traffic, cpu_ms));
     std::printf("path=pageable-fast-event kernel_ms=%.6f speedup=%.3f "
                 "effective_GiB_s=%.3f\n", fast_ms, cpu_ms / fast_ms,
