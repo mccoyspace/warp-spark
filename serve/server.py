@@ -42,6 +42,7 @@ from typing import Optional
 
 from . import api
 from .engine import Cancelled, Engine, EngineError
+from .prefix_cache import CONTROLLER_OVERHEAD_BYTES, PrefixCache
 from .regions import RegionParser
 
 SERVER_NAME = "waste"
@@ -50,6 +51,23 @@ SERVER_NAME = "waste"
 # request is text; anything at this size is a base64 image, and several of
 # those are a decode bomb rather than a conversation.
 MAX_BODY_BYTES = 64 * 1024 * 1024
+
+
+def _prefix_identity(engine: Engine, model_id: str, model_info: dict,
+                     markers: dict[int, str]) -> tuple:
+    """Strictly process-local model/config/tokenizer/template identity."""
+    return (
+        "waste-prefix-cache-v1",
+        id(engine),
+        getattr(engine, "model_path", None),
+        model_id,
+        api.PROMPT_CACHE_VERSION,
+        model_info.get("arch"),
+        model_info.get("n_layers"),
+        model_info.get("hidden"),
+        model_info.get("ctx_max"),
+        tuple(sorted(markers.items())),
+    )
 
 
 class ChatServer(ThreadingHTTPServer):
@@ -64,7 +82,25 @@ class ChatServer(ThreadingHTTPServer):
                  default_thinking: bool = True,
                  allow_local_images: bool = False,
                  log_requests: bool = True,
-                 tmpdir: Optional[str] = None):
+                 tmpdir: Optional[str] = None,
+                 prefix_cache_bytes: int = 0,
+                 prefix_cache_entries: int = 8):
+        if prefix_cache_bytes < 0 or prefix_cache_entries < 0:
+            raise ValueError("prefix cache limits must be non-negative")
+        if prefix_cache_bytes and not prefix_cache_entries:
+            raise ValueError("a non-empty prefix cache needs at least one entry")
+        if (prefix_cache_bytes and
+                prefix_cache_bytes < CONTROLLER_OVERHEAD_BYTES):
+            raise ValueError(
+                f"an enabled prefix cache needs at least "
+                f"{CONTROLLER_OVERHEAD_BYTES} bytes")
+        if prefix_cache_bytes:
+            used = engine.memory_used()
+            reserved = int(used.get("host_reserved_bytes", 0))
+            if prefix_cache_bytes > reserved:
+                raise ValueError(
+                    f"prefix cache limit {prefix_cache_bytes} exceeds the "
+                    f"engine's host reservation {reserved}")
         super().__init__(addr, handler)
         self.engine = engine
         self.model_id = model_id
@@ -85,6 +121,11 @@ class ChatServer(ThreadingHTTPServer):
         self.markers = engine.marker_ids()
         self.stop_tokens = [tid for tid, text in self.markers.items()
                             if text == "<|end_of_msg|>"]
+        self.prefix_cache_identity = _prefix_identity(
+            engine, model_id, self.model_info, self.markers)
+        self.prefix_cache = PrefixCache(
+            prefix_cache_bytes, prefix_cache_entries,
+            self.prefix_cache_identity)
 
     def handle_error(self, request, client_address):
         """A client hanging up is not an error worth a traceback.
@@ -222,6 +263,7 @@ class Handler(BaseHTTPRequestHandler):
             "model": self.server.model_id,
             "engine": engine_mod.build_info(),
             "uptime_s": api.now() - self.server.started,
+            "prefix_cache": self.server.prefix_cache.stats(),
         })
 
     def _models(self):
@@ -278,6 +320,15 @@ class Handler(BaseHTTPRequestHandler):
                 prompt_len=len(prompt.tokens))
             stops = api.stop_strings(body)
 
+            # Keep the existing meaning of waste.ms: model work for this
+            # request, including prompt evaluation. A cold cache miss moves
+            # part of that prefill into prepare(), so timing only generate()
+            # would make misses look artificially fast.
+            run_started = time.time()
+            run_tokens, cache_use = srv.prefix_cache.prepare(
+                engine, prompt.tokens, prompt.cache_boundaries,
+                srv.prefix_cache_identity)
+
             request_id = api.new_id("chatcmpl")
             created = api.now()
             parser = RegionParser(in_think=prompt.thinking,
@@ -285,13 +336,15 @@ class Handler(BaseHTTPRequestHandler):
                                   markers=srv.markers)
 
             if stream:
-                self._chat_stream(body, prompt, opts, stops, parser,
-                                  request_id, created)
+                self._chat_stream(body, prompt, run_tokens, cache_use,
+                                  opts, stops, parser,
+                                  request_id, created, run_started)
             else:
-                self._chat_blocking(body, prompt, opts, stops, parser,
-                                    request_id, created)
+                self._chat_blocking(body, prompt, run_tokens, cache_use,
+                                    opts, stops, parser,
+                                    request_id, created, run_started)
 
-    def _run(self, prompt, opts, stops, parser, on_delta):
+    def _run(self, prompt_tokens, opts, stops, parser, on_delta):
         """Drive one generation. Returns (n_tokens, hit_limit, stopped).
 
         `on_delta(delta)` is called on the engine thread for each token, and
@@ -342,7 +395,7 @@ class Handler(BaseHTTPRequestHandler):
             return True
 
         completed = engine.generate(
-            prompt.tokens, on_token,
+            prompt_tokens, on_token,
             temperature=opts["temperature"], top_p=opts["top_p"],
             top_k=opts["top_k"], seed=opts["seed"],
             max_tokens=opts["max_tokens"],
@@ -354,10 +407,10 @@ class Handler(BaseHTTPRequestHandler):
         hit_limit = completed and state["n"] >= opts["max_tokens"]
         return state["n"], hit_limit, state["stopped"]
 
-    def _chat_blocking(self, body, prompt, opts, stops, parser,
-                       request_id, created):
-        t0 = time.time()
-        n, hit_limit, stopped = self._run(prompt, opts, stops, parser,
+    def _chat_blocking(self, body, prompt, run_tokens, cache_use,
+                       opts, stops, parser,
+                       request_id, created, run_started):
+        n, hit_limit, stopped = self._run(run_tokens, opts, stops, parser,
                                           lambda d: None)
         reason = api.finish_reason(parser, hit_limit=hit_limit, stopped=stopped)
         usage = api.usage_block(len(prompt.tokens), n)
@@ -365,11 +418,13 @@ class Handler(BaseHTTPRequestHandler):
             parser, model=self.server.model_id, request_id=request_id,
             created=created, reason=reason, usage=usage,
             extra=api.engine_extra(self.server.engine.stats(),
-                                   ms=(time.time() - t0) * 1000))
+                                   ms=(time.time() - run_started) * 1000,
+                                   prefix_cache=cache_use.response()))
         self._send_json(200, payload)
 
-    def _chat_stream(self, body, prompt, opts, stops, parser,
-                     request_id, created):
+    def _chat_stream(self, body, prompt, run_tokens, cache_use,
+                     opts, stops, parser,
+                     request_id, created, run_started):
         model = self.server.model_id
         self.send_response(200)
         self.send_header("Content-Type", "text/event-stream")
@@ -381,7 +436,6 @@ class Handler(BaseHTTPRequestHandler):
         self.send_header("Transfer-Encoding", "chunked")
         self.end_headers()
 
-        t0 = time.time()
         sent_role = False
         named: set[int] = set()
 
@@ -424,7 +478,7 @@ class Handler(BaseHTTPRequestHandler):
                 raise Cancelled()
 
         try:
-            n, hit_limit, stopped = self._run(prompt, opts, stops, parser,
+            n, hit_limit, stopped = self._run(run_tokens, opts, stops, parser,
                                               on_delta)
         except Cancelled:
             # The client is gone. Nothing left to write to.
@@ -461,7 +515,8 @@ class Handler(BaseHTTPRequestHandler):
             write({"id": request_id, "object": "chat.completion.chunk",
                    "created": created, "model": model, "choices": [],
                    "waste": api.engine_extra(self.server.engine.stats(),
-                                             ms=(time.time() - t0) * 1000)})
+                                             ms=(time.time() - run_started) * 1000,
+                                             prefix_cache=cache_use.response())})
             write("[DONE]")
             self.wfile.write(b"0\r\n\r\n")
             self.wfile.flush()
@@ -537,7 +592,9 @@ def serve(engine: Engine, *, host: str = "127.0.0.1", port: int = 8000,
           model_id: str = "waste", api_key: Optional[str] = None,
           default_max_tokens: int = 4096, default_thinking: bool = True,
           allow_local_images: bool = False, log_requests: bool = True,
-          ready: Optional[threading.Event] = None) -> ChatServer:
+          ready: Optional[threading.Event] = None,
+          prefix_cache_bytes: int = 0,
+          prefix_cache_entries: int = 8) -> ChatServer:
     """Build the server. The caller decides whether to serve_forever."""
     # IPv6-capable when the host asks for it, without forcing it: binding
     # :: on a host with IPv6 disabled fails outright.
@@ -547,7 +604,9 @@ def serve(engine: Engine, *, host: str = "127.0.0.1", port: int = 8000,
                      api_key=api_key, default_max_tokens=default_max_tokens,
                      default_thinking=default_thinking,
                      allow_local_images=allow_local_images,
-                     log_requests=log_requests)
+                     log_requests=log_requests,
+                     prefix_cache_bytes=prefix_cache_bytes,
+                     prefix_cache_entries=prefix_cache_entries)
     if ready is not None:
         ready.set()
     return srv

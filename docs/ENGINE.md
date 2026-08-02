@@ -280,6 +280,11 @@ leave the live conversation unchanged. (Version 1 has no payload checksum.)
 This is the primitive a server can use for an exact prefix cache; cache policy
 and prefix matching deliberately remain host concerns.
 
+`waste_prefill_chunk_size` reports the grouping used by `waste_eval` and
+`waste_generate`. A host that splits a prompt around a checkpoint must split
+on a multiple of this value to preserve the unsplit call boundaries and
+floating-point arithmetic order exactly.
+
 Version 1 validates layout and bounds but has no model/manifest identity
 fingerprint. Snapshots are opaque, context/model-local values. A host must not
 reuse one across containers merely because their shapes match; durable or

@@ -593,6 +593,7 @@ def build_chat_segments(messages: list[Any],
                         add_generation_prompt: bool = True,
                         thinking: bool = True,
                         image_prompts: Optional[list[str]] = None,
+                        family_root_end: Optional[list[int]] = None,
                         **kwargs: Any) -> list[Segment]:
     """Render a conversation into segments, in K3's own order.
 
@@ -604,7 +605,15 @@ def build_chat_segments(messages: list[Any],
 
     Keyword arguments beyond the named ones mirror upstream's `**kwargs`:
     `thinking_effort`, `tool_choice`, `response_format`, `response_schema`.
+
+    When `family_root_end` is supplied, it receives the segment offset after
+    the stable leading request family: tool declarations, the thinking-effort
+    note, and consecutive leading system/developer messages. Request-tail
+    controls and user turns are deliberately excluded. The caller still has
+    to prove the encoded prefix and choose an engine-safe checkpoint offset.
     """
+    if family_root_end is not None:
+        family_root_end.clear()
     # Re-sort tool results at the lowest layer, so every caller gets
     # correctly ordered XTML whether it came through the server or not.
     messages = normalize_xtml_tool_result_messages(messages)
@@ -625,9 +634,11 @@ def build_chat_segments(messages: list[Any],
 
     tool_calls = None
     tool_index = 0
+    root_end = 0
 
     if tools:
         segments.extend(_render_tool_declare(tools))
+        root_end = len(segments)
 
     thinking_effort = kwargs.get("thinking_effort")
     if thinking and thinking_effort is not None:
@@ -642,12 +653,16 @@ def build_chat_segments(messages: list[Any],
             "thinking channel (not including the response channel), "
             "supported values include `low`, `medium`, `high`, and `max`.\n"
             f"Now the system is invoked with `thinking_effort={thinking_effort}`."))
+        root_end = len(segments)
 
+    leading_system = True
     for message in messages:
         if not isinstance(message, dict):
             continue
 
         role = message["role"]
+        if role != "system":
+            leading_system = False
         if role == "user":
             attrs = [("role", "user")]
             if message.get("name"):
@@ -700,6 +715,9 @@ def build_chat_segments(messages: list[Any],
             segments.extend(_close_tag("message"))
             segments.extend(_end_of_msg())
 
+        if leading_system and role == "system":
+            root_end = len(segments)
+
     tool_choice = kwargs.get("tool_choice")
     if tool_choice == "required":
         segments.extend(_internal_system_message(
@@ -738,6 +756,8 @@ def build_chat_segments(messages: list[Any],
         segments.extend(_open_tag("think" if thinking else "response"))
 
     image_state.assert_consumed()
+    if family_root_end is not None and root_end:
+        family_root_end.append(root_end)
     return segments
 
 
