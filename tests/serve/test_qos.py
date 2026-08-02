@@ -349,6 +349,26 @@ class TestInjectedDevice(unittest.TestCase):
             self.assertEqual(status_path.read_text(), "sentinel\n")
             self.assertEqual(events_path.read_text(), "sentinel\n")
 
+    def test_artifact_paths_canonicalize_leading_slashes_and_missing_tail(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            directory = Path(temporary).resolve()
+            missing = directory / "not-created" / "status.json"
+            single = Path("/" + os.fspath(missing).lstrip("/"))
+            for prefix in ("//", "///", "////"):
+                alias = Path(prefix + os.fspath(missing).lstrip("/"))
+                with self.subTest(alias=alias), self.assertRaisesRegex(
+                        ValueError, "collide"):
+                    validate_artifact_paths(single, None, alias)
+
+            real_parent = directory / "real"
+            real_parent.mkdir()
+            alias_parent = directory / "alias"
+            alias_parent.symlink_to(real_parent, target_is_directory=True)
+            status = real_parent / "missing" / "same.json"
+            lock = alias_parent / "missing" / "same.json"
+            with self.assertRaisesRegex(ValueError, "collide"):
+                validate_artifact_paths(status, None, lock)
+
     def test_colliding_artifacts_fail_before_any_path_mutation(self):
         with tempfile.TemporaryDirectory() as temporary:
             directory = Path(temporary).resolve()
@@ -843,9 +863,11 @@ class TestRequestProtocol(unittest.TestCase):
 
     def test_eof_during_an_active_lease_releases_the_device(self):
         device = FakeDevice()
+        fatal_reasons = []
         supervisor_socket, client = socket.socketpair()
         supervisor = RequestSupervisor(
-            supervisor_socket, device, latency_us=0, max_hold_seconds=1)
+            supervisor_socket, device, latency_us=0, max_hold_seconds=1,
+            fatal_control_callback=fatal_reasons.append)
         thread = threading.Thread(target=supervisor.serve, daemon=True)
         thread.start()
 
@@ -867,6 +889,43 @@ class TestRequestProtocol(unittest.TestCase):
             self.assertFalse(thread.is_alive())
             self.assertFalse(device.active)
             self.assertEqual(supervisor.closed_reason, "eof")
+            self.assertEqual(fatal_reasons, ["eof"])
+        finally:
+            client.close()
+            supervisor_socket.close()
+
+    def test_planned_stop_racing_with_eof_is_not_fatal(self):
+        supervisor_socket, client = socket.socketpair()
+        stop = threading.Event()
+        first_check = threading.Event()
+        checks = 0
+        fatal_reasons = []
+        result = []
+
+        def should_stop():
+            nonlocal checks
+            checks += 1
+            if checks == 1:
+                first_check.set()
+                return False
+            return stop.is_set()
+
+        supervisor = RequestSupervisor(
+            supervisor_socket, FakeDevice(), latency_us=0,
+            max_hold_seconds=1, should_stop=should_stop,
+            fatal_control_callback=fatal_reasons.append)
+        thread = threading.Thread(
+            target=lambda: result.append(supervisor.serve()), daemon=True)
+        thread.start()
+        try:
+            self.assertTrue(first_check.wait(timeout=0.5))
+            stop.set()
+            client.close()
+            thread.join(timeout=1)
+            self.assertFalse(thread.is_alive())
+            self.assertEqual(result, ["child_exit"])
+            self.assertEqual(supervisor.closed_reason, "child_exit")
+            self.assertEqual(fatal_reasons, [])
         finally:
             client.close()
             supervisor_socket.close()
@@ -973,6 +1032,60 @@ class TestRequestProtocol(unittest.TestCase):
                          if event == "fatal_control")
             self.assertEqual(fatal["reason"], "control_send_timeout")
             self.assertTrue(all(not active for _event, active, _ in events))
+        finally:
+            client.close()
+            parent_socket.close()
+
+    def test_normal_end_close_error_is_terminal(self):
+        device, _closed = close_error_device("END close failed after close")
+        fatal_reasons = []
+        supervisor_socket, client_socket = socket.socketpair()
+        supervisor = RequestSupervisor(
+            supervisor_socket, device, latency_us=0, max_hold_seconds=1,
+            fatal_control_callback=fatal_reasons.append)
+        thread = threading.Thread(target=supervisor.serve, daemon=True)
+        thread.start()
+        client = RequestQos(
+            client_socket, timeout=0.2, require_root_peer=False)
+        try:
+            with self.assertRaisesRegex(QosError, "END close failed"):
+                with client.scope("cmpl-end-close-error"):
+                    pass
+            thread.join(timeout=0.5)
+            self.assertFalse(thread.is_alive())
+            self.assertEqual(supervisor.closed_reason, "device_close_error")
+            self.assertEqual(fatal_reasons, ["device_close_error"])
+            self.assertFalse(device.active)
+            self.assertEqual(supervisor.fd_open_count, 1)
+            self.assertEqual(supervisor.fd_close_count, 1)
+        finally:
+            client.close()
+            supervisor_socket.close()
+
+    def test_immediate_ack_loss_and_close_error_preserve_both_causes(self):
+        device, _closed = close_error_device(
+            "broken-ACK close failed after close")
+        parent_socket, client_socket = socket.socketpair()
+        broken_socket = BrokenAckSocket(parent_socket, "begin")
+        supervisor = RequestSupervisor(
+            broken_socket, device, latency_us=0, max_hold_seconds=1)
+        thread = threading.Thread(target=supervisor.serve, daemon=True)
+        thread.start()
+        client = RequestQos(
+            client_socket, timeout=0.1, require_root_peer=False)
+        try:
+            with self.assertRaises(QosError):
+                with client.scope("cmpl-broken-ack-close-error"):
+                    self.fail("body ran without a BEGIN acknowledgement")
+            thread.join(timeout=0.5)
+            self.assertFalse(thread.is_alive())
+            self.assertEqual(supervisor.closed_reason, "control_error")
+            self.assertIn("acknowledgement channel loss",
+                          supervisor.last_error)
+            self.assertIn("broken-ACK close failed", supervisor.last_error)
+            self.assertEqual(supervisor.fd_open_count, 1)
+            self.assertEqual(supervisor.fd_close_count, 1)
+            self.assertEqual(supervisor.fd_close_errors, 1)
         finally:
             client.close()
             parent_socket.close()

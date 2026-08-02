@@ -135,7 +135,11 @@ def validate_artifact_paths(status_path: Path,
         if not path.name:
             raise ValueError(f"{label} path must name a file")
         absolute = os.path.abspath(os.path.normpath(os.fspath(path)))
-        key = os.path.normcase(absolute)
+        # normpath intentionally preserves exactly two leading POSIX slashes,
+        # even though this host resolves //path and /path to the same object.
+        # realpath also canonicalizes every existing prefix while retaining a
+        # normalized missing tail, so static aliases collide before creation.
+        key = os.path.normcase(os.path.realpath(absolute))
         previous = normalized.get(key)
         if previous is not None:
             raise ValueError(
@@ -543,9 +547,14 @@ class RequestSupervisor:
             if close_error is not None:
                 self.last_error += f"; descriptor close reported {close_error}"
         elif close_error is not None:
-            self.last_error = (
+            close_message = (
                 f"PM-QoS descriptor close failed after logical release: "
                 f"{close_error}")
+            if reason in ("protocol_error", "control_error") and \
+                    self.last_error:
+                self.last_error = f"{self.last_error}; {close_message}"
+            else:
+                self.last_error = close_message
         elif reason == "end":
             self.leases_completed += 1
         released = {"request_id": request_id,
@@ -667,7 +676,7 @@ class RequestSupervisor:
                         "error": self.last_error})
                 finally:
                     self._flush_telemetry()
-                return True
+                return False
             self._send({"ok": True, "op": "end", **released})
             self._flush_telemetry()
             return True
@@ -694,7 +703,12 @@ class RequestSupervisor:
                     continue
                 chunk = self.control.recv(4096)
                 if not chunk:
-                    reason = "eof"
+                    # A planned holder shutdown or an already-exited child can
+                    # close its inherited endpoint while this thread is in
+                    # select/recv.  Recheck the stop predicate at the observed
+                    # EOF so that expected teardown is not reported as a fatal
+                    # loss of the strict control plane.
+                    reason = "child_exit" if self.should_stop() else "eof"
                     break
                 self.buffer.extend(chunk)
                 if len(self.buffer) > MAX_FRAME_BYTES:
@@ -715,7 +729,7 @@ class RequestSupervisor:
                         reason = "protocol_error"
                         return reason
                     if not self._handle(message):
-                        reason = "protocol_error"
+                        reason = self.fatal_control_reason or "protocol_error"
                         return reason
         except OSError as exc:
             control_error = f"PM-QoS control I/O failed: {exc}"
@@ -1002,7 +1016,8 @@ def run_scoped(command: Sequence[str], *, user: str, latency_us: int,
                                      child.poll() is not None))
             reason = supervisor.serve()
             status["supervisor_exit_reason"] = reason
-            if reason in ("eof", "protocol_error", "control_error") and \
+            if reason in ("eof", "protocol_error", "control_error",
+                           "device_close_error") and \
                     child.poll() is None:
                 # The strict-profile server must not outlive its required
                 # control plane and continue under a misleading profile name.
