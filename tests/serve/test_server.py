@@ -30,6 +30,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
 from serve import xtml                                      # noqa: E402
 from serve.engine import EngineError, WASTE_E_IO            # noqa: E402
+from serve.prefix_cache import CONTROLLER_OVERHEAD_BYTES    # noqa: E402
 from serve.server import serve                              # noqa: E402
 from tests.serve.fake_engine import (FakeEngine, reply_plain,   # noqa: E402
                                      reply_tool_call)
@@ -123,6 +124,7 @@ class TestBasics(ServerTestCase):
         self.assertEqual(status, 200)
         self.assertEqual(body["status"], "ok")
         self.assertEqual(body["model"], "test-model")
+        self.assertFalse(body["prefix_cache"]["enabled"])
 
     def test_models(self):
         status, body = self.get("/v1/models")
@@ -192,6 +194,7 @@ class TestChatCompletions(ServerTestCase):
         _, body = self.chat()
         self.assertIn("waste", body)
         self.assertEqual(body["waste"]["expert_hit_rate"], 0.75)
+        self.assertEqual(body["waste"]["prefix_cache"]["status"], "disabled")
 
     def test_no_thinking_request(self):
         self.engine.reply = reply_plain("Direct.", thinking=False)
@@ -292,6 +295,245 @@ class TestChatCompletions(ServerTestCase):
         markers = set(self.engine.marker_ids())
         self.assertEqual(sum(1 for t in benign if t in markers),
                          sum(1 for t in attacked if t in markers))
+
+
+class TestPrefixCache(ServerTestCase):
+    """Exact family-root snapshots through the public HTTP surface."""
+
+    engine_kwargs = {"host_reserved_bytes": 1 << 20, "prefill_chunk": 4}
+    server_kwargs = {"prefix_cache_bytes": 1 << 20,
+                     "prefix_cache_entries": 2}
+
+    @staticmethod
+    def messages(system: str, user: str):
+        return [{"role": "system", "content": system},
+                {"role": "user", "content": user}]
+
+    def test_repeated_prompt_restores_exact_prefix(self):
+        self.engine.reply = reply_plain("same answer")
+        messages = self.messages("stable instructions " * 8, "first task")
+
+        status, cold = self.chat(messages=messages, temperature=0)
+        self.assertEqual(status, 200, cold)
+        status, warm = self.chat(messages=messages, temperature=0)
+        self.assertEqual(status, 200, warm)
+
+        cold_cache = cold["waste"]["prefix_cache"]
+        warm_cache = warm["waste"]["prefix_cache"]
+        self.assertEqual(cold_cache["status"], "miss")
+        self.assertGreater(cold_cache["cached_tokens"], 0)
+        self.assertEqual(warm_cache["status"], "hit")
+        self.assertEqual(warm_cache["restored_tokens"],
+                         cold_cache["cached_tokens"])
+        self.assertEqual(warm_cache["replayed_tokens"],
+                         warm["usage"]["prompt_tokens"]
+                         - warm_cache["restored_tokens"])
+        self.assertEqual(cold["choices"], warm["choices"])
+        self.assertEqual(self.engine.prompts[0], self.engine.prompts[1])
+        self.assertEqual(len(self.engine.prefills), 1)
+        self.assertEqual(self.engine.imports, 1)
+
+    def test_shared_root_replays_only_the_divergent_tail(self):
+        root = "shared agent policy " * 8
+        _, first = self.chat(messages=self.messages(root, "alpha"))
+        _, second = self.chat(messages=self.messages(root, "beta"))
+
+        cache = second["waste"]["prefix_cache"]
+        self.assertEqual(first["waste"]["prefix_cache"]["status"], "miss")
+        self.assertEqual(cache["status"], "hit")
+        restored = cache["restored_tokens"]
+        self.assertGreater(restored, 0)
+        self.assertEqual(self.engine.prompts[0][:restored],
+                         self.engine.prompts[1][:restored])
+        self.assertNotEqual(self.engine.prompts[0], self.engine.prompts[1])
+
+    def test_developer_role_is_a_cacheable_leading_system_turn(self):
+        messages = [{"role": "developer", "content": "policy " * 12},
+                    {"role": "user", "content": "question"}]
+        _, cold = self.chat(messages=messages)
+        _, warm = self.chat(messages=messages)
+        self.assertEqual(cold["waste"]["prefix_cache"]["status"], "miss")
+        self.assertEqual(warm["waste"]["prefix_cache"]["status"], "hit")
+
+    def test_tool_schema_alone_is_a_cacheable_family_root(self):
+        tools = [{"type": "function", "function": {
+            "name": "lookup",
+            "description": "shared tool schema " * 8,
+            "parameters": {"type": "object", "properties": {
+                "query": {"type": "string"}}}}}]
+        messages = [{"role": "user", "content": "question"}]
+        _, cold = self.chat(messages=messages, tools=tools)
+        _, warm = self.chat(messages=messages, tools=tools)
+        self.assertEqual(cold["waste"]["prefix_cache"]["status"], "miss")
+        self.assertEqual(warm["waste"]["prefix_cache"]["status"], "hit")
+
+    def test_concurrent_hits_with_different_roots_keep_state_isolated(self):
+        a = self.messages("concurrent family A " * 12, "question A")
+        b = self.messages("concurrent family B " * 12, "question B")
+        self.chat(messages=a)
+        self.chat(messages=b)
+        expected_a = list(self.engine.prompts[0])
+        expected_b = list(self.engine.prompts[1])
+        results = []
+        guard = threading.Lock()
+
+        def one(messages):
+            result = self.chat(messages=messages)
+            with guard:
+                results.append(result)
+
+        threads = [threading.Thread(target=one, args=(a if i % 2 else b,))
+                   for i in range(8)]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join(timeout=20)
+        self.assertFalse(any(thread.is_alive() for thread in threads))
+        self.assertEqual(len(results), 8)
+        for status, body in results:
+            self.assertEqual(status, 200, body)
+            self.assertEqual(body["waste"]["prefix_cache"]["status"], "hit")
+
+        # FakeEngine reconstructs each full prompt from restored state plus
+        # the replayed suffix. A cross-family restore would leave a hybrid
+        # here even though the scripted answer itself is the same.
+        concurrent_prompts = self.engine.prompts[2:]
+        self.assertEqual(sum(p == expected_a for p in concurrent_prompts), 4)
+        self.assertEqual(sum(p == expected_b for p in concurrent_prompts), 4)
+
+    def test_lru_entry_limit_is_deterministic(self):
+        a = self.messages("family A " * 12, "question")
+        b = self.messages("family B " * 12, "question")
+        self.assertEqual(self.chat(messages=a)[1]["waste"]["prefix_cache"]
+                         ["status"], "miss")
+        self.assertEqual(self.chat(messages=b)[1]["waste"]["prefix_cache"]
+                         ["status"], "miss")
+        # The two-entry cache is full. Touch A, then admit C: B must go.
+        self.assertEqual(self.chat(messages=a)[1]["waste"]["prefix_cache"]
+                         ["status"], "hit")
+        c = self.messages("family C " * 12, "question")
+        self.assertEqual(self.chat(messages=c)[1]["waste"]["prefix_cache"]
+                         ["status"], "miss")
+        self.assertEqual(self.chat(messages=b)[1]["waste"]["prefix_cache"]
+                         ["status"], "miss")
+        _, health = self.get("/health")
+        stats = health["prefix_cache"]
+        self.assertEqual(stats["entries"], 2)
+        self.assertEqual(stats["evictions"], 2)
+        self.assertLessEqual(stats["bytes_used"], stats["max_bytes"])
+
+    def test_identity_change_invalidates_all_entries(self):
+        messages = self.messages("stable root " * 10, "question")
+        self.chat(messages=messages)
+        self.assertEqual(self.server.prefix_cache.stats()["entries"], 1)
+
+        self.server.prefix_cache.ensure_identity(("different",))
+        self.assertEqual(self.server.prefix_cache.stats()["entries"], 0)
+        _, body = self.chat(messages=messages)
+        self.assertEqual(body["waste"]["prefix_cache"]["status"], "miss")
+        self.assertEqual(self.server.prefix_cache.stats()["invalidations"], 2)
+
+    def test_restore_mismatch_fails_closed_and_recovers(self):
+        messages = self.messages("stable root " * 10, "question")
+        _, cold = self.chat(messages=messages)
+        self.engine.fail_state_import_once = True
+        _, recovered = self.chat(messages=messages)
+
+        cache = recovered["waste"]["prefix_cache"]
+        self.assertEqual(cache["status"], "restore_failed")
+        self.assertEqual(cache["restored_tokens"], 0)
+        self.assertEqual(cold["choices"], recovered["choices"])
+        self.assertEqual(self.engine.prompts[0], self.engine.prompts[1])
+        _, health = self.get("/health")
+        self.assertEqual(health["prefix_cache"]["restore_failures"], 1)
+
+    def test_snapshot_failure_resets_and_runs_the_unsplit_prompt(self):
+        messages = self.messages("stable root " * 10, "question")
+        self.engine.fail_state_export_once = True
+        _, body = self.chat(messages=messages)
+        cache = body["waste"]["prefix_cache"]
+        self.assertEqual(cache["status"], "snapshot_failed")
+        self.assertEqual(cache["cached_tokens"], 0)
+        self.assertEqual(self.engine.run_prompts[-1], self.engine.prompts[-1])
+        self.assertEqual(self.server.prefix_cache.stats()["entries"], 0)
+        self.assertEqual(self.server.prefix_cache.stats()["snapshot_failures"],
+                         1)
+
+    def test_snapshot_allocation_failure_is_an_uncached_200(self):
+        messages = self.messages("stable root " * 10, "question")
+        self.engine.fail_state_export_memory_once = True
+        status, body = self.chat(messages=messages)
+        self.assertEqual(status, 200, body)
+        cache = body["waste"]["prefix_cache"]
+        self.assertEqual(cache["status"], "allocation_failed")
+        self.assertEqual(cache["cached_tokens"], 0)
+        self.assertEqual(self.engine.run_prompts[-1], self.engine.prompts[-1])
+        stats = self.server.prefix_cache.stats()
+        self.assertEqual(stats["entries"], 0)
+        self.assertEqual(stats["allocation_failures"], 1)
+
+    def test_image_request_bypasses_even_with_a_system_root(self):
+        self.engine.vision = True
+        _, body = self.chat(messages=[
+            {"role": "system", "content": "stable root " * 8},
+            {"role": "user", "content": [
+                {"type": "image_url", "image_url": {
+                    "url": "data:image/png;base64,aGVsbG8="}},
+                {"type": "text", "text": "what is this?"}]}])
+        self.assertEqual(body["waste"]["prefix_cache"]["status"],
+                         "bypass_no_root")
+        self.assertEqual(self.server.prefix_cache.stats()["entries"], 0)
+
+    def test_no_stable_family_root_bypasses(self):
+        _, body = self.chat(messages=[{"role": "user", "content": "hello"}])
+        self.assertEqual(body["waste"]["prefix_cache"]["status"],
+                         "bypass_no_root")
+
+    def test_stream_reports_the_same_cache_counters(self):
+        messages = self.messages("stable root " * 10, "question")
+        self.chat(messages=messages)
+        events = self.stream(messages=messages)
+        reports = [event["waste"]["prefix_cache"]
+                   for event in events[:-1]
+                   if isinstance(event, dict) and "waste" in event]
+        self.assertEqual(len(reports), 1)
+        self.assertEqual(reports[0]["status"], "hit")
+
+
+class TestPrefixCacheLimits(unittest.TestCase):
+    def test_cache_must_be_precharged_to_the_engine(self):
+        engine = FakeEngine(host_reserved_bytes=CONTROLLER_OVERHEAD_BYTES)
+        with self.assertRaises(ValueError):
+            serve(engine, host="127.0.0.1", port=0,
+                  prefix_cache_bytes=CONTROLLER_OVERHEAD_BYTES + 1)
+
+    def test_enabled_cache_must_cover_its_controller(self):
+        engine = FakeEngine(
+            host_reserved_bytes=CONTROLLER_OVERHEAD_BYTES - 1)
+        with self.assertRaises(ValueError):
+            serve(engine, host="127.0.0.1", port=0,
+                  prefix_cache_bytes=CONTROLLER_OVERHEAD_BYTES - 1)
+
+
+class TestPrefixCacheAdmissionLimit(ServerTestCase):
+    limit = CONTROLLER_OVERHEAD_BYTES + 1024
+    engine_kwargs = {"host_reserved_bytes": limit, "prefill_chunk": 4}
+    server_kwargs = {"prefix_cache_bytes": limit,
+                     "prefix_cache_entries": 8}
+
+    def test_snapshot_larger_than_byte_limit_is_not_retained(self):
+        _, body = self.chat(messages=[
+            {"role": "system", "content": "root " * 10},
+            {"role": "user", "content": "question"}])
+        cache = body["waste"]["prefix_cache"]
+        self.assertEqual(cache["status"], "miss")
+        self.assertEqual(cache["cached_tokens"], 0)
+        _, health = self.get("/health")
+        stats = health["prefix_cache"]
+        self.assertEqual(stats["entries"], 0)
+        self.assertEqual(stats["bytes_used"], CONTROLLER_OVERHEAD_BYTES)
+        self.assertEqual(stats["entry_bytes_used"], 0)
+        self.assertEqual(stats["admission_rejects"], 1)
 
 
 class TestStreaming(ServerTestCase):

@@ -1,0 +1,218 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 SQLite Cloud, Inc.
+"""Policy checks for the exact in-process prefix cache."""
+
+import platform
+import sys
+import unittest
+from pathlib import Path
+from unittest.mock import patch
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+
+from serve.prefix_cache import (CONTROLLER_OVERHEAD_BYTES,               # noqa: E402
+                                ENTRY_OVERHEAD_BYTES, PrefixCache, _Entry)
+from tests.serve.fake_engine import FakeEngine             # noqa: E402
+
+
+class TestPrefixCachePolicy(unittest.TestCase):
+    @staticmethod
+    def finish(engine, suffix):
+        output = []
+        engine.generate(suffix,
+                        lambda token, *_: output.append(token) or True,
+                        max_tokens=4)
+        return output, bytes(engine.state_export())
+
+    def test_deepest_exact_ancestor_never_passes_stable_boundary(self):
+        identity = ("one engine",)
+        cache = PrefixCache(1 << 20, 4, identity)
+        engine = FakeEngine(host_reserved_bytes=1 << 20, prefill_chunk=4)
+        tokens = list(range(1, 21))
+
+        engine.state_reset()
+        _, first = cache.prepare(engine, tokens, [12], identity)
+        self.assertEqual(first.status, "miss")
+        self.assertEqual(first.cached_tokens, 12)
+
+        # The twelve-token entry is an exact prefix, but this request proves
+        # only four tokens are a stable family root. Restoring past that
+        # boundary would turn a prior request tail into shared state.
+        engine.state_reset()
+        _, shorter = cache.prepare(engine, tokens, [4], identity)
+        self.assertEqual(shorter.status, "miss")
+        self.assertEqual(engine.imports, 0)
+        self.assertEqual(shorter.cached_tokens, 4)
+
+        # Both exact ancestors now exist. The deepest allowed one wins.
+        engine.state_reset()
+        suffix, deepest = cache.prepare(engine, tokens, [12], identity)
+        self.assertEqual(deepest.status, "hit")
+        self.assertEqual(deepest.restored_tokens, 12)
+        self.assertEqual(suffix, tokens[12:])
+
+    def test_token_mismatch_is_never_a_hash_style_hit(self):
+        identity = ("one engine",)
+        cache = PrefixCache(1 << 20, 4, identity)
+        engine = FakeEngine(host_reserved_bytes=1 << 20, prefill_chunk=4)
+        original = list(range(1, 21))
+        changed = list(original)
+        changed[5] = 999
+
+        engine.state_reset()
+        cache.prepare(engine, original, [12], identity)
+        engine.state_reset()
+        _, use = cache.prepare(engine, changed, [12], identity)
+        self.assertEqual(use.status, "miss")
+        self.assertEqual(engine.imports, 0)
+
+    def test_shallow_hit_promotes_deeper_root_and_preserves_full_state(self):
+        identity = ("one engine",)
+        cache = PrefixCache(1 << 20, 4, identity)
+        engine = FakeEngine(host_reserved_bytes=1 << 20, prefill_chunk=4)
+        tokens = list(range(1, 25))
+
+        engine.state_reset()
+        suffix, shallow = cache.prepare(engine, tokens, [8], identity)
+        shallow_output, shallow_state = self.finish(engine, suffix)
+        self.assertEqual(shallow.status, "miss")
+        self.assertEqual(shallow.cached_tokens, 8)
+
+        engine.state_reset()
+        suffix, promoted = cache.prepare(engine, tokens, [16], identity)
+        promoted_output, promoted_state = self.finish(engine, suffix)
+        self.assertEqual(promoted.status, "hit")
+        self.assertEqual(promoted.restored_tokens, 8)
+        self.assertEqual(promoted.promoted_tokens, 8)
+        self.assertEqual(promoted.cached_tokens, 16)
+        self.assertEqual(engine.prefills[-1], tokens[8:16])
+
+        engine.state_reset()
+        suffix, deepest = cache.prepare(engine, tokens, [16], identity)
+        deepest_output, deepest_state = self.finish(engine, suffix)
+        self.assertEqual(deepest.status, "hit")
+        self.assertEqual(deepest.restored_tokens, 16)
+        self.assertEqual(deepest.promoted_tokens, 0)
+        self.assertEqual(shallow_output, promoted_output)
+        self.assertEqual(shallow_output, deepest_output)
+        self.assertEqual(shallow_state, promoted_state)
+        self.assertEqual(shallow_state, deepest_state)
+
+        stats = cache.stats()
+        self.assertEqual(stats["admissions"], 2)
+        self.assertEqual(stats["entries"], 2)
+        self.assertEqual(stats["promotions"], 1)
+        self.assertEqual(stats["promoted_tokens"], 8)
+        self.assertLessEqual(stats["bytes_used"], stats["max_bytes"])
+        self.assertEqual(stats["controller_bytes"], CONTROLLER_OVERHEAD_BYTES)
+
+    def test_failed_restore_releases_old_blob_before_replacement_export(self):
+        identity = ("one engine",)
+        cache = PrefixCache(1 << 20, 1, identity)
+        engine = FakeEngine(host_reserved_bytes=1 << 20, prefill_chunk=4)
+        tokens = list(range(1, 21))
+        engine.state_reset()
+        cache.prepare(engine, tokens, [12], identity)
+        old_blob = cache._entries[0].blob
+        real_export = engine.state_export
+        lengths_at_export = []
+
+        def checked_export():
+            lengths_at_export.append(len(old_blob))
+            return real_export()
+
+        engine.state_export = checked_export
+        engine.fail_state_import_once = True
+        engine.state_reset()
+        _, use = cache.prepare(engine, tokens, [12], identity)
+        self.assertEqual(use.status, "restore_failed")
+        self.assertEqual(lengths_at_export, [0])
+        self.assertEqual(len(old_blob), 0)
+        self.assertEqual(cache.stats()["entries"], 1)
+
+    def test_one_entry_promotion_releases_shallow_blob_before_export(self):
+        identity = ("one engine",)
+        cache = PrefixCache(1 << 20, 1, identity)
+        engine = FakeEngine(host_reserved_bytes=1 << 20, prefill_chunk=4)
+        tokens = list(range(1, 25))
+
+        engine.state_reset()
+        cache.prepare(engine, tokens, [8], identity)
+        old_blob = cache._entries[0].blob
+        real_export = engine.state_export
+        lengths_at_export = []
+
+        def checked_export():
+            lengths_at_export.append(len(old_blob))
+            return real_export()
+
+        engine.state_export = checked_export
+        engine.state_reset()
+        suffix, use = cache.prepare(engine, tokens, [16], identity)
+        self.assertEqual(use.status, "hit")
+        self.assertEqual(use.restored_tokens, 8)
+        self.assertEqual(use.cached_tokens, 16)
+        self.assertEqual(use.promoted_tokens, 8)
+        self.assertEqual(suffix, tokens[16:])
+        self.assertEqual(lengths_at_export, [0])
+        self.assertEqual(len(old_blob), 0)
+        stats = cache.stats()
+        self.assertEqual(stats["entries"], 1)
+        self.assertEqual(stats["evictions"], 1)
+        self.assertLessEqual(stats["bytes_used"], stats["max_bytes"])
+
+    def test_insert_allocation_failures_reset_for_unsplit_fallback(self):
+        identity = ("one engine",)
+        tokens = list(range(1, 21))
+
+        baseline = FakeEngine(prefill_chunk=4)
+        baseline.state_reset()
+        expected_output, expected_state = self.finish(baseline, tokens)
+
+        for error in (MemoryError, OverflowError):
+            with self.subTest(error=error.__name__):
+                cache = PrefixCache(1 << 20, 2, identity)
+                engine = FakeEngine(
+                    host_reserved_bytes=1 << 20, prefill_chunk=4)
+                engine.state_reset()
+                with patch.object(cache, "_insert", side_effect=error):
+                    suffix, use = cache.prepare(
+                        engine, tokens, [12], identity)
+                self.assertEqual(use.status, "allocation_failed")
+                self.assertEqual(suffix, tokens)
+                output, state = self.finish(engine, suffix)
+                self.assertEqual(output, expected_output)
+                self.assertEqual(state, expected_state)
+                stats = cache.stats()
+                self.assertEqual(stats["allocation_failures"], 1)
+                self.assertEqual(stats["entries"], 0)
+                self.assertEqual(stats["bytes_used"],
+                                 CONTROLLER_OVERHEAD_BYTES)
+
+    @unittest.skipUnless(platform.python_implementation() == "CPython",
+                         "shallow allocation accounting is CPython-specific")
+    def test_metadata_charges_cover_retained_cpython_objects(self):
+        key = bytes(17)
+        blob = bytearray(19)
+        entry = _Entry(key, 12345, blob, 67890, 2, 3)
+        entry_meta = (sys.getsizeof(entry)
+                      + sys.getsizeof(key) - len(key)
+                      + sys.getsizeof(blob) - len(blob)
+                      + sys.getsizeof([entry]) - sys.getsizeof([]))
+        for value in (entry.n_tokens, entry.charge,
+                      entry.created, entry.last_used):
+            entry_meta += sys.getsizeof(value)
+        self.assertLessEqual(entry_meta, ENTRY_OVERHEAD_BYTES)
+
+        cache = PrefixCache(1 << 20, 8, ("identity",))
+        controller = (sys.getsizeof(cache) + sys.getsizeof(cache.__dict__)
+                      + sys.getsizeof(cache._entries)
+                      + sys.getsizeof(cache._lock)
+                      + sys.getsizeof(cache._counters))
+        controller += sum(sys.getsizeof(key) + sys.getsizeof(value)
+                          for key, value in cache._counters.items())
+        self.assertLessEqual(controller, CONTROLLER_OVERHEAD_BYTES)
+
+
+if __name__ == "__main__":
+    unittest.main(verbosity=2)

@@ -458,6 +458,34 @@ class TestGeneration(EngineTestCase):
 
 
 class TestState(EngineTestCase):
+    def test_aligned_prefill_split_is_bit_exact(self):
+        """A cacheable split preserves output and final recurrent state."""
+        chunk = self.engine.prefill_chunk_size()
+        self.assertGreater(chunk, 0)
+        tokens = self.engine.tokenize("stable prefix " * (chunk * 2))
+        self.assertGreater(len(tokens), chunk)
+        split = (len(tokens) // chunk - 1) * chunk
+        self.assertGreater(split, 0)
+        self.assertLess(split, len(tokens))
+
+        baseline: list[int] = []
+        self.engine.generate(tokens,
+                             lambda token, *_: baseline.append(token) or True,
+                             temperature=0, max_tokens=4)
+        baseline_state = self.engine.state_export()
+
+        self.engine.state_reset()
+        self.engine.prefill(tokens[:split])
+        snapshot = self.engine.state_export()
+        self.engine.state_reset()
+        self.engine.state_import(snapshot)
+        split_output: list[int] = []
+        self.engine.generate(tokens[split:],
+                             lambda token, *_: split_output.append(token) or True,
+                             temperature=0, max_tokens=4)
+        self.assertEqual(split_output, baseline)
+        self.assertEqual(self.engine.state_export(), baseline_state)
+
     def test_memory_snapshot_round_trip_is_byte_exact(self):
         self.engine.generate(self.engine.tokenize("hello world"),
                              lambda *a: True, max_tokens=2)

@@ -744,6 +744,13 @@ waste_status waste_eval(waste_ctx *c, const int32_t *tokens, size_t n,
     return WASTE_OK;
 }
 
+uint32_t waste_prefill_chunk_size(const waste_ctx *c)
+{
+    if (!c) return 0;
+    const int n = waste_model_chunk_max(&c->m);
+    return n > 0 ? (uint32_t)n : 0;
+}
+
 static int argmax(const float *logits, int vocab)
 {
     int best = 0;

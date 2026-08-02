@@ -252,6 +252,8 @@ def _bind(lib) -> None:
     lib.waste_eval.argtypes = [C.c_void_p, C.POINTER(C.c_int32), C.c_size_t,
                                C.POINTER(C.POINTER(C.c_float)),
                                C.POINTER(C.c_size_t)]
+    lib.waste_prefill_chunk_size.restype = C.c_uint32
+    lib.waste_prefill_chunk_size.argtypes = [C.c_void_p]
     # Which expert record failed, when one does. A status of "I/O error" is
     # not something an operator can act on for a container holding 89,000
     # of them; this names the record.
@@ -684,6 +686,24 @@ class Engine:
         st = self.lib.waste_state_import(self._ctx, src, len(view))
         if st != WASTE_OK:
             raise EngineError("state_import", st)
+
+    def prefill_chunk_size(self) -> int:
+        """Prompt split alignment required for bit-exact checkpointing."""
+        self._check()
+        n = int(self.lib.waste_prefill_chunk_size(self._ctx))
+        if not n:
+            raise EngineError("prefill_chunk_size", WASTE_E_FORMAT)
+        return n
+
+    def prefill(self, tokens: list[int]) -> None:
+        """Evaluate prompt tokens without copying vocabulary logits."""
+        self._check()
+        if not tokens:
+            raise EngineError("prefill", WASTE_E_ARG, "empty prompt")
+        src = (C.c_int32 * len(tokens))(*tokens)
+        st = self.lib.waste_eval(self._ctx, src, len(tokens), None, None)
+        if st != WASTE_OK:
+            raise EngineError("prefill", st, self._detail())
 
     # ---- generation -----------------------------------------------------
 
