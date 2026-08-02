@@ -492,8 +492,8 @@ against no cache, session-state round-trip, the RAM plan and the
 format-version guard all now run on every platform and in CI.
 
 Counts drift as checks are added, so take them from a run rather than
-from here. As of 2026-08-02 the suite is **44 checks**; without a container it is
-**32 pass / 0 fail / 12 skip**.
+from here. As of 2026-08-02 the suite is **45 checks**; without a container it is
+**33 pass / 0 fail / 12 skip**.
 
 Those skips are what still needs real weights: the oracle diff (those
 logits belong to actual Kimi-Linear weights), the container round-trip

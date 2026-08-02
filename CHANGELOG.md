@@ -14,10 +14,10 @@ Spark integration release based on upstream 0.6.3. This is API 2, not a
 drop-in upstream 0.6.3 library: `waste_cfg` and `waste_memplan` have grown to
 account for host-owned memory and process ownership. The four functions that
 read or write those structures export `_v2` symbols; source clients use the
-ordinary names through header macros, while an API-1 binary fails symbol
-resolution instead of crossing the boundary with smaller structures. Dynamic
-bindings can verify `waste_api_version()` and the two exported structure sizes
-before making any structure-bearing call.
+ordinary names through header macros, while an API-1 binary using those calls
+fails symbol resolution instead of crossing the boundary with smaller
+structures. Dynamic bindings can verify `waste_api_version()` and the two
+exported structure sizes before making any structure-bearing call.
 
 ## 0.6.3 — 2026-08-02
 

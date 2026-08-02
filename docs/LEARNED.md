@@ -2353,3 +2353,22 @@ The real-container result above belongs to the upstream capacity layer: 24
 passes, zero failures, and 16 skips in that container. It is not the combined
 Spark integration-suite count and it does not relabel the GN100 throughput
 campaign, whose explicit cache size bypasses automatic budget resolution.
+
+The composed integration was then exercised on the GN100, not inferred from
+those upstream rows. Private and host cgroup namespaces reported exact 6 GiB
+and 5 GiB usable capacities and completed automatic opens. A 64 MiB group with
+a synthetic 184,124,008-byte floor returned `WASTE_E_MEMORY` with exit 1 before
+a model-sized allocation, while an explicit 900 MiB budget in a 1 GiB group
+opened with the documented warning. That pair is the policy in executable form: current
+pressure can refuse an automatic open, but it does not silently rewrite an
+explicit caller contract.
+
+Merging that layer exposed a separate release concern: the Spark integration's
+public config and memory-plan structures had grown while still claiming
+upstream 0.6.3/API 1. That is memory corruption for a prebuilt API-1 caller, not
+a cosmetic version mismatch. The integration is therefore
+`0.7.0-spark.1`/API 2, and the four functions that cross either changed
+structure have `_v2` symbols. Old binaries using those calls fail to resolve
+them; current dynamic bindings check API identity and exact structure sizes
+first. A fork can carry different policy, but it cannot safely borrow
+upstream's ABI name.

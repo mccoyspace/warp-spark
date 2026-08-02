@@ -39,7 +39,7 @@ The order below follows dependencies, not the historical sprint order.
 | Order | Proposed PR | Upstream boundary | Status on current base |
 | ---: | --- | --- | --- |
 | 0 | Linux 4 KiB `O_DIRECT` eligibility and transfer probing | Portable correctness | Already implemented upstream; no duplicate PR |
-| 1 | Auto-budget from Linux `MemAvailable` and cgroup-v2 headroom | Generic safety; preserve other platforms | PR-ready on `pr/linux-memory-budget` |
+| 1 | Auto-budget from Linux `MemAvailable` and cgroup-v2 headroom | Generic safety; preserve other platforms | Upstream 0.6.3 has stable cgroup capacity; current-pressure layer is discuss-first |
 | 2 | POSIX model-container ownership lock with explicit opt-out | Generic safety/policy | PR-ready on `pr/posix-model-lock` |
 | 3 | Explicit Linux CPU-list affinity | Generic configuration | Keep the GN100 CPU choice outside core |
 | 4 | Final phase/layer trace and request-boundary flushing | Generic observability | Reconcile with upstream cache traces |
@@ -56,6 +56,15 @@ adds portable reset and race tests. The GN100 lookahead result and Spark launch
 policy are evidence for that patch, not behavior the portable PR should impose.
 Because upstream introduced the sweep recently, first send the maintainer the
 short failure mode and offer the patch; open the PR if they want that shape.
+
+Upstream 0.6.3 independently fixed the stable half of the Linux memory issue:
+`waste_usable_ram()` now respects finite cgroup-v2 max/high over the hierarchy.
+Do not submit the old `pr/linux-memory-budget` branch as written. The remaining
+proposal is only the dynamic half (`MemAvailable`, `memory.current`, early
+under-floor refusal, and host reservations), reconstructed on current upstream
+and presented as a policy question before a PR. The Spark fork's API-2 ABI and
+host-reservation fields are integration dependencies, not changes to smuggle
+into that first discussion.
 
 The old public `pread_batch` backend remains a diagnostic control, not a
 production API.  A raw `io_uring` PR is conditional: first show that it adds
