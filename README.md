@@ -118,7 +118,7 @@ out before committing a disk to K3.
 - **Zero dependencies.** No BLAS, no ONNX, no Python in the inference
   path, nothing to install. The Python under `tools/` converts models and
   validates the engine; it never runs alongside it.
-- **Fully embeddable.** Twenty-six public functions in
+- **Fully embeddable.** A small public C API in
   [src/waste.h](src/waste.h): open a model under a RAM ceiling, generate,
   save the session, close. The CLI is a client of that API and touches
   nothing private — if the CLI can do it, so can an embedding host.

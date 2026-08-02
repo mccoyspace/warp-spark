@@ -14,10 +14,10 @@
  *     waste_ctx, so a host can hold several models at once.
  *   - The caller owns the RAM budget. waste_cfg.ram_budget_bytes is a hard
  *     ceiling on everything the engine allocates (weights, caches, KV,
- *     scratch). The engine sizes its expert cache to fit and never
- *     exceeds the budget; if the budget is below the floor
- *     (waste_plan_memory's floor_bytes), loading fails with
- *     WASTE_E_RAM_BUDGET instead of swapping the machine to death.
+ *     scratch) plus any caller memory declared in host_reserved_bytes.
+ *     The engine sizes its expert cache to fit and never exceeds the
+ *     budget; if the budget is below that combined floor, loading fails
+ *     with WASTE_E_RAM_BUDGET instead of swapping the machine to death.
  *   - No hidden I/O: expert streaming happens on the caller's thread or
  *     on the engine's own pool, never via page-fault surprises.
  *   - Errors are returned, never printed. Nothing calls exit().
@@ -65,7 +65,7 @@ typedef enum {
     WASTE_OK = 0,
     WASTE_E_IO = -1,           /* file missing, short read, bad checksum   */
     WASTE_E_FORMAT = -2,       /* container malformed or wrong version     */
-    WASTE_E_RAM_BUDGET = -3,   /* budget below the model's floor           */
+    WASTE_E_RAM_BUDGET = -3,   /* budget below engine + host floor         */
     WASTE_E_OOM = -4,
     WASTE_E_ARG = -5,
     WASTE_E_UNSUPPORTED = -6,  /* arch/quant combination not built in      */
@@ -92,6 +92,10 @@ typedef struct {
      * the queued image embeddings. waste_open folds it into the figures
      * above when vision is on, so the resolved budget accounts for it. */
     uint64_t vision_bytes;
+    /* Caller-owned bytes reserved inside ram_budget_bytes. This is zero
+     * from waste_plan_memory (which has no configuration); after open,
+     * waste_memory_used reports the value that reduced the expert cache. */
+    uint64_t host_reserved_bytes;
 } waste_memplan;
 
 /* Compute the memory floor without loading weights. ctx_tokens sizes the
@@ -121,9 +125,13 @@ typedef struct {
      * that ceiling: the last fraction buys a little hit rate and risks
      * the OS paging the cache out, which costs far more than it gains.
      * When not even floor + 1x fits, it runs at floor_bytes.
+     * host_reserved_bytes then comes out of that selected total; only a
+     * reservation larger than all optional cache raises it to the combined
+     * floor needed to open.
      *
      * Loading fails with WASTE_E_RAM_BUDGET if the value given is below
-     * floor_bytes. waste_memory_used reports what was actually resolved. */
+     * floor_bytes + host_reserved_bytes. waste_memory_used reports what
+     * was actually resolved. */
     uint64_t ram_budget_bytes;
 
     /* Longest sequence a context holds — prompt plus generation — and a
@@ -185,6 +193,13 @@ typedef struct {
      * expert this container does not have are skipped, because it is one
      * of the few files the engine reads that nobody asked it to. */
     const char *usage_path;
+
+    /* Memory retained by the host for this context, such as exported state
+     * snapshots. It is part of ram_budget_bytes, not additional to it: the
+     * engine subtracts it before sizing the expert cache. A non-zero value
+     * therefore requires ram_budget_bytes >= floor_bytes + this value;
+     * addition overflow is rejected with WASTE_E_RAM_BUDGET. */
+    uint64_t host_reserved_bytes;
 } waste_cfg;
 
 /* Removed in 0.6.0, having never done anything: `io_threads` (there is no
@@ -208,7 +223,8 @@ waste_status waste_open(const char *model_path, const waste_cfg *cfg,
                         waste_ctx **out);
 void waste_close(waste_ctx *ctx);
 
-/* What the engine actually allocated, after open. */
+/* What the engine actually allocated, after open, plus the caller-owned
+ * reservation charged to this context's hard budget. */
 waste_status waste_memory_used(const waste_ctx *ctx, waste_memplan *out);
 
 /* What went wrong, specifically, when the status alone is too coarse to
@@ -350,9 +366,24 @@ waste_status waste_eval(waste_ctx *ctx, const int32_t *tokens, size_t n,
 
 /* KDA state is O(1) in context length and MLA KV is compressed, so a whole
  * session checkpoint is small — worth persisting when a cold re-prefill
- * costs minutes at streaming speeds. */
+ * costs minutes at streaming speeds.
+ *
+ * Version 1 snapshots validate their state layout but carry no model or
+ * manifest fingerprint. Treat both file and memory snapshots as opaque,
+ * context/model-local data: do not restore one into a different container
+ * merely because its dimensions happen to match. */
 waste_status waste_state_save(waste_ctx *ctx, const char *path);
 waste_status waste_state_load(waste_ctx *ctx, const char *path);
+/* The same canonical checkpoint representation without a filesystem round
+ * trip. waste_state_size returns the exact current size. Export reports the
+ * required size through `written`; a short buffer returns WASTE_E_ARG and
+ * leaves the destination untouched. Import validates shape, bounds, and the
+ * complete length before modifying live state, so a rejected snapshot leaves
+ * the current conversation bit-for-bit intact. */
+waste_status waste_state_size(const waste_ctx *ctx, size_t *bytes);
+waste_status waste_state_export(const waste_ctx *ctx, void *dst,
+                                size_t capacity, size_t *written);
+waste_status waste_state_import(waste_ctx *ctx, const void *src, size_t bytes);
 void         waste_state_reset(waste_ctx *ctx);
 
 /* ---- introspection ----------------------------------------------------- */

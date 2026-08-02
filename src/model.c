@@ -2370,9 +2370,186 @@ static void state_fill(const waste_model *m, waste_state_hdr *h, int pos)
     h->pos = pos; h->n_blockres = m->n_blockres;
 }
 
+static int state_add_bytes(uint64_t *total, uint64_t count, uint64_t width)
+{
+    if (width && count > UINT64_MAX / width) return -1;
+    const uint64_t bytes = count * width;
+    if (*total > UINT64_MAX - bytes) return -1;
+    *total += bytes;
+    return 0;
+}
+
+/* Exact serialized size of the live portion of a context. MLA contributes
+ * only `pos` latent rows, rather than its ctx-sized backing allocation. */
+int waste_model_state_size(const waste_model *m, int pos, size_t *bytes)
+{
+    if (!m || !bytes) return -1;
+    const waste_config *c = &m->cfg;
+    const int H = c->kda_heads, D = c->kda_dim, C = H * D;
+    const int nb_max = c->attn_res_block
+                     ? c->n_layers / c->attn_res_block + 2 : 0;
+    if (pos < 0 || pos == INT32_MAX ||
+        (m->has_mla && pos > m->kv_cap) ||
+        m->n_blockres < 0 || m->n_blockres > nb_max)
+        return -1;
+
+    uint64_t n = sizeof(waste_state_hdr);
+    for (int L = 0; L < c->n_layers; L++) {
+        if (c->kda_layer[L]) {
+            const uint64_t nf = (uint64_t)H * (uint64_t)D * (uint64_t)D +
+                                (uint64_t)3 * (uint64_t)C *
+                                (uint64_t)(c->conv_k - 1);
+            if (state_add_bytes(&n, nf, sizeof(float))) return -1;
+        } else {
+            const int nkv = m->n_kv[L];
+            if (nkv < 0 || nkv > m->kv_cap || nkv != pos) return -1;
+            if (state_add_bytes(&n, 1, sizeof(int32_t)) ||
+                state_add_bytes(&n, (uint64_t)nkv *
+                                     (uint64_t)(c->kv_lora + c->qk_rope),
+                                sizeof(float)))
+                return -1;
+        }
+    }
+    if (state_add_bytes(&n, (uint64_t)m->n_blockres *
+                             (uint64_t)c->hidden, sizeof(float)) ||
+        state_add_bytes(&n, (uint64_t)c->hidden, sizeof(float)) ||
+        n > SIZE_MAX)
+        return -1;
+    *bytes = (size_t)n;
+    return 0;
+}
+
+int waste_model_state_export(const waste_model *m, int pos, void *dst,
+                             size_t capacity, size_t *written)
+{
+    size_t need = 0;
+    if (!written || waste_model_state_size(m, pos, &need)) return -1;
+    *written = need;
+    /* Do not partially initialize a caller's cache entry. */
+    if (!dst || capacity < need) return -1;
+
+    const waste_config *c = &m->cfg;
+    uint8_t *p = (uint8_t *)dst;
+    waste_state_hdr h;
+    state_fill(m, &h, pos);
+    memcpy(p, &h, sizeof h); p += sizeof h;
+
+    const int H = c->kda_heads, D = c->kda_dim, C = H * D;
+    for (int L = 0; L < c->n_layers; L++) {
+        if (c->kda_layer[L]) {
+            size_t n = (size_t)H * (size_t)D * (size_t)D * sizeof(float);
+            memcpy(p, m->S[L], n); p += n;
+            n = (size_t)3 * (size_t)C * (size_t)(c->conv_k - 1) *
+                sizeof(float);
+            memcpy(p, m->conv[L], n); p += n;
+        } else {
+            const int32_t nkv = m->n_kv[L];
+            memcpy(p, &nkv, sizeof nkv); p += sizeof nkv;
+            const size_t n = (size_t)nkv *
+                             (size_t)(c->kv_lora + c->qk_rope) *
+                             sizeof(float);
+            if (n) { memcpy(p, m->latcache[L], n); p += n; }
+        }
+    }
+    if (c->attn_res_block && m->n_blockres > 0) {
+        const size_t n = (size_t)m->n_blockres * (size_t)c->hidden *
+                         sizeof(float);
+        memcpy(p, m->blockres, n); p += n;
+    }
+    {
+        const size_t n = (size_t)c->hidden * sizeof(float);
+        memcpy(p, m->x, n); p += n;
+    }
+    return (size_t)(p - (uint8_t *)dst) == need ? 0 : -1;
+}
+
+int waste_model_state_import(waste_model *m, const void *src, size_t bytes,
+                             int *pos)
+{
+    if (!m || !src || bytes < sizeof(waste_state_hdr)) return -2;
+    const waste_config *c = &m->cfg;
+    waste_state_hdr h, want;
+    memcpy(&h, src, sizeof h);
+    state_fill(m, &want, 0);
+    if (h.magic != want.magic || h.version != want.version ||
+        h.n_layers != want.n_layers || h.hidden != want.hidden ||
+        h.kda_heads != want.kda_heads || h.kda_dim != want.kda_dim ||
+        h.conv_k != want.conv_k || h.n_heads != want.n_heads ||
+        h.qk_nope != want.qk_nope || h.qk_rope != want.qk_rope ||
+        h.v_head != want.v_head || h.attn_res_block != want.attn_res_block)
+        return -2;
+
+    const int H = c->kda_heads, D = c->kda_dim, C = H * D;
+    const int nb_max = c->attn_res_block
+                     ? c->n_layers / c->attn_res_block + 2 : 0;
+    if (h.pos < 0 || h.pos == INT32_MAX ||
+        (m->has_mla && h.pos > m->kv_cap) ||
+        h.n_blockres < 0 || h.n_blockres > nb_max)
+        return -2;
+
+    /* Preflight the complete buffer before replacing one byte of live
+     * state. memcpy reads the per-layer count because a byte buffer need
+     * not align it naturally. */
+    size_t off = sizeof h;
+    for (int L = 0; L < c->n_layers; L++) {
+        uint64_t n = 0;
+        if (c->kda_layer[L]) {
+            n = ((uint64_t)H * D * D +
+                 (uint64_t)3 * C * (c->conv_k - 1)) * sizeof(float);
+        } else {
+            int32_t nkv = 0;
+            if (off > bytes || bytes - off < sizeof nkv) return -2;
+            memcpy(&nkv, (const uint8_t *)src + off, sizeof nkv);
+            if (nkv < 0 || nkv > m->kv_cap || nkv != h.pos) return -2;
+            n = sizeof nkv + (uint64_t)nkv *
+                (uint64_t)(c->kv_lora + c->qk_rope) * sizeof(float);
+        }
+        if (n > SIZE_MAX || off > bytes || (size_t)n > bytes - off)
+            return -2;
+        off += (size_t)n;
+    }
+    {
+        const uint64_t tail = ((uint64_t)h.n_blockres * c->hidden +
+                               (uint64_t)c->hidden) * sizeof(float);
+        if (tail > SIZE_MAX || off > bytes || (size_t)tail != bytes - off)
+            return -2;
+    }
+
+    const uint8_t *p = (const uint8_t *)src + sizeof h;
+    for (int L = 0; L < c->n_layers; L++) {
+        if (c->kda_layer[L]) {
+            size_t n = (size_t)H * (size_t)D * (size_t)D * sizeof(float);
+            memcpy(m->S[L], p, n); p += n;
+            n = (size_t)3 * (size_t)C * (size_t)(c->conv_k - 1) *
+                sizeof(float);
+            memcpy(m->conv[L], p, n); p += n;
+        } else {
+            int32_t nkv = 0;
+            memcpy(&nkv, p, sizeof nkv); p += sizeof nkv;
+            const size_t n = (size_t)nkv *
+                             (size_t)(c->kv_lora + c->qk_rope) *
+                             sizeof(float);
+            if (n) { memcpy(m->latcache[L], p, n); p += n; }
+            m->n_kv[L] = nkv;
+        }
+    }
+    m->n_blockres = h.n_blockres;
+    if (c->attn_res_block && h.n_blockres > 0) {
+        const size_t n = (size_t)h.n_blockres * (size_t)c->hidden *
+                         sizeof(float);
+        memcpy(m->blockres, p, n); p += n;
+    }
+    memcpy(m->x, p, (size_t)c->hidden * sizeof(float));
+    if (pos) *pos = h.pos;
+    return 0;
+}
+
 int waste_model_state_save(const waste_model *m, const char *path, int pos)
 {
     const waste_config *c = &m->cfg;
+    size_t state_bytes = 0;
+    if (waste_model_state_size(m, pos, &state_bytes)) return -1;
+    (void)state_bytes;
     static _Atomic unsigned save_seq;
     const size_t pn = strlen(path);
     char *tmp = (char *)malloc(pn + 64);

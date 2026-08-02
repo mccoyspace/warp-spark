@@ -75,7 +75,8 @@ class MemPlan(C.Structure):
                 ("min_expert_cache", C.c_uint64),
                 ("floor_bytes", C.c_uint64),
                 ("recommended_bytes", C.c_uint64),
-                ("vision_bytes", C.c_uint64)]
+                ("vision_bytes", C.c_uint64),
+                ("host_reserved_bytes", C.c_uint64)]
 
 
 class Cfg(C.Structure):
@@ -86,7 +87,8 @@ class Cfg(C.Structure):
                 ("use_direct_io", C.c_int),
                 ("vision", C.c_int),
                 ("verify_records", C.c_int),
-                ("usage_path", C.c_char_p)]
+                ("usage_path", C.c_char_p),
+                ("host_reserved_bytes", C.c_uint64)]
 
 
 class GenParams(C.Structure):
@@ -260,6 +262,13 @@ def _bind(lib) -> None:
     lib.waste_state_save.argtypes = [C.c_void_p, C.c_char_p]
     lib.waste_state_load.restype = C.c_int
     lib.waste_state_load.argtypes = [C.c_void_p, C.c_char_p]
+    lib.waste_state_size.restype = C.c_int
+    lib.waste_state_size.argtypes = [C.c_void_p, C.POINTER(C.c_size_t)]
+    lib.waste_state_export.restype = C.c_int
+    lib.waste_state_export.argtypes = [C.c_void_p, C.c_void_p, C.c_size_t,
+                                       C.POINTER(C.c_size_t)]
+    lib.waste_state_import.restype = C.c_int
+    lib.waste_state_import.argtypes = [C.c_void_p, C.c_void_p, C.c_size_t]
     lib.waste_state_reset.restype = None
     lib.waste_state_reset.argtypes = [C.c_void_p]
 
@@ -368,11 +377,14 @@ class Engine:
                  direct_io: bool = True,
                  vision: bool = False,
                  verify_records: bool = False,
-                 usage_path: Optional[str] = None):
+                 usage_path: Optional[str] = None,
+                 host_reserved_bytes: int = 0):
         ram_budget_bytes = _bounded_int(
             "ram_budget_bytes", ram_budget_bytes, 0, (1 << 64) - 1)
         ctx_tokens = _bounded_int("ctx_tokens", ctx_tokens, 0, (1 << 32) - 1)
         n_threads = _bounded_int("n_threads", n_threads, 0, (1 << 31) - 1)
+        host_reserved_bytes = _bounded_int(
+            "host_reserved_bytes", host_reserved_bytes, 0, (1 << 64) - 1)
         self.lib = _lib()
         self.model_path = str(model_path)
         self._lock = threading.RLock()
@@ -392,6 +404,7 @@ class Engine:
         # and a temporary would be freed before waste_open reads it.
         self._usage = usage_path.encode() if usage_path else None
         cfg.usage_path = self._usage
+        cfg.host_reserved_bytes = host_reserved_bytes
 
         st = self.lib.waste_open(self.model_path.encode(), C.byref(cfg),
                                  C.byref(self._ctx))
@@ -630,6 +643,47 @@ class Engine:
         st = self.lib.waste_state_load(self._ctx, str(path).encode())
         if st != WASTE_OK:
             raise EngineError("state_load", st, str(path))
+
+    def state_size(self) -> int:
+        """Return the exact byte size of the current opaque snapshot."""
+        self._check()
+        n = C.c_size_t()
+        st = self.lib.waste_state_size(self._ctx, C.byref(n))
+        if st != WASTE_OK:
+            raise EngineError("state_size", st)
+        return n.value
+
+    def state_export(self) -> bytearray:
+        """Copy the current compact KDA/MLA state into an opaque blob."""
+        self._check()
+        size = self.state_size()
+        blob = bytearray(size)
+        dst = (C.c_ubyte * size).from_buffer(blob)
+        written = C.c_size_t()
+        st = self.lib.waste_state_export(
+            self._ctx, dst, size, C.byref(written))
+        if st != WASTE_OK:
+            raise EngineError("state_export", st)
+        if written.value != size:
+            raise EngineError("state_export", WASTE_E_IO,
+                              f"size changed from {size} to {written.value}")
+        return blob
+
+    def state_import(self, blob) -> None:
+        """Transactionally restore a context/model-local opaque snapshot."""
+        self._check()
+        view = memoryview(blob)
+        if not view.c_contiguous:
+            raise ValueError("state snapshot must be C-contiguous")
+        view = view.cast("B")
+        if not view:
+            raise ValueError("state snapshot is empty")
+        array_type = C.c_ubyte * len(view)
+        src = (array_type.from_buffer_copy(view) if view.readonly
+               else array_type.from_buffer(view))
+        st = self.lib.waste_state_import(self._ctx, src, len(view))
+        if st != WASTE_OK:
+            raise EngineError("state_import", st)
 
     # ---- generation -----------------------------------------------------
 
