@@ -218,13 +218,22 @@ The optional server implements the OpenAI chat-completions API:
 ```bash
 make libwaste.dylib                 # use libwaste.so on Linux
 python3 -m serve ~/models/k3.waste --port 8000
+```
 
+For recurring agent prompts, `--prefix-cache 2G --prefix-cache-entries 8`
+reserves a bounded in-process cache for exact system-prompt/tool-schema state.
+It restores the shared family root and replays only the divergent tail while
+keeping output and state bit-identical to an uncached request.
+
+```bash
 curl localhost:8000/v1/chat/completions \
   -H 'Content-Type: application/json' \
   -d '{"model":"k3","messages":[{"role":"user","content":"Why is the sky blue?"}]}'
 ```
 
 It supports streaming, tools, structured output, thinking controls, and images. See [docs/SERVE.md](docs/SERVE.md) for the protocol and [examples/README.md](examples/README.md) for complete requests.
+
+Prefix-cache policy and accounting are detailed in [docs/PREFIX_CACHE.md](docs/PREFIX_CACHE.md).
 
 ## Library
 

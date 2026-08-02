@@ -214,6 +214,28 @@ same request gets different answers depending on what came before, and one
 client's turn conditions another's. The lock spans prompt building *and*
 generation, so the image queue cannot be crossed between requests either.
 
+### Exact prefix caching
+
+Repeated agent requests often share a large system prompt and tool schema.
+The opt-in in-process cache snapshots that stable family root and restores it
+before replaying only the divergent request tail:
+
+```bash
+python3 -m serve ~/models/k3.waste \
+  --prefix-cache 2G --prefix-cache-entries 8
+```
+
+The 2 GB is reserved inside the engine's hard RAM budget before the expert
+cache is sized. Matches compare exact token bytes, checkpoints are aligned so
+cold and unsplit arithmetic remain bit-identical, and both retained-cache
+accounting bytes and entry count are hard LRU bounds. A shallow ancestor hit is
+promoted to the current stable root. Requests with images or no stable
+system/tool root, and raw completions, bypass. Each chat response reports its
+hit/miss and restored/replayed/promoted token counts under
+`waste.prefix_cache`; `/health` reports cumulative counters. See
+[PREFIX_CACHE.md](PREFIX_CACHE.md) for the precise accounting boundary,
+policy, invalidation, and failure behavior.
+
 ### Concurrency
 
 `waste.h`: a `waste_ctx` is not thread-safe. So generations serialize on
@@ -347,5 +369,7 @@ python3 -m serve MODEL [options]
   --max-tokens N     default cap when a request does not set one (4096)
   --no-thinking      answer without the think channel unless asked
   --allow-local-images
+  --prefix-cache SIZE          exact-prefix snapshot bytes (off by default)
+  --prefix-cache-entries N     hard entry limit (default 8)
   --plan             print the memory plan and exit
 ```

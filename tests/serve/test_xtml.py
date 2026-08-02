@@ -212,6 +212,33 @@ class TestStructure(unittest.TestCase):
             xtml.build_chat_segments(**cases["tools_unsorted_keys"]))
         self.assertEqual(a, b)
 
+    def test_family_root_stops_before_the_first_non_system_turn(self):
+        root: list[int] = []
+        segments = xtml.build_chat_segments(messages=[
+            {"role": "system", "content": "root one"},
+            {"role": "system", "content": "root two"},
+            {"role": "user", "content": "request"},
+            {"role": "system", "content": "request-tail control"},
+        ], family_root_end=root)
+        self.assertEqual(len(root), 1)
+        prefix = xtml.render_text(segments[:root[0]])
+        self.assertIn("root one", prefix)
+        self.assertIn("root two", prefix)
+        self.assertNotIn("request", prefix)
+        self.assertNotIn("request-tail control", prefix)
+
+    def test_tools_are_a_family_root_without_a_system_message(self):
+        root: list[int] = []
+        segments = xtml.build_chat_segments(
+            messages=[{"role": "user", "content": "request"}],
+            tools=[{"type": "function", "function": {
+                "name": "lookup", "parameters": {"type": "object"}}}],
+            family_root_end=root)
+        self.assertEqual(len(root), 1)
+        prefix = xtml.render_text(segments[:root[0]])
+        self.assertIn("tool-declare", prefix)
+        self.assertNotIn("request", prefix)
+
     def test_tool_result_order_does_not_change_the_prompt(self):
         cases = dict(CASES)
         a = xtml.render_text(

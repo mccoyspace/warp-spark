@@ -276,15 +276,22 @@ def resolve_image(ref: str, tmpdir: str, *,
 
 # ---- prompt assembly -----------------------------------------------------
 
+# Bump whenever build_prompt/build_chat_segments changes the token meaning of
+# a cacheable family root. Prefix caches are process-local, but making the
+# template component explicit keeps accidental engine reuse fail-closed.
+PROMPT_CACHE_VERSION = 1
+
 
 class Prompt:
     """A request rendered down to what the engine takes."""
 
     def __init__(self, tokens: list[int], *, thinking: bool,
-                 n_images: int = 0):
+                 n_images: int = 0,
+                 cache_boundaries: Optional[list[int]] = None):
         self.tokens = tokens
         self.thinking = thinking
         self.n_images = n_images
+        self.cache_boundaries = tuple(cache_boundaries or ())
 
 
 def build_prompt(engine: Engine, body: dict, *, default_thinking: bool,
@@ -375,10 +382,12 @@ def build_prompt(engine: Engine, body: dict, *, default_thinking: bool,
     if response_format is not None:
         kwargs["response_format"] = response_format
 
+    family_root_end: list[int] = []
     try:
         segments = fmt.build_chat_segments(
             messages, tools, thinking=thinking, add_generation_prompt=True,
-            image_prompts=image_prompts or None, **kwargs)
+            image_prompts=image_prompts or None,
+            family_root_end=family_root_end, **kwargs)
     except chatfmt.ChatFormatError as e:
         raise APIError(str(e), param=e.param or "messages")
     except xtml.XTMLError as e:
@@ -395,7 +404,18 @@ def build_prompt(engine: Engine, body: dict, *, default_thinking: bool,
             f"{ctx_max}", status=400, code="context_length_exceeded",
             param="messages")
 
-    return Prompt(tokens, thinking=thinking, n_images=n_images)
+    cache_boundaries: list[int] = []
+    if family_root_end and not n_images:
+        # Segment tokenization is deliberately non-associative. Re-tokenize
+        # exactly the reported segment prefix, then prove it is a byte-for-
+        # byte token prefix before offering it to the cache. Images bypass:
+        # equal media marker tokens do not identify equal pixel embeddings.
+        root = engine.tokenize_segments(segments[:family_root_end[-1]])
+        if root and len(root) < len(tokens) and tokens[:len(root)] == root:
+            cache_boundaries.append(len(root))
+
+    return Prompt(tokens, thinking=thinking, n_images=n_images,
+                  cache_boundaries=cache_boundaries)
 
 
 # ---- sampling ------------------------------------------------------------
@@ -505,7 +525,8 @@ def usage_block(prompt_tokens: int, completion_tokens: int,
     return u
 
 
-def engine_extra(stats: dict, *, ms: float) -> dict:
+def engine_extra(stats: dict, *, ms: float,
+                 prefix_cache: Optional[dict] = None) -> dict:
     """Engine counters, alongside the OpenAI body.
 
     An expert-streaming engine's interesting number is not tokens per
@@ -513,7 +534,7 @@ def engine_extra(stats: dict, *, ms: float) -> dict:
     show that has nowhere in the OpenAI schema to read it from.
     """
     accesses = stats["experts_hit"] + stats["experts_missed"]
-    return {
+    out = {
         "tokens_generated": stats["tokens_generated"],
         "experts_hit": stats["experts_hit"],
         "experts_missed": stats["experts_missed"],
@@ -522,6 +543,9 @@ def engine_extra(stats: dict, *, ms: float) -> dict:
         "direct_io": bool(stats["direct_io"]),
         "ms": round(ms, 1),
     }
+    if prefix_cache is not None:
+        out["prefix_cache"] = prefix_cache
+    return out
 
 
 def model_object(model_id: str, created: int, info: Optional[dict] = None) -> dict:

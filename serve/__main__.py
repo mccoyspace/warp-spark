@@ -26,6 +26,7 @@ from .engine import (CACHE_LFRU, CACHE_LRU,                  # noqa: E402
                      WASTE_E_ARG, WASTE_E_BUSY, WASTE_E_UNSUPPORTED,
                      Engine, EngineError, build_info, physical_ram,
                      plan_memory)
+from .prefix_cache import CONTROLLER_OVERHEAD_BYTES          # noqa: E402
 from .server import serve                                    # noqa: E402
 
 POLICIES = {"lfru": CACHE_LFRU, "lru": CACHE_LRU}
@@ -140,10 +141,28 @@ examples:
                    help="let requests name images by filesystem path. Off by "
                         "default: it lets any client read files the server "
                         "can reach")
+    s.add_argument("--prefix-cache", type=parse_size, default=0,
+                   metavar="SIZE",
+                   help="reserve SIZE inside the RAM budget for exact shared-"
+                        "prefix snapshots (off by default; minimum 4K, "
+                        "e.g. 2G)")
+    s.add_argument("--prefix-cache-entries",
+                   type=bounded_int(1, (1 << 31) - 1), default=8,
+                   metavar="N",
+                   help="hard snapshot entry limit (default 8)")
     s.add_argument("--plan", action="store_true",
                    help="print the memory plan and exit without loading")
 
     args = ap.parse_args(argv)
+
+    # Reject an impossible retained-cache budget before opening a potentially
+    # enormous model. ChatServer repeats this invariant for programmatic
+    # callers; the CLI check keeps a typo from paying K3's startup cost first.
+    if (args.prefix_cache and
+            args.prefix_cache < CONTROLLER_OVERHEAD_BYTES):
+        print(f"prefix cache must be 0 (disabled) or at least "
+              f"{CONTROLLER_OVERHEAD_BYTES} bytes", file=sys.stderr)
+        return 2
 
     model = Path(args.model).expanduser()
     if not model.exists():
@@ -161,6 +180,9 @@ examples:
             print(f"  scratch      {human(plan.scratch_bytes)}")
             print(f"  min cache    {human(plan.min_expert_cache)}")
             print(f"  floor        {human(plan.floor_bytes)}")
+            if args.prefix_cache:
+                print(f"  prefix cache {human(args.prefix_cache)} reserved")
+                print(f"  floor+host   {human(plan.floor_bytes + args.prefix_cache)}")
             print(f"  recommended  {human(plan.recommended_bytes)}")
             if plan.vision_bytes:
                 print(f"  vision       {human(plan.vision_bytes)} "
@@ -180,17 +202,19 @@ examples:
             vision=args.vision,
             verify_records=args.verify,
             usage_path=args.usage,
-            exclusive_open=args.exclusive_open)
-    except EngineError as e:
+            exclusive_open=args.exclusive_open,
+            host_reserved_bytes=args.prefix_cache)
+    except (EngineError, ValueError) as e:
         print(f"{e}", file=sys.stderr)
         # Two statuses that say nothing useful on their own when --cpus is
         # what produced them, and here it usually is.
-        if args.cpus and e.status == WASTE_E_ARG:
+        status = getattr(e, "status", None)
+        if args.cpus and status == WASTE_E_ARG:
             print(f"--cpus: not a cpu list: {args.cpus}", file=sys.stderr)
-        elif args.cpus and e.status == WASTE_E_UNSUPPORTED:
+        elif args.cpus and status == WASTE_E_UNSUPPORTED:
             print("--cpus: this platform does not bind threads to CPUs "
                   "(Linux and Windows only)", file=sys.stderr)
-        elif args.exclusive_open and e.status == WASTE_E_BUSY:
+        elif args.exclusive_open and status == WASTE_E_BUSY:
             print("--exclusive-open: another process owns this container; "
                   "stop it or retry without --exclusive-open", file=sys.stderr)
         return 1
@@ -205,6 +229,9 @@ examples:
             print(f"quant    {info['quant_summary']}")
         print(f"memory   {human(used['floor_bytes'])} resident, "
               f"expert cache {human(used['min_expert_cache'])}")
+        if args.prefix_cache:
+            print(f"prefix   {human(args.prefix_cache)} reserved, "
+                  f"at most {args.prefix_cache_entries} family roots")
         if args.vision:
             print("vision   on — requests may carry base64 images")
         if not args.api_key and args.host not in ("127.0.0.1", "localhost",
@@ -217,8 +244,10 @@ examples:
                     api_key=args.api_key,
                     default_max_tokens=args.max_tokens,
                     default_thinking=not args.no_thinking,
-                    allow_local_images=args.allow_local_images)
-    except (EngineError, OSError) as e:
+                    allow_local_images=args.allow_local_images,
+                    prefix_cache_bytes=args.prefix_cache,
+                    prefix_cache_entries=args.prefix_cache_entries)
+    except (EngineError, OSError, ValueError) as e:
         engine.close()
         print(f"{e}", file=sys.stderr)
         return 1

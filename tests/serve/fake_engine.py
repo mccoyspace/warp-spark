@@ -17,12 +17,14 @@ this checks everything above it.
 
 from __future__ import annotations
 
+import struct
 import threading
+from array import array
 from dataclasses import dataclass, field
 from typing import Callable, Optional
 
 from serve import xtml
-from serve.engine import EngineError, WASTE_E_UNSUPPORTED
+from serve.engine import EngineError, WASTE_E_FORMAT, WASTE_E_UNSUPPORTED
 
 MARKERS = {1: xtml.OPEN_TOKEN, 2: xtml.CLOSE_TOKEN,
            3: xtml.SEP_TOKEN, 4: xtml.END_OF_MSG_TOKEN}
@@ -86,12 +88,23 @@ class FakeEngine:
     fail_with: Optional[Exception] = None
     # Sleep this long before each token, to test client disconnects.
     delay: float = 0.0
+    host_reserved_bytes: int = 0
+    prefill_chunk: int = 4
+    fail_state_import_once: bool = False
+    fail_state_export_once: bool = False
+    fail_state_export_memory_once: bool = False
+    model_path: str = "fake.waste"
 
     prompts: list[list[int]] = field(default_factory=list)
+    run_prompts: list[list[int]] = field(default_factory=list)
+    prefills: list[list[int]] = field(default_factory=list)
     calls: list[dict] = field(default_factory=list)
     images: list[str] = field(default_factory=list)
     resets: int = 0
+    imports: int = 0
+    exports: int = 0
     closed: bool = False
+    _state_tokens: list[int] = field(default_factory=list)
     _lock: threading.RLock = field(default_factory=threading.RLock)
 
     # ---- what api.py and server.py use ----------------------------------
@@ -126,7 +139,8 @@ class FakeEngine:
     def memory_used(self) -> dict:
         return {"trunk_bytes": 1, "state_bytes": 1, "scratch_bytes": 1,
                 "min_expert_cache": 1, "floor_bytes": 4,
-                "recommended_bytes": 8, "vision_bytes": 0}
+                "recommended_bytes": 8, "vision_bytes": 0,
+                "host_reserved_bytes": self.host_reserved_bytes}
 
     def tokenize(self, text: str, *, markup: bool = False,
                  add_bos: bool = False) -> list[int]:
@@ -169,6 +183,50 @@ class FakeEngine:
 
     def state_reset(self) -> None:
         self.resets += 1
+        self._state_tokens.clear()
+
+    def prefill_chunk_size(self) -> int:
+        return self.prefill_chunk
+
+    def prefill(self, tokens: list[int]) -> None:
+        if not tokens:
+            raise EngineError("prefill", WASTE_E_FORMAT, "empty prompt")
+        self.prefills.append(list(tokens))
+        self._state_tokens.extend(tokens)
+
+    def state_size(self) -> int:
+        return 8 + 4 * len(self._state_tokens)
+
+    def state_export(self) -> bytearray:
+        self.exports += 1
+        if self.fail_state_export_memory_once:
+            self.fail_state_export_memory_once = False
+            raise MemoryError("injected snapshot allocation failure")
+        if self.fail_state_export_once:
+            self.fail_state_export_once = False
+            raise EngineError("state_export", WASTE_E_FORMAT,
+                              "injected export failure")
+        payload = array("i", self._state_tokens).tobytes()
+        return bytearray(struct.pack("<4sI", b"FAKE", len(self._state_tokens))
+                         + payload)
+
+    def state_import(self, blob) -> None:
+        self.imports += 1
+        if self.fail_state_import_once:
+            self.fail_state_import_once = False
+            raise EngineError("state_import", WASTE_E_FORMAT,
+                              "injected mismatch")
+        raw = bytes(blob)
+        if len(raw) < 8:
+            raise EngineError("state_import", WASTE_E_FORMAT,
+                              "short snapshot")
+        magic, count = struct.unpack("<4sI", raw[:8])
+        if magic != b"FAKE" or len(raw) != 8 + count * 4:
+            raise EngineError("state_import", WASTE_E_FORMAT,
+                              "invalid snapshot")
+        restored = array("i")
+        restored.frombytes(raw[8:])
+        self._state_tokens = list(restored)
 
     def close(self) -> None:
         self.closed = True
@@ -184,7 +242,10 @@ class FakeEngine:
         with self._lock:
             if self.fail_with is not None:
                 raise self.fail_with
-            self.prompts.append(list(prompt))
+            run_prompt = list(prompt)
+            self.run_prompts.append(run_prompt)
+            self.prompts.append(self._state_tokens + run_prompt)
+            self._state_tokens.extend(run_prompt)
             self.calls.append({"temperature": temperature, "top_p": top_p,
                                "top_k": top_k, "seed": seed,
                                "max_tokens": max_tokens,
