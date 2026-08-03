@@ -155,6 +155,7 @@ typedef struct {
     int      cuda_kda_mode, cuda_kda_effective, cuda_kda_failed;
     int      cuda_dense_scope, cuda_dense_effective;
     int      cuda_vq_mode, cuda_vq_effective, cuda_vq_preflight_modes;
+    int      cuda_vq_group;          /* experts between mode-2 stream syncs */
     int      cuda_kda_state_dirty;
     uint64_t cuda_kda_fallbacks, cuda_kda_calls, cuda_dense_calls;
     uint64_t cuda_vq_experts, cuda_vq_applies, cuda_vq_lut_builds;
@@ -229,6 +230,7 @@ int         waste_model_cuda_dense_effective(const waste_model *m);
 uint64_t    waste_model_cuda_dense_calls(const waste_model *m);
 int         waste_model_set_cuda_vq(waste_model *m, int mode);
 int         waste_model_get_cuda_vq(const waste_model *m);
+int         waste_model_get_cuda_vq_group(const waste_model *m);
 int         waste_model_cuda_vq_effective(const waste_model *m);
 uint64_t    waste_model_cuda_vq_experts(const waste_model *m);
 uint64_t    waste_model_cuda_vq_applies(const waste_model *m);

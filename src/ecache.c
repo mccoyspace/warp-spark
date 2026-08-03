@@ -127,11 +127,29 @@ static void ec_release_last(waste_ecache *c)
      * reclaimed for another expert may have a reader writing into it, and
      * a volatile object under an in-flight write is how a purged page
      * becomes a silently zeroed weight. */
-    if (c->slot[c->last_used].state == EC_READY) ec_volatile(c, c->last_used);
+    if (c->slot[c->last_used].state == EC_READY &&
+        c->slot[c->last_used].holds == 0)
+        ec_volatile(c, c->last_used);
     c->last_used = -1;
 }
 
 static int32_t ec_key(int layer, int expert) { return (layer << 16) | expert; }
+
+/* A handle names both a slot and the particular record binding that occupied
+ * it. Slot indices alone are not enough: clear-and-refill can put a new
+ * record in the same slot while an old error-path handle still exists. */
+static uint64_t ec_next_epoch(waste_ecache *c)
+{
+    c->hold_epoch++;
+    if (c->hold_epoch == 0) c->hold_epoch++;   /* zero is the invalid epoch */
+    return c->hold_epoch;
+}
+
+static void ec_invalidate_holds(waste_ecache *c, int si)
+{
+    c->slot[si].holds = 0;
+    c->slot[si].epoch = ec_next_epoch(c);
+}
 
 static uint32_t ec_hash(int32_t k)
 {
@@ -382,7 +400,7 @@ static int ec_pinned(const waste_ecache *c, int i)
      * the synchronous fallback inside get() does not, and that is the hole
      * this closes. */
     return c->slot[i].state == EC_INFLIGHT || c->slot[i].pin == c->pf_gen ||
-           i == c->last_used;
+           c->slot[i].holds != 0 || i == c->last_used;
 }
 
 static int ec_victim(waste_ecache *c)
@@ -439,6 +457,7 @@ static void ec_claim_spec(waste_ecache *c, int vi, int32_t key)
 {
     ec_nonvolatile(c, vi);
     const int had = c->slot[vi].key >= 0;
+    ec_invalidate_holds(c, vi);
     c->slot[vi].key = key;
     c->slot[vi].state = EC_INFLIGHT;
     c->slot[vi].fresh = 0;              /* a demand hit on it is a real hit */
@@ -458,6 +477,7 @@ static void ec_claim(waste_ecache *c, int vi, int32_t key, int fresh)
      * record is of no interest, it is being overwritten either way. */
     ec_nonvolatile(c, vi);
     const int had = c->slot[vi].key >= 0;
+    ec_invalidate_holds(c, vi);
     c->slot[vi].key = key;
     c->slot[vi].state = EC_INFLIGHT;
     c->slot[vi].fresh = (uint8_t)fresh;
@@ -472,6 +492,7 @@ static void ec_claim(waste_ecache *c, int vi, int32_t key, int fresh)
 
 static void ec_drop(waste_ecache *c, int vi)
 {
+    ec_invalidate_holds(c, vi);
     c->slot[vi].key = -1;
     c->slot[vi].state = EC_EMPTY;
     c->slot[vi].fresh = 0;
@@ -549,8 +570,25 @@ void waste_ecache_hint(waste_ecache *c, int layer, const int *ids, int n)
     ec_unlock(c);
 }
 
-const uint8_t *waste_ecache_get(waste_ecache *c, int layer, int expert,
-                                waste_fetch_fn fetch, void *user)
+/* Finish handing out a READY slot while the cache lock is held. An ordinary
+ * get uses the historical one-call lifetime; an explicit get increments a
+ * refcount before read-ahead is allowed to choose its next victim. */
+static int ec_take_ready(waste_ecache *c, int si, waste_ecache_hold *hold)
+{
+    if (!hold) {
+        c->last_used = si;
+        return 0;
+    }
+    if (c->slot[si].holds == UINT32_MAX) return -1;
+    c->slot[si].holds++;
+    hold->slot = si;
+    hold->epoch = c->slot[si].epoch;
+    return 0;
+}
+
+static const uint8_t *ec_get(waste_ecache *c, int layer, int expert,
+                             waste_fetch_fn fetch, void *user,
+                             waste_ecache_hold *hold)
 {
     const int32_t key = ec_key(layer, expert);
 
@@ -585,7 +623,12 @@ const uint8_t *waste_ecache_get(waste_ecache *c, int layer, int expert,
                 else { c->hits++; c->slot[si].hits++; }
                 c->slot[si].last = c->clock;
                 uint8_t *d = c->slot[si].data;
-                c->last_used = si;
+                if (ec_take_ready(c, si, hold) != 0) {
+                    ec_volatile(c, si);
+                    ec_issue_next(c);
+                    ec_unlock(c);
+                    return NULL;
+                }
                 ec_issue_next(c);
                 ec_unlock(c);
                 return d;
@@ -618,11 +661,55 @@ const uint8_t *waste_ecache_get(waste_ecache *c, int layer, int expert,
         return NULL;
     }
     c->slot[vi].state = EC_READY;
-    c->last_used = vi;
+    if (ec_take_ready(c, vi, hold) != 0) {
+        ec_volatile(c, vi);
+        if (c->io) pthread_cond_broadcast(&c->io->done);
+        ec_issue_next(c);
+        ec_unlock(c);
+        return NULL;
+    }
     if (c->io) pthread_cond_broadcast(&c->io->done);
     ec_issue_next(c);
     ec_unlock(c);
     return dst;
+}
+
+const uint8_t *waste_ecache_get(waste_ecache *c, int layer, int expert,
+                                waste_fetch_fn fetch, void *user)
+{
+    return ec_get(c, layer, expert, fetch, user, NULL);
+}
+
+const uint8_t *waste_ecache_get_hold(waste_ecache *c, int layer, int expert,
+                                     waste_fetch_fn fetch, void *user,
+                                     waste_ecache_hold *hold)
+{
+    if (!hold) return NULL;
+    hold->epoch = 0;
+    hold->slot = -1;
+    return ec_get(c, layer, expert, fetch, user, hold);
+}
+
+void waste_ecache_release_hold(waste_ecache *c, waste_ecache_hold *hold)
+{
+    if (!hold) return;
+    const int si = hold->slot;
+    const uint64_t epoch = hold->epoch;
+    /* Invalidate first so every ordinary error path can release twice
+     * harmlessly without touching the slot twice. */
+    hold->slot = -1;
+    hold->epoch = 0;
+    if (!c || si < 0 || epoch == 0) return;
+
+    ec_lock(c);
+    if (c->slot && si < c->n_slots && c->slot[si].epoch == epoch &&
+        c->slot[si].holds != 0) {
+        c->slot[si].holds--;
+        if (c->slot[si].holds == 0 && c->slot[si].state == EC_READY &&
+            c->last_used != si)
+            ec_volatile(c, si);
+    }
+    ec_unlock(c);
 }
 
 /* Caller holds the cache lock. Every queued asynchronous job owns an
@@ -662,6 +749,7 @@ void waste_ecache_clear(waste_ecache *c)
     ec_wait_idle(c);
     for (int i = 0; i < c->n_slots; i++) {
         if (c->slot[i].state == EC_READY) ec_volatile(c, i);
+        ec_invalidate_holds(c, i);
         c->slot[i].key = -1;
         c->slot[i].state = EC_EMPTY;
         c->slot[i].fresh = 0;
@@ -760,6 +848,7 @@ int waste_ecache_warm(waste_ecache *c, const char *path,
         if (vi < 0) break;
         if (fetch(user, ent[i].layer, ent[i].expert_id, c->slot[vi].data) != 0) continue;
         const int had = c->slot[vi].key >= 0;
+        ec_invalidate_holds(c, vi);
         c->slot[vi].key = key;
         c->slot[vi].state = EC_READY;
         c->slot[vi].hits = ent[i].hits;

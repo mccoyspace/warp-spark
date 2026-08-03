@@ -30,7 +30,11 @@ enum {
     VQ_ENTRIES = 256,
     VQ_INDEX_BLOCK = 64,
     VQ_BUILD_THREADS = 256,
-    VQ_DOWN_THREADS = 256
+    VQ_DOWN_THREADS = 256,
+    VQ_GROUP_MAX = 16,
+    VQ_GROUP_IDLE = 0,
+    VQ_GROUP_PAIR = 1,
+    VQ_GROUP_DOWN = 2
 };
 
 typedef struct {
@@ -42,6 +46,15 @@ typedef struct {
     float *vq_lut[3];
     size_t vq_lut_values[3];
     size_t vq_y_capacity;
+    float *vq_group_pair_host_y, *vq_group_pair_device_y;
+    float *vq_group_down_host_x, *vq_group_down_device_x;
+    float *vq_group_down_host_y, *vq_group_down_device_y;
+    size_t vq_group_pair_slot_values;
+    size_t vq_group_down_x_slot_values;
+    size_t vq_group_down_y_slot_values;
+    int vq_group_phase, vq_group_count;
+    int vq_group_rows, vq_group_cols;
+    int vq_group_pair_prepared, vq_group_failed;
     int vq_ready;
 } waste_cuda_kda;
 
@@ -231,6 +244,35 @@ static void cuda_problem(const char *where, cudaError_t status)
             cudaGetErrorString(status));
 }
 
+static void cuda_vq_group_reset(waste_cuda_kda *ctx)
+{
+    ctx->vq_group_phase = VQ_GROUP_IDLE;
+    ctx->vq_group_count = 0;
+    ctx->vq_group_rows = 0;
+    ctx->vq_group_cols = 0;
+}
+
+/* A grouped-call error is sticky inside this backend as well as in model.c.
+ * Synchronizing here is important: expert records are host pointers read by
+ * the kernels, so the cache must not be allowed to recycle them while work
+ * from a rejected group is still in flight. */
+static int cuda_vq_group_abort(waste_cuda_kda *ctx, const char *where,
+                               cudaError_t status)
+{
+    if (status != cudaSuccess) cuda_problem(where, status);
+    if (ctx && ctx->stream) {
+        const cudaError_t drained = cudaStreamSynchronize(ctx->stream);
+        if (drained != cudaSuccess && drained != status)
+            cuda_problem("VQ group error drain", drained);
+    }
+    if (ctx) {
+        cuda_vq_group_reset(ctx);
+        ctx->vq_group_pair_prepared = 0;
+        ctx->vq_group_failed = 1;
+    }
+    return -1;
+}
+
 static pthread_once_t cuda_device_once = PTHREAD_ONCE_INIT;
 static cudaError_t cuda_device_status = cudaSuccess;
 
@@ -348,6 +390,32 @@ extern "C" int waste_cuda_q4_matvec(waste_model *m, float *y,
 static void cuda_vq_release(waste_cuda_kda *ctx)
 {
     if (!ctx) return;
+    if (ctx->stream && ctx->vq_group_phase != VQ_GROUP_IDLE)
+        cudaStreamSynchronize(ctx->stream);
+    if (ctx->vq_group_down_device_y)
+        cudaFree(ctx->vq_group_down_device_y);
+    if (ctx->vq_group_down_host_y)
+        cudaFreeHost(ctx->vq_group_down_host_y);
+    if (ctx->vq_group_down_device_x)
+        cudaFree(ctx->vq_group_down_device_x);
+    if (ctx->vq_group_down_host_x)
+        cudaFreeHost(ctx->vq_group_down_host_x);
+    if (ctx->vq_group_pair_device_y)
+        cudaFree(ctx->vq_group_pair_device_y);
+    if (ctx->vq_group_pair_host_y)
+        cudaFreeHost(ctx->vq_group_pair_host_y);
+    ctx->vq_group_down_device_y = NULL;
+    ctx->vq_group_down_host_y = NULL;
+    ctx->vq_group_down_device_x = NULL;
+    ctx->vq_group_down_host_x = NULL;
+    ctx->vq_group_pair_device_y = NULL;
+    ctx->vq_group_pair_host_y = NULL;
+    ctx->vq_group_pair_slot_values = 0;
+    ctx->vq_group_down_x_slot_values = 0;
+    ctx->vq_group_down_y_slot_values = 0;
+    cuda_vq_group_reset(ctx);
+    ctx->vq_group_pair_prepared = 0;
+    ctx->vq_group_failed = 0;
     for (int i = 0; i < 3; i++) {
         if (ctx->vq_lut[i]) cudaFree(ctx->vq_lut[i]);
         ctx->vq_lut[i] = NULL;
@@ -390,8 +458,26 @@ extern "C" int waste_cuda_vq_init(waste_model *m)
     ctx->vq_y_capacity = (size_t)inter * 2;
     if ((size_t)lat > ctx->vq_y_capacity) ctx->vq_y_capacity = (size_t)lat;
     if (ctx->vq_y_capacity > ctx->capacity) return -1;
+    ctx->vq_group_pair_slot_values = (size_t)inter * 2;
+    ctx->vq_group_down_x_slot_values = (size_t)inter;
+    ctx->vq_group_down_y_slot_values = (size_t)lat;
+    if (ctx->vq_group_pair_slot_values >
+            SIZE_MAX / VQ_GROUP_MAX / sizeof(float) ||
+        ctx->vq_group_down_x_slot_values >
+            SIZE_MAX / VQ_GROUP_MAX / sizeof(float) ||
+        ctx->vq_group_down_y_slot_values >
+            SIZE_MAX / VQ_GROUP_MAX / sizeof(float)) {
+        cuda_vq_release(ctx);
+        return -1;
+    }
 
     const size_t book_values = (size_t)m->n_books * VQ_VEC_DIM * VQ_ENTRIES;
+    const size_t group_pair_bytes = VQ_GROUP_MAX *
+        ctx->vq_group_pair_slot_values * sizeof(float);
+    const size_t group_down_x_bytes = VQ_GROUP_MAX *
+        ctx->vq_group_down_x_slot_values * sizeof(float);
+    const size_t group_down_y_bytes = VQ_GROUP_MAX *
+        ctx->vq_group_down_y_slot_values * sizeof(float);
     cudaError_t status = cudaMalloc((void **)&ctx->vq_books,
                                     book_values * sizeof(float));
     if (status == cudaSuccess)
@@ -403,6 +489,24 @@ extern "C" int waste_cuda_vq_init(waste_model *m)
     for (int i = 0; status == cudaSuccess && i < 3; i++)
         status = cudaMalloc((void **)&ctx->vq_lut[i],
                             ctx->vq_lut_values[i] * sizeof(float));
+    if (status == cudaSuccess)
+        status = cudaHostAlloc((void **)&ctx->vq_group_pair_host_y,
+                               group_pair_bytes, cudaHostAllocDefault);
+    if (status == cudaSuccess)
+        status = cudaMalloc((void **)&ctx->vq_group_pair_device_y,
+                            group_pair_bytes);
+    if (status == cudaSuccess)
+        status = cudaHostAlloc((void **)&ctx->vq_group_down_host_x,
+                               group_down_x_bytes, cudaHostAllocDefault);
+    if (status == cudaSuccess)
+        status = cudaMalloc((void **)&ctx->vq_group_down_device_x,
+                            group_down_x_bytes);
+    if (status == cudaSuccess)
+        status = cudaHostAlloc((void **)&ctx->vq_group_down_host_y,
+                               group_down_y_bytes, cudaHostAllocDefault);
+    if (status == cudaSuccess)
+        status = cudaMalloc((void **)&ctx->vq_group_down_device_y,
+                            group_down_y_bytes);
     if (status == cudaSuccess)
         status = cudaMemcpyAsync(ctx->vq_books, m->codebooksT,
                                  book_values * sizeof(float),
@@ -425,8 +529,10 @@ extern "C" int waste_cuda_vq_prepare_pair(waste_model *m, int mode,
 {
     waste_cuda_kda *ctx = m ? (waste_cuda_kda *)m->cuda_kda_ctx : NULL;
     if (!ctx || !ctx->vq_ready || (mode != 1 && mode != 2) ||
+        ctx->vq_group_failed || ctx->vq_group_phase != VQ_GROUP_IDLE ||
         cols < 1 || cols % VQ_VEC_DIM || (size_t)cols > ctx->capacity)
         return -1;
+    ctx->vq_group_pair_prepared = 0;
     const size_t values =
         (size_t)(cols / VQ_VEC_DIM) * VQ_STAGES * VQ_ENTRIES;
     if (values > ctx->vq_lut_values[0] || values > ctx->vq_lut_values[1])
@@ -463,6 +569,7 @@ extern "C" int waste_cuda_vq_prepare_pair(waste_model *m, int mode,
         cuda_problem("VQ gate/up prepare", status);
         return -1;
     }
+    if (mode == 2) ctx->vq_group_pair_prepared = 1;
     return 0;
 }
 
@@ -475,7 +582,8 @@ extern "C" int waste_cuda_vq_apply_pair(waste_model *m,
 {
     waste_cuda_kda *ctx = m ? (waste_cuda_kda *)m->cuda_kda_ctx : NULL;
     if (!ctx || !ctx->vq_ready || !gate_y || !up_y || !gate_idx ||
-        !up_idx || !scale || rows < 1 || cols < 1 ||
+        !up_idx || !scale || ctx->vq_group_failed ||
+        ctx->vq_group_phase != VQ_GROUP_IDLE || rows < 1 || cols < 1 ||
         rows % VQ_INDEX_BLOCK || cols % VQ_VEC_DIM ||
         (size_t)(2 * rows) > ctx->vq_y_capacity)
         return -1;
@@ -491,11 +599,194 @@ extern "C" int waste_cuda_vq_apply_pair(waste_model *m,
     if (status == cudaSuccess) status = cudaStreamSynchronize(ctx->stream);
     if (status != cudaSuccess) {
         cuda_problem("VQ gate/up apply", status);
+        ctx->vq_group_pair_prepared = 0;
         return -1;
     }
     memcpy(gate_y, ctx->host_y, (size_t)rows * sizeof(float));
     memcpy(up_y, ctx->host_y + rows, (size_t)rows * sizeof(float));
+    ctx->vq_group_pair_prepared = 0;
     return 0;
+}
+
+/* Grouped mode-2 handoff. The pair LUT is still prepared once with
+ * waste_cuda_vq_prepare_pair(); these calls only defer the K per-expert
+ * apply handoffs until one contiguous D2H and one stream synchronization.
+ * After finish, host_outputs[slot] is valid until the next grouped pair and
+ * has the layout [gate rows][up rows]. Slots must arrive as 0,1,...,count-1
+ * so the returned storage is contiguous and count is bounded by top-k 16. */
+extern "C" int waste_cuda_vq_group_pair_enqueue(
+    waste_model *m, int slot, const uint8_t *gate_idx,
+    const uint8_t *up_idx, const uint16_t *scale, int rows, int cols)
+{
+    waste_cuda_kda *ctx = m ? (waste_cuda_kda *)m->cuda_kda_ctx : NULL;
+    if (!ctx || !ctx->vq_ready || ctx->vq_group_failed) return -1;
+    const size_t values = cols > 0 && cols % VQ_VEC_DIM == 0
+        ? (size_t)(cols / VQ_VEC_DIM) * VQ_STAGES * VQ_ENTRIES : 0;
+    if (!gate_idx || !up_idx || !scale || !ctx->vq_group_pair_prepared ||
+        slot < 0 || slot >= VQ_GROUP_MAX || slot != ctx->vq_group_count ||
+        rows < 1 || rows % VQ_INDEX_BLOCK || cols < 1 ||
+        cols % VQ_VEC_DIM || (size_t)rows * 2 !=
+            ctx->vq_group_pair_slot_values ||
+        values != ctx->vq_lut_values[0] ||
+        (ctx->vq_group_phase != VQ_GROUP_IDLE &&
+         ctx->vq_group_phase != VQ_GROUP_PAIR) ||
+        (ctx->vq_group_phase == VQ_GROUP_PAIR &&
+         (rows != ctx->vq_group_rows || cols != ctx->vq_group_cols)))
+        return cuda_vq_group_abort(ctx, "VQ pair group arguments",
+                                   cudaErrorInvalidValue);
+    if (ctx->vq_group_phase == VQ_GROUP_IDLE) {
+        if (slot != 0)
+            return cuda_vq_group_abort(ctx, "VQ pair group first slot",
+                                       cudaErrorInvalidValue);
+        ctx->vq_group_phase = VQ_GROUP_PAIR;
+        ctx->vq_group_rows = rows;
+        ctx->vq_group_cols = cols;
+    }
+
+    float *device_y = ctx->vq_group_pair_device_y +
+        (size_t)slot * ctx->vq_group_pair_slot_values;
+    vq_apply_pair<<<rows / VQ_INDEX_BLOCK, 2 * VQ_INDEX_BLOCK,
+                    0, ctx->stream>>>(
+        device_y, gate_idx, up_idx, scale,
+        ctx->vq_lut[0], ctx->vq_lut[1], rows, cols / VQ_VEC_DIM);
+    const cudaError_t status = cudaGetLastError();
+    if (status != cudaSuccess)
+        return cuda_vq_group_abort(ctx, "VQ pair group enqueue", status);
+    ctx->vq_group_count++;
+    return 0;
+}
+
+extern "C" int waste_cuda_vq_group_pair_finish(
+    waste_model *m, int count, const float **host_outputs)
+{
+    waste_cuda_kda *ctx = m ? (waste_cuda_kda *)m->cuda_kda_ctx : NULL;
+    if (!ctx || !ctx->vq_ready || ctx->vq_group_failed) return -1;
+    if (!host_outputs || ctx->vq_group_phase != VQ_GROUP_PAIR ||
+        count < 1 || count > VQ_GROUP_MAX || count != ctx->vq_group_count)
+        return cuda_vq_group_abort(ctx, "VQ pair group finish arguments",
+                                   cudaErrorInvalidValue);
+    const size_t bytes = (size_t)count *
+        ctx->vq_group_pair_slot_values * sizeof(float);
+    cudaError_t status = cudaMemcpyAsync(
+        ctx->vq_group_pair_host_y, ctx->vq_group_pair_device_y, bytes,
+        cudaMemcpyDeviceToHost, ctx->stream);
+    if (status == cudaSuccess) status = cudaStreamSynchronize(ctx->stream);
+    if (status != cudaSuccess)
+        return cuda_vq_group_abort(ctx, "VQ pair group finish", status);
+    for (int slot = 0; slot < count; slot++)
+        host_outputs[slot] = ctx->vq_group_pair_host_y +
+            (size_t)slot * ctx->vq_group_pair_slot_values;
+    cuda_vq_group_reset(ctx);
+    return 0;
+}
+
+/* Down uses one pinned and one device x slot per expert. This makes the
+ * caller free to reuse or modify its activation as soon as enqueue returns.
+ * The stream deliberately reuses the one down LUT in build/apply order:
+ * H2D[x0], build0, apply0, H2D[x1], build1, apply1, ... . Outputs are
+ * distinct, so finish can return them with one contiguous D2H+sync. */
+extern "C" int waste_cuda_vq_group_down_enqueue(
+    waste_model *m, int slot, const uint8_t *idx, const uint16_t *scale,
+    const float *x, int cb_base, int rows, int cols)
+{
+    waste_cuda_kda *ctx = m ? (waste_cuda_kda *)m->cuda_kda_ctx : NULL;
+    if (!ctx || !ctx->vq_ready || ctx->vq_group_failed) return -1;
+    const size_t values = cols > 0 && cols % VQ_VEC_DIM == 0
+        ? (size_t)(cols / VQ_VEC_DIM) * VQ_STAGES * VQ_ENTRIES : 0;
+    if (!idx || !scale || !x || cb_base < 0 ||
+        cb_base + VQ_STAGES > m->n_books ||
+        slot < 0 || slot >= VQ_GROUP_MAX || slot != ctx->vq_group_count ||
+        rows < 1 || rows % VQ_INDEX_BLOCK || cols < 1 ||
+        cols % VQ_VEC_DIM || (size_t)rows !=
+            ctx->vq_group_down_y_slot_values ||
+        (size_t)cols != ctx->vq_group_down_x_slot_values ||
+        values != ctx->vq_lut_values[2] ||
+        (ctx->vq_group_phase != VQ_GROUP_IDLE &&
+         ctx->vq_group_phase != VQ_GROUP_DOWN) ||
+        (ctx->vq_group_phase == VQ_GROUP_DOWN &&
+         (rows != ctx->vq_group_rows || cols != ctx->vq_group_cols)))
+        return cuda_vq_group_abort(ctx, "VQ down group arguments",
+                                   cudaErrorInvalidValue);
+    if (ctx->vq_group_phase == VQ_GROUP_IDLE) {
+        if (slot != 0)
+            return cuda_vq_group_abort(ctx, "VQ down group first slot",
+                                       cudaErrorInvalidValue);
+        ctx->vq_group_phase = VQ_GROUP_DOWN;
+        ctx->vq_group_rows = rows;
+        ctx->vq_group_cols = cols;
+    }
+
+    float *host_x = ctx->vq_group_down_host_x +
+        (size_t)slot * ctx->vq_group_down_x_slot_values;
+    float *device_x = ctx->vq_group_down_device_x +
+        (size_t)slot * ctx->vq_group_down_x_slot_values;
+    float *device_y = ctx->vq_group_down_device_y +
+        (size_t)slot * ctx->vq_group_down_y_slot_values;
+    memcpy(host_x, x, (size_t)cols * sizeof(float));
+    cudaError_t status = cudaMemcpyAsync(
+        device_x, host_x, (size_t)cols * sizeof(float),
+        cudaMemcpyHostToDevice, ctx->stream);
+    if (status == cudaSuccess) {
+        const int total = (int)values;
+        vq_build_one<<<(total + VQ_BUILD_THREADS - 1) / VQ_BUILD_THREADS,
+                        VQ_BUILD_THREADS, 0, ctx->stream>>>(
+            ctx->vq_lut[2], ctx->vq_books, device_x,
+            cols / VQ_VEC_DIM, cb_base);
+        status = cudaGetLastError();
+    }
+    if (status == cudaSuccess) {
+        vq_apply_one<<<(rows + VQ_DOWN_THREADS - 1) / VQ_DOWN_THREADS,
+                        VQ_DOWN_THREADS, 0, ctx->stream>>>(
+            device_y, idx, scale, ctx->vq_lut[2], rows,
+            cols / VQ_VEC_DIM);
+        status = cudaGetLastError();
+    }
+    if (status != cudaSuccess)
+        return cuda_vq_group_abort(ctx, "VQ down group enqueue", status);
+    ctx->vq_group_count++;
+    return 0;
+}
+
+extern "C" int waste_cuda_vq_group_down_finish(
+    waste_model *m, int count, const float **host_outputs)
+{
+    waste_cuda_kda *ctx = m ? (waste_cuda_kda *)m->cuda_kda_ctx : NULL;
+    if (!ctx || !ctx->vq_ready || ctx->vq_group_failed) return -1;
+    if (!host_outputs || ctx->vq_group_phase != VQ_GROUP_DOWN ||
+        count < 1 || count > VQ_GROUP_MAX || count != ctx->vq_group_count)
+        return cuda_vq_group_abort(ctx, "VQ down group finish arguments",
+                                   cudaErrorInvalidValue);
+    const size_t bytes = (size_t)count *
+        ctx->vq_group_down_y_slot_values * sizeof(float);
+    cudaError_t status = cudaMemcpyAsync(
+        ctx->vq_group_down_host_y, ctx->vq_group_down_device_y, bytes,
+        cudaMemcpyDeviceToHost, ctx->stream);
+    if (status == cudaSuccess) status = cudaStreamSynchronize(ctx->stream);
+    if (status != cudaSuccess)
+        return cuda_vq_group_abort(ctx, "VQ down group finish", status);
+    for (int slot = 0; slot < count; slot++)
+        host_outputs[slot] = ctx->vq_group_down_host_y +
+            (size_t)slot * ctx->vq_group_down_y_slot_values;
+    cuda_vq_group_reset(ctx);
+    return 0;
+}
+
+/* Used when CPU-side collection fails after some kernels were enqueued.
+ * Successful drain is reusable; a CUDA error remains sticky and is never
+ * converted into a CPU fallback. */
+extern "C" int waste_cuda_vq_group_drain(waste_model *m)
+{
+    waste_cuda_kda *ctx = m ? (waste_cuda_kda *)m->cuda_kda_ctx : NULL;
+    if (!ctx) return m ? 0 : -1;
+    const cudaError_t status = cudaStreamSynchronize(ctx->stream);
+    cuda_vq_group_reset(ctx);
+    ctx->vq_group_pair_prepared = 0;
+    if (status != cudaSuccess) {
+        cuda_problem("VQ group drain", status);
+        ctx->vq_group_failed = 1;
+        return -1;
+    }
+    return ctx->vq_group_failed ? -1 : 0;
 }
 
 extern "C" int waste_cuda_vq_apply_down(waste_model *m, int mode,
@@ -507,7 +798,9 @@ extern "C" int waste_cuda_vq_apply_down(waste_model *m, int mode,
 {
     waste_cuda_kda *ctx = m ? (waste_cuda_kda *)m->cuda_kda_ctx : NULL;
     if (!ctx || !ctx->vq_ready || (mode != 1 && mode != 2) || !y || !idx ||
-        !scale || rows < 1 || cols < 1 || rows % VQ_INDEX_BLOCK ||
+        !scale || ctx->vq_group_failed ||
+        ctx->vq_group_phase != VQ_GROUP_IDLE ||
+        rows < 1 || cols < 1 || rows % VQ_INDEX_BLOCK ||
         cols % VQ_VEC_DIM || (size_t)rows > ctx->vq_y_capacity ||
         (size_t)cols > ctx->capacity)
         return -1;

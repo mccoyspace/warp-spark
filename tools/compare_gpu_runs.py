@@ -106,6 +106,7 @@ class Arm:
     dense_expected_calls: int | None = None
     vq_mode: int | None = None
     vq_effective: int | None = None
+    vq_group: int = 1
     vq_experts: int | None = None
     vq_expected_experts: int | None = None
     vq_applies: int | None = None
@@ -287,6 +288,9 @@ def load_capture(path: str) -> Capture:
             ),
             vq_mode=_optional_arm_integer(raw_arm, "vq_mode", path),
             vq_effective=_optional_arm_integer(raw_arm, "vq_effective", path),
+            vq_group=(1 if raw_arm.get("vq_group") is None else _integer(
+                raw_arm.get("vq_group"), f"{path}: arm.vq_group", minimum=1
+            )),
             vq_experts=_optional_arm_integer(raw_arm, "vq_experts", path),
             vq_expected_experts=_optional_arm_integer(
                 raw_arm, "vq_expected_experts", path
@@ -394,6 +398,7 @@ def _arm_dict(arm: Arm) -> dict[str, Any]:
         "dense_expected_calls": arm.dense_expected_calls,
         "vq_mode": arm.vq_mode,
         "vq_effective": arm.vq_effective,
+        "vq_group": arm.vq_group,
         "vq_experts": arm.vq_experts,
         "vq_expected_experts": arm.vq_expected_experts,
         "vq_applies": arm.vq_applies,
@@ -480,6 +485,10 @@ def _validate_cuda_arms(cpu: Capture, gpu: Capture) -> dict[str, Any] | None:
             raise CaptureError(
                 "CUDA VQ candidate must have mode 1 or 2 and matching effective mode"
             )
+        if gpu.arm.vq_group not in (1, 2, 4, 8, 16):
+            raise CaptureError("CUDA VQ candidate has invalid expert group size")
+        if gpu.arm.value == 1 and gpu.arm.vq_group != 1:
+            raise CaptureError("CUDA VQ mode 1 cannot use grouped synchronization")
         cpu_layer_runs, cpu_experts = _vq_route_work(cpu)
         gpu_layer_runs, gpu_experts = _vq_route_work(gpu)
         if (cpu_layer_runs == 0 or cpu_layer_runs != gpu_layer_runs or
@@ -488,7 +497,10 @@ def _validate_cuda_arms(cpu: Capture, gpu: Capture) -> dict[str, Any] | None:
                 "CUDA VQ captures have different or empty routed workloads"
             )
         expected_applies = 3 * gpu_experts
-        expected_syncs = 2 * gpu_experts
+        groups_per_layer = (
+            gpu.top_k + gpu.arm.vq_group - 1
+        ) // gpu.arm.vq_group
+        expected_syncs = 2 * gpu_layer_runs * groups_per_layer
         expected_lut_builds = (
             0 if gpu.arm.value == 1 else gpu_experts + 2 * gpu_layer_runs
         )

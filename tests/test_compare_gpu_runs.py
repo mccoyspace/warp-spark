@@ -149,7 +149,7 @@ class CompareGpuRunsTest(unittest.TestCase):
         return control, candidate
 
     @staticmethod
-    def vq_arms(mode=1):
+    def vq_arms(mode=1, group=1):
         base = {
             "key": "cuda_vq",
             "fallbacks": 0,
@@ -161,6 +161,7 @@ class CompareGpuRunsTest(unittest.TestCase):
             "dense_effective": 2,
             "dense_calls": 30,
             "dense_expected_calls": 30,
+            "vq_group": group,
         }
         zero = {
             "vq_experts": 0,
@@ -198,8 +199,8 @@ class CompareGpuRunsTest(unittest.TestCase):
             "vq_expected_lut_builds": lut_builds,
             "vq_launches": launches,
             "vq_expected_launches": launches,
-            "vq_syncs": 2 * experts,
-            "vq_expected_syncs": 2 * experts,
+            "vq_syncs": 2 * layer_runs * ((2 + group - 1) // group),
+            "vq_expected_syncs": 2 * layer_runs * ((2 + group - 1) // group),
         }
         return control, candidate
 
@@ -338,6 +339,11 @@ class CompareGpuRunsTest(unittest.TestCase):
                 self.assertEqual(result["arms"]["gpu"]["vq_applies"], 24)
                 self.assertEqual(result["arms"]["gpu"]["dense_scope"], 2)
 
+        control, candidate = self.vq_arms(2, group=2)
+        result = self.compare(cpu_arm=control, gpu_arm=candidate)
+        self.assertEqual(result["arms"]["gpu"]["vq_group"], 2)
+        self.assertEqual(result["arms"]["gpu"]["vq_syncs"], 8)
+
     def test_vq_rejects_bad_base_fallback_or_counter_shortfall(self):
         control, candidate = self.vq_arms(1)
         mutations = (
@@ -347,6 +353,7 @@ class CompareGpuRunsTest(unittest.TestCase):
             {"fallbacks": 1},
             {"vq_applies": 23},
             {"vq_launches": 15, "calls": 15},
+            {"vq_group": 3},
         )
         for mutation in mutations:
             with self.subTest(mutation=mutation):

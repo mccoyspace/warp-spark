@@ -51,8 +51,21 @@ typedef struct {
     uint32_t hits;       /* LFRU frequency term                             */
     uint64_t last;       /* LFRU recency term                               */
     uint64_t pin;        /* hint generation holding it; 0 = evictable       */
+    uint64_t epoch;      /* changes whenever the slot is rebound             */
+    uint32_t holds;      /* explicit users of data; nonzero = unevictable    */
     uint8_t *data;
 } waste_eslot;
+
+/* An explicit record hold. The epoch makes a handle invalid as soon as its
+ * slot is cleared or reused, so releasing an old handle cannot release a
+ * newer occupant of the same slot. Treat this as an owned value: do not
+ * copy it, and release it exactly once. */
+typedef struct {
+    uint64_t epoch;
+    int32_t slot;
+} waste_ecache_hold;
+
+#define WASTE_ECACHE_HOLD_INIT { 0, -1 }
 
 /* The most experts one hint may name. top_k is bounded at 64 by cfg_sane,
  * so a decode hint always fits; a prefill chunk names more and is clipped,
@@ -95,6 +108,7 @@ typedef struct {
     size_t slot_bytes;               /* what was handed to vm_allocate     */
     int last_used;                   /* held nonvolatile until the next get */
     uint64_t purged;                 /* slots the kernel reclaimed         */
+    uint64_t hold_epoch;             /* source of slot-binding epochs      */
 } waste_ecache;
 
 /* O_DIRECT requires the destination buffer to be aligned to the device's
@@ -128,6 +142,16 @@ void waste_ecache_clear(waste_ecache *c);
  * NULL on failure. */
 const uint8_t *waste_ecache_get(waste_ecache *c, int layer, int expert,
                                 waste_fetch_fn fetch, void *user);
+
+/* Get a record and keep its slot resident until release. This has the same
+ * hit/miss and fetch behavior as waste_ecache_get(), but unlike that API the
+ * returned pointer remains valid across subsequent cache accesses. `hold`
+ * is invalidated on failure. clear() invalidates every outstanding handle;
+ * releasing such a stale handle is harmless. */
+const uint8_t *waste_ecache_get_hold(waste_ecache *c, int layer, int expert,
+                                     waste_fetch_fn fetch, void *user,
+                                     waste_ecache_hold *hold);
+void waste_ecache_release_hold(waste_ecache *c, waste_ecache_hold *hold);
 
 /* ---- read-ahead ---------------------------------------------------------
  *

@@ -124,10 +124,11 @@ int main(int argc, char **argv)
            waste_model_get_cuda_dense(&m),
            waste_model_cuda_dense_effective(&m),
            (unsigned long long)waste_model_cuda_dense_calls(&m));
-    printf("cuda vq: requested %d, effective %d, experts %llu, applies %llu, "
+    printf("cuda vq: requested %d, effective %d, group %d, experts %llu, applies %llu, "
            "lut builds %llu, launches %llu, syncs %llu\n",
            waste_model_get_cuda_vq(&m),
            waste_model_cuda_vq_effective(&m),
+           waste_model_get_cuda_vq_group(&m),
            (unsigned long long)waste_model_cuda_vq_experts(&m),
            (unsigned long long)waste_model_cuda_vq_applies(&m),
            (unsigned long long)waste_model_cuda_vq_lut_builds(&m),

@@ -68,6 +68,21 @@ static void *release_fetch(void *arg)
     return NULL;
 }
 
+typedef struct {
+    waste_ecache *cache;
+    fetch_gate *gate;
+    waste_ecache_hold hold;
+    const uint8_t *data;
+} hold_get;
+
+static void *run_hold_get(void *arg)
+{
+    hold_get *g = (hold_get *)arg;
+    g->data = waste_ecache_get_hold(g->cache, 6, 42, gated_fetch, g->gate,
+                                    &g->hold);
+    return NULL;
+}
+
 int main(void)
 {
     waste_model_set_lookahead(-1);
@@ -116,6 +131,44 @@ int main(void)
     }
     waste_ecache_clear(&c);
     if (!thread_rc) pthread_join(release, NULL);
+
+    /* Two callers requesting the same in-flight record both acquire a real
+     * reference. The second waits on the reader mutex instead of observing
+     * a half-filled payload or stealing the first caller's lifetime. */
+    pthread_mutex_lock(&g.mu);
+    g.started = 0;
+    g.release = 0;
+    pthread_mutex_unlock(&g.mu);
+    hold_get hg[2] = {
+        { &c, &g, WASTE_ECACHE_HOLD_INIT, NULL },
+        { &c, &g, WASTE_ECACHE_HOLD_INIT, NULL }
+    };
+    pthread_t ht[2];
+    const int hrc0 = pthread_create(&ht[0], NULL, run_hold_get, &hg[0]);
+    CHECK(hrc0 == 0, "first concurrent hold thread");
+    if (!hrc0) {
+        pthread_mutex_lock(&g.mu);
+        while (!g.started) pthread_cond_wait(&g.cv, &g.mu);
+        pthread_mutex_unlock(&g.mu);
+    }
+    const int hrc1 = pthread_create(&ht[1], NULL, run_hold_get, &hg[1]);
+    CHECK(hrc1 == 0, "second concurrent hold thread");
+    pthread_mutex_lock(&g.mu);
+    g.release = 1;
+    pthread_cond_broadcast(&g.cv);
+    pthread_mutex_unlock(&g.mu);
+    if (!hrc0) pthread_join(ht[0], NULL);
+    if (!hrc1) pthread_join(ht[1], NULL);
+    if (!hrc0 && !hrc1) {
+        CHECK(hg[0].data != NULL && hg[0].data == hg[1].data,
+              "concurrent holds share the completed resident record");
+        CHECK(hg[0].hold.slot == hg[1].hold.slot &&
+              c.slot[hg[0].hold.slot].holds == 2,
+              "concurrent holds are reference-counted");
+    }
+    waste_ecache_release_hold(&c, &hg[0].hold);
+    waste_ecache_release_hold(&c, &hg[1].hold);
+    waste_ecache_clear(&c);
     waste_ecache_io_stop(&c);
 
     for (int i = 0; i < c.n_slots; i++) {
@@ -128,7 +181,61 @@ int main(void)
     CHECK(c.pf_gen == 1 && c.purged == 0,
           "clear resets hint and purge generations");
 
+    /* Explicit holds survive later get() calls and drain(), but leave the
+     * slot available immediately after release. Fill the whole cache with
+     * held records so eviction has no candidate at all. */
+    waste_ecache_hold h[4] = {
+        WASTE_ECACHE_HOLD_INIT, WASTE_ECACHE_HOLD_INIT,
+        WASTE_ECACHE_HOLD_INIT, WASTE_ECACHE_HOLD_INIT
+    };
+    const uint8_t *held[4];
+    for (int i = 0; i < 4; i++) {
+        held[i] = waste_ecache_get_hold(&c, 2, 10 + i, gated_fetch, &g, &h[i]);
+        CHECK(held[i] != NULL, "get-and-hold returns a record");
+        CHECK(h[i].slot >= 0 && c.slot[h[i].slot].holds == 1,
+              "get-and-hold pins its slot");
+    }
+    waste_ecache_drain(&c);
+    for (int i = 0; i < 4; i++)
+        CHECK(c.slot[h[i].slot].holds == 1, "drain preserves an active hold");
+
+    waste_ecache_hold blocked = WASTE_ECACHE_HOLD_INIT;
+    CHECK(waste_ecache_get_hold(&c, 2, 99, gated_fetch, &g, &blocked) == NULL,
+          "a cache containing only held slots cannot evict one");
+    CHECK(blocked.slot == -1 && blocked.epoch == 0,
+          "failed get-and-hold leaves an invalid handle");
+
+    waste_ecache_release_hold(&c, &h[1]);
+    CHECK(h[1].slot == -1 && h[1].epoch == 0,
+          "release invalidates its handle");
+    CHECK(waste_ecache_get_hold(&c, 2, 99, gated_fetch, &g, &blocked) != NULL,
+          "a released slot is evictable again");
+
+    /* clear() is the sweep-level lifetime boundary. Old handles must not be
+     * able to decrement a new hold that happens to reuse their slot. */
+    waste_ecache_hold stale = h[0];
+    waste_ecache_clear(&c);
+    waste_ecache_hold fresh = WASTE_ECACHE_HOLD_INIT;
+    CHECK(waste_ecache_get_hold(&c, 3, 7, gated_fetch, &g, &fresh) != NULL,
+          "get-and-hold works after clear");
+    CHECK(fresh.slot >= 0 && c.slot[fresh.slot].holds == 1,
+          "new post-clear hold is active");
+    waste_ecache_release_hold(&c, &stale);
+    CHECK(c.slot[fresh.slot].holds == 1,
+          "a stale pre-clear handle cannot release a new record");
+    waste_ecache_release_hold(&c, &fresh);
+    CHECK(fresh.slot == -1, "fresh post-clear handle releases normally");
+    for (int i = 0; i < 4; i++) waste_ecache_release_hold(&c, &h[i]);
+    waste_ecache_release_hold(&c, &blocked);
+
+    /* Free invalidates the cache before releasing storage; cleanup code may
+     * still safely release an owned handle afterward. */
+    waste_ecache_hold at_free = WASTE_ECACHE_HOLD_INIT;
+    CHECK(waste_ecache_get_hold(&c, 4, 1, gated_fetch, &g, &at_free) != NULL,
+          "active hold before free");
     waste_ecache_free(&c);
+    waste_ecache_release_hold(&c, &at_free);
+    CHECK(at_free.slot == -1, "release after free is harmless");
     pthread_cond_destroy(&g.cv);
     pthread_mutex_destroy(&g.mu);
     waste_model_set_lookahead(0);

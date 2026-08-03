@@ -167,7 +167,11 @@ static cuda_vq_target cuda_vq_targets(const waste_model *m, int mode,
     target.launches = mode == 1
         ? target.experts * UINT64_C(2)
         : layers * steps + target.experts * UINT64_C(3);
-    target.syncs = target.experts * UINT64_C(2);
+    const uint64_t group = mode == 2
+        ? (uint64_t)waste_model_get_cuda_vq_group(m) : UINT64_C(1);
+    const uint64_t groups_per_layer =
+        ((uint64_t)m->cfg.top_k + group - UINT64_C(1)) / group;
+    target.syncs = layers * steps * groups_per_layer * UINT64_C(2);
     return target;
 }
 
@@ -238,6 +242,7 @@ static int write_capture(const char *dir, const char *key, int value, int rep,
             ", \"dense_calls\": %" PRIu64
             ", \"dense_expected_calls\": %" PRIu64
             ", \"vq_mode\": %d, \"vq_effective\": %d"
+            ", \"vq_group\": %d"
             ", \"vq_experts\": %" PRIu64
             ", \"vq_expected_experts\": %" PRIu64
             ", \"vq_applies\": %" PRIu64
@@ -260,6 +265,7 @@ static int write_capture(const char *dir, const char *key, int value, int rep,
             waste_model_cuda_dense_effective(m),
             waste_model_cuda_dense_calls(m), dense_expected,
             waste_model_get_cuda_vq(m), waste_model_cuda_vq_effective(m),
+            waste_model_get_cuda_vq_group(m),
             waste_model_cuda_vq_experts(m), vq_expected.experts,
             waste_model_cuda_vq_applies(m), vq_expected.applies,
             waste_model_cuda_vq_lut_builds(m), vq_expected.lut_builds,
