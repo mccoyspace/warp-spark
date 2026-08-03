@@ -228,6 +228,9 @@ waste$(EXE): cli/main.o libwaste.a
 TESTNAMES := test_kda test_container test_forward test_tokenizer test_k3parts \
              test_state test_vision test_image test_lock test_memory test_abi test_ecache \
              sweep
+ifndef WINDOWS
+TESTNAMES += spec_probe
+endif
 TESTBINS  := $(addsuffix $(EXE),$(TESTNAMES))
 
 test: $(TESTBINS)
@@ -254,6 +257,10 @@ test_ecache$(EXE): tests/test_ecache.o libwaste.a
 # library the checks do and must never drift from it.
 sweep$(EXE): tests/sweep.o libwaste.a
 	$(CC) $(CFLAGS) -o $@ $^ $(LDLIBS)
+ifndef WINDOWS
+spec_probe$(EXE): tests/spec_probe.o libwaste.a
+	$(CC) $(CFLAGS) -o $@ $^ $(LDLIBS)
+endif
 test_tokenizer$(EXE): tests/test_tokenizer.o libwaste.a
 	$(CC) $(CFLAGS) -o $@ $^ $(LDLIBS)
 test_k3parts$(EXE): tests/test_k3parts.o libwaste.a

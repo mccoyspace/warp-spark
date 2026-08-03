@@ -32,3 +32,4 @@ k3parts.bin
 # containers a fuzzer kept for reproduction
 fuzz-case-*/
 sweep
+/spec_probe

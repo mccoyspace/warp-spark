@@ -1,0 +1,100 @@
+{
+  "schema": "waste.gn100.speculative_preinference_amendment.v1",
+  "date": "2026-08-03",
+  "status": "frozen_before_new_model_inference",
+  "supplements_tag": "gn100-sprint16-preregistered-2026-08-03",
+  "h2": {
+    "sha256": "5c5b806358a26bb8d9ce782aab190b7e10bd83f00e445d1bab7367333cee5bee",
+    "status": "embargoed_unspent",
+    "model_steps": 0
+  },
+  "mtp_audit": {
+    "repository": "moonshotai/Kimi-K3",
+    "repository_commit": "9f62e4e9fffbd0a83ddd60e1c209d828994b3569",
+    "authenticated_read_only": true,
+    "source_config_sha256": "9710e121a58d03ac92c8d6da287a19541994319afbbe6d6202af001ffd379213",
+    "source_index_sha256": "a1c5210650ce71d2d3ae9ec5a101ac4afd3cf4b10091be589853437eb967febd",
+    "source_index_bytes": 59764096,
+    "source_tensor_names": 497220,
+    "source_expert_tensor_names": 494592,
+    "source_nonexpert_tensor_names": 2628,
+    "converted_trunk_tensors": 2628,
+    "converted_expert_layers": 92,
+    "converted_manifest_num_nextn_predict_layers": 0,
+    "mtp_name_matches": 0,
+    "available": false,
+    "decision": "exclude_unavailable_not_a_tested_candidate"
+  },
+  "candidate_grid": {
+    "draft_classes": ["kimi_linear", "prompt_lookup"],
+    "kimi_linear_prompt_formats": ["target_ids", "kimi_native"],
+    "prompt_lookup_prompt_formats": ["canonical_k3_context"],
+    "block_widths": [2, 4, 8],
+    "trace_width": 8,
+    "candidate_cells": 9,
+    "mtp": "excluded_unavailable"
+  },
+  "prompt_lookup": {
+    "max_ngram": 4,
+    "min_ngram": 1,
+    "occurrence_tie_break": "most_recent",
+    "max_proposals": 8,
+    "source": "already_known_canonical_k3_context_only",
+    "no_match": "zero_proposals_then_one_direct_k3_token",
+    "tuning_after_trace": false
+  },
+  "selection": {
+    "selection_tiers": ["A", "B"],
+    "veto_only_tier": "H1",
+    "modeled_gain_min_percent": 15.0,
+    "integrated_gain_min_percent": 10.0,
+    "tie_within_percentage_points": 1.0,
+    "tie_breaks": ["smaller_k", "prompt_lookup", "target_ids", "kimi_native"],
+    "runner_up_substitution": false
+  },
+  "state_costs": {
+    "charge_implemented_mechanism_only": true,
+    "measure": [
+      "in_memory_export",
+      "in_memory_import",
+      "contiguous_copy_1_thread_optimistic_floor",
+      "contiguous_copy_10_thread_optimistic_floor"
+    ],
+    "load_only_position_zero_role": "inference_free_fixed_kda_conv_floor_without_mla_latent_rows",
+    "actual_state_probe": {
+      "selection": "longest_frozen_development_prompt_by_token_count",
+      "position": "prompt_tokens_plus_31_last_root_of_32_token_trace",
+      "actual_mla_latent_rows": true,
+      "rollback_check": "advance_restore_replay_requires_byte_identical_logits_ordered_routes_and_post_state",
+      "candidate_selection_role": "none"
+    },
+    "durable_checkpoint_io_charged_to_blocks": false,
+    "pointer_swap_claimed": false
+  },
+  "joint_budget": {
+    "F_target_cache_mib": 59340,
+    "R_S_target_cache_mib": 40502,
+    "R_S_draft_cache_mib": 16926,
+    "target_rollback_bytes": 536870912,
+    "draft_rollback_bytes": 134217728
+  },
+  "safety_measurement": {
+    "process_swap_scope": "complete_model_subprocess",
+    "major_fault_scope": "named_timed_inference_or_state_copy_window",
+    "load_startup_major_faults": "recorded_informational_not_gated",
+    "capture_affinity": [5, 6, 7, 8, 9, 15, 16, 17, 18, 19],
+    "pm_qos": {"scope": "child", "latency_us": 0, "holder_uid": 0}
+  },
+  "verification_bounds": {
+    "exact_reference": "serial_waste_model_step",
+    "diagnostic_only": ["chunk_Tk_i8mm_off", "chunk_Tk_i8mm_on"],
+    "required_decomposition": [
+      "time",
+      "cuda_launches",
+      "expert_union",
+      "cache_misses",
+      "expert_bytes"
+    ],
+    "diagnostic_can_qualify_without_byte_exactness": false
+  }
+}
