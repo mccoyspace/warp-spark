@@ -300,6 +300,22 @@ static int ec_lfru_age_env(void)
     return (int)value;
 }
 
+static int ec_lfru_prior_log2_env(void)
+{
+    const char *e = getenv("WASTE_LFRU_PRIOR_LOG2");
+    return e && *e && *e != '0';
+}
+
+/* Integer bit_length: the registered prior score 1+floor(log2(n)) for
+ * positive counts, with zero kept zero defensively for a malformed or
+ * hand-written usage file. */
+static uint32_t ec_bit_length(uint32_t n)
+{
+    uint32_t bits = 0;
+    while (n) { bits++; n >>= 1; }
+    return bits;
+}
+
 int waste_ecache_init(waste_ecache *c, size_t budget_bytes, size_t rec_bytes,
                       int policy)
 {
@@ -308,6 +324,7 @@ int waste_ecache_init(waste_ecache *c, size_t budget_bytes, size_t rec_bytes,
     c->budget_bytes = budget_bytes;
     c->policy = policy;
     c->lfru_age_tokens = (uint32_t)ec_lfru_age_env();
+    c->lfru_prior_log2 = ec_lfru_prior_log2_env();
     c->rng = 0x9e3779b9u;
     /* Generations start at 1 so that a slot's zeroed pin means "never
      * hinted" rather than "pinned by the current batch". */
@@ -401,6 +418,31 @@ void waste_ecache_decode_tick(waste_ecache *c)
                             ? c->slot[i].hits / 2 : 1;
     }
     ec_unlock(c);
+}
+
+void waste_ecache_set_lfru_prior_log2(waste_ecache *c, int enabled)
+{
+    if (!c) return;
+    ec_lock(c);
+    c->lfru_prior_log2 = enabled != 0;
+    c->lfru_prior_events = 0;
+    c->lfru_prior_entries = 0;
+    ec_unlock(c);
+}
+
+int waste_ecache_get_lfru_prior_log2(const waste_ecache *c)
+{
+    return c ? c->lfru_prior_log2 : 0;
+}
+
+uint64_t waste_ecache_lfru_prior_events(const waste_ecache *c)
+{
+    return c ? c->lfru_prior_events : 0;
+}
+
+uint64_t waste_ecache_lfru_prior_entries(const waste_ecache *c)
+{
+    return c ? c->lfru_prior_entries : 0;
 }
 
 void waste_ecache_free(waste_ecache *c)
@@ -826,6 +868,8 @@ void waste_ecache_clear(waste_ecache *c)
     c->purged = 0;
     c->lfru_age_phase = 0;
     c->lfru_age_events = 0;
+    c->lfru_prior_events = 0;
+    c->lfru_prior_entries = 0;
     ec_unlock(c);
 }
 
@@ -899,6 +943,8 @@ int waste_ecache_warm(waste_ecache *c, const char *path,
     qsort(ent, (size_t)n, sizeof *ent, hits_desc);
     const int want = (int)n < c->n_slots ? (int)n : c->n_slots;
 
+    const int compress = c->policy == 0 && c->lfru_prior_log2;
+    uint64_t transformed = 0;
     int loaded = 0;
     for (int i = 0; i < want; i++) {
         const int32_t key = ((int32_t)ent[i].layer << 16) | ent[i].expert_id;
@@ -910,11 +956,18 @@ int waste_ecache_warm(waste_ecache *c, const char *path,
         ec_invalidate_holds(c, vi);
         c->slot[vi].key = key;
         c->slot[vi].state = EC_READY;
-        c->slot[vi].hits = ent[i].hits;
+        /* Selection above used the raw counts. Only the resident prior is
+         * compressed; every hit from the prompt onward remains linear. */
+        c->slot[vi].hits = compress ? ec_bit_length(ent[i].hits) : ent[i].hits;
         c->slot[vi].last = ++c->clock;
         if (had) ec_rehash(c); else ec_insert(c, key, vi);
         ec_volatile(c, vi);        /* warmed and idle: the kernel may have it */
         loaded++;
+        if (compress) transformed++;
+    }
+    if (transformed) {
+        c->lfru_prior_events++;
+        c->lfru_prior_entries += transformed;
     }
     free(ent);
     return loaded;

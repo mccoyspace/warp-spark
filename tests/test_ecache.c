@@ -16,6 +16,8 @@
 
 #if defined(_WIN32)
 #include <windows.h>
+#else
+#include <unistd.h>
 #endif
 
 #define REC_BYTES 16384
@@ -44,6 +46,170 @@ static void age_env(const char *value)
     if (value) setenv("WASTE_LFRU_AGE_TOKENS", value, 1);
     else unsetenv("WASTE_LFRU_AGE_TOKENS");
 #endif
+}
+
+static void prior_env(const char *value)
+{
+#if defined(_WIN32)
+    _putenv_s("WASTE_LFRU_PRIOR_LOG2", value ? value : "");
+#else
+    if (value) setenv("WASTE_LFRU_PRIOR_LOG2", value, 1);
+    else unsetenv("WASTE_LFRU_PRIOR_LOG2");
+#endif
+}
+
+static int immediate_fetch(void *user, int layer, int expert, uint8_t *dst)
+{
+    (void)user;
+    memset(dst, (layer + expert) & 0xff, REC_BYTES);
+    return 0;
+}
+
+typedef struct {
+    int layer, expert;
+    uint32_t hits;
+} usage_fixture;
+
+static int temp_path(char *path, size_t cap)
+{
+#if defined(_WIN32)
+    char dir[MAX_PATH], name[MAX_PATH];
+    const DWORD n = GetTempPathA(MAX_PATH, dir);
+    if (!n || n >= MAX_PATH || !GetTempFileNameA(dir, "wst", 0, name)) return -1;
+    if (strlen(name) + 1 > cap) { DeleteFileA(name); return -1; }
+    memcpy(path, name, strlen(name) + 1);
+    return 0;
+#else
+    const char pattern[] = "/tmp/waste-ecache-XXXXXX";
+    if (sizeof pattern > cap) return -1;
+    memcpy(path, pattern, sizeof pattern);
+    const int fd = mkstemp(path);
+    if (fd < 0) return -1;
+    close(fd);
+    return 0;
+#endif
+}
+
+static int write_usage_fixture(const char *path, const usage_fixture *entry,
+                               int n)
+{
+    waste_ecache source;
+    if (waste_ecache_init(&source, (size_t)n * REC_BYTES, REC_BYTES, 0)) return -1;
+    for (int i = 0; i < n; i++) {
+        source.slot[i].key = (entry[i].layer << 16) | entry[i].expert;
+        source.slot[i].state = EC_READY;
+        source.slot[i].hits = entry[i].hits;
+        source.slot[i].last = (uint64_t)i + 1;
+    }
+    const int rc = waste_ecache_save_usage(&source, path, (uint64_t)n);
+    waste_ecache_free(&source);
+    return rc;
+}
+
+static int find_slot(const waste_ecache *c, int layer, int expert)
+{
+    const int32_t key = (layer << 16) | expert;
+    for (int i = 0; i < c->n_slots; i++)
+        if (c->slot[i].key == key && c->slot[i].state == EC_READY) return i;
+    return -1;
+}
+
+static void check_prior_log2(void)
+{
+    char usage_a[512] = {0}, usage_b[512] = {0}, usage_zero[512] = {0};
+    const usage_fixture a[] = {
+        { 4, 1, 8 }, { 3, 2, 63 }, { 5, 3, 0 }
+    };
+    const usage_fixture b[] = { { 6, 4, 7 } };
+    const usage_fixture zero[] = { { 7, 5, 0 } };
+    if (temp_path(usage_a, sizeof usage_a) ||
+        temp_path(usage_b, sizeof usage_b) ||
+        temp_path(usage_zero, sizeof usage_zero)) {
+        CHECK(0, "temporary usage paths");
+        goto done;
+    }
+    if (write_usage_fixture(usage_a, a, 3) ||
+        write_usage_fixture(usage_b, b, 1) ||
+        write_usage_fixture(usage_zero, zero, 1)) {
+        CHECK(0, "usage fixtures");
+        goto done;
+    }
+
+    waste_ecache hot;
+    if (waste_ecache_init(&hot, 2 * REC_BYTES, REC_BYTES, 0)) {
+        CHECK(0, "prior cache initialization");
+        goto done;
+    }
+    CHECK(waste_ecache_get_lfru_prior_log2(&hot) == 0,
+          "prior compression is disabled by default");
+    CHECK(waste_ecache_warm(&hot, usage_a, immediate_fetch, NULL) == 2,
+          "raw hotlist fills the bounded cache");
+    int s63 = find_slot(&hot, 3, 2), s8 = find_slot(&hot, 4, 1);
+    CHECK(s63 >= 0 && s8 >= 0 && find_slot(&hot, 5, 3) < 0,
+          "raw counts select the hottest entries before compression");
+    CHECK(s63 >= 0 && hot.slot[s63].hits == 63 &&
+          s8 >= 0 && hot.slot[s8].hits == 8,
+          "control warm retains raw prior counts");
+    CHECK(waste_ecache_lfru_prior_events(&hot) == 0 &&
+          waste_ecache_lfru_prior_entries(&hot) == 0,
+          "control warm records no compression");
+
+    waste_ecache_clear(&hot);
+    waste_ecache_set_lfru_prior_log2(&hot, 1);
+    CHECK(waste_ecache_get_lfru_prior_log2(&hot) == 1,
+          "prior compression setter enables the mode");
+    const int warmed = waste_ecache_warm(&hot, usage_a, immediate_fetch, NULL);
+    s63 = find_slot(&hot, 3, 2); s8 = find_slot(&hot, 4, 1);
+    CHECK(warmed == 2 && s63 >= 0 && s8 >= 0,
+          "compressed warm keeps raw-count membership");
+    CHECK(hot.slot[s63].hits == 6, "63 imported hits compress to six");
+    CHECK(hot.slot[s8].hits == 4, "eight imported hits compress to four");
+    CHECK(waste_ecache_lfru_prior_events(&hot) == 1 &&
+          waste_ecache_lfru_prior_entries(&hot) == (uint64_t)warmed,
+          "one nonempty warm counts every transformed entry");
+    CHECK(waste_ecache_get(&hot, 4, 1, immediate_fetch, NULL) != NULL &&
+          hot.slot[s8].hits == 5,
+          "current prompt and decode hits remain linear");
+
+    CHECK(waste_ecache_warm(&hot, usage_a, immediate_fetch, NULL) == 0 &&
+          waste_ecache_lfru_prior_events(&hot) == 1 &&
+          waste_ecache_lfru_prior_entries(&hot) == 2,
+          "an empty repeated warm does not create an event");
+    CHECK(waste_ecache_warm(&hot, usage_b, immediate_fetch, NULL) == 1 &&
+          waste_ecache_lfru_prior_events(&hot) == 2 &&
+          waste_ecache_lfru_prior_entries(&hot) == 3,
+          "a second nonempty warm accumulates one event and entry");
+
+    waste_ecache_clear(&hot);
+    CHECK(waste_ecache_get_lfru_prior_log2(&hot) == 1 &&
+          waste_ecache_lfru_prior_events(&hot) == 0 &&
+          waste_ecache_lfru_prior_entries(&hot) == 0,
+          "clear retains the mode and resets prior counters");
+    CHECK(waste_ecache_warm(&hot, usage_zero, immediate_fetch, NULL) == 1,
+          "zero-count defensive fixture warms");
+    const int szero = find_slot(&hot, 7, 5);
+    CHECK(szero >= 0 && hot.slot[szero].hits == 0 &&
+          waste_ecache_lfru_prior_events(&hot) == 1 &&
+          waste_ecache_lfru_prior_entries(&hot) == 1,
+          "zero has a defined zero-bit score and is still counted");
+
+    waste_ecache_clear(&hot);
+    hot.policy = 1;
+    CHECK(waste_ecache_warm(&hot, usage_a, immediate_fetch, NULL) == 2,
+          "LRU hotlist warms normally");
+    s63 = find_slot(&hot, 3, 2); s8 = find_slot(&hot, 4, 1);
+    CHECK(s63 >= 0 && hot.slot[s63].hits == 63 &&
+          s8 >= 0 && hot.slot[s8].hits == 8,
+          "LRU ignores prior compression");
+    CHECK(waste_ecache_lfru_prior_events(&hot) == 0 &&
+          waste_ecache_lfru_prior_entries(&hot) == 0,
+          "LRU records no prior compression");
+    waste_ecache_free(&hot);
+
+done:
+    if (usage_a[0]) remove(usage_a);
+    if (usage_b[0]) remove(usage_b);
+    if (usage_zero[0]) remove(usage_zero);
 }
 
 static int gated_fetch(void *user, int layer, int expert, uint8_t *dst)
@@ -97,6 +263,7 @@ static void *run_hold_get(void *arg)
 int main(void)
 {
     age_env(NULL);
+    prior_env(NULL);
     waste_model_set_lookahead(-1);
     CHECK(waste_model_get_lookahead() == 0, "negative lookahead clamps to zero");
     waste_model_set_lookahead(WASTE_PF_MAX + 1);
@@ -108,6 +275,8 @@ int main(void)
           "cache initialization");
     CHECK(waste_ecache_get_lfru_age(&c) == 0,
           "LFRU aging is disabled by default");
+    CHECK(waste_ecache_get_lfru_prior_log2(&c) == 0,
+          "LFRU prior compression is disabled by default");
     if (failed) return 1;
 
     fetch_gate g;
@@ -302,14 +471,20 @@ int main(void)
     waste_ecache_release_hold(&c, &at_free);
     CHECK(at_free.slot == -1, "release after free is harmless");
 
+    check_prior_log2();
+
     waste_ecache from_env;
     age_env("4");
+    prior_env("1");
     CHECK(waste_ecache_init(&from_env, REC_BYTES, REC_BYTES, 0) == 0,
           "environment-configured aging cache initializes");
     CHECK(waste_ecache_get_lfru_age(&from_env) == 4,
           "WASTE_LFRU_AGE_TOKENS initializes the per-cache setting");
+    CHECK(waste_ecache_get_lfru_prior_log2(&from_env) == 1,
+          "WASTE_LFRU_PRIOR_LOG2 initializes the per-cache setting");
     waste_ecache_free(&from_env);
     age_env(NULL);
+    prior_env(NULL);
     pthread_cond_destroy(&g.cv);
     pthread_mutex_destroy(&g.mu);
     waste_model_set_lookahead(0);

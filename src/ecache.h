@@ -87,6 +87,9 @@ typedef struct {
     uint32_t lfru_age_tokens; /* 0 off; otherwise decode-token half-life     */
     uint32_t lfru_age_phase;  /* successful decode tokens since last aging   */
     uint64_t lfru_age_events; /* completed frequency-halving passes          */
+    int lfru_prior_log2;      /* compress imported frequency before prefill   */
+    uint64_t lfru_prior_events;  /* nonempty compressed hotlist loads         */
+    uint64_t lfru_prior_entries; /* entries compressed across those loads     */
 
     /* read-ahead; io == NULL means every fetch is synchronous, which is
      * what the engine did before 0.7.0 and still does when asked for zero
@@ -149,6 +152,17 @@ void waste_ecache_set_lfru_age(waste_ecache *c, int tokens);
 int  waste_ecache_get_lfru_age(const waste_ecache *c);
 uint64_t waste_ecache_lfru_age_events(const waste_ecache *c);
 void waste_ecache_decode_tick(waste_ecache *c);
+
+/* Optional one-shot compression of a learned LFRU prior. Raw usage counts
+ * still sort and select the records that warm the cache; after each
+ * successful fetch their resident score becomes bit_length(raw_hits).
+ * Subsequent prompt and decode hits increment that score normally. Zero is
+ * off, and LRU ignores the setting. clear() retains the setting and resets
+ * the per-arm event and entry counters. */
+void waste_ecache_set_lfru_prior_log2(waste_ecache *c, int enabled);
+int  waste_ecache_get_lfru_prior_log2(const waste_ecache *c);
+uint64_t waste_ecache_lfru_prior_events(const waste_ecache *c);
+uint64_t waste_ecache_lfru_prior_entries(const waste_ecache *c);
 
 /* Returns a pointer to the expert's record bytes, reading it through
  * `fetch` on a miss, or waiting for the read a hint already started.
