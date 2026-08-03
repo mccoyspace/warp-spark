@@ -120,6 +120,10 @@ int main(int argc, char **argv)
            waste_model_cuda_kda_effective(&m),
            (unsigned long long)waste_model_cuda_kda_fallbacks(&m),
            (unsigned long long)waste_model_cuda_kda_calls(&m));
+    printf("cuda dense: requested %d, effective %d, calls %llu\n",
+           waste_model_get_cuda_dense(&m),
+           waste_model_cuda_dense_effective(&m),
+           (unsigned long long)waste_model_cuda_dense_calls(&m));
 
     extern double waste_prof[16];
     if (getenv("WASTE_PROFILE")) {

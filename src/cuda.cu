@@ -4,8 +4,9 @@
  * storage. The 29 GiB trunk stays in its existing host allocation, so the
  * expert cache and CUDA do not discover one another through reclaim.
  *
- * This module deliberately implements one operation. Decode KDA calls it
- * directly; prefill and every non-KDA path remain on the qualified CPU.
+ * This module deliberately implements one operation. Selected decode-only
+ * KDA and dense projections call it directly; prefill, the router, absorbed
+ * MLA kv_b, the Q8 head, and VQ experts remain on the qualified CPU.
  */
 
 #include "model.h"
@@ -146,8 +147,23 @@ static waste_cuda_kda *cuda_create(const waste_model *m)
     waste_cuda_kda *ctx = (waste_cuda_kda *)calloc(1, sizeof *ctx);
     if (!ctx) return NULL;
     const size_t channels = (size_t)m->cfg.kda_heads * m->cfg.kda_dim;
-    ctx->capacity = channels > (size_t)m->cfg.hidden
-                  ? channels : (size_t)m->cfg.hidden;
+    const size_t mla_q = (size_t)m->cfg.n_heads *
+                         (size_t)(m->cfg.qk_nope + m->cfg.qk_rope);
+    const size_t mla_v = (size_t)m->cfg.n_heads * (size_t)m->cfg.v_head;
+    const size_t shared = (size_t)m->cfg.moe_inter *
+                          (size_t)(m->cfg.n_shared ? m->cfg.n_shared : 1);
+    ctx->capacity = (size_t)m->cfg.hidden;
+#define GROW_CAPACITY(n) do { const size_t z = (size_t)(n); \
+    if (z > ctx->capacity) ctx->capacity = z; } while (0)
+    GROW_CAPACITY(channels);
+    GROW_CAPACITY(mla_q);
+    GROW_CAPACITY(mla_v);
+    GROW_CAPACITY(m->cfg.q_lora);
+    GROW_CAPACITY(m->cfg.kv_lora + m->cfg.qk_rope);
+    GROW_CAPACITY(m->cfg.latent_dim);
+    GROW_CAPACITY(shared);
+    GROW_CAPACITY(m->cfg.dense_inter);
+#undef GROW_CAPACITY
     status = cudaStreamCreateWithFlags(&ctx->stream, cudaStreamNonBlocking);
     if (status == cudaSuccess)
         status = cudaHostAlloc((void **)&ctx->host_x,
@@ -223,7 +239,7 @@ extern "C" void waste_cuda_kda_free(waste_model *m)
 }
 
 /* The generic dispatch table is intentionally untouched: this experiment is
- * per-model and KDA-only, while waste_k is process-global. */
+ * per-model and decode-only, while waste_k is process-global. */
 extern "C" const char *waste_register_cuda(waste_kernels *)
 {
     return NULL;

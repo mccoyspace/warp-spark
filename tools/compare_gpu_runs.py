@@ -96,6 +96,10 @@ class Arm:
     fallbacks: int
     calls: int | None
     expected_calls: int | None
+    kda_mode: int | None = None
+    kda_effective: int | None = None
+    kda_calls: int | None = None
+    kda_expected_calls: int | None = None
 
 
 @dataclass(frozen=True)
@@ -217,6 +221,10 @@ def load_capture(path: str) -> Capture:
             raise CaptureError(f"{path}: arm.key must be a non-empty string")
         calls = raw_arm.get("calls")
         expected_calls = raw_arm.get("expected_calls")
+        kda_mode = raw_arm.get("kda_mode")
+        kda_effective = raw_arm.get("kda_effective")
+        kda_calls = raw_arm.get("kda_calls")
+        kda_expected_calls = raw_arm.get("kda_expected_calls")
         arm = Arm(
             key=key,
             value=_integer(raw_arm.get("value"), f"{path}: arm.value"),
@@ -238,12 +246,22 @@ def load_capture(path: str) -> Capture:
                     expected_calls, f"{path}: arm.expected_calls"
                 )
             ),
+            kda_mode=(None if kda_mode is None else _integer(
+                kda_mode, f"{path}: arm.kda_mode")),
+            kda_effective=(None if kda_effective is None else _integer(
+                kda_effective, f"{path}: arm.kda_effective")),
+            kda_calls=(None if kda_calls is None else _integer(
+                kda_calls, f"{path}: arm.kda_calls")),
+            kda_expected_calls=(
+                None if kda_expected_calls is None else _integer(
+                    kda_expected_calls, f"{path}: arm.kda_expected_calls")
+            ),
         )
 
     raw_steps = raw.get("steps")
     if not isinstance(raw_steps, list) or not raw_steps:
         raise CaptureError(f"{path}: steps must be a non-empty list")
-    if arm is not None and arm.key == "cuda" and len(raw_steps) < 2:
+    if arm is not None and arm.key in ("cuda", "cuda_dense") and len(raw_steps) < 2:
         raise CaptureError(f"{path}: CUDA capture must contain a decode step")
     steps = []
     for expected_index, item in enumerate(raw_steps):
@@ -288,7 +306,8 @@ def load_capture(path: str) -> Capture:
             if len(set(ids)) != len(ids):
                 raise CaptureError(f"{rwhere}.experts contains duplicate ids")
             routes.append(RouteRow(layer, ids))
-        if arm is not None and arm.key == "cuda" and expected_index > 0 and not routes:
+        if (arm is not None and arm.key in ("cuda", "cuda_dense") and
+                expected_index > 0 and not routes):
             raise CaptureError(f"{where}.routes must contain decode route rows")
         steps.append(Step(index, position, input_token, tuple(routes)))
 
@@ -311,6 +330,10 @@ def _arm_dict(arm: Arm) -> dict[str, Any]:
         "fallbacks": arm.fallbacks,
         "calls": arm.calls,
         "expected_calls": arm.expected_calls,
+        "kda_mode": arm.kda_mode,
+        "kda_effective": arm.kda_effective,
+        "kda_calls": arm.kda_calls,
+        "kda_expected_calls": arm.kda_expected_calls,
     }
 
 
@@ -321,6 +344,37 @@ def _validate_cuda_arms(cpu: Capture, gpu: Capture) -> dict[str, Any] | None:
         raise CaptureError(
             f"captures have different arm keys: {cpu.arm.key!r} vs {gpu.arm.key!r}"
         )
+    if cpu.arm.key == "cuda_dense":
+        for label, arm in (("control", cpu.arm), ("candidate", gpu.arm)):
+            if (arm.kda_mode not in (1, 2) or
+                    arm.kda_effective != arm.kda_mode or
+                    arm.kda_calls is None or arm.kda_expected_calls is None or
+                    arm.kda_calls != arm.kda_expected_calls or
+                    arm.kda_calls == 0):
+                raise CaptureError(
+                    f"CUDA dense {label} has invalid KDA base metadata"
+                )
+            if arm.fallbacks != 0:
+                raise CaptureError(
+                    f"CUDA dense {label} reported a CUDA fallback/failure"
+                )
+        if cpu.arm.kda_mode != gpu.arm.kda_mode:
+            raise CaptureError("CUDA dense captures use different KDA base modes")
+        if (cpu.arm.value != 0 or cpu.arm.effective != 0 or
+                cpu.arm.calls != 0 or cpu.arm.expected_calls != 0):
+            raise CaptureError(
+                "CUDA dense control must declare scope/effective/calls zero"
+            )
+        if (gpu.arm.value not in (1, 2, 3) or
+                gpu.arm.effective != gpu.arm.value or
+                gpu.arm.calls is None or gpu.arm.expected_calls is None or
+                gpu.arm.calls != gpu.arm.expected_calls or gpu.arm.calls == 0):
+            raise CaptureError(
+                f"CUDA dense candidate executed {gpu.arm.calls} calls; "
+                f"expected {gpu.arm.expected_calls} at scope {gpu.arm.value}"
+            )
+        return {"cpu": _arm_dict(cpu.arm), "gpu": _arm_dict(gpu.arm)}
+
     if cpu.arm.key != "cuda":
         return {"cpu": _arm_dict(cpu.arm), "gpu": _arm_dict(gpu.arm)}
 

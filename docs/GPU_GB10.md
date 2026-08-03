@@ -324,11 +324,11 @@ are retained in
 5. **Storage contention: measured.** A sustained worst-case loop costs 4.0%
    bandwidth and 23-29% p95/p99 latency against stable bracketing baselines.
 
-Dense decode has now cleared its gate. The next independent GPU target is the
-VQ expert gather, where irregular lookup defeated the SVE prototype and is a
-better architectural match for the GPU. Whole-layer graphs, CPU/GPU overlap,
-and prefill CUDA remain possible follow-ons, but the direct Q4 path is already
-large enough that they should be justified by a measured profile rather than
-added by default. If VQ offload is uneconomic, speculative decoding remains
-the next architectural experiment; its batch dimension may also make a later
-whole-block GPU design materially different.
+KDA dense decode has now cleared its gate. Before attempting a new kernel
+class, sprint 12 expands the validated Q4 path across the remaining
+conventional decode projections under the preregistered arms in
+[GPU_DENSE_GB10.md](GPU_DENSE_GB10.md). The resulting residual profile will
+then decide whether VQ expert gather, absorbed MLA or the Q8 language-model
+head is the next independent GPU target. Whole-layer graphs, CPU/GPU overlap,
+and prefill CUDA remain possible follow-ons, but each must be justified by a
+measured profile rather than added by default.

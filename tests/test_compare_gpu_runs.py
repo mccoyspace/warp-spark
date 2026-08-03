@@ -129,6 +129,25 @@ class CompareGpuRunsTest(unittest.TestCase):
         }
         return cpu, gpu
 
+    @staticmethod
+    def dense_arms():
+        base = {
+            "fallbacks": 0,
+            "kda_mode": 1,
+            "kda_effective": 1,
+            "kda_calls": 24,
+            "kda_expected_calls": 24,
+        }
+        control = {
+            **base, "key": "cuda_dense", "value": 0, "effective": 0,
+            "calls": 0, "expected_calls": 0,
+        }
+        candidate = {
+            **base, "key": "cuda_dense", "value": 3, "effective": 3,
+            "calls": 30, "expected_calls": 30,
+        }
+        return control, candidate
+
     def test_self_compare_is_exact(self):
         result = self.compare()
         self.assertEqual(result["causally_compared_steps"], 3)
@@ -237,6 +256,22 @@ class CompareGpuRunsTest(unittest.TestCase):
                 bad.update(mutation)
                 with self.assertRaises(COMPARE.CaptureError):
                     self.compare(cpu_arm=cpu_arm, gpu_arm=bad)
+
+    def test_valid_dense_scope_retains_qualified_kda_base(self):
+        control, candidate = self.dense_arms()
+        result = self.compare(cpu_arm=control, gpu_arm=candidate)
+        self.assertEqual(result["arms"]["cpu"]["kda_calls"], 24)
+        self.assertEqual(result["arms"]["gpu"]["value"], 3)
+        self.assertEqual(result["arms"]["gpu"]["calls"], 30)
+
+    def test_dense_scope_rejects_bad_base_or_call_shortfall(self):
+        control, candidate = self.dense_arms()
+        for mutation in ({"kda_calls": 23}, {"calls": 29}, {"fallbacks": 1}):
+            with self.subTest(mutation=mutation):
+                bad = copy.deepcopy(candidate)
+                bad.update(mutation)
+                with self.assertRaises(COMPARE.CaptureError):
+                    self.compare(cpu_arm=control, gpu_arm=bad)
 
     def test_missing_arm_metadata_is_rejected(self):
         with self.assertRaises(COMPARE.CaptureError):

@@ -33,6 +33,7 @@
  *   sweep CONTAINER ids,.. n_gen iodepth=2,4,8 [repeat]
  *   sweep CONTAINER ids,.. n_gen cache=3400,17736,23879 [repeat]
  *   sweep CONTAINER ids,.. n_gen cuda=0,1,2 [repeat]
+ *   WASTE_CUDA_KDA=1 sweep CONTAINER ids,.. n_gen cuda_dense=0,1,2,3 [repeat]
  *
  * `cache` is in MB and re-makes the expert cache in place. The trunk is what
  * a load costs, not the cache, so a budget sweep no longer needs a process
@@ -88,6 +89,42 @@ static uint64_t cuda_call_target(const waste_model *m, int n_gen)
     return calls;
 }
 
+static uint64_t cuda_dense_call_target(const waste_model *m, int scope,
+                                       int n_gen)
+{
+    uint64_t calls = 0;
+    if (scope >= 1) {
+        for (int layer = 0; layer < m->cfg.n_layers; layer++) {
+            const char *prefix = m->cfg.prefix;
+            char name[192];
+            snprintf(name, sizeof name,
+                     "%smodel.layers.%d.block_sparse_moe.gate.weight",
+                     prefix, layer);
+            if (!waste_find(m, name)) continue;
+            calls += 3;                         /* shared gate/up/down */
+            if (m->cfg.latent_dim) calls += 2; /* latent down/up */
+        }
+    }
+    if (scope >= 2) {
+        for (int layer = 0; layer < m->cfg.n_layers; layer++) {
+            if (m->cfg.kda_layer[layer]) continue;
+            calls += m->cfg.q_lora ? 2 : 1;    /* q_a/q_b or q */
+            calls += 2;                         /* kv_a and o */
+            if (m->cfg.mla_output_gate) calls++;
+        }
+    }
+    if (scope >= 3) {
+        for (int layer = 0; layer < m->cfg.n_layers; layer++) {
+            char name[192];
+            snprintf(name, sizeof name,
+                     "%smodel.layers.%d.block_sparse_moe.gate.weight",
+                     m->cfg.prefix, layer);
+            if (!waste_find(m, name)) calls += 3;
+        }
+    }
+    return calls * (uint64_t)n_gen;
+}
+
 static int write_capture(const char *dir, const char *key, int value, int rep,
                          const waste_model *m, int prompt_tokens, int n_gen,
                          const int *inputs, const int *routes,
@@ -119,6 +156,16 @@ static int write_capture(const char *dir, const char *key, int value, int rep,
         fprintf(stderr, "could not write capture manifest %s\n", manifest_path);
         return -1;
     }
+    const int dense_arm = !strcmp(key, "cuda_dense");
+    const int effective = dense_arm ? waste_model_cuda_dense_effective(m)
+                                    : waste_model_cuda_kda_effective(m);
+    const uint64_t calls = dense_arm ? waste_model_cuda_dense_calls(m)
+                                     : waste_model_cuda_kda_calls(m);
+    const uint64_t expected = dense_arm
+        ? cuda_dense_call_target(m, value, n_gen)
+        : (value ? cuda_call_target(m, n_gen) : UINT64_C(0));
+    const uint64_t kda_expected = waste_model_get_cuda_kda(m)
+        ? cuda_call_target(m, n_gen) : UINT64_C(0);
     fprintf(json,
             "{\n  \"schema\": \"waste.gpu_capture.v1\",\n"
             "  \"dtype\": \"float32-le\",\n"
@@ -127,15 +174,17 @@ static int write_capture(const char *dir, const char *key, int value, int rep,
             "  \"arm\": {\"key\": \"%s\", \"value\": %d, "
             "\"repeat\": %d, \"effective\": %d, \"fallbacks\": %" PRIu64
             ", \"calls\": %" PRIu64 ", \"expected_calls\": %" PRIu64
+            ", \"kda_mode\": %d, \"kda_effective\": %d"
+            ", \"kda_calls\": %" PRIu64
+            ", \"kda_expected_calls\": %" PRIu64
             ", \"seconds\": %.9f, \"token_hash\": \"0x%016" PRIx64
             "\", \"logit_hash\": \"0x%016" PRIx64
             "\", \"route_hash\": \"0x%016" PRIx64 "\"},\n"
             "  \"steps\": [\n",
             logits_name, m->cfg.vocab, m->cfg.top_k, key, value, rep,
-            waste_model_cuda_kda_effective(m),
-            waste_model_cuda_kda_fallbacks(m),
-            waste_model_cuda_kda_calls(m),
-            value ? cuda_call_target(m, n_gen) : UINT64_C(0), seconds,
+            effective, waste_model_cuda_kda_fallbacks(m), calls, expected,
+            waste_model_get_cuda_kda(m), waste_model_cuda_kda_effective(m),
+            waste_model_cuda_kda_calls(m), kda_expected, seconds,
             token_hash, logit_hash, route_hash);
     const int route_layers = m->cfg.n_layers - m->cfg.first_dense;
     const size_t route_stride = (size_t)route_layers * m->cfg.top_k;
@@ -179,7 +228,8 @@ int main(int argc, char **argv)
     if (argc < 5) {
         fprintf(stderr,
                 "usage: %s CONTAINER ids,.. n_gen KEY=v1,v2,.. [repeat]\n"
-                "  KEY is lookahead, iodepth, cache (MB), or cuda\n", argv[0]);
+                "  KEY is lookahead, iodepth, cache (MB), cuda, or cuda_dense\n",
+                argv[0]);
         return 2;
     }
     int ids[MAX_IDS], n = 0;
@@ -208,7 +258,8 @@ int main(int argc, char **argv)
     const int is_depth = !strcmp(key, "iodepth");
     const int is_cache = !strcmp(key, "cache");
     const int is_cuda = !strcmp(key, "cuda");
-    if (!is_look && !is_depth && !is_cache && !is_cuda) {
+    const int is_dense = !strcmp(key, "cuda_dense");
+    if (!is_look && !is_depth && !is_cache && !is_cuda && !is_dense) {
         fprintf(stderr, "unknown key %s\n", key);
         return 2;
     }
@@ -218,7 +269,7 @@ int main(int argc, char **argv)
     memset(&lo, 0, sizeof lo);
     const char *cmb = getenv("WASTE_CACHE_MB");
     const unsigned long long cache_mb = cmb ? strtoull(cmb, NULL, 10) : 0;
-    if ((is_look || is_depth || is_cuda) && cache_mb == 0) {
+    if ((is_look || is_depth || is_cuda || is_dense) && cache_mb == 0) {
         fprintf(stderr, "WASTE_CACHE_MB must be positive for %s sweeps\n", key);
         return 2;
     }
@@ -238,9 +289,15 @@ int main(int argc, char **argv)
         waste_model_free(&m);
         return 1;
     }
-    if ((is_look || is_depth || is_cuda) &&
+    if ((is_look || is_depth || is_cuda || is_dense) &&
         waste_ecache_io_threads(&m.cache) == 0) {
         fprintf(stderr, "%s sweep has no effective reader threads\n", key);
+        waste_model_free(&m);
+        return 1;
+    }
+    if (is_dense && !waste_model_get_cuda_kda(&m)) {
+        fprintf(stderr,
+                "cuda_dense sweep requires WASTE_CUDA_KDA=1 or 2\n");
         waste_model_free(&m);
         return 1;
     }
@@ -292,11 +349,11 @@ int main(int argc, char **argv)
     /* Interleaved rather than grouped: if the machine drifts over the run —
      * and it does — a grouped sweep charges the drift to the last arm and
      * an interleaved one spreads it across all of them. */
-    printf("%8s %4s %7s %3s %3s %3s %4s %7s %6s %10s %11s %9s %9s %8s %14s "
-           "%18s %18s %18s\n",
+    printf("%10s %4s %7s %3s %3s %3s %4s %7s %6s %10s %11s %9s %9s %8s %14s "
+           "%18s %18s %18s %4s %7s\n",
            key, "rep", "slots", "io", "qd", "eff", "fall", "calls", "warm",
            "seconds", "tok/s", "hits", "misses", "hit", "bytes",
-           "token_hash", "logit_hash", "route_hash");
+           "token_hash", "logit_hash", "route_hash", "deff", "dcalls");
     const uint64_t expected_cuda_calls = is_cuda
         ? cuda_call_target(&m, n_gen) : UINT64_C(0);
     for (int r = 0; r < repeat; r++) {
@@ -316,6 +373,17 @@ int main(int argc, char **argv)
                 if (waste_model_set_cuda_kda(&m, requested) ||
                     waste_model_get_cuda_kda(&m) != requested) {
                     fprintf(stderr, "cuda=%d is unavailable for this build/model\n",
+                            requested);
+                    waste_model_free(&m);
+                    return 1;
+                }
+                value = requested;
+            } else if (is_dense) {
+                const int requested = value;
+                if (waste_model_set_cuda_dense(&m, requested) ||
+                    waste_model_get_cuda_dense(&m) != requested) {
+                    fprintf(stderr,
+                            "cuda_dense=%d is unavailable for this build/model\n",
                             requested);
                     waste_model_free(&m);
                     return 1;
@@ -355,8 +423,12 @@ int main(int argc, char **argv)
             /* CUDA is a decode-only experiment. Force even a one-token
              * prompt or a one-token final chunk through CPU so the timed
              * call target and both arms begin from the same prompt state. */
-            const int decode_cuda_mode = is_cuda ? value : 0;
-            if (decode_cuda_mode) m.cuda_kda_mode = 0;
+            const int decode_cuda_mode = m.cuda_kda_mode;
+            const int decode_dense_scope = m.cuda_dense_scope;
+            if (is_cuda || is_dense) {
+                m.cuda_kda_mode = 0;
+                m.cuda_dense_scope = 0;
+            }
             const float *lg = NULL;
             for (int done = 0; done < n; ) {
                 int k = n - done;
@@ -367,7 +439,10 @@ int main(int argc, char **argv)
                 if (!lg) break;
                 done += k;
             }
-            if (decode_cuda_mode) m.cuda_kda_mode = decode_cuda_mode;
+            if (is_cuda || is_dense) {
+                m.cuda_kda_mode = decode_cuda_mode;
+                m.cuda_dense_scope = decode_dense_scope;
+            }
             if (!lg) {
                 fprintf(stderr, "prompt failed\n");
                 waste_model_free(&m);
@@ -424,17 +499,24 @@ int main(int argc, char **argv)
             const uint64_t cuda_fallbacks =
                 waste_model_cuda_kda_fallbacks(&m);
             const uint64_t cuda_calls = waste_model_cuda_kda_calls(&m);
-            printf("%8d %4d %7d %3d %3d %3d %4" PRIu64 " %7" PRIu64
+            const int dense_effective = waste_model_cuda_dense_effective(&m);
+            const uint64_t dense_calls = waste_model_cuda_dense_calls(&m);
+            const uint64_t expected_kda_calls = decode_cuda_mode
+                ? cuda_call_target(&m, n_gen) : UINT64_C(0);
+            const uint64_t expected_dense_calls = cuda_dense_call_target(
+                &m, decode_dense_scope, n_gen);
+            printf("%10d %4d %7d %3d %3d %3d %4" PRIu64 " %7" PRIu64
                    " %6d %10.6f %11.6f %9" PRIu64
                    " %9" PRIu64 " %7.2f%% %14" PRIu64 " 0x%016" PRIx64
-                   " 0x%016" PRIx64 " 0x%016" PRIx64 "\n",
+                   " 0x%016" PRIx64 " 0x%016" PRIx64 " %4d %7" PRIu64 "\n",
                    value, r + 1, m.cache.n_slots,
                    waste_ecache_io_threads(&m.cache),
                    waste_ecache_io_depth(&m.cache),
                    cuda_effective, cuda_fallbacks, cuda_calls, warmed,
                    dt, n_gen / dt,
                    h, mi, 100.0 * (double)h / (double)(h + mi ? h + mi : 1),
-                   bytes, token_hash, logit_hash, route_hash);
+                   bytes, token_hash, logit_hash, route_hash,
+                   dense_effective, dense_calls);
             fflush(stdout);
             if (capture_dir && write_capture(
                     capture_dir, key, value, r + 1, &m, n, n_gen,
@@ -456,6 +538,24 @@ int main(int argc, char **argv)
                         " (expected=%" PRIu64 ")\n",
                         value, cuda_effective, cuda_fallbacks, cuda_calls,
                         value ? expected_cuda_calls : UINT64_C(0));
+                free(capture_logits); free(capture_inputs); free(capture_routes);
+                waste_model_free(&m);
+                return 1;
+            }
+            if (is_dense &&
+                (cuda_effective != decode_cuda_mode || cuda_fallbacks != 0 ||
+                 cuda_calls != expected_kda_calls ||
+                 (value == 0 && (dense_effective != 0 || dense_calls != 0)) ||
+                 (value != 0 && (dense_effective != value ||
+                                 dense_calls != expected_dense_calls)))) {
+                fprintf(stderr,
+                        "cuda_dense=%d acceptance failed: kda=%d/%d calls=%" PRIu64
+                        "/%" PRIu64 ", dense=%d calls=%" PRIu64 "/%" PRIu64
+                        ", fallbacks=%" PRIu64 "\n",
+                        value, cuda_effective, decode_cuda_mode,
+                        cuda_calls, expected_kda_calls,
+                        dense_effective, dense_calls, expected_dense_calls,
+                        cuda_fallbacks);
                 free(capture_logits); free(capture_inputs); free(capture_routes);
                 waste_model_free(&m);
                 return 1;
