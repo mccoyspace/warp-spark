@@ -34,6 +34,8 @@
  *   sweep CONTAINER ids,.. n_gen cache=3400,17736,23879 [repeat]
  *   sweep CONTAINER ids,.. n_gen cuda=0,1,2 [repeat]
  *   WASTE_CUDA_KDA=1 sweep CONTAINER ids,.. n_gen cuda_dense=0,1,2,3 [repeat]
+ *   WASTE_CUDA_KDA=1 WASTE_CUDA_DENSE=2 \
+ *     sweep CONTAINER ids,.. n_gen cuda_vq=0,1,2 [repeat]
  *
  * `cache` is in MB and re-makes the expert cache in place. The trunk is what
  * a load costs, not the cache, so a budget sweep no longer needs a process
@@ -54,6 +56,9 @@
 #endif
 
 #include "../src/model.h"
+
+extern double waste_prof[16];
+extern uint64_t waste_prof_n[16];
 
 static double now(void)
 {
@@ -125,6 +130,47 @@ static uint64_t cuda_dense_call_target(const waste_model *m, int scope,
     return calls * (uint64_t)n_gen;
 }
 
+typedef struct {
+    uint64_t experts;
+    uint64_t applies;
+    uint64_t lut_builds;
+    uint64_t launches;
+    uint64_t syncs;
+} cuda_vq_target;
+
+static uint64_t cuda_vq_moe_layer_count(const waste_model *m)
+{
+    uint64_t layers = 0;
+    for (int layer = 0; layer < m->cfg.n_layers; layer++) {
+        char name[192];
+        snprintf(name, sizeof name,
+                 "%smodel.layers.%d.block_sparse_moe.gate.weight",
+                 m->cfg.prefix, layer);
+        if (waste_find(m, name)) layers++;
+    }
+    return layers;
+}
+
+static cuda_vq_target cuda_vq_targets(const waste_model *m, int mode,
+                                      int n_gen)
+{
+    cuda_vq_target target;
+    memset(&target, 0, sizeof target);
+    if (mode == 0) return target;
+
+    const uint64_t steps = (uint64_t)n_gen;
+    const uint64_t layers = cuda_vq_moe_layer_count(m);
+    target.experts = layers * (uint64_t)m->cfg.top_k * steps;
+    target.applies = target.experts * UINT64_C(3); /* gate, up, down */
+    target.lut_builds = mode == 2
+        ? layers * UINT64_C(2) * steps + target.experts : UINT64_C(0);
+    target.launches = mode == 1
+        ? target.experts * UINT64_C(2)
+        : layers * steps + target.experts * UINT64_C(3);
+    target.syncs = target.experts * UINT64_C(2);
+    return target;
+}
+
 static int write_capture(const char *dir, const char *key, int value, int rep,
                          const waste_model *m, int prompt_tokens, int n_gen,
                          const int *inputs, const int *routes,
@@ -157,15 +203,26 @@ static int write_capture(const char *dir, const char *key, int value, int rep,
         return -1;
     }
     const int dense_arm = !strcmp(key, "cuda_dense");
-    const int effective = dense_arm ? waste_model_cuda_dense_effective(m)
+    const int vq_arm = !strcmp(key, "cuda_vq");
+    const cuda_vq_target vq_expected = cuda_vq_targets(
+        m, waste_model_get_cuda_vq(m), n_gen);
+    const int effective = vq_arm ? waste_model_cuda_vq_effective(m)
+                        : dense_arm ? waste_model_cuda_dense_effective(m)
                                     : waste_model_cuda_kda_effective(m);
-    const uint64_t calls = dense_arm ? waste_model_cuda_dense_calls(m)
+    /* For the additive v1 schema's generic call fields, a VQ call is an
+     * actual CUDA launch.  The explicit semantic counters below remain the
+     * authoritative breakdown. */
+    const uint64_t calls = vq_arm ? waste_model_cuda_vq_launches(m)
+                         : dense_arm ? waste_model_cuda_dense_calls(m)
                                      : waste_model_cuda_kda_calls(m);
-    const uint64_t expected = dense_arm
-        ? cuda_dense_call_target(m, value, n_gen)
-        : (value ? cuda_call_target(m, n_gen) : UINT64_C(0));
+    const uint64_t expected = vq_arm
+        ? vq_expected.launches
+        : dense_arm ? cuda_dense_call_target(m, value, n_gen)
+                    : (value ? cuda_call_target(m, n_gen) : UINT64_C(0));
     const uint64_t kda_expected = waste_model_get_cuda_kda(m)
         ? cuda_call_target(m, n_gen) : UINT64_C(0);
+    const uint64_t dense_expected = cuda_dense_call_target(
+        m, waste_model_get_cuda_dense(m), n_gen);
     fprintf(json,
             "{\n  \"schema\": \"waste.gpu_capture.v1\",\n"
             "  \"dtype\": \"float32-le\",\n"
@@ -177,6 +234,20 @@ static int write_capture(const char *dir, const char *key, int value, int rep,
             ", \"kda_mode\": %d, \"kda_effective\": %d"
             ", \"kda_calls\": %" PRIu64
             ", \"kda_expected_calls\": %" PRIu64
+            ", \"dense_scope\": %d, \"dense_effective\": %d"
+            ", \"dense_calls\": %" PRIu64
+            ", \"dense_expected_calls\": %" PRIu64
+            ", \"vq_mode\": %d, \"vq_effective\": %d"
+            ", \"vq_experts\": %" PRIu64
+            ", \"vq_expected_experts\": %" PRIu64
+            ", \"vq_applies\": %" PRIu64
+            ", \"vq_expected_applies\": %" PRIu64
+            ", \"vq_lut_builds\": %" PRIu64
+            ", \"vq_expected_lut_builds\": %" PRIu64
+            ", \"vq_launches\": %" PRIu64
+            ", \"vq_expected_launches\": %" PRIu64
+            ", \"vq_syncs\": %" PRIu64
+            ", \"vq_expected_syncs\": %" PRIu64
             ", \"seconds\": %.9f, \"token_hash\": \"0x%016" PRIx64
             "\", \"logit_hash\": \"0x%016" PRIx64
             "\", \"route_hash\": \"0x%016" PRIx64 "\"},\n"
@@ -184,7 +255,16 @@ static int write_capture(const char *dir, const char *key, int value, int rep,
             logits_name, m->cfg.vocab, m->cfg.top_k, key, value, rep,
             effective, waste_model_cuda_kda_fallbacks(m), calls, expected,
             waste_model_get_cuda_kda(m), waste_model_cuda_kda_effective(m),
-            waste_model_cuda_kda_calls(m), kda_expected, seconds,
+            waste_model_cuda_kda_calls(m), kda_expected,
+            waste_model_get_cuda_dense(m),
+            waste_model_cuda_dense_effective(m),
+            waste_model_cuda_dense_calls(m), dense_expected,
+            waste_model_get_cuda_vq(m), waste_model_cuda_vq_effective(m),
+            waste_model_cuda_vq_experts(m), vq_expected.experts,
+            waste_model_cuda_vq_applies(m), vq_expected.applies,
+            waste_model_cuda_vq_lut_builds(m), vq_expected.lut_builds,
+            waste_model_cuda_vq_launches(m), vq_expected.launches,
+            waste_model_cuda_vq_syncs(m), vq_expected.syncs, seconds,
             token_hash, logit_hash, route_hash);
     const int route_layers = m->cfg.n_layers - m->cfg.first_dense;
     const size_t route_stride = (size_t)route_layers * m->cfg.top_k;
@@ -228,7 +308,8 @@ int main(int argc, char **argv)
     if (argc < 5) {
         fprintf(stderr,
                 "usage: %s CONTAINER ids,.. n_gen KEY=v1,v2,.. [repeat]\n"
-                "  KEY is lookahead, iodepth, cache (MB), cuda, or cuda_dense\n",
+                "  KEY is lookahead, iodepth, cache (MB), cuda, cuda_dense, "
+                "or cuda_vq\n",
                 argv[0]);
         return 2;
     }
@@ -259,7 +340,9 @@ int main(int argc, char **argv)
     const int is_cache = !strcmp(key, "cache");
     const int is_cuda = !strcmp(key, "cuda");
     const int is_dense = !strcmp(key, "cuda_dense");
-    if (!is_look && !is_depth && !is_cache && !is_cuda && !is_dense) {
+    const int is_vq = !strcmp(key, "cuda_vq");
+    if (!is_look && !is_depth && !is_cache && !is_cuda && !is_dense &&
+        !is_vq) {
         fprintf(stderr, "unknown key %s\n", key);
         return 2;
     }
@@ -269,7 +352,8 @@ int main(int argc, char **argv)
     memset(&lo, 0, sizeof lo);
     const char *cmb = getenv("WASTE_CACHE_MB");
     const unsigned long long cache_mb = cmb ? strtoull(cmb, NULL, 10) : 0;
-    if ((is_look || is_depth || is_cuda || is_dense) && cache_mb == 0) {
+    if ((is_look || is_depth || is_cuda || is_dense || is_vq) &&
+        cache_mb == 0) {
         fprintf(stderr, "WASTE_CACHE_MB must be positive for %s sweeps\n", key);
         return 2;
     }
@@ -289,7 +373,7 @@ int main(int argc, char **argv)
         waste_model_free(&m);
         return 1;
     }
-    if ((is_look || is_depth || is_cuda || is_dense) &&
+    if ((is_look || is_depth || is_cuda || is_dense || is_vq) &&
         waste_ecache_io_threads(&m.cache) == 0) {
         fprintf(stderr, "%s sweep has no effective reader threads\n", key);
         waste_model_free(&m);
@@ -298,6 +382,14 @@ int main(int argc, char **argv)
     if (is_dense && !waste_model_get_cuda_kda(&m)) {
         fprintf(stderr,
                 "cuda_dense sweep requires WASTE_CUDA_KDA=1 or 2\n");
+        waste_model_free(&m);
+        return 1;
+    }
+    if (is_vq && (waste_model_get_cuda_kda(&m) != 1 ||
+                  waste_model_get_cuda_dense(&m) != 2)) {
+        fprintf(stderr,
+                "cuda_vq sweep requires WASTE_CUDA_KDA=1 and "
+                "WASTE_CUDA_DENSE=2\n");
         waste_model_free(&m);
         return 1;
     }
@@ -350,10 +442,11 @@ int main(int argc, char **argv)
      * and it does — a grouped sweep charges the drift to the last arm and
      * an interleaved one spreads it across all of them. */
     printf("%10s %4s %7s %3s %3s %3s %4s %7s %6s %10s %11s %9s %9s %8s %14s "
-           "%18s %18s %18s %4s %7s\n",
+           "%18s %18s %18s %4s %7s %4s %9s %9s %9s %9s %9s\n",
            key, "rep", "slots", "io", "qd", "eff", "fall", "calls", "warm",
            "seconds", "tok/s", "hits", "misses", "hit", "bytes",
-           "token_hash", "logit_hash", "route_hash", "deff", "dcalls");
+           "token_hash", "logit_hash", "route_hash", "deff", "dcalls",
+           "veff", "vexperts", "vapplies", "vluts", "vlaunch", "vsync");
     const uint64_t expected_cuda_calls = is_cuda
         ? cuda_call_target(&m, n_gen) : UINT64_C(0);
     for (int r = 0; r < repeat; r++) {
@@ -384,6 +477,17 @@ int main(int argc, char **argv)
                     waste_model_get_cuda_dense(&m) != requested) {
                     fprintf(stderr,
                             "cuda_dense=%d is unavailable for this build/model\n",
+                            requested);
+                    waste_model_free(&m);
+                    return 1;
+                }
+                value = requested;
+            } else if (is_vq) {
+                const int requested = value;
+                if (waste_model_set_cuda_vq(&m, requested) ||
+                    waste_model_get_cuda_vq(&m) != requested) {
+                    fprintf(stderr,
+                            "cuda_vq=%d is unavailable for this build/model\n",
                             requested);
                     waste_model_free(&m);
                     return 1;
@@ -425,9 +529,11 @@ int main(int argc, char **argv)
              * call target and both arms begin from the same prompt state. */
             const int decode_cuda_mode = m.cuda_kda_mode;
             const int decode_dense_scope = m.cuda_dense_scope;
-            if (is_cuda || is_dense) {
+            const int decode_vq_mode = m.cuda_vq_mode;
+            if (is_cuda || is_dense || is_vq) {
                 m.cuda_kda_mode = 0;
                 m.cuda_dense_scope = 0;
+                m.cuda_vq_mode = 0;
             }
             const float *lg = NULL;
             for (int done = 0; done < n; ) {
@@ -439,9 +545,10 @@ int main(int argc, char **argv)
                 if (!lg) break;
                 done += k;
             }
-            if (is_cuda || is_dense) {
+            if (is_cuda || is_dense || is_vq) {
                 m.cuda_kda_mode = decode_cuda_mode;
                 m.cuda_dense_scope = decode_dense_scope;
+                m.cuda_vq_mode = decode_vq_mode;
             }
             if (!lg) {
                 fprintf(stderr, "prompt failed\n");
@@ -462,6 +569,11 @@ int main(int argc, char **argv)
             logit_hash = hash_bytes(logit_hash, lg,
                                     (size_t)m.cfg.vocab * sizeof *lg);
             int routed[WASTE_MAX_LAYERS * 64];
+            const int profile = getenv("WASTE_PROFILE") != NULL;
+            if (profile) {
+                memset(waste_prof, 0, sizeof(double) * 16);
+                memset(waste_prof_n, 0, sizeof(uint64_t) * 16);
+            }
             const double s = now();
             for (int i = 0; i < n_gen; i++) {
                 token_hash = hash_bytes(token_hash, &cur, sizeof cur);
@@ -501,14 +613,25 @@ int main(int argc, char **argv)
             const uint64_t cuda_calls = waste_model_cuda_kda_calls(&m);
             const int dense_effective = waste_model_cuda_dense_effective(&m);
             const uint64_t dense_calls = waste_model_cuda_dense_calls(&m);
+            const int vq_effective = waste_model_cuda_vq_effective(&m);
+            const uint64_t vq_experts = waste_model_cuda_vq_experts(&m);
+            const uint64_t vq_applies = waste_model_cuda_vq_applies(&m);
+            const uint64_t vq_lut_builds =
+                waste_model_cuda_vq_lut_builds(&m);
+            const uint64_t vq_launches = waste_model_cuda_vq_launches(&m);
+            const uint64_t vq_syncs = waste_model_cuda_vq_syncs(&m);
             const uint64_t expected_kda_calls = decode_cuda_mode
                 ? cuda_call_target(&m, n_gen) : UINT64_C(0);
             const uint64_t expected_dense_calls = cuda_dense_call_target(
                 &m, decode_dense_scope, n_gen);
+            const cuda_vq_target expected_vq = cuda_vq_targets(
+                &m, decode_vq_mode, n_gen);
             printf("%10d %4d %7d %3d %3d %3d %4" PRIu64 " %7" PRIu64
                    " %6d %10.6f %11.6f %9" PRIu64
                    " %9" PRIu64 " %7.2f%% %14" PRIu64 " 0x%016" PRIx64
-                   " 0x%016" PRIx64 " 0x%016" PRIx64 " %4d %7" PRIu64 "\n",
+                   " 0x%016" PRIx64 " 0x%016" PRIx64 " %4d %7" PRIu64
+                   " %4d %9" PRIu64 " %9" PRIu64 " %9" PRIu64
+                   " %9" PRIu64 " %9" PRIu64 "\n",
                    value, r + 1, m.cache.n_slots,
                    waste_ecache_io_threads(&m.cache),
                    waste_ecache_io_depth(&m.cache),
@@ -516,7 +639,15 @@ int main(int argc, char **argv)
                    dt, n_gen / dt,
                    h, mi, 100.0 * (double)h / (double)(h + mi ? h + mi : 1),
                    bytes, token_hash, logit_hash, route_hash,
-                   dense_effective, dense_calls);
+                   dense_effective, dense_calls, vq_effective, vq_experts,
+                   vq_applies, vq_lut_builds, vq_launches, vq_syncs);
+            if (profile) {
+                printf("profile %s=%d rep=%d", key, value, r + 1);
+                for (int p = 0; p < 16; p++)
+                    printf(" p%d=%.9f n%d=%" PRIu64,
+                           p, waste_prof[p], p, waste_prof_n[p]);
+                putchar('\n');
+            }
             fflush(stdout);
             if (capture_dir && write_capture(
                     capture_dir, key, value, r + 1, &m, n, n_gen,
@@ -556,6 +687,43 @@ int main(int argc, char **argv)
                         cuda_calls, expected_kda_calls,
                         dense_effective, dense_calls, expected_dense_calls,
                         cuda_fallbacks);
+                free(capture_logits); free(capture_inputs); free(capture_routes);
+                waste_model_free(&m);
+                return 1;
+            }
+            if (is_vq &&
+                (cuda_effective != decode_cuda_mode ||
+                 decode_cuda_mode != 1 || cuda_fallbacks != 0 ||
+                 cuda_calls != expected_kda_calls ||
+                 dense_effective != decode_dense_scope ||
+                 decode_dense_scope != 2 ||
+                 dense_calls != expected_dense_calls ||
+                 vq_effective != decode_vq_mode ||
+                 decode_vq_mode != value ||
+                 vq_experts != expected_vq.experts ||
+                 vq_applies != expected_vq.applies ||
+                 vq_lut_builds != expected_vq.lut_builds ||
+                 vq_launches != expected_vq.launches ||
+                 vq_syncs != expected_vq.syncs)) {
+                fprintf(stderr,
+                        "cuda_vq=%d acceptance failed: kda=%d/%d calls=%" PRIu64
+                        "/%" PRIu64 ", dense=%d/%d calls=%" PRIu64 "/%" PRIu64
+                        ", vq=%d/%d experts=%" PRIu64 "/%" PRIu64
+                        " applies=%" PRIu64 "/%" PRIu64
+                        " luts=%" PRIu64 "/%" PRIu64
+                        " launches=%" PRIu64 "/%" PRIu64
+                        " syncs=%" PRIu64 "/%" PRIu64
+                        ", fallbacks=%" PRIu64 "\n",
+                        value, cuda_effective, decode_cuda_mode,
+                        cuda_calls, expected_kda_calls,
+                        dense_effective, decode_dense_scope,
+                        dense_calls, expected_dense_calls,
+                        vq_effective, decode_vq_mode,
+                        vq_experts, expected_vq.experts,
+                        vq_applies, expected_vq.applies,
+                        vq_lut_builds, expected_vq.lut_builds,
+                        vq_launches, expected_vq.launches,
+                        vq_syncs, expected_vq.syncs, cuda_fallbacks);
                 free(capture_logits); free(capture_inputs); free(capture_routes);
                 waste_model_free(&m);
                 return 1;

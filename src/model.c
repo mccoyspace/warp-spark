@@ -32,10 +32,27 @@
 #include "waste_backend.h"
 #include "waste_format.h"
 
+static int bank_fetch(void *user, int layer, int expert, uint8_t *dst);
+static void vq_build_lut(waste_model *m, float *lut, int cb_base,
+                         const float *x, int N, int stages, int entries,
+                         int vec_dim);
+
 #if defined(WASTE_ENABLE_CUDA)
 int  waste_cuda_q4_matvec(waste_model *m, float *y,
                           const waste_tensor *tensor, const float *x,
                           int out, int in, int mode);
+int  waste_cuda_vq_init(waste_model *m);
+int  waste_cuda_vq_prepare_pair(waste_model *m, int mode, const float *x,
+                                const float *gate_lut, const float *up_lut,
+                                int cb_base, int cols);
+int  waste_cuda_vq_apply_pair(waste_model *m, float *gate_y, float *up_y,
+                              const uint8_t *gate_idx,
+                              const uint8_t *up_idx,
+                              const uint16_t *scale, int rows, int cols);
+int  waste_cuda_vq_apply_down(waste_model *m, int mode, float *y,
+                              const uint8_t *idx, const uint16_t *scale,
+                              const float *x, const float *cpu_lut,
+                              int cb_base, int rows, int cols);
 void waste_cuda_kda_free(waste_model *m);
 #endif
 
@@ -385,11 +402,12 @@ static void matvec_t(waste_model *m, float *y, const waste_tensor *t,
 #if defined(WASTE_ENABLE_CUDA)
 static int cuda_projection_failed(waste_model *m, const char *scope)
 {
-    fprintf(stderr, "waste: CUDA %s Q4 projection failed\n", scope);
+    fprintf(stderr, "waste: CUDA %s operation failed\n", scope);
     m->cuda_kda_failed = 1;
     m->cuda_kda_state_dirty = 1;
     m->cuda_kda_effective = 0;
     m->cuda_dense_effective = 0;
+    m->cuda_vq_effective = 0;
     m->cuda_kda_fallbacks++;
     return -1;
 }
@@ -517,6 +535,7 @@ fail:
     m->cuda_kda_failed = 1;
     m->cuda_kda_effective = 0;
     m->cuda_dense_effective = 0;
+    m->cuda_vq_effective = 0;
     m->cuda_kda_fallbacks++;
     return -1;
 }
@@ -603,6 +622,114 @@ fail:
     m->cuda_kda_failed = 1;
     m->cuda_kda_effective = 0;
     m->cuda_dense_effective = 0;
+    m->cuda_vq_effective = 0;
+    m->cuda_kda_fallbacks++;
+    return -1;
+}
+
+/* Sprint 13 is deliberately a K3 VQ3R experiment, not a generic promise
+ * about every vector-quantized container. Keep its accepted dense baseline
+ * and exact blocked layout explicit so an opt-in cannot silently execute a
+ * different record geometry. */
+static int cuda_vq_preflight(waste_model *m, int mode)
+{
+    if (!mode) return 0;
+    const waste_config *c = &m->cfg;
+    if (mode < 1 || mode > 2 || m->cuda_kda_mode != 1 ||
+        m->cuda_dense_scope != 2) {
+        fprintf(stderr,
+                "waste: CUDA VQ requires CUDA KDA mode 1 and dense scope 2\n");
+        goto fail;
+    }
+    if (m->stages != 3 || m->vec_dim != 8 || m->cb_entries != 256 ||
+        m->vq_index_block != 64 || c->latent_dim != 3584 ||
+        c->moe_inter != 3072 || c->top_k != 16 || !m->codebooksT ||
+        m->n_books < 9) {
+        fprintf(stderr,
+                "waste: CUDA VQ requires K3 VQ3R 3584/3072, top-16, "
+                "index-block-64 geometry\n");
+        goto fail;
+    }
+    if (waste_cuda_vq_init(m)) {
+        fprintf(stderr, "waste: CUDA VQ initialization failed\n");
+        goto fail;
+    }
+    if (m->cuda_vq_preflight_modes & (1 << mode)) return 0;
+
+    /* Exercise the actual HMM record, both return handoffs and the selected
+     * LUT path before a token can mutate recurrent state. This direct read
+     * is setup work rather than cache demand and its counter is restored. */
+    {
+        int L = -1;
+        for (int i = 0; i < c->n_layers; i++)
+            if (m->bank[i].fd >= 0 && m->bank[i].rec_bytes > 0) {
+                L = i;
+                break;
+            }
+        if (L < 0) {
+            fprintf(stderr, "waste: CUDA VQ found no expert bank to warm\n");
+            goto fail;
+        }
+        const uint64_t reads_before = m->expert_reads;
+        if (bank_fetch(m, L, 0, m->miss_buf)) goto fail;
+        m->expert_reads = reads_before;
+        const waste_expert_hdr *h = (const waste_expert_hdr *)m->miss_buf;
+        if (h->fmt != WQ_VQ3R) {
+            fprintf(stderr, "waste: CUDA VQ requires VQ3R expert records\n");
+            goto fail;
+        }
+        const int lat = c->latent_dim;
+        const int inter = c->moe_inter;
+        const int lut_sz =
+            ((c->hidden > lat ? c->hidden : lat) / m->vec_dim) *
+            m->stages * m->cb_entries;
+        float *gate = m->ff;
+        float *up = gate + inter;
+        float *down = m->e_gate;
+        float *gate_lut = m->lut;
+        float *up_lut = gate_lut + lut_sz;
+        float *down_lut = up_lut + lut_sz;
+        const uint8_t *rec = m->miss_buf;
+        const uint16_t *scale =
+            (const uint16_t *)(rec + h->chan_corr_off);
+        if (mode == 1) {
+            vq_build_lut(m, gate_lut, h->codebook_id, m->x, lat,
+                         m->stages, m->cb_entries, m->vec_dim);
+            vq_build_lut(m, up_lut, h->codebook_id + m->stages,
+                         m->x, lat, m->stages, m->cb_entries, m->vec_dim);
+        }
+        if (waste_cuda_vq_prepare_pair(
+                m, mode, m->x, gate_lut, up_lut, h->codebook_id, lat) ||
+            waste_cuda_vq_apply_pair(
+                m, gate, up, rec + h->gate_off, rec + h->up_off,
+                scale, inter, lat))
+            goto fail;
+        for (int i = 0; i < inter; i++)
+            gate[i] = c->act_situ
+                ? waste_situ_pair(gate[i], up[i], c->situ_beta,
+                                  c->situ_linear_beta)
+                : (gate[i] / (1.0f + expf(-gate[i]))) * up[i];
+        if (mode == 1)
+            vq_build_lut(m, down_lut, h->codebook_id + 2 * m->stages,
+                         gate, inter, m->stages, m->cb_entries, m->vec_dim);
+        if (waste_cuda_vq_apply_down(
+                m, mode, down, rec + h->down_off, scale + 2 * inter,
+                gate, mode == 1 ? down_lut : NULL,
+                h->codebook_id + 2 * m->stages, lat, inter))
+            goto fail;
+        for (int i = 0; i < inter; i++)
+            if (!isfinite(gate[i]) || !isfinite(up[i])) goto fail;
+        for (int i = 0; i < lat; i++)
+            if (!isfinite(down[i])) goto fail;
+    }
+    m->cuda_vq_preflight_modes |= 1 << mode;
+    return 0;
+
+fail:
+    m->cuda_kda_failed = 1;
+    m->cuda_kda_effective = 0;
+    m->cuda_dense_effective = 0;
+    m->cuda_vq_effective = 0;
     m->cuda_kda_fallbacks++;
     return -1;
 }
@@ -1116,8 +1243,6 @@ static void cfg_from_json(waste_config *c, const js_doc *d, int cfg)
     }
 }
 
-/* Defined below, next to record_check; the cache needs it at load. */
-static int bank_fetch(void *user, int layer, int expert, uint8_t *dst);
 static void start_readers(waste_model *m);
 
 /* Wire the resident trunk. The cache is the cold part of this engine —
@@ -1175,14 +1300,23 @@ int waste_model_load(waste_model *m, const char *dir, int kv_cap,
         int mode = e ? atoi(e) : 0;
         e = getenv("WASTE_CUDA_DENSE");
         int scope = e ? atoi(e) : 0;
+        e = getenv("WASTE_CUDA_VQ");
+        int vq_mode = e ? atoi(e) : 0;
         const char *backend = getenv("WASTE_BACKEND");
-        if (backend && !strcmp(backend, "cpu")) { mode = 0; scope = 0; }
+        if (backend && !strcmp(backend, "cpu")) {
+            mode = 0;
+            scope = 0;
+            vq_mode = 0;
+        }
         if (mode < 0) mode = 0;
         if (mode > 2) mode = 2;
         if (scope < 0) scope = 0;
         if (scope > 3) scope = 3;
+        if (vq_mode < 0) vq_mode = 0;
+        if (vq_mode > 2) vq_mode = 2;
         m->cuda_kda_mode = mode;
         m->cuda_dense_scope = scope;
+        m->cuda_vq_mode = vq_mode;
     }
 #endif
     m->kv_cap = kv_cap;
@@ -1258,6 +1392,7 @@ int waste_model_load(waste_model *m, const char *dir, int kv_cap,
     m->stages = (int)js_int(&d, js_get(&d, eq, "stages"), 3);
     m->vec_dim = (int)js_int(&d, js_get(&d, eq, "vec_dim"), 8);
     m->cb_entries = (int)js_int(&d, js_get(&d, eq, "entries"), 256);
+    m->vq_index_block = (int)js_int(&d, js_get(&d, eq, "index_block"), 0);
     /* cfg_sane covers `config`; this block is the other half of the
      * manifest and nothing checked it. All three size the LUT and two of
      * them divide: `"vec_dim": 0` was a division by zero in three places,
@@ -1560,6 +1695,8 @@ int waste_model_load(waste_model *m, const char *dir, int kv_cap,
         return -1;
     if (m->cuda_dense_scope &&
         cuda_dense_preflight(m, m->cuda_dense_scope)) return -1;
+    if (m->cuda_vq_mode &&
+        cuda_vq_preflight(m, m->cuda_vq_mode)) return -1;
 #endif
     return 0;
 }
@@ -2611,29 +2748,101 @@ static int moe_layer(waste_model *m, int L, const float *in, float *out, int *ro
          * step report it; m->read_error is what carries the reason out. */
         if (!rec) break;
         const waste_expert_hdr *h = (const waste_expert_hdr *)rec;
+#if defined(WASTE_ENABLE_CUDA)
+        if (m->cuda_vq_mode && h->fmt != WQ_VQ3R)
+            return cuda_projection_failed(m, "VQ3R record validation");
+#endif
         const uint16_t *sc = (const uint16_t *)(rec + h->chan_corr_off);
 
         PROF_START(P_EMM);
         /* gate/up see the same input and the same per-layer codebooks for
          * every routed expert, so their tables are built once per token. */
         if (!lut_ready) {
-            vq_build_lut(m, lut_gate, h->codebook_id + 0 * m->stages,
-                         xin, lat, m->stages, m->cb_entries, m->vec_dim);
-            vq_build_lut(m, lut_up, h->codebook_id + 1 * m->stages,
-                         xin, lat, m->stages, m->cb_entries, m->vec_dim);
+            if (m->cuda_vq_mode != 2) {
+                vq_build_lut(m, lut_gate, h->codebook_id + 0 * m->stages,
+                             xin, lat, m->stages, m->cb_entries, m->vec_dim);
+                vq_build_lut(m, lut_up, h->codebook_id + 1 * m->stages,
+                             xin, lat, m->stages, m->cb_entries, m->vec_dim);
+            }
+#if defined(WASTE_ENABLE_CUDA)
+            if (m->cuda_vq_mode) {
+                if (waste_cuda_vq_prepare_pair(
+                        m, m->cuda_vq_mode, xin, lut_gate, lut_up,
+                        h->codebook_id, lat))
+                    return cuda_projection_failed(m, "VQ gate/up prepare");
+                if (m->cuda_vq_mode == 2) {
+                    m->cuda_vq_lut_builds += 2;
+                    m->cuda_vq_launches++;
+                }
+            }
+#endif
             lut_ready = 1;
         }
-        vq_apply(m, ga, rec + h->gate_off, sc, inter, lat, lut_gate);
-        vq_apply(m, ub, rec + h->up_off, sc + inter, inter, lat, lut_up);
+#if defined(WASTE_ENABLE_CUDA)
+        if (m->cuda_vq_mode) {
+            {
+                PROF_START(P_LUTA);
+                const int failed = waste_cuda_vq_apply_pair(
+                    m, ga, ub, rec + h->gate_off, rec + h->up_off,
+                    sc, inter, lat);
+                PROF_END(P_LUTA);
+                if (failed)
+                    return cuda_projection_failed(m, "VQ gate/up apply");
+            }
+            m->cuda_vq_launches++;
+            m->cuda_vq_syncs++;
+        } else
+#endif
+        {
+            vq_apply(m, ga, rec + h->gate_off, sc, inter, lat, lut_gate);
+            vq_apply(m, ub, rec + h->up_off, sc + inter, inter, lat, lut_up);
+        }
         if (c->act_situ)
             for (int i = 0; i < inter; i++)
                 ga[i] = waste_situ_pair(ga[i], ub[i], c->situ_beta, c->situ_linear_beta);
         else
             for (int i = 0; i < inter; i++) ga[i] = silu(ga[i]) * ub[i];
-        vq_matvec(m, acc, rec + h->down_off, sc + 2 * inter, ga, lat, inter,
-                  h->codebook_id + 2 * m->stages, lut_down);
+#if defined(WASTE_ENABLE_CUDA)
+        if (m->cuda_vq_mode) {
+            if (m->cuda_vq_mode == 1)
+                vq_build_lut(m, lut_down,
+                             h->codebook_id + 2 * m->stages,
+                             ga, inter, m->stages, m->cb_entries,
+                             m->vec_dim);
+            {
+                PROF_START(P_LUTA);
+                const int failed = waste_cuda_vq_apply_down(
+                    m, m->cuda_vq_mode, acc, rec + h->down_off,
+                    sc + 2 * inter, ga,
+                    m->cuda_vq_mode == 1 ? lut_down : NULL,
+                    h->codebook_id + 2 * m->stages, lat, inter);
+                PROF_END(P_LUTA);
+                if (failed)
+                    return cuda_projection_failed(m, "VQ down apply");
+            }
+            if (m->cuda_vq_mode == 2) {
+                m->cuda_vq_lut_builds++;
+                m->cuda_vq_launches += 2;
+            } else {
+                m->cuda_vq_launches++;
+            }
+            m->cuda_vq_syncs++;
+        } else
+#endif
+        {
+            vq_matvec(m, acc, rec + h->down_off, sc + 2 * inter,
+                      ga, lat, inter,
+                      h->codebook_id + 2 * m->stages, lut_down);
+        }
         const float wj = w[j];
         for (int i = 0; i < lat; i++) ysum[i] += wj * acc[i];
+#if defined(WASTE_ENABLE_CUDA)
+        if (m->cuda_vq_mode) {
+            m->cuda_vq_effective = m->cuda_vq_mode;
+            m->cuda_vq_experts++;
+            m->cuda_vq_applies += 3;
+        }
+#endif
         PROF_END(P_EMM);
     }
     if (c->latent_dim) {
@@ -2953,8 +3162,14 @@ void waste_model_reset(waste_model *m)
      * CUDA. CPU mode can still be selected for a reset model. */
     m->cuda_kda_effective = 0;
     m->cuda_dense_effective = 0;
+    m->cuda_vq_effective = 0;
     m->cuda_kda_calls = 0;
     m->cuda_dense_calls = 0;
+    m->cuda_vq_experts = 0;
+    m->cuda_vq_applies = 0;
+    m->cuda_vq_lut_builds = 0;
+    m->cuda_vq_launches = 0;
+    m->cuda_vq_syncs = 0;
     m->cuda_kda_state_dirty = 0;
     if (!m->cuda_kda_failed) m->cuda_kda_fallbacks = 0;
 }
@@ -2977,7 +3192,8 @@ int waste_model_set_cuda_kda(waste_model *m, int mode)
 #if defined(WASTE_ENABLE_CUDA)
     const char *backend = getenv("WASTE_BACKEND");
     if (mode && backend && !strcmp(backend, "cpu")) return -1;
-    if (!mode && m->cuda_dense_scope) return -1;
+    if (!mode && (m->cuda_dense_scope || m->cuda_vq_mode)) return -1;
+    if (m->cuda_vq_mode && mode != 1) return -1;
     if (mode && m->cuda_kda_failed) return -1;
     m->cuda_kda_mode = mode;
     m->cuda_kda_effective = 0;
@@ -3018,6 +3234,7 @@ int waste_model_set_cuda_dense(waste_model *m, int scope)
     const char *backend = getenv("WASTE_BACKEND");
     if (scope && backend && !strcmp(backend, "cpu")) return -1;
     if (scope && (!m->cuda_kda_mode || m->cuda_kda_failed)) return -1;
+    if (m->cuda_vq_mode && scope != 2) return -1;
     m->cuda_dense_scope = scope;
     m->cuda_dense_effective = 0;
     m->cuda_dense_calls = 0;
@@ -3043,6 +3260,66 @@ int waste_model_cuda_dense_effective(const waste_model *m)
 uint64_t waste_model_cuda_dense_calls(const waste_model *m)
 {
     return m ? m->cuda_dense_calls : 0;
+}
+
+int waste_model_set_cuda_vq(waste_model *m, int mode)
+{
+    if (!m || mode < 0 || mode > 2) return -1;
+#if defined(WASTE_ENABLE_CUDA)
+    const char *backend = getenv("WASTE_BACKEND");
+    if (mode && backend && !strcmp(backend, "cpu")) return -1;
+    if (mode && (m->cuda_kda_mode != 1 || m->cuda_dense_scope != 2 ||
+                 m->cuda_kda_failed))
+        return -1;
+    m->cuda_vq_mode = mode;
+    m->cuda_vq_effective = 0;
+    m->cuda_vq_experts = 0;
+    m->cuda_vq_applies = 0;
+    m->cuda_vq_lut_builds = 0;
+    m->cuda_vq_launches = 0;
+    m->cuda_vq_syncs = 0;
+    if (!m->cuda_kda_failed) m->cuda_kda_fallbacks = 0;
+    if (mode && cuda_vq_preflight(m, mode)) return -1;
+    return 0;
+#else
+    m->cuda_vq_mode = 0;
+    return mode ? -1 : 0;
+#endif
+}
+
+int waste_model_get_cuda_vq(const waste_model *m)
+{
+    return m ? m->cuda_vq_mode : 0;
+}
+
+int waste_model_cuda_vq_effective(const waste_model *m)
+{
+    return m ? m->cuda_vq_effective : 0;
+}
+
+uint64_t waste_model_cuda_vq_experts(const waste_model *m)
+{
+    return m ? m->cuda_vq_experts : 0;
+}
+
+uint64_t waste_model_cuda_vq_applies(const waste_model *m)
+{
+    return m ? m->cuda_vq_applies : 0;
+}
+
+uint64_t waste_model_cuda_vq_lut_builds(const waste_model *m)
+{
+    return m ? m->cuda_vq_lut_builds : 0;
+}
+
+uint64_t waste_model_cuda_vq_launches(const waste_model *m)
+{
+    return m ? m->cuda_vq_launches : 0;
+}
+
+uint64_t waste_model_cuda_vq_syncs(const waste_model *m)
+{
+    return m ? m->cuda_vq_syncs : 0;
 }
 
 /* Read-ahead. The internal SSD reaches 12.89 GB/s at queue depth 2 against
@@ -3689,7 +3966,7 @@ const float *waste_model_prefill(waste_model *m, const int *tokens, int n,
     const waste_config *c = &m->cfg;
     const int hid = c->hidden;
     if (m->cuda_kda_state_dirty ||
-        ((m->cuda_kda_mode || m->cuda_dense_scope) &&
+        ((m->cuda_kda_mode || m->cuda_dense_scope || m->cuda_vq_mode) &&
          m->cuda_kda_failed)) return NULL;
     if (n <= 0) return m->logits;
     if (n == 1) return waste_model_step(m, tokens[0], pos0, NULL);
@@ -3838,7 +4115,7 @@ const float *waste_model_step(waste_model *m, int token, int pos, int *routed)
     const waste_config *c = &m->cfg;
     const int hid = c->hidden;
     if (m->cuda_kda_state_dirty ||
-        ((m->cuda_kda_mode || m->cuda_dense_scope) &&
+        ((m->cuda_kda_mode || m->cuda_dense_scope || m->cuda_vq_mode) &&
          m->cuda_kda_failed)) return NULL;
     {   /* see waste_model_prefill */
         const int cm = waste_model_ctx_max(m);
@@ -3869,7 +4146,7 @@ const float *waste_model_step(waste_model *m, int token, int pos, int *routed)
 
     for (int L = 0; L < c->n_layers; L++) {
         if (m->read_error ||
-            ((m->cuda_kda_mode || m->cuda_dense_scope) &&
+            ((m->cuda_kda_mode || m->cuda_dense_scope || m->cuda_vq_mode) &&
              m->cuda_kda_failed))
             break;                       /* see waste_model_prefill */
         char b[128];
@@ -3950,7 +4227,8 @@ const float *waste_model_step(waste_model *m, int token, int pos, int *routed)
             if (df) { fwrite(m->x, sizeof(float), (size_t)hid, df); fclose(df); }
         }
     }
-    if ((m->cuda_kda_mode || m->cuda_dense_scope) && m->cuda_kda_failed) {
+    if ((m->cuda_kda_mode || m->cuda_dense_scope || m->cuda_vq_mode) &&
+        m->cuda_kda_failed) {
         free(resid);
         free(norm);
         return NULL;
@@ -3970,7 +4248,7 @@ const float *waste_model_step(waste_model *m, int token, int pos, int *routed)
     free(resid);
     free(norm);
     return (m->read_error ||
-            ((m->cuda_kda_mode || m->cuda_dense_scope) &&
+            ((m->cuda_kda_mode || m->cuda_dense_scope || m->cuda_vq_mode) &&
              m->cuda_kda_failed))
          ? NULL : m->logits;
 }

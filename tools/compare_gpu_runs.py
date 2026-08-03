@@ -100,6 +100,22 @@ class Arm:
     kda_effective: int | None = None
     kda_calls: int | None = None
     kda_expected_calls: int | None = None
+    dense_scope: int | None = None
+    dense_effective: int | None = None
+    dense_calls: int | None = None
+    dense_expected_calls: int | None = None
+    vq_mode: int | None = None
+    vq_effective: int | None = None
+    vq_experts: int | None = None
+    vq_expected_experts: int | None = None
+    vq_applies: int | None = None
+    vq_expected_applies: int | None = None
+    vq_lut_builds: int | None = None
+    vq_expected_lut_builds: int | None = None
+    vq_launches: int | None = None
+    vq_expected_launches: int | None = None
+    vq_syncs: int | None = None
+    vq_expected_syncs: int | None = None
 
 
 @dataclass(frozen=True)
@@ -186,6 +202,11 @@ def _integer(
     return value
 
 
+def _optional_arm_integer(raw_arm: dict[str, Any], key: str, path: str) -> int | None:
+    value = raw_arm.get(key)
+    return None if value is None else _integer(value, f"{path}: arm.{key}")
+
+
 def load_capture(path: str) -> Capture:
     try:
         with open(path, encoding="utf-8") as stream:
@@ -256,12 +277,45 @@ def load_capture(path: str) -> Capture:
                 None if kda_expected_calls is None else _integer(
                     kda_expected_calls, f"{path}: arm.kda_expected_calls")
             ),
+            dense_scope=_optional_arm_integer(raw_arm, "dense_scope", path),
+            dense_effective=_optional_arm_integer(
+                raw_arm, "dense_effective", path
+            ),
+            dense_calls=_optional_arm_integer(raw_arm, "dense_calls", path),
+            dense_expected_calls=_optional_arm_integer(
+                raw_arm, "dense_expected_calls", path
+            ),
+            vq_mode=_optional_arm_integer(raw_arm, "vq_mode", path),
+            vq_effective=_optional_arm_integer(raw_arm, "vq_effective", path),
+            vq_experts=_optional_arm_integer(raw_arm, "vq_experts", path),
+            vq_expected_experts=_optional_arm_integer(
+                raw_arm, "vq_expected_experts", path
+            ),
+            vq_applies=_optional_arm_integer(raw_arm, "vq_applies", path),
+            vq_expected_applies=_optional_arm_integer(
+                raw_arm, "vq_expected_applies", path
+            ),
+            vq_lut_builds=_optional_arm_integer(
+                raw_arm, "vq_lut_builds", path
+            ),
+            vq_expected_lut_builds=_optional_arm_integer(
+                raw_arm, "vq_expected_lut_builds", path
+            ),
+            vq_launches=_optional_arm_integer(raw_arm, "vq_launches", path),
+            vq_expected_launches=_optional_arm_integer(
+                raw_arm, "vq_expected_launches", path
+            ),
+            vq_syncs=_optional_arm_integer(raw_arm, "vq_syncs", path),
+            vq_expected_syncs=_optional_arm_integer(
+                raw_arm, "vq_expected_syncs", path
+            ),
         )
 
     raw_steps = raw.get("steps")
     if not isinstance(raw_steps, list) or not raw_steps:
         raise CaptureError(f"{path}: steps must be a non-empty list")
-    if arm is not None and arm.key in ("cuda", "cuda_dense") and len(raw_steps) < 2:
+    if (arm is not None and arm.key in ("cuda", "cuda_dense", "cuda_vq") and
+            len(raw_steps) < 2):
         raise CaptureError(f"{path}: CUDA capture must contain a decode step")
     steps = []
     for expected_index, item in enumerate(raw_steps):
@@ -306,7 +360,7 @@ def load_capture(path: str) -> Capture:
             if len(set(ids)) != len(ids):
                 raise CaptureError(f"{rwhere}.experts contains duplicate ids")
             routes.append(RouteRow(layer, ids))
-        if (arm is not None and arm.key in ("cuda", "cuda_dense") and
+        if (arm is not None and arm.key in ("cuda", "cuda_dense", "cuda_vq") and
                 expected_index > 0 and not routes):
             raise CaptureError(f"{where}.routes must contain decode route rows")
         steps.append(Step(index, position, input_token, tuple(routes)))
@@ -334,7 +388,35 @@ def _arm_dict(arm: Arm) -> dict[str, Any]:
         "kda_effective": arm.kda_effective,
         "kda_calls": arm.kda_calls,
         "kda_expected_calls": arm.kda_expected_calls,
+        "dense_scope": arm.dense_scope,
+        "dense_effective": arm.dense_effective,
+        "dense_calls": arm.dense_calls,
+        "dense_expected_calls": arm.dense_expected_calls,
+        "vq_mode": arm.vq_mode,
+        "vq_effective": arm.vq_effective,
+        "vq_experts": arm.vq_experts,
+        "vq_expected_experts": arm.vq_expected_experts,
+        "vq_applies": arm.vq_applies,
+        "vq_expected_applies": arm.vq_expected_applies,
+        "vq_lut_builds": arm.vq_lut_builds,
+        "vq_expected_lut_builds": arm.vq_expected_lut_builds,
+        "vq_launches": arm.vq_launches,
+        "vq_expected_launches": arm.vq_expected_launches,
+        "vq_syncs": arm.vq_syncs,
+        "vq_expected_syncs": arm.vq_expected_syncs,
     }
+
+
+def _vq_route_work(capture: Capture) -> tuple[int, int]:
+    """Return (MoE layer executions, routed experts) for decode rows.
+
+    Step zero is the CPU prompt result in sweep captures.  Every later route
+    row is one executed MoE layer and contains exactly ``top_k`` experts, so
+    the capture itself can independently audit the semantic CUDA counters
+    instead of trusting values emitted by the same writer.
+    """
+    layer_runs = sum(len(step.routes) for step in capture.steps[1:])
+    return layer_runs, layer_runs * capture.top_k
 
 
 def _validate_cuda_arms(cpu: Capture, gpu: Capture) -> dict[str, Any] | None:
@@ -344,6 +426,93 @@ def _validate_cuda_arms(cpu: Capture, gpu: Capture) -> dict[str, Any] | None:
         raise CaptureError(
             f"captures have different arm keys: {cpu.arm.key!r} vs {gpu.arm.key!r}"
         )
+    if cpu.arm.key == "cuda_vq":
+        counter_names = ("experts", "applies", "lut_builds", "launches", "syncs")
+        for label, arm in (("control", cpu.arm), ("candidate", gpu.arm)):
+            if (arm.kda_mode != 1 or arm.kda_effective != 1 or
+                    arm.kda_calls is None or arm.kda_expected_calls is None or
+                    arm.kda_calls != arm.kda_expected_calls or
+                    arm.kda_calls == 0):
+                raise CaptureError(
+                    f"CUDA VQ {label} has invalid KDA=1 base metadata"
+                )
+            if (arm.dense_scope != 2 or arm.dense_effective != 2 or
+                    arm.dense_calls is None or
+                    arm.dense_expected_calls is None or
+                    arm.dense_calls != arm.dense_expected_calls or
+                    arm.dense_calls == 0):
+                raise CaptureError(
+                    f"CUDA VQ {label} has invalid dense=2 base metadata"
+                )
+            if arm.fallbacks != 0:
+                raise CaptureError(
+                    f"CUDA VQ {label} reported a CUDA fallback/failure"
+                )
+            for counter in counter_names:
+                actual = getattr(arm, f"vq_{counter}")
+                expected = getattr(arm, f"vq_expected_{counter}")
+                if actual is None or expected is None or actual != expected:
+                    raise CaptureError(
+                        f"CUDA VQ {label} {counter}={actual}; expected {expected}"
+                    )
+            if (arm.value != arm.vq_mode or
+                    arm.effective != arm.vq_effective or
+                    arm.calls != arm.vq_launches or
+                    arm.expected_calls != arm.vq_expected_launches):
+                raise CaptureError(
+                    f"CUDA VQ {label} generic arm metadata disagrees with VQ metadata"
+                )
+
+        if (cpu.arm.kda_calls != gpu.arm.kda_calls or
+                cpu.arm.dense_calls != gpu.arm.dense_calls):
+            raise CaptureError("CUDA VQ captures use different base workloads")
+        if (cpu.arm.value != 0 or cpu.arm.effective != 0 or
+                cpu.arm.vq_mode != 0 or cpu.arm.vq_effective != 0 or
+                any(getattr(cpu.arm, f"vq_{name}") != 0
+                    for name in counter_names)):
+            raise CaptureError(
+                "CUDA VQ control must declare mode/effective/counters zero"
+            )
+        if (gpu.arm.value not in (1, 2) or
+                gpu.arm.effective != gpu.arm.value or
+                gpu.arm.vq_mode != gpu.arm.value or
+                gpu.arm.vq_effective != gpu.arm.value):
+            raise CaptureError(
+                "CUDA VQ candidate must have mode 1 or 2 and matching effective mode"
+            )
+        cpu_layer_runs, cpu_experts = _vq_route_work(cpu)
+        gpu_layer_runs, gpu_experts = _vq_route_work(gpu)
+        if (cpu_layer_runs == 0 or cpu_layer_runs != gpu_layer_runs or
+                cpu_experts != gpu_experts):
+            raise CaptureError(
+                "CUDA VQ captures have different or empty routed workloads"
+            )
+        expected_applies = 3 * gpu_experts
+        expected_syncs = 2 * gpu_experts
+        expected_lut_builds = (
+            0 if gpu.arm.value == 1 else gpu_experts + 2 * gpu_layer_runs
+        )
+        expected_launches = (
+            2 * gpu_experts if gpu.arm.value == 1
+            else 3 * gpu_experts + gpu_layer_runs
+        )
+        route_expected = {
+            "experts": gpu_experts,
+            "applies": expected_applies,
+            "lut_builds": expected_lut_builds,
+            "launches": expected_launches,
+            "syncs": expected_syncs,
+        }
+        for counter, expected in route_expected.items():
+            actual = getattr(gpu.arm, f"vq_{counter}")
+            declared = getattr(gpu.arm, f"vq_expected_{counter}")
+            if actual != expected or declared != expected:
+                raise CaptureError(
+                    f"CUDA VQ candidate {counter}={actual}/{declared}; "
+                    f"route rows require {expected}"
+                )
+        return {"cpu": _arm_dict(cpu.arm), "gpu": _arm_dict(gpu.arm)}
+
     if cpu.arm.key == "cuda_dense":
         for label, arm in (("control", cpu.arm), ("candidate", gpu.arm)):
             if (arm.kda_mode not in (1, 2) or

@@ -148,6 +148,61 @@ class CompareGpuRunsTest(unittest.TestCase):
         }
         return control, candidate
 
+    @staticmethod
+    def vq_arms(mode=1):
+        base = {
+            "key": "cuda_vq",
+            "fallbacks": 0,
+            "kda_mode": 1,
+            "kda_effective": 1,
+            "kda_calls": 24,
+            "kda_expected_calls": 24,
+            "dense_scope": 2,
+            "dense_effective": 2,
+            "dense_calls": 30,
+            "dense_expected_calls": 30,
+        }
+        zero = {
+            "vq_experts": 0,
+            "vq_expected_experts": 0,
+            "vq_applies": 0,
+            "vq_expected_applies": 0,
+            "vq_lut_builds": 0,
+            "vq_expected_lut_builds": 0,
+            "vq_launches": 0,
+            "vq_expected_launches": 0,
+            "vq_syncs": 0,
+            "vq_expected_syncs": 0,
+        }
+        control = {
+            **base, **zero, "value": 0, "effective": 0,
+            "calls": 0, "expected_calls": 0,
+            "vq_mode": 0, "vq_effective": 0,
+        }
+        experts = 8
+        # Two decode steps each contain two MoE route rows.  With TOP_K=2,
+        # that is four layer executions and eight expert triplets.
+        layer_runs = 4
+        lut_builds = 0 if mode == 1 else experts + 2 * layer_runs
+        launches = (2 * experts if mode == 1
+                    else 3 * experts + layer_runs)
+        candidate = {
+            **base, "value": mode, "effective": mode,
+            "calls": launches, "expected_calls": launches,
+            "vq_mode": mode, "vq_effective": mode,
+            "vq_experts": experts,
+            "vq_expected_experts": experts,
+            "vq_applies": 3 * experts,
+            "vq_expected_applies": 3 * experts,
+            "vq_lut_builds": lut_builds,
+            "vq_expected_lut_builds": lut_builds,
+            "vq_launches": launches,
+            "vq_expected_launches": launches,
+            "vq_syncs": 2 * experts,
+            "vq_expected_syncs": 2 * experts,
+        }
+        return control, candidate
+
     def test_self_compare_is_exact(self):
         result = self.compare()
         self.assertEqual(result["causally_compared_steps"], 3)
@@ -272,6 +327,59 @@ class CompareGpuRunsTest(unittest.TestCase):
                 bad.update(mutation)
                 with self.assertRaises(COMPARE.CaptureError):
                     self.compare(cpu_arm=control, gpu_arm=bad)
+
+    def test_valid_vq_modes_retain_exact_base_and_semantic_counters(self):
+        for mode in (1, 2):
+            with self.subTest(mode=mode):
+                control, candidate = self.vq_arms(mode)
+                result = self.compare(cpu_arm=control, gpu_arm=candidate)
+                self.assertEqual(result["arms"]["cpu"]["vq_experts"], 0)
+                self.assertEqual(result["arms"]["gpu"]["vq_mode"], mode)
+                self.assertEqual(result["arms"]["gpu"]["vq_applies"], 24)
+                self.assertEqual(result["arms"]["gpu"]["dense_scope"], 2)
+
+    def test_vq_rejects_bad_base_fallback_or_counter_shortfall(self):
+        control, candidate = self.vq_arms(1)
+        mutations = (
+            {"kda_mode": 2},
+            {"dense_calls": 29},
+            {"dense_calls": 29, "dense_expected_calls": 29},
+            {"fallbacks": 1},
+            {"vq_applies": 23},
+            {"vq_launches": 15, "calls": 15},
+        )
+        for mutation in mutations:
+            with self.subTest(mutation=mutation):
+                bad = copy.deepcopy(candidate)
+                bad.update(mutation)
+                with self.assertRaises(COMPARE.CaptureError):
+                    self.compare(cpu_arm=control, gpu_arm=bad)
+
+    def test_vq_rejects_self_consistent_but_impossible_mode2_counts(self):
+        control, candidate = self.vq_arms(2)
+        candidate.update({
+            "vq_lut_builds": 18,
+            "vq_expected_lut_builds": 18,
+        })
+        with self.assertRaises(COMPARE.CaptureError):
+            self.compare(cpu_arm=control, gpu_arm=candidate)
+
+    def test_vq_rejects_self_consistent_counts_that_disagree_with_routes(self):
+        control, candidate = self.vq_arms(1)
+        candidate.update({
+            "calls": 12,
+            "expected_calls": 12,
+            "vq_experts": 6,
+            "vq_expected_experts": 6,
+            "vq_applies": 18,
+            "vq_expected_applies": 18,
+            "vq_launches": 12,
+            "vq_expected_launches": 12,
+            "vq_syncs": 12,
+            "vq_expected_syncs": 12,
+        })
+        with self.assertRaises(COMPARE.CaptureError):
+            self.compare(cpu_arm=control, gpu_arm=candidate)
 
     def test_missing_arm_metadata_is_rejected(self):
         with self.assertRaises(COMPARE.CaptureError):
