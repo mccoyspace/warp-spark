@@ -1,0 +1,83 @@
+{
+  "schema": "waste.gn100.speculative_contract.v1",
+  "date": "2026-08-03",
+  "status": "preregistered_before_new_model_inference",
+  "parent_commit": "c8945e44331c9ffedbd8a2849634a014f4c3a916",
+  "branch": "exp/speculative-decoding-gb10",
+  "models": {
+    "target": "kimi-k3",
+    "target_manifest_sha256": "da3232925d8eeaf0df07ee45743f6467c7eecbc4c0e2513899028e788a1a07f2",
+    "draft": "kimi-linear-48b-a3b-instruct",
+    "draft_manifest_sha256": "d287b2cc45b7f6b3800c1a8114aafcc3eedf163947cf164e5aa3d3df18494369",
+    "tokenizer_sha256": "b6c497a7469b33ced9c38afb1ad6e47f03f5e5dc05f15930799210ec050c5103",
+    "target_specials_sha256": "d3350d087a42ad97d800f7187264f09e8188b2ab9e02485b89d494831c99d0c3",
+    "draft_specials_sha256": "64fdacd414acbc34c28745b96a0197d4f8246b78b178c44a1dbfb416a658b18a"
+  },
+  "corpora": {
+    "development_veto": {
+      "path": "docs/gn100/sprint14-heldout-corpus.json",
+      "sha256": "4fb4ca60d82ed521c0d59732c748a5f99b22f720d35e19d5590b41bc01c423fe",
+      "selection_cases": 8,
+      "veto_cases": 4,
+      "continuation_tokens": 32
+    },
+    "h2": {
+      "path": "docs/gn100/sprint15-h2-corpus.json",
+      "sha256": "5c5b806358a26bb8d9ce782aab190b7e10bd83f00e445d1bab7367333cee5bee",
+      "cases": 6,
+      "continuation_tokens": 64,
+      "inference_status": "embargoed_unspent"
+    }
+  },
+  "candidate_grid": {
+    "prompt_formats": ["target_ids", "kimi_native"],
+    "block_widths": [2, 4, 8],
+    "trace_width": 8,
+    "adaptive_width": false,
+    "sampling": "greedy"
+  },
+  "comparators": {
+    "F": "qualified_full-cache K3 without draft",
+    "R": "reduced-cache K3 with draft and rollback allocations resident but disabled",
+    "S": "same allocation as R with speculation enabled"
+  },
+  "selection": {
+    "score": "min(median_A+B_predicted_S_over_R_gain, median_A+B_predicted_S_over_F_gain)",
+    "tie_within_percentage_points": 1.0,
+    "tie_breaks": ["smaller_k", "target_ids"],
+    "modeled_gain_min_percent": 15.0,
+    "case_regression_floor_percent": -5.0,
+    "h1_can_select": false,
+    "runner_up_substitution": false
+  },
+  "development_gate": {
+    "tokens": 64,
+    "repeats": 2,
+    "median_S_over_F_gain_min_percent": 10.0,
+    "median_S_over_R_gain_min_percent": 10.0,
+    "selection_cases_positive_min": 6,
+    "selection_case_regression_floor_percent": -5.0,
+    "h1_median_gain_min_percent": 0.0,
+    "h1_case_regression_floor_percent": -5.0,
+    "exact_contract": true
+  },
+  "h2_gate": {
+    "single_use": true,
+    "tokens": 64,
+    "repeats": 2,
+    "median_S_over_F_gain_min_percent": 10.0,
+    "median_S_over_R_gain_min_percent": 10.0,
+    "families_positive_min": 5,
+    "family_regression_floor_percent": -2.0,
+    "overall_S_tok_s_min": 1.0,
+    "each_family_S_tok_s_min": 0.95,
+    "exact_contract": true
+  },
+  "safety": {
+    "loaded_memavailable_min_gib": 24.0,
+    "process_swap_max_bytes": 0,
+    "timed_major_faults_max": 0,
+    "cuda_fallbacks_max": 0,
+    "h2_model_steps_before_seal_max": 0
+  }
+}
