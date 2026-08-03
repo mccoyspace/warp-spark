@@ -1,0 +1,245 @@
+{
+  "schema": "waste.gn100.gpu_dense_sprint.v1",
+  "date": "2026-08-02",
+  "machine": "NVIDIA DGX Spark / Acer Veriton GN100",
+  "device": "NVIDIA GB10",
+  "branch": "exp/cuda-dense-gb10",
+  "parent_commit": "32541d9e21ae793ec999b31561863a7459333928",
+  "implementation_commit": "1bca4d403f67c07d1a543a58438ba723eecba716",
+  "status": "scope2_strict_ordered_contract_pass_experimental",
+  "accepted_scope": 2,
+  "model": {
+    "manifest_sha256": "da3232925d8eeaf0df07ee45743f6467c7eecbc4c0e2513899028e788a1a07f2",
+    "usage_sha256": "e2949e8d14da3c46d766daa99e6b93f946c8cfc0425eba4815450079996899dd",
+    "prompt_ids": [1008, 10484, 318, 15383, 387],
+    "decode_tokens": 64
+  },
+  "profile": {
+    "cuda_kda": 1,
+    "cuda_dense": 2,
+    "threads": 8,
+    "cpu_set": "5-9,15-19",
+    "pm_qos_latency_us": 0,
+    "q8": 1,
+    "sdot": 0,
+    "i8mm": 0,
+    "cache_mb": 53196,
+    "io_threads": 2,
+    "io_depth": 2,
+    "lookahead": 0,
+    "direct_io": 1,
+    "mlock": 0,
+    "purgeable": 0
+  },
+  "scopes": [
+    {
+      "scope": 0,
+      "description": "KDA only",
+      "kda_calls_per_token": 552,
+      "dense_calls_per_token": 0,
+      "total_cuda_calls_per_token": 552
+    },
+    {
+      "scope": 1,
+      "description": "KDA plus shared FFN and latent MoE bridges",
+      "kda_calls_per_token": 552,
+      "dense_calls_per_token": 460,
+      "total_cuda_calls_per_token": 1012
+    },
+    {
+      "scope": 2,
+      "description": "scope 1 plus conventional MLA projections",
+      "kda_calls_per_token": 552,
+      "dense_calls_per_token": 580,
+      "total_cuda_calls_per_token": 1132
+    },
+    {
+      "scope": 3,
+      "description": "scope 2 plus non-MoE dense FFN",
+      "kda_calls_per_token": 552,
+      "dense_calls_per_token": 583,
+      "total_cuda_calls_per_token": 1135
+    }
+  ],
+  "integrated_16_token_campaign": {
+    "repeats": 2,
+    "one_model_load": true,
+    "alternating_order": true,
+    "scope0_tok_s": [0.513522, 0.510998],
+    "scope1_tok_s": [0.617254, 0.618831],
+    "scope2_tok_s": [0.682626, 0.681030],
+    "scope3_tok_s": [0.700494, 0.693742],
+    "medians_tok_s": {
+      "scope0": 0.512260,
+      "scope1": 0.6180425,
+      "scope2": 0.681828,
+      "scope3": 0.697118
+    },
+    "improvement_percent": {
+      "scope1_vs_scope0": 20.650,
+      "scope2_vs_scope1": 10.321,
+      "scope2_vs_scope0": 33.102,
+      "scope3_vs_scope2": 2.243,
+      "scope3_vs_scope0": 36.087
+    },
+    "kda_calls_per_repeat": 8832,
+    "dense_calls_per_repeat": {
+      "scope0": 0,
+      "scope1": 7360,
+      "scope2": 9280,
+      "scope3": 9328
+    },
+    "fallbacks": 0,
+    "expert_hits_per_arm": 12526,
+    "expert_misses_per_arm": 11026,
+    "expert_bytes_per_arm": 136797200384,
+    "major_faults": 0,
+    "swaps": 0,
+    "peak_rss_kib": 83738376,
+    "gpu_temperature_c": {
+      "before": 44,
+      "after": 62
+    },
+    "maximum_repeat_delta_percent": 0.964
+  },
+  "final_64_token_captures": {
+    "scope0": {
+      "seconds": 130.631782,
+      "tok_s": 0.489927,
+      "dense_calls": 0
+    },
+    "scope1": {
+      "seconds": 102.633434,
+      "tok_s": 0.623578,
+      "dense_calls": 29440,
+      "changed_route_memberships": 0,
+      "ordered_route_changes": 1,
+      "expert_replacements": 0,
+      "max_abs_logit_error": 4.1008e-5,
+      "max_step_mean_abs_logit_error": 6.5742e-6
+    },
+    "scope2": {
+      "seconds": 95.029600,
+      "tok_s": 0.673474,
+      "improvement_vs_scope0_percent": 37.464,
+      "kda_calls": 35328,
+      "dense_calls": 37120,
+      "expected_kda_calls": 35328,
+      "expected_dense_calls": 37120,
+      "fallbacks": 0,
+      "causal_logit_steps": 65,
+      "route_rows": 5888,
+      "selected_expert_slots": 94208,
+      "changed_route_memberships": 0,
+      "ordered_route_changes": 0,
+      "expert_replacements": 0,
+      "argmax_changes": 0,
+      "top10_set_changes": 0,
+      "max_abs_logit_error": 3.0517578125e-5,
+      "max_step_mean_abs_logit_error": 3.4805869553e-6,
+      "nonfinite_control": 0,
+      "nonfinite_cuda": 0
+    },
+    "scope3": {
+      "seconds": 93.108590,
+      "tok_s": 0.687369,
+      "improvement_vs_scope0_percent": 40.300,
+      "dense_calls": 37312,
+      "changed_route_memberships": 0,
+      "ordered_route_changes": 1,
+      "expert_replacements": 0,
+      "max_abs_logit_error": 5.67436e-5,
+      "max_step_mean_abs_logit_error": 4.2015e-6
+    }
+  },
+  "decision": {
+    "accepted": "scope 2",
+    "reason": "cleared both five-percent component gates and preserved all ordered routes over the 64-token strict corpus",
+    "scope3_disposition": "diagnostic_only",
+    "scope3_registered_contract": "pass",
+    "scope3_reason": "not selected: only 2.243 percent median incremental gain and one order-only route change; no membership replacement"
+  },
+  "synchronization": {
+    "estimated_handoff_ms": 0.03,
+    "scope2_calls_per_token": 1132,
+    "scope2_estimated_sync_ms_per_token": 33.96,
+    "scope2_measured_seconds_per_token": 1.484837,
+    "scope2_estimated_token_share_percent": 2.287,
+    "cuda_graph_trigger_percent": 5.0,
+    "disposition": "do not add graphs"
+  },
+  "post_expansion_profile": {
+    "decode_tokens": 16,
+    "kda_percent": 7.7,
+    "mla_percent": 2.4,
+    "moe_percent": 89.3,
+    "expert_io_percent": 22.2,
+    "expert_matmul_percent": 56.6,
+    "vq_lut_apply_percent": 51.0,
+    "lm_head_percent": 0.7,
+    "next_target": "VQ expert gather"
+  },
+  "storage_contention": {
+    "fio": {
+      "direct": 1,
+      "ioengine": "libaio",
+      "rw": "randread",
+      "block_bytes": 12582912,
+      "queue_depth": 2,
+      "runtime_seconds": 60,
+      "ramp_seconds": 10
+    },
+    "baseline_before": {
+      "bandwidth_bytes_s": 13223360872,
+      "p95_ns": 1253376,
+      "p99_ns": 1351680
+    },
+    "scope2_engine_overlap": {
+      "bandwidth_bytes_s": 8568744349,
+      "p95_ns": 3588096,
+      "p99_ns": 3817472,
+      "engine_seconds": 109.182899,
+      "engine_tok_s": 0.586172
+    },
+    "baseline_after": {
+      "bandwidth_bytes_s": 13204067717,
+      "p95_ns": 1269760,
+      "p99_ns": 1433600
+    },
+    "baseline_bandwidth_drift_percent": -0.146,
+    "versus_baseline_mean_percent": {
+      "bandwidth": -35.153,
+      "p95": 184.416,
+      "p99": 174.118
+    },
+    "interpretation": "end-to-end same-SSD saturation bound that supersedes the synthetic screen for capacity planning; not attributable solely to coherent GPU traffic"
+  },
+  "tests": {
+    "spark_portable": "33 passed, 0 failed, 13 skipped",
+    "spark_cuda_build": "make clean; make -j8 WASTE_NATIVE=1 WASTE_ENABLE_CUDA=1 all test",
+    "comparator_checks": 13
+  },
+  "evidence_root": "/home/kevin/waste-gn100-experiment-20260730/validation/sprint12-dense-q4-20260802",
+  "evidence_archive": "gn100-sprint12-evidence-2026-08-02.tar.gz",
+  "evidence_archive_sha256": "a38522b49866a3aa93b551560b69ade282bb960f6f26c1aea7050e4e5bfd65a0",
+  "evidence_sha256": {
+    "campaign16.txt": "074a19a435e6966917917daa4171ec22ba672b0f74b7d490606cf7272b88f258",
+    "campaign16-time.txt": "e06e95bbe1e9ec0e9f0d8378bcdd90e4964bfe918b70888aeb3085bd43eb8cfe",
+    "captures16/cuda_dense-0-rep1.json": "8429f4efcd60caaa70e9e23f3a888804a2a892166bf67029b46a5cd117aa9132",
+    "captures16/cuda_dense-0-rep1.logits.f32": "3ccb859a44012570eaa10119bb0e3eb820e0c317a81299524f1968b765e9fa54",
+    "captures16/cuda_dense-2-rep1.json": "cd7c69fddc49d089f6b08438144cd60bec44cd620c6ef39dbf7823faeadd7946",
+    "captures16/cuda_dense-2-rep1.logits.f32": "e2fffc384aa9ad58697b5a4869b09024f275f4cf29f081f27f456853a1ad9b37",
+    "captures64/cuda_dense-0-rep1.json": "902f69593e82def4687f3d6123f26da1cc7c006f9ca52ff31781505756b14210",
+    "captures64/cuda_dense-0-rep1.logits.f32": "19198c9be95b63f0c72b5087f6aa08a0c57b18b846f621bc759c2fc53a92b1bd",
+    "captures64-isolate/cuda_dense-2-rep1.json": "9476cc44a19675ff23e8121e11f1bdb47e8b79c6ded3fe54c830ac1a14d40e42",
+    "captures64-isolate/cuda_dense-2-rep1.logits.f32": "b98f8a684e03ccce8c8d8ee191804b922149ac9964122e74a6f2f952b324d63c",
+    "compare64-scope2.json": "8f607c0cc14a9fc50d4fc473044c3c8459cb354e51ae2fa7e8e3fed9901a18eb",
+    "profile-scope2.txt": "0bde1e3e624a6671a21b17568b39e97c6db8f5d2cf171be4d6a4d8b8433f60f1",
+    "fio-engine-before.json": "afc14bc7935747056fa537acbafafba52080c7a59983300d671520a60db0093c",
+    "fio-engine-contended.json": "ee442ab9fa9a7d8092f02bde4e5e05f717851876dc0d01037be8ea4450daf88a",
+    "fio-engine-after.json": "32302203fcaddf8388762e623fe40ccf41119a6d8fbfdca4d9def12573d1bced",
+    "contention-engine.txt": "8366231ac31b0b96cc1879e18d63046a07c604079e7ee90d312b5adcb2e642b3",
+    "tests.txt": "134c8d3be8c37cda436b496f536e0bc6ba97a5c70e1b794fb85e66a6e649e44d",
+    "cuda-build.txt": "61c9b35ff92d1a55b2f9cff271d12b70ff7b0dd336ed86bb605227d11bcdaa83"
+  }
+}

@@ -6,10 +6,11 @@
 > uses eight compute threads on pinned performance CPUs, child-scoped Q0, two
 > direct-I/O readers at depth two, Q8, and no router lookahead, and measures
 > **0.34–0.35 tok/s**.
-> The separate `exp/cuda-gb10` branch now has an opt-in decode-KDA CUDA path
-> that passed its 64-token strict route/logit gate at **0.4758 tok/s** versus
-> **0.3373 tok/s** CPU; it remains experimental. See
-> [the GB10 CUDA result](docs/GPU_GB10.md).
+> The separate `exp/cuda-dense-gb10` branch now extends the opt-in CUDA path
+> through the conventional dense Q4 projections. Its accepted scope passed
+> the 64-token strict ordered-route/logit gate at **0.6735 tok/s** versus
+> **0.4899 tok/s** for KDA-only CUDA; it remains experimental. See
+> [the dense GB10 CUDA result](docs/GPU_DENSE_GB10.md).
 > Start with [GN100 results and reproduction notes](docs/GN100.md), then see
 > [the upstreaming map](docs/UPSTREAMING.md) and
 > [upstream issue #14](https://github.com/sqliteai/waste/issues/14).

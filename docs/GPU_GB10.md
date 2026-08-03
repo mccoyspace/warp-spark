@@ -189,9 +189,10 @@ toggling `WASTE_ENABLE_CUDA`.
 
 The path performs 69 KDA layers times eight projections, or 552 CUDA calls per
 decode token. It synchronizes after each projection; no graph or CPU/GPU
-overlap is claimed. Preflight checks every projection before decode and warms
-the real kernel outside the timer. A runtime failure aborts the token rather
-than mixing GPU and CPU arithmetic, poisons the partially changed recurrent
+overlap is claimed. Preflight validates every selected projection's format
+before decode and warm-tests the real kernel outside the timer. A runtime
+failure aborts the token rather than mixing GPU and CPU arithmetic, poisons
+the partially changed recurrent
 state, blocks prefill/decode/snapshot export, and requires a reset for CPU
 recovery after selecting CPU mode, or a model reload before CUDA can be
 attempted again. Captures record requested and effective mode, fallbacks,
@@ -324,11 +325,13 @@ are retained in
 5. **Storage contention: measured.** A sustained worst-case loop costs 4.0%
    bandwidth and 23-29% p95/p99 latency against stable bracketing baselines.
 
-KDA dense decode has now cleared its gate. Before attempting a new kernel
-class, sprint 12 expands the validated Q4 path across the remaining
-conventional decode projections under the preregistered arms in
-[GPU_DENSE_GB10.md](GPU_DENSE_GB10.md). The resulting residual profile will
-then decide whether VQ expert gather, absorbed MLA or the Q8 language-model
-head is the next independent GPU target. Whole-layer graphs, CPU/GPU overlap,
-and prefill CUDA remain possible follow-ons, but each must be justified by a
-measured profile rather than added by default.
+KDA dense decode cleared its gate. Sprint 12 then expanded the same kernel
+class through the conventional dense Q4 projections. Cumulative scope 2
+passed the stronger ordered-route contract at 0.673474 tok/s; scope 3 remains
+diagnostic. The post-expansion profile identifies VQ expert gather as the next
+independent GPU target. Results and exact evidence hashes are in
+[GPU_DENSE_GB10.md](GPU_DENSE_GB10.md) and
+[gn100/sprint12-dense-gpu-summary.json](gn100/sprint12-dense-gpu-summary.json).
+Whole-layer graphs, CPU/GPU overlap, and prefill CUDA remain possible
+follow-ons, but each must be justified by a measured profile rather than
+added by default.
