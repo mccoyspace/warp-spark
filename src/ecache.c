@@ -5,6 +5,7 @@
 
 #include "ecache.h"
 
+#include <limits.h>
 #include <pthread.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -289,6 +290,16 @@ int waste_ecache_io_depth(const waste_ecache *c)
 
 /* ---- cache -------------------------------------------------------------- */
 
+static int ec_lfru_age_env(void)
+{
+    const char *e = getenv("WASTE_LFRU_AGE_TOKENS");
+    if (!e || !*e || *e == '-') return 0;
+    char *end = NULL;
+    const unsigned long value = strtoul(e, &end, 10);
+    if (end == e || *end || value > INT_MAX) return 0;
+    return (int)value;
+}
+
 int waste_ecache_init(waste_ecache *c, size_t budget_bytes, size_t rec_bytes,
                       int policy)
 {
@@ -296,6 +307,7 @@ int waste_ecache_init(waste_ecache *c, size_t budget_bytes, size_t rec_bytes,
     c->rec_bytes = rec_bytes;
     c->budget_bytes = budget_bytes;
     c->policy = policy;
+    c->lfru_age_tokens = (uint32_t)ec_lfru_age_env();
     c->rng = 0x9e3779b9u;
     /* Generations start at 1 so that a slot's zeroed pin means "never
      * hinted" rather than "pinned by the current batch". */
@@ -344,6 +356,51 @@ int waste_ecache_init(waste_ecache *c, size_t budget_bytes, size_t rec_bytes,
         fprintf(stderr, "waste: could not wire %d of %d cache slots; "
                         "those stay pageable\n", c->wire_failed, c->n_slots);
     return 0;
+}
+
+void waste_ecache_set_lfru_age(waste_ecache *c, int tokens)
+{
+    if (!c) return;
+    if (tokens < 0) tokens = 0;
+    ec_lock(c);
+    c->lfru_age_tokens = (uint32_t)tokens;
+    c->lfru_age_phase = 0;
+    c->lfru_age_events = 0;
+    ec_unlock(c);
+}
+
+int waste_ecache_get_lfru_age(const waste_ecache *c)
+{
+    return c ? (int)c->lfru_age_tokens : 0;
+}
+
+uint64_t waste_ecache_lfru_age_events(const waste_ecache *c)
+{
+    return c ? c->lfru_age_events : 0;
+}
+
+void waste_ecache_decode_tick(waste_ecache *c)
+{
+    if (!c) return;
+    ec_lock(c);
+    if (c->policy != 0 || c->lfru_age_tokens == 0) {
+        c->lfru_age_phase = 0;
+        ec_unlock(c);
+        return;
+    }
+    c->lfru_age_phase++;
+    if (c->lfru_age_phase < c->lfru_age_tokens) {
+        ec_unlock(c);
+        return;
+    }
+    c->lfru_age_phase = 0;
+    c->lfru_age_events++;
+    for (int i = 0; i < c->n_slots; i++) {
+        if (c->slot[i].state != EC_READY) continue;
+        c->slot[i].hits = c->slot[i].hits > 1
+                            ? c->slot[i].hits / 2 : 1;
+    }
+    ec_unlock(c);
 }
 
 void waste_ecache_free(waste_ecache *c)
@@ -767,6 +824,8 @@ void waste_ecache_clear(waste_ecache *c)
     memset(c->pf_ids, 0, sizeof c->pf_ids);
     c->last_used = -1;
     c->purged = 0;
+    c->lfru_age_phase = 0;
+    c->lfru_age_events = 0;
     ec_unlock(c);
 }
 

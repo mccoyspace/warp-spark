@@ -36,6 +36,8 @@
  *   WASTE_CUDA_KDA=1 sweep CONTAINER ids,.. n_gen cuda_dense=0,1,2,3 [repeat]
  *   WASTE_CUDA_KDA=1 WASTE_CUDA_DENSE=2 \
  *     sweep CONTAINER ids,.. n_gen cuda_vq=0,1,2 [repeat]
+ *   WASTE_CUDA_KDA=1 WASTE_CUDA_DENSE=2 WASTE_CUDA_VQ=2 \
+ *     sweep CONTAINER ids,.. n_gen lfru_age=0,4 [repeat]
  *
  * `cache` is in MB and re-makes the expert cache in place. The trunk is what
  * a load costs, not the cache, so a budget sweep no longer needs a process
@@ -208,18 +210,21 @@ static int write_capture(const char *dir, const char *key, int value, int rep,
     }
     const int dense_arm = !strcmp(key, "cuda_dense");
     const int vq_arm = !strcmp(key, "cuda_vq");
+    const int age_arm = !strcmp(key, "lfru_age");
     const cuda_vq_target vq_expected = cuda_vq_targets(
         m, waste_model_get_cuda_vq(m), n_gen);
-    const int effective = vq_arm ? waste_model_cuda_vq_effective(m)
+    const int effective = age_arm ? waste_ecache_get_lfru_age(&m->cache)
+                        : vq_arm ? waste_model_cuda_vq_effective(m)
                         : dense_arm ? waste_model_cuda_dense_effective(m)
                                     : waste_model_cuda_kda_effective(m);
     /* For the additive v1 schema's generic call fields, a VQ call is an
      * actual CUDA launch.  The explicit semantic counters below remain the
      * authoritative breakdown. */
-    const uint64_t calls = vq_arm ? waste_model_cuda_vq_launches(m)
+    const uint64_t calls = age_arm ? UINT64_C(0)
+                         : vq_arm ? waste_model_cuda_vq_launches(m)
                          : dense_arm ? waste_model_cuda_dense_calls(m)
                                      : waste_model_cuda_kda_calls(m);
-    const uint64_t expected = vq_arm
+    const uint64_t expected = age_arm ? UINT64_C(0) : vq_arm
         ? vq_expected.launches
         : dense_arm ? cuda_dense_call_target(m, value, n_gen)
                     : (value ? cuda_call_target(m, n_gen) : UINT64_C(0));
@@ -235,6 +240,7 @@ static int write_capture(const char *dir, const char *key, int value, int rep,
             "  \"arm\": {\"key\": \"%s\", \"value\": %d, "
             "\"repeat\": %d, \"effective\": %d, \"fallbacks\": %" PRIu64
             ", \"calls\": %" PRIu64 ", \"expected_calls\": %" PRIu64
+            ", \"lfru_age_tokens\": %d, \"lfru_age_events\": %" PRIu64
             ", \"kda_mode\": %d, \"kda_effective\": %d"
             ", \"kda_calls\": %" PRIu64
             ", \"kda_expected_calls\": %" PRIu64
@@ -259,6 +265,8 @@ static int write_capture(const char *dir, const char *key, int value, int rep,
             "  \"steps\": [\n",
             logits_name, m->cfg.vocab, m->cfg.top_k, key, value, rep,
             effective, waste_model_cuda_kda_fallbacks(m), calls, expected,
+            waste_ecache_get_lfru_age(&m->cache),
+            waste_ecache_lfru_age_events(&m->cache),
             waste_model_get_cuda_kda(m), waste_model_cuda_kda_effective(m),
             waste_model_cuda_kda_calls(m), kda_expected,
             waste_model_get_cuda_dense(m),
@@ -315,7 +323,7 @@ int main(int argc, char **argv)
         fprintf(stderr,
                 "usage: %s CONTAINER ids,.. n_gen KEY=v1,v2,.. [repeat]\n"
                 "  KEY is lookahead, iodepth, cache (MB), cuda, cuda_dense, "
-                "or cuda_vq\n",
+                "cuda_vq, or lfru_age\n",
                 argv[0]);
         return 2;
     }
@@ -347,8 +355,9 @@ int main(int argc, char **argv)
     const int is_cuda = !strcmp(key, "cuda");
     const int is_dense = !strcmp(key, "cuda_dense");
     const int is_vq = !strcmp(key, "cuda_vq");
+    const int is_age = !strcmp(key, "lfru_age");
     if (!is_look && !is_depth && !is_cache && !is_cuda && !is_dense &&
-        !is_vq) {
+        !is_vq && !is_age) {
         fprintf(stderr, "unknown key %s\n", key);
         return 2;
     }
@@ -358,7 +367,7 @@ int main(int argc, char **argv)
     memset(&lo, 0, sizeof lo);
     const char *cmb = getenv("WASTE_CACHE_MB");
     const unsigned long long cache_mb = cmb ? strtoull(cmb, NULL, 10) : 0;
-    if ((is_look || is_depth || is_cuda || is_dense || is_vq) &&
+    if ((is_look || is_depth || is_cuda || is_dense || is_vq || is_age) &&
         cache_mb == 0) {
         fprintf(stderr, "WASTE_CACHE_MB must be positive for %s sweeps\n", key);
         return 2;
@@ -379,7 +388,7 @@ int main(int argc, char **argv)
         waste_model_free(&m);
         return 1;
     }
-    if ((is_look || is_depth || is_cuda || is_dense || is_vq) &&
+    if ((is_look || is_depth || is_cuda || is_dense || is_vq || is_age) &&
         waste_ecache_io_threads(&m.cache) == 0) {
         fprintf(stderr, "%s sweep has no effective reader threads\n", key);
         waste_model_free(&m);
@@ -396,6 +405,17 @@ int main(int argc, char **argv)
         fprintf(stderr,
                 "cuda_vq sweep requires WASTE_CUDA_KDA=1 and "
                 "WASTE_CUDA_DENSE=2\n");
+        waste_model_free(&m);
+        return 1;
+    }
+    if (is_age &&
+        (waste_model_get_cuda_kda(&m) != 1 ||
+         waste_model_get_cuda_dense(&m) != 2 ||
+         waste_model_get_cuda_vq(&m) != 2 ||
+         waste_model_get_cuda_vq_group(&m) != 1)) {
+        fprintf(stderr,
+                "lfru_age sweep requires WASTE_CUDA_KDA=1, "
+                "WASTE_CUDA_DENSE=2, WASTE_CUDA_VQ=2 and VQ group 1\n");
         waste_model_free(&m);
         return 1;
     }
@@ -448,11 +468,12 @@ int main(int argc, char **argv)
      * and it does — a grouped sweep charges the drift to the last arm and
      * an interleaved one spreads it across all of them. */
     printf("%10s %4s %7s %3s %3s %3s %4s %7s %6s %10s %11s %9s %9s %8s %14s "
-           "%18s %18s %18s %4s %7s %4s %9s %9s %9s %9s %9s\n",
+           "%18s %18s %18s %4s %7s %4s %9s %9s %9s %9s %9s %5s\n",
            key, "rep", "slots", "io", "qd", "eff", "fall", "calls", "warm",
            "seconds", "tok/s", "hits", "misses", "hit", "bytes",
            "token_hash", "logit_hash", "route_hash", "deff", "dcalls",
-           "veff", "vexperts", "vapplies", "vluts", "vlaunch", "vsync");
+           "veff", "vexperts", "vapplies", "vluts", "vlaunch", "vsync",
+           "ages");
     const uint64_t expected_cuda_calls = is_cuda
         ? cuda_call_target(&m, n_gen) : UINT64_C(0);
     for (int r = 0; r < repeat; r++) {
@@ -467,6 +488,14 @@ int main(int argc, char **argv)
                 const int max_depth = m.cache.n_slots / 4;
                 if (max_depth > 0 && value > max_depth) value = max_depth;
                 m.cache.depth = value;
+            } else if (is_age) {
+                if (value < 0) {
+                    fprintf(stderr, "lfru_age must be nonnegative\n");
+                    waste_model_free(&m);
+                    return 1;
+                }
+                waste_ecache_set_lfru_age(&m.cache, value);
+                value = waste_ecache_get_lfru_age(&m.cache);
             } else if (is_cuda) {
                 const int requested = value;
                 if (waste_model_set_cuda_kda(&m, requested) ||
@@ -536,7 +565,7 @@ int main(int argc, char **argv)
             const int decode_cuda_mode = m.cuda_kda_mode;
             const int decode_dense_scope = m.cuda_dense_scope;
             const int decode_vq_mode = m.cuda_vq_mode;
-            if (is_cuda || is_dense || is_vq) {
+            if (is_cuda || is_dense || is_vq || is_age) {
                 m.cuda_kda_mode = 0;
                 m.cuda_dense_scope = 0;
                 m.cuda_vq_mode = 0;
@@ -551,7 +580,7 @@ int main(int argc, char **argv)
                 if (!lg) break;
                 done += k;
             }
-            if (is_cuda || is_dense || is_vq) {
+            if (is_cuda || is_dense || is_vq || is_age) {
                 m.cuda_kda_mode = decode_cuda_mode;
                 m.cuda_dense_scope = decode_dense_scope;
                 m.cuda_vq_mode = decode_vq_mode;
@@ -591,6 +620,9 @@ int main(int argc, char **argv)
                     waste_model_free(&m);
                     return 1;
                 }
+                /* This loop is the harness's generated-decode boundary.
+                 * Prompt chunks above never advance the aging phase. */
+                waste_ecache_decode_tick(&m.cache);
                 logit_hash = hash_bytes(logit_hash, lg,
                                         (size_t)m.cfg.vocab * sizeof *lg);
                 if (capture_logits)
@@ -632,12 +664,14 @@ int main(int argc, char **argv)
                 &m, decode_dense_scope, n_gen);
             const cuda_vq_target expected_vq = cuda_vq_targets(
                 &m, decode_vq_mode, n_gen);
+            const uint64_t expected_age_events = is_age && value > 0
+                ? (uint64_t)n_gen / (uint64_t)value : UINT64_C(0);
             printf("%10d %4d %7d %3d %3d %3d %4" PRIu64 " %7" PRIu64
                    " %6d %10.6f %11.6f %9" PRIu64
                    " %9" PRIu64 " %7.2f%% %14" PRIu64 " 0x%016" PRIx64
                    " 0x%016" PRIx64 " 0x%016" PRIx64 " %4d %7" PRIu64
                    " %4d %9" PRIu64 " %9" PRIu64 " %9" PRIu64
-                   " %9" PRIu64 " %9" PRIu64 "\n",
+                   " %9" PRIu64 " %9" PRIu64 " %5" PRIu64 "\n",
                    value, r + 1, m.cache.n_slots,
                    waste_ecache_io_threads(&m.cache),
                    waste_ecache_io_depth(&m.cache),
@@ -646,7 +680,8 @@ int main(int argc, char **argv)
                    h, mi, 100.0 * (double)h / (double)(h + mi ? h + mi : 1),
                    bytes, token_hash, logit_hash, route_hash,
                    dense_effective, dense_calls, vq_effective, vq_experts,
-                   vq_applies, vq_lut_builds, vq_launches, vq_syncs);
+                   vq_applies, vq_lut_builds, vq_launches, vq_syncs,
+                   waste_ecache_lfru_age_events(&m.cache));
             if (profile) {
                 printf("profile %s=%d rep=%d", key, value, r + 1);
                 for (int p = 0; p < 16; p++)
@@ -721,6 +756,47 @@ int main(int argc, char **argv)
                         " syncs=%" PRIu64 "/%" PRIu64
                         ", fallbacks=%" PRIu64 "\n",
                         value, cuda_effective, decode_cuda_mode,
+                        cuda_calls, expected_kda_calls,
+                        dense_effective, decode_dense_scope,
+                        dense_calls, expected_dense_calls,
+                        vq_effective, decode_vq_mode,
+                        vq_experts, expected_vq.experts,
+                        vq_applies, expected_vq.applies,
+                        vq_lut_builds, expected_vq.lut_builds,
+                        vq_launches, expected_vq.launches,
+                        vq_syncs, expected_vq.syncs, cuda_fallbacks);
+                free(capture_logits); free(capture_inputs); free(capture_routes);
+                waste_model_free(&m);
+                return 1;
+            }
+            if (is_age &&
+                (waste_ecache_get_lfru_age(&m.cache) != value ||
+                 waste_ecache_lfru_age_events(&m.cache) != expected_age_events ||
+                 cuda_effective != 1 || decode_cuda_mode != 1 ||
+                 cuda_fallbacks != 0 || cuda_calls != expected_kda_calls ||
+                 dense_effective != 2 || decode_dense_scope != 2 ||
+                 dense_calls != expected_dense_calls ||
+                 vq_effective != 2 || decode_vq_mode != 2 ||
+                 vq_experts != expected_vq.experts ||
+                 vq_applies != expected_vq.applies ||
+                 vq_lut_builds != expected_vq.lut_builds ||
+                 vq_launches != expected_vq.launches ||
+                 vq_syncs != expected_vq.syncs)) {
+                fprintf(stderr,
+                        "lfru_age=%d acceptance failed: effective=%d ages=%" PRIu64
+                        "/%" PRIu64 ", "
+                        "kda=%d/%d calls=%" PRIu64 "/%" PRIu64
+                        ", dense=%d/%d calls=%" PRIu64 "/%" PRIu64
+                        ", vq=%d/%d experts=%" PRIu64 "/%" PRIu64
+                        " applies=%" PRIu64 "/%" PRIu64
+                        " luts=%" PRIu64 "/%" PRIu64
+                        " launches=%" PRIu64 "/%" PRIu64
+                        " syncs=%" PRIu64 "/%" PRIu64
+                        ", fallbacks=%" PRIu64 "\n",
+                        value, waste_ecache_get_lfru_age(&m.cache),
+                        waste_ecache_lfru_age_events(&m.cache),
+                        expected_age_events,
+                        cuda_effective, decode_cuda_mode,
                         cuda_calls, expected_kda_calls,
                         dense_effective, decode_dense_scope,
                         dense_calls, expected_dense_calls,

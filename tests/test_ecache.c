@@ -10,6 +10,7 @@
 #include <pthread.h>
 #include <stdint.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 #include <time.h>
 
@@ -34,6 +35,16 @@ static int failed;
         failed = 1;                                                        \
     }                                                                      \
 } while (0)
+
+static void age_env(const char *value)
+{
+#if defined(_WIN32)
+    _putenv_s("WASTE_LFRU_AGE_TOKENS", value ? value : "");
+#else
+    if (value) setenv("WASTE_LFRU_AGE_TOKENS", value, 1);
+    else unsetenv("WASTE_LFRU_AGE_TOKENS");
+#endif
+}
 
 static int gated_fetch(void *user, int layer, int expert, uint8_t *dst)
 {
@@ -85,6 +96,7 @@ static void *run_hold_get(void *arg)
 
 int main(void)
 {
+    age_env(NULL);
     waste_model_set_lookahead(-1);
     CHECK(waste_model_get_lookahead() == 0, "negative lookahead clamps to zero");
     waste_model_set_lookahead(WASTE_PF_MAX + 1);
@@ -94,6 +106,8 @@ int main(void)
     waste_ecache c;
     CHECK(waste_ecache_init(&c, 4 * REC_BYTES, REC_BYTES, 0) == 0,
           "cache initialization");
+    CHECK(waste_ecache_get_lfru_age(&c) == 0,
+          "LFRU aging is disabled by default");
     if (failed) return 1;
 
     fetch_gate g;
@@ -181,6 +195,57 @@ int main(void)
     CHECK(c.pf_gen == 1 && c.purged == 0,
           "clear resets hint and purge generations");
 
+    /* A hotlist's raw hit counts are retained until the opt-in decode
+     * clock reaches its half-life. Only resident, completed records age;
+     * an in-flight reader still owns its metadata and payload. */
+    c.slot[0].state = EC_READY;    c.slot[0].hits = 1;
+    c.slot[1].state = EC_READY;    c.slot[1].hits = 2;
+    c.slot[2].state = EC_READY;    c.slot[2].hits = 3;
+    c.slot[3].state = EC_INFLIGHT; c.slot[3].hits = 8;
+    waste_ecache_decode_tick(&c);
+    CHECK(c.slot[1].hits == 2 && c.slot[2].hits == 3,
+          "default-off decode ticks do not age frequencies");
+    waste_ecache_set_lfru_age(&c, 4);
+    for (int i = 0; i < 3; i++) waste_ecache_decode_tick(&c);
+    CHECK(c.slot[0].hits == 1 && c.slot[1].hits == 2 &&
+          c.slot[2].hits == 3 && c.slot[3].hits == 8,
+          "aging waits for the configured decode-token interval");
+    waste_ecache_decode_tick(&c);
+    CHECK(c.slot[0].hits == 1 && c.slot[1].hits == 1 &&
+          c.slot[2].hits == 1 && c.slot[3].hits == 8,
+          "aging halves READY frequencies with a minimum of one");
+    CHECK(waste_ecache_lfru_age_events(&c) == 1,
+          "a completed interval records one aging event");
+
+    /* clear() is also the sweep arm boundary: keep the selected half-life,
+     * but restart its phase so the following arm cannot inherit a partial
+     * interval from the previous one. */
+    waste_ecache_clear(&c);
+    CHECK(waste_ecache_get_lfru_age(&c) == 4 && c.lfru_age_phase == 0 &&
+          waste_ecache_lfru_age_events(&c) == 0,
+          "clear retains the setting and resets the aging phase");
+    c.slot[0].state = EC_READY; c.slot[0].hits = 8;
+    waste_ecache_decode_tick(&c);
+    waste_ecache_decode_tick(&c);
+    waste_ecache_clear(&c);
+    c.slot[0].state = EC_READY; c.slot[0].hits = 8;
+    waste_ecache_decode_tick(&c);
+    waste_ecache_decode_tick(&c);
+    CHECK(c.slot[0].hits == 8,
+          "a cleared partial interval does not age the next arm early");
+    waste_ecache_decode_tick(&c);
+    waste_ecache_decode_tick(&c);
+    CHECK(c.slot[0].hits == 4, "the reset arm ages on its own fourth tick");
+    c.policy = 1;
+    waste_ecache_set_lfru_age(&c, 1);
+    c.slot[0].hits = 8;
+    waste_ecache_decode_tick(&c);
+    CHECK(c.slot[0].hits == 8 && c.lfru_age_phase == 0,
+          "the LFRU lever does not alter an LRU cache");
+    c.policy = 0;
+    waste_ecache_set_lfru_age(&c, 0);
+    waste_ecache_clear(&c);
+
     /* Explicit holds survive later get() calls and drain(), but leave the
      * slot available immediately after release. Fill the whole cache with
      * held records so eviction has no candidate at all. */
@@ -236,6 +301,15 @@ int main(void)
     waste_ecache_free(&c);
     waste_ecache_release_hold(&c, &at_free);
     CHECK(at_free.slot == -1, "release after free is harmless");
+
+    waste_ecache from_env;
+    age_env("4");
+    CHECK(waste_ecache_init(&from_env, REC_BYTES, REC_BYTES, 0) == 0,
+          "environment-configured aging cache initializes");
+    CHECK(waste_ecache_get_lfru_age(&from_env) == 4,
+          "WASTE_LFRU_AGE_TOKENS initializes the per-cache setting");
+    waste_ecache_free(&from_env);
+    age_env(NULL);
     pthread_cond_destroy(&g.cv);
     pthread_mutex_destroy(&g.mu);
     waste_model_set_lookahead(0);

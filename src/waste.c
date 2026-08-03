@@ -1140,6 +1140,10 @@ waste_status waste_generate(waste_ctx *c, const int32_t *prompt, size_t n,
         const double dt = nowf() - t0;
         c->stats.sec_total += dt;
         c->stats.tokens_generated++;
+        /* A learned hotlist is a prior, not a permanent vote. Optional
+         * LFRU aging advances only after a successful generated step; the
+         * chunked prompt loop above deliberately never ticks it. */
+        if (lg) waste_ecache_decode_tick(&c->m.cache);
 
         int stop = 0;
         for (size_t s = 0; s < p.n_stop; s++) if (p.stop_tokens[s] == cur) stop = 1;

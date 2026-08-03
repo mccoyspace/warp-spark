@@ -83,9 +83,9 @@ else
 fi
 
 if ./test_ecache 2>/dev/null | grep -q "^ECACHE OK"; then
-    ok "sweep cache reset drains readers and restores deterministic state"
+    ok "cache reset, holds and opt-in decode-only LFRU aging"
 else
-    no "sweep cache reset or lookahead bounds"
+    no "cache reset, holds, lookahead bounds or LFRU aging"
 fi
 
 SWEEP_MODEL="$TMP/sweep-test.waste"

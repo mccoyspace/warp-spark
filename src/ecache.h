@@ -84,6 +84,9 @@ typedef struct {
     uint64_t spec_issued;/* records the lookahead fetched on a guess         */
     unsigned rng;
     int policy;          /* 0 = LFRU, 1 = LRU                               */
+    uint32_t lfru_age_tokens; /* 0 off; otherwise decode-token half-life     */
+    uint32_t lfru_age_phase;  /* successful decode tokens since last aging   */
+    uint64_t lfru_age_events; /* completed frequency-halving passes          */
 
     /* read-ahead; io == NULL means every fetch is synchronous, which is
      * what the engine did before 0.7.0 and still does when asked for zero
@@ -136,6 +139,16 @@ int  waste_ecache_init(waste_ecache *c, size_t budget_bytes, size_t rec_bytes,
 void waste_ecache_free(waste_ecache *c);
 void waste_ecache_drain(waste_ecache *c);
 void waste_ecache_clear(waste_ecache *c);
+
+/* Optional, decode-only aging for a learned LFRU prior. Every `tokens`
+ * successful generated steps halves the frequency of each resident READY
+ * record, retaining a minimum of one. Zero disables it. The cache does not
+ * infer phase: product and measurement callers tick it only after decode,
+ * never while prefilling. clear() resets the phase but retains the setting. */
+void waste_ecache_set_lfru_age(waste_ecache *c, int tokens);
+int  waste_ecache_get_lfru_age(const waste_ecache *c);
+uint64_t waste_ecache_lfru_age_events(const waste_ecache *c);
+void waste_ecache_decode_tick(waste_ecache *c);
 
 /* Returns a pointer to the expert's record bytes, reading it through
  * `fetch` on a miss, or waiting for the read a hint already started.
