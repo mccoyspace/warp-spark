@@ -328,10 +328,18 @@ are retained in
 KDA dense decode cleared its gate. Sprint 12 then expanded the same kernel
 class through the conventional dense Q4 projections. Cumulative scope 2
 passed the stronger ordered-route contract at 0.673474 tok/s; scope 3 remains
-diagnostic. The post-expansion profile identifies VQ expert gather as the next
-independent GPU target. Results and exact evidence hashes are in
+diagnostic. Results and exact evidence hashes are in
 [GPU_DENSE_GB10.md](GPU_DENSE_GB10.md) and
 [gn100/sprint12-dense-gpu-summary.json](gn100/sprint12-dense-gpu-summary.json).
-Whole-layer graphs, CPU/GPU overlap, and prefill CUDA remain possible
-follow-ons, but each must be justified by a measured profile rather than
-added by default.
+
+Sprint 13 moved expert VQ LUT construction and gather to CUDA while retaining
+SiTU and router-ordered weighted accumulation on the CPU. Mode 2/group 1
+passed a byte-exact 64-token comparison at 0.901801 tok/s versus 0.707878
+tok/s with CPU VQ. A capture-trained, explicitly in-sample studio profile
+reached a repeated 1.003615 tok/s median over 16 tokens; its 64-token endpoint
+was 0.944126 tok/s. Grouped synchronization was rejected because the reduced
+wait count exposed more expert I/O and made every group larger than one
+slower. See [GPU_VQ_GB10.md](GPU_VQ_GB10.md) for the contract, profile split,
+and storage-contention result. Whole-layer graphs, CPU/GPU overlap, and
+prefill CUDA remain possible follow-ons, but each must be justified by a
+measured profile rather than added by default.

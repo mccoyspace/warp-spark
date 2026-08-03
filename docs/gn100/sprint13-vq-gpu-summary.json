@@ -1,0 +1,290 @@
+{
+  "schema": "waste.gn100.gpu_vq_sprint.v1",
+  "date": "2026-08-03",
+  "machine": "NVIDIA DGX Spark / Acer Veriton GN100",
+  "device": "NVIDIA GB10",
+  "branch": "exp/cuda-vq-gb10",
+  "parent_commit": "5105885f026973f07bb26e508c9e2a205c9532f8",
+  "preregistration_commits": [
+    "858e160",
+    "96613e5",
+    "2338def"
+  ],
+  "hotlist_converter_commit": "6ed20aeefa33379f0367ae605bfc7398ec6e1cf6",
+  "implementation_commit": "4b970c5724fefd530340d3a4df2d3282d260d7c4",
+  "status": "vq_mode2_strict_contract_pass_experimental_studio_profile_in_sample",
+  "decision": {
+    "accepted_cuda_vq": 2,
+    "accepted_vq_group": 1,
+    "strict_contract": "pass_byte_exact",
+    "one_tps_stretch_target": "pass_16_token_in_sample_studio_profile",
+    "sustained_64_token_one_tps": false,
+    "promotion": "experimental_branch_only",
+    "upstream_submission": "none"
+  },
+  "model": {
+    "manifest_sha256": "da3232925d8eeaf0df07ee45743f6467c7eecbc4c0e2513899028e788a1a07f2",
+    "baseline_usage_sha256": "e2949e8d14da3c46d766daa99e6b93f946c8cfc0425eba4815450079996899dd",
+    "studio_usage_sha256": "bc05755addf7f2ee5cfb755e1d40adeae5619c03d1016a0d42be3dec402d8531",
+    "studio_usage_provenance": "in_sample_fixed_64_token_route_capture",
+    "studio_usage_entries": 25072,
+    "studio_usage_routed_tokens": 64,
+    "studio_usage_selections": 94208,
+    "prompt_ids": [1008, 10484, 318, 15383, 387]
+  },
+  "strict_profile": {
+    "cuda_kda": 1,
+    "cuda_dense": 2,
+    "cuda_vq": 2,
+    "cuda_vq_group": 1,
+    "threads": 10,
+    "cpu_set": "5-9,15-19",
+    "pm_qos_latency_us": 0,
+    "q8": 1,
+    "sdot": 0,
+    "i8mm": 0,
+    "cache_mb": 59340,
+    "io_threads": 2,
+    "io_depth": 2,
+    "lookahead": 0,
+    "direct_io": 1,
+    "mlock": 0,
+    "purgeable": 0
+  },
+  "studio_profile_delta": {
+    "threads": 10,
+    "cache_mb": 59340,
+    "lookahead": 6,
+    "usage": "capture-derived in-sample hotlist",
+    "intended_scope": "exclusive single-user recurring-prompt workload"
+  },
+  "semantic_work_per_decode_token": {
+    "routed_experts": 1472,
+    "vq_applications": 4416,
+    "vq_lut_builds_mode2": 1656,
+    "vq_launches_mode2": 4508,
+    "vq_syncs_group1": 2944
+  },
+  "standalone_real_record_pilot": {
+    "records": 16,
+    "record_bytes_each": 12406784,
+    "expert_bytes_copied": 0,
+    "strict_row_bit_mismatches": 0,
+    "tree_max_abs": 1.01327896e-6,
+    "fp16_edge_case_mismatches": 0,
+    "strict_repeat_mismatches": 0,
+    "lut_build_speedup": {
+      "gate": 20.579,
+      "up": 17.511,
+      "down": 15.387
+    },
+    "apply_speedup": {
+      "gate": 16.153,
+      "up": 16.849,
+      "down": 11.019
+    },
+    "integration_pipeline_ms": {
+      "cpu_8_threads": 3.075,
+      "cuda_strict_row": 0.214,
+      "speedup": 14.355
+    },
+    "gates": "pass"
+  },
+  "fixed_budget_hotlist_screen": {
+    "decode_tokens": 8,
+    "cache_mb": 53196,
+    "original_usage_tok_s": [0.803106, 0.807100],
+    "capture_usage_tok_s": [0.902581, 0.922796],
+    "original_usage_bytes_gb_reported": 72.964,
+    "capture_usage_bytes_gb_reported": 56.922,
+    "capture_usage_top4495_coverage_percent": 58.823,
+    "interpretation": "in-sample ceiling that admitted studio-profile tuning"
+  },
+  "group_sweep": {
+    "decode_tokens": 16,
+    "repeats": 2,
+    "medians_tok_s": {
+      "group1": 0.936831,
+      "group2": 0.9340685,
+      "group4": 0.9193595,
+      "group8": 0.905899,
+      "group16": 0.863330
+    },
+    "change_vs_group1_percent": {
+      "group2": -0.295,
+      "group4": -1.865,
+      "group8": -3.302,
+      "group16": -7.846
+    },
+    "group16_profile_over_8_tokens": {
+      "vq_wait_seconds_saved": 1.51,
+      "expert_io_seconds_added": 2.28
+    },
+    "correctness": "byte-exact hashes and exact semantic/launch/sync counts in every arm",
+    "decision": "reject groups larger than one"
+  },
+  "lookahead_screen": {
+    "decode_tokens": 16,
+    "repeats": 2,
+    "width0_tok_s": [0.944058, 0.938488],
+    "width6_tok_s": [0.973528, 0.979545],
+    "width0_median_tok_s": 0.941273,
+    "width6_median_tok_s": 0.9765365,
+    "gain_percent": 3.746,
+    "extra_expert_bytes_percent": 13.8,
+    "strict_gate": "reject_below_5_percent_and_above_byte_limit",
+    "studio_disposition": "retain for aggressive single-user profile"
+  },
+  "final_studio_16_token_confirmation": {
+    "tok_s": [1.004224, 1.003005],
+    "seconds": [15.932697, 15.952056],
+    "median_tok_s": 1.0036145,
+    "hit_rate_percent": 71.15,
+    "hits": 16757,
+    "misses": 6795,
+    "expert_bytes": 111561801728,
+    "token_hash": "0x9b644bbcf8b95005",
+    "logit_hash": "0x63b24b6dd7a7294b",
+    "route_hash": "0x08efeee45c83aafc",
+    "kda_calls": 8832,
+    "dense_calls": 9280,
+    "vq_experts": 23552,
+    "vq_applies": 70656,
+    "vq_lut_builds": 26496,
+    "vq_launches": 72128,
+    "vq_syncs": 47104,
+    "fallbacks": 0
+  },
+  "queue_depth_screen": {
+    "decode_tokens": 16,
+    "tok_s": {
+      "depth2": 1.007297,
+      "depth4": 1.002326,
+      "depth8": 1.001715
+    },
+    "decision": "retain depth two"
+  },
+  "strict_64_token_capture": {
+    "lookahead": 0,
+    "cpu_vq": {
+      "seconds": 90.411068,
+      "tok_s": 0.707878
+    },
+    "cuda_vq": {
+      "seconds": 70.969114,
+      "tok_s": 0.901801,
+      "improvement_percent": 27.395
+    },
+    "expert_hits_each": 56136,
+    "expert_misses_each": 38072,
+    "expert_bytes_each": 472351080448,
+    "token_hash": "0xae63ad384447d76d",
+    "logit_hash": "0x66e819b83c461028",
+    "route_hash": "0xbdd3ebd1aaa7cdbc",
+    "causal_logit_steps": 65,
+    "finite_logit_pairs": 10649600,
+    "byte_changed_logit_steps": 0,
+    "max_abs_logit_error": 0.0,
+    "route_rows": 5888,
+    "selected_expert_slots": 94208,
+    "changed_route_rows": 0,
+    "ordered_route_changes": 0,
+    "expert_replacements": 0,
+    "argmax_changes": 0,
+    "top10_set_changes": 0,
+    "nonfinite_values": 0,
+    "kda_calls": 35328,
+    "dense_calls": 37120,
+    "vq_experts": 94208,
+    "vq_applies": 282624,
+    "vq_lut_builds": 105984,
+    "vq_launches": 288512,
+    "vq_syncs": 188416,
+    "fallbacks": 0
+  },
+  "studio_64_token_endpoint": {
+    "lookahead": 6,
+    "cpu_vq_tok_s": 0.722252,
+    "cuda_vq_tok_s": 0.944126,
+    "cuda_vq_seconds": 67.787536,
+    "improvement_percent": 30.720,
+    "byte_exact_logits_routes_tokens": true,
+    "cpu_hits": 62454,
+    "cpu_misses": 31754,
+    "cpu_expert_bytes": 528032727040,
+    "cuda_hits": 62442,
+    "cuda_misses": 31766,
+    "cuda_expert_bytes": 528318083072,
+    "expert_byte_change_percent": 0.054,
+    "one_tps": false
+  },
+  "storage_contention": {
+    "fio": {
+      "direct": 1,
+      "ioengine": "libaio",
+      "rw": "randread",
+      "block_bytes": 12582912,
+      "queue_depth": 2,
+      "runtime_seconds": 60,
+      "ramp_seconds": 10
+    },
+    "baseline_before": {
+      "bandwidth_bytes_s": 13387772108,
+      "p95_ns": 1630208,
+      "p99_ns": 1728512
+    },
+    "cuda_vq_engine_overlap": {
+      "bandwidth_bytes_s": 8384134224,
+      "p95_ns": 3948544,
+      "p99_ns": 4145152,
+      "engine_seconds": 79.160778,
+      "engine_tok_s": 0.808481
+    },
+    "baseline_after": {
+      "bandwidth_bytes_s": 13186452227,
+      "p95_ns": 1662976,
+      "p99_ns": 1744896
+    },
+    "baseline_bandwidth_drift_percent": -1.504,
+    "versus_baseline_mean_percent": {
+      "bandwidth": -36.900,
+      "p95": 139.801,
+      "p99": 138.679
+    },
+    "interpretation": "same-SSD saturation bound; one-TPS studio profile assumes exclusive model-SSD use"
+  },
+  "tests": {
+    "spark_cuda_native": "34 passed, 0 failed, 13 skipped",
+    "serve_checks": 269,
+    "gpu_comparator_checks": 13,
+    "capture_hotlist_converter_checks": 5,
+    "focused_python_checks": 22,
+    "group16_real_k3_smoke": "pass, 184 synchronizations/token, zero fallback"
+  },
+  "evidence_root": "/home/kevin/waste-gn100-experiment-20260730/validation/sprint13-vq-20260802",
+  "evidence_archive": "gn100-sprint13-evidence-2026-08-03.tar.gz",
+  "evidence_archive_sha256": "5374bef47b6eac115be4ff98e02dd7b2c46239a07aa9105d55f412fc475becfe",
+  "artifact_manifest_sha256": "6841aa9292b95f9fadadd73308650219a972926d9c744268c53f8a54e3cc5ca7",
+  "evidence_sha256": {
+    "pilot-real-record.txt": "70b4cd35999154683c1b950362f818fceb77b1be1e5cb84facedba382c8dc3b6",
+    "group-1-16tok.txt": "638c47cdb63d5e943da7bd987d2a70c7aef2e17a5acd8c92966b2cfa1bb49be2",
+    "group-2-16tok.txt": "14bbf29a232ccbe081e1d11531f4e88720c5b11a6034816e86452b251e400aac",
+    "group-4-16tok.txt": "7d2bfde4092f69676d3fc4e62a52039347738a269ea88a4fd8903446574b26e8",
+    "group-8-16tok.txt": "02726db37203781fd84228ba3f7e659b9ce07b5bd2cd56beedfdeb7886417d42",
+    "group-16-16tok.txt": "fc6d1521142dfa0f4cba29110418e851f132393c9895c07bb3240a41718c63ab",
+    "final-studio-repeat.txt": "32fe593826b77d3c861f4e4c587f1db8879347b4a1fa18a4acb85d2aa5a5fc11",
+    "final-qd-screen.txt": "06c2a26a80d0d4a8696d8d95543852474a2eb3f958cb26b6954b998a72719ebb",
+    "strict64-look0.txt": "627ac4b07d152d97f5ed3569f5633cf0fece41fcd304aadd63b662e9e46b070b",
+    "compare-strict64-look0.json": "d5618a9b8268f41c3c1e93a536d044c7026ce077cd68747ae9e7d347c80bd131",
+    "final64.txt": "34359b7d37095f6420c320ad9de68f198089d8aa60062a2de5fa38c01d419f04",
+    "compare-final64.json": "9a956a2e6655c61e98fa66aad1b36df3fa8927a051604c087e8d42bee36a1b53",
+    "fio-engine-before.json": "62dc4572fcef37e609f5ca4540b3a5980b6dd120eaf43fb571c3d24cdb137eb5",
+    "fio-engine-contended.json": "2500078dbbc256a70cac1a100d616836acc5440deae730468f27675397625317",
+    "fio-engine-after.json": "a120a5eb02b0a06ba3948c7512e9d143c79d335527596e14580126067a9957df",
+    "contention-engine.txt": "e4db17de57cde8656a4064ea9efa66b1a66325651ac9d6cd8f9424c6aea98813",
+    "usage-sprint12-corpus64.waste": "bc05755addf7f2ee5cfb755e1d40adeae5619c03d1016a0d42be3dec402d8531",
+    "cuda-build.txt": "c4ec6e35b7cdc6d597a09e216e74e71bebf8633eb7bb987e75c21b20e912da74",
+    "tests.txt": "8975ffa349784ed36f6ec058737a844a88c60917632cc7f0e8ef44819da5ce9d",
+    "measured-source-files.sha256": "cbf3305cf0c65b96d8c2ece740285e4b25b9fbe91263127140d2091b56889f48"
+  }
+}

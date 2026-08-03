@@ -184,3 +184,108 @@ group is selected only if two matched repeats improve median throughput by at
 least 5% over group 1. Group sizes are tested in ascending order and the work
 stops once larger groups reduce I/O/compute overlap or no longer improve the
 median. One tok/s remains the stretch target rather than an acceptance waiver.
+
+## Measured result
+
+The strict CUDA kernel passed. On 16 distinct real K3 expert records, the
+standalone pilot preserved the CPU scalar dependency chain bit-for-bit and
+improved the individual apply shapes by 11.02-16.85x in the archived
+confirmation. The integrated mode-2
+path completed all three expert matrices on CUDA, retained SiTU and the final
+weighted sum on the CPU, and never copied an expert record into a second
+cache. Mode 3 was not built: the retained activation/handoff share measured
+about 3.5%, below its registered trigger.
+
+The definitive lookahead-off 64-token comparison used ten compute threads, a
+59,340 MiB expert cache, two direct-I/O readers at depth two, the
+capture-derived hotlist, and group one:
+
+| measurement | CPU VQ | CUDA VQ mode 2 |
+| --- | ---: | ---: |
+| decode time | 90.411068 s | 70.969114 s |
+| throughput | 0.707878 tok/s | **0.901801 tok/s** |
+| expert hits / misses | 56,136 / 38,072 | 56,136 / 38,072 |
+| expert bytes | 472,351,080,448 | 472,351,080,448 |
+
+That is a 27.4% engine improvement. Across 65 causal logit rows, 10,649,600
+finite logit pairs, 5,888 routed rows and 94,208 selected expert slots, the
+captures were byte-identical: zero changed logits, tokens, top-ten sets,
+route memberships, route orders or expert replacements. The CUDA arm
+reported exactly 94,208 experts, 282,624 applications, 105,984 LUT builds,
+288,512 launches and 188,416 synchronizations, with zero fallback. The
+process and Q0 holder exited cleanly.
+
+The faster single-user profile adds three measured policy changes rather than
+changing CUDA arithmetic: ten compute threads, a 59,340 MiB cache, and
+lookahead width six. Its hotlist was trained from the existing fixed 64-token
+route capture, so this is explicitly an in-sample recurring-prompt/studio
+result, not a general K3 claim. The saved final confirmation was:
+
+| repeat | time | throughput | hit rate | expert bytes |
+| ---: | ---: | ---: | ---: | ---: |
+| 1 | 15.932697 s | **1.004224 tok/s** | 71.15% | 111,561,801,728 |
+| 2 | 15.952056 s | **1.003005 tok/s** | 71.15% | 111,561,801,728 |
+
+The median is **1.003615 tok/s**, which clears the sprint's stretch target.
+Both repeats have identical token, logit and route hashes and exact CUDA
+counters. A separate confirmation produced a 1.009791 tok/s median, and the
+final queue-depth screen reproduced 1.007297 tok/s at depth two. Depths four
+and eight were slightly slower at 1.002326 and 1.001715 tok/s, so depth two
+remains selected.
+
+The result does not sustain 1 tok/s across this entire 64-token continuation.
+With width six, the longer CUDA arm reached 0.944126 tok/s versus 0.722252
+tok/s for CPU VQ, a 30.7% improvement. It remained fully byte-identical, but
+asynchronous prefetch timing changed 12 of 94,208 cache outcomes and moved
+0.05% more bytes. The lookahead-off proof above supplies the exact cache-I/O
+accounting gate; the lookahead-on run supplies the realistic performance
+endpoint.
+
+### Grouped synchronization decision
+
+Grouping reduced the registered two synchronizations per expert exactly as
+designed, but it also delayed router-order consumption and destroyed useful
+expert-I/O/compute cadence:
+
+| experts per group | median tok/s | change from group 1 |
+| ---: | ---: | ---: |
+| 1 | **0.936831** | — |
+| 2 | 0.934069 | -0.29% |
+| 4 | 0.919360 | -1.86% |
+| 8 | 0.905899 | -3.30% |
+| 16 | 0.863330 | -7.85% |
+
+A group-16 trace cut VQ waiting by about 1.51 seconds over eight tokens, but
+expert I/O grew by about 2.28 seconds. All group arms preserved byte-identical
+outputs, exact semantic/launch/sync counts, explicit cache-hold lifetimes and
+zero fallback. Group one is selected; larger groups remain an opt-in negative
+experiment on this branch rather than part of the performance profile.
+
+### Same-SSD contention
+
+The engine-level contention screen repeated Sprint 12's 12 MiB random
+`O_DIRECT` fio job at queue depth two, bracketed by uncontended 60-second
+baselines:
+
+| arm | fio bandwidth | p95 | p99 |
+| --- | ---: | ---: | ---: |
+| before | 13.388 GB/s | 1.630 ms | 1.729 ms |
+| concurrent CUDA VQ engine | 8.384 GB/s | 3.949 ms | 4.145 ms |
+| after | 13.186 GB/s | 1.663 ms | 1.745 ms |
+
+The bracketing bandwidth drift was 1.50%. Against their mean, contention
+reduced fio bandwidth by 36.9% and raised p95/p99 by 139.8%/138.7%. The model
+completed at 0.808481 tok/s while fio was active, versus 0.944126 tok/s in its
+uncontended 64-token capture. This is an expected shared-device saturation
+bound: the 1 TPS studio result assumes exclusive use of the model SSD.
+
+## Disposition
+
+CUDA VQ mode 2/group 1 passes the strict arithmetic and engine gates. The
+capture-derived hotlist, larger safe cache, width-six lookahead and ten-thread
+selection together cross 1 tok/s for the measured recurring-prompt workload.
+The claim remains experimental and in-sample; nothing is promoted to
+`spark/integration` or proposed upstream from this sprint. The next honest
+work is held-out prompt-family validation and storage/cache policy, not more
+VQ synchronization machinery. Exact counters, commands, captures and hashes
+are in [the Sprint 13 summary](gn100/sprint13-vq-gpu-summary.json).
