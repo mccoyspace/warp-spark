@@ -19,6 +19,11 @@
 > fired before lookahead-six or 64-token testing; no cache policy was selected
 > or promoted. See [the held-out result](docs/GPU_VQ_HELDOUT_GB10.md) and its
 > [machine-readable summary](docs/gn100/sprint14-heldout-aging-summary.json).
+> Sprint 15 then tested one preregistered inherited-prior compression policy.
+> It was exact and safe but failed development admission: A+B median gain was
+> -0.02383% and decode traffic increased by 16.962 GiB. The stop rule preserved
+> the fresh H2 corpus unspent; nothing was promoted. See
+> [the Sprint 15 result](docs/GPU_VQ_PRIOR_GB10.md).
 > Start with [GN100 results and reproduction notes](docs/GN100.md), then see
 > [the upstreaming map](docs/UPSTREAMING.md) and
 > [upstream issue #14](https://github.com/sqliteai/waste/issues/14).

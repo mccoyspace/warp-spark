@@ -293,4 +293,7 @@ improved unseen-family throughput by 4.5573% and misses by 7.8974%,
 narrowly missing its respective 5% and 10% gates; it stopped without selecting
 the policy. Exact Sprint 13 counters, commands, captures and hashes are in
 [the Sprint 13 summary](gn100/sprint13-vq-gpu-summary.json); the held-out
-disposition is in [GPU_VQ_HELDOUT_GB10.md](GPU_VQ_HELDOUT_GB10.md).
+disposition is in [GPU_VQ_HELDOUT_GB10.md](GPU_VQ_HELDOUT_GB10.md). A later
+single-candidate inherited-prior compression experiment also failed its
+development gate and preserved fresh H2 unspent; see
+[GPU_VQ_PRIOR_GB10.md](GPU_VQ_PRIOR_GB10.md).

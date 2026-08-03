@@ -244,3 +244,51 @@ published on the experimental branch with machine-readable stage summaries,
 the pre-H2 seal if reached, source references, manifest-verified raw evidence,
 a tag, and an experimental release. This sprint does not promote a policy to
 `spark/integration` or propose it upstream automatically.
+
+## Measured result and disposition
+
+The complete 48-row development campaign was valid, but the candidate failed
+admission. The frozen analyzer returned exit 2 (`valid=true`,
+`development_pass=false`). Across the eight A+B prompt families, the median
+paired-prompt throughput gain was **-0.02383%**. Treatment added 1,468 decode
+misses and 18,213,158,912 expert bytes (**16.962 GiB**), so the median-gain,
+miss-direction, and byte-direction gates all failed. No A/B family fell below
+the -5% floor.
+
+| development scope | median family gain | decode misses, control -> treatment | decode-byte change | result |
+| --- | ---: | ---: | ---: | --- |
+| A+B, eight families | **-0.02383%** | 152,754 -> 154,222 | +16.962 GiB | primary gate failed |
+| legacy H1, four families | -0.08363% | 96,614 -> 96,224 | -4.506 GiB | veto checks passed; cannot rescue A+B |
+
+H1 exposed a useful phase interaction without changing the decision. Prior
+compression saved 390 decode misses and 4.506 GiB there, but added 752 prefill
+misses and 8.689 GiB. Prefill plus decode therefore regressed by 362 misses
+and 4.183 GiB. On the familiar A+B traffic, compression worsened prefill and
+decode by the same 1,468 misses and 16.962 GiB apiece. The evidence is
+consistent with the imported raw ordering being useful until a sufficiently
+different prompt exerts enough pressure to rewrite residency. A future
+experiment could preregister pressure-gated decay or an explicit blend of
+imported and live evidence; that is a post-hoc hypothesis requiring a fresh
+H3 tier, not a selected Sprint 15 policy.
+
+`color_value_b` had a timing-only outlier that is retained rather than hidden.
+Its control repeats were 0.110583 and 0.760799 tok/s despite identical cache
+traffic, while treatment repeated at 0.698716 and 0.765018 tok/s. The archived
+case artifacts show no process swap or major fault, but they do not establish
+the timing anomaly's cause. The formal family gain of 67.98% is therefore
+timing-contaminated and not attributable to the policy; it does not change the
+negative A+B median or either exact traffic gate.
+
+All 12 cases and 48 rows preserved the per-case greedy-token, full-logit, and
+ordered-route hashes. Both repeats of every arm had identical cache totals;
+all CUDA, prior, aging, and fallback counters were exact. There were zero
+process swaps, major faults, or swap-outs; minimum loaded `MemAvailable` was
+31,022,808 KiB (29.586 GiB), and every Q0 holder released cleanly.
+
+The preregistered stop was honored. No H2 model step ran, no pre-H2 seal was
+created, and no H2 inference artifact exists; the frozen H2 corpus remains
+unspent. The transform stays default-off, no policy moves to
+`spark/integration`, and there is no upstream proposal from this sprint. See
+the [machine-readable result](gn100/sprint15-prior-compression-summary.json),
+the [unspent H2 corpus](gn100/sprint15-h2-corpus.json), and the
+[raw-evidence checksum](gn100/gn100-sprint15-evidence-2026-08-03.tar.gz.sha256).
