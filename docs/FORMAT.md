@@ -292,8 +292,18 @@ for the LFRU policy, written by `--learn` and preloaded on the next open
 so a run starts warm instead of empty. Measured on Kimi-Linear at a 5 GB
 budget: 1602 misses cold against 1175 warm, 61% → 72%. The
 cross-layer routing pairs for a pilot/COUPLE prefetcher have a field in
-the entry struct and no code behind them, and the converter cannot yet
-bake an initial hotlist from a calibration corpus.
+the entry struct and no code behind them. `tools/capture_to_usage.py` can
+build an initial hotlist from one or more deterministic route captures:
+
+```bash
+python3 tools/capture_to_usage.py capture-*.json -o usage.waste
+```
+
+The input captures must use `waste.gpu_capture.v1`; only their routed expert
+rows are consumed. Use representative calibration traffic and validate on
+held-out prompt families. A hotlist built from the same capture used to
+measure it is useful as a diagnostic ceiling, but its hit rate is in-sample
+and must be reported that way.
 
 ## Converter pipeline (`tools/convert.py`)
 
