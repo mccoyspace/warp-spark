@@ -6,6 +6,12 @@
 > uses eight compute threads on pinned performance CPUs, child-scoped Q0, two
 > direct-I/O readers at depth two, Q8, and no router lookahead, and measures
 > **0.34–0.35 tok/s**.
+> Separately, the quarantined
+> [`exp/cuda-dense-gb10`](https://github.com/mccoyspace/waste-spark/tree/exp/cuda-dense-gb10)
+> branch reaches **0.6735 tok/s** on the fixed 64-token corpus versus
+> 0.4899 tok/s for KDA-only CUDA, with zero ordered-route changes. It remains
+> experimental and is not part of `spark/integration`; see the
+> [Sprint 12 evidence release](https://github.com/mccoyspace/waste-spark/releases/tag/gn100-sprint12-results-2026-08-02).
 > Start with [GN100 results and reproduction notes](docs/GN100.md), then see
 > [the upstreaming map](docs/UPSTREAMING.md) and
 > [upstream issue #14](https://github.com/sqliteai/waste/issues/14).
