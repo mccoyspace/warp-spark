@@ -146,3 +146,41 @@ accepted capture requires exact semantic counts and zero fallback.
 No result from this sprint is promoted into `spark/integration` or proposed
 upstream automatically. Publication means an `exp/*` branch, exact source and
 model hashes, a machine-readable summary and immutable raw evidence.
+
+## Post-pilot amendment: fixed-budget hotlist and grouped synchronization
+
+The standalone pilot passed bit-exactly on 16 distinct records at 9.85-11.93x
+for the individual apply shapes. Integrated mode 2 then exposed the next
+bottleneck rather than reproducing that factor at engine level: the original
+3,008-entry hotlist sustains about 0.81 tok/s over eight decode tokens, while
+expert I/O grows as the CPU VQ work that used to hide it disappears. Mode 3's
+measured non-LUT residual is only about 3.5% of token time, below its registered
+build trigger, so mode 3 remains deferred.
+
+A diagnostic hotlist built from the existing fixed 64-token route capture
+fills all 4,495 slots at the unchanged 53,196 MiB cache budget. Its top-4,495
+entries cover 58.82% of captured selections, versus 49.28% for the first 3,008.
+Matched two-repeat results are 0.903/0.923 tok/s against 0.803/0.807 tok/s for
+the original hotlist, with 56.92 GB versus 72.96 GB read over eight tokens.
+This is an in-sample ceiling result, not a general cache claim. The converter
+and hotlist are retained because representative recurring prompt families are
+a real target workload; promotion requires a separately captured calibration
+set and held-out prompt-family validation.
+
+The remaining mode-2 micro-arm changes scheduling only. Experimental
+`WASTE_CUDA_VQ_GROUP` values 1, 2, 4, 8 and 16 queue already-validated kernels
+and synchronize twice per expert group rather than twice per expert. Kernel
+count, LUT construction, SiTU, expert weights, and the CPU `j = 0..15`
+accumulation order do not change. Expert-cache records receive explicit holds
+until the group's stream work is drained; no expert bytes or LUTs are copied
+into a second cache. Mode 1 remains group 1.
+
+For K3, the registered synchronization counts are 2,944, 1,472, 736, 368 and
+184 per token for groups 1, 2, 4, 8 and 16 respectively; launch count remains
+4,508. Each group arm must retain byte-identical logits, routes and tokens,
+the same expert hit/miss/byte counters, exact semantic and launch/sync counts,
+zero fallback, clean held-slot release on errors, and clean Q0 teardown. A
+group is selected only if two matched repeats improve median throughput by at
+least 5% over group 1. Group sizes are tested in ascending order and the work
+stops once larger groups reduce I/O/compute overlap or no longer improve the
+median. One tok/s remains the stretch target rather than an acceptance waiver.
