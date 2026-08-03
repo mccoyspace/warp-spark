@@ -1,0 +1,418 @@
+{
+  "schema": "waste.gn100.sprint14_heldout_aging.v1",
+  "date": "2026-08-03",
+  "machine": "NVIDIA DGX Spark / Acer Veriton GN100",
+  "device": "NVIDIA GB10",
+  "host": "gn100-77bd",
+  "kernel": "Linux 6.17.0-1021-nvidia aarch64",
+  "branch": "exp/cuda-vq-heldout-gb10",
+  "parent_commit": "dbaf26f9f0144f6193215987461d9c934e2f2ea5",
+  "preregistration_commit": "9dcfa0d4fc220805c262d21746258709e97043a2",
+  "implementation_commit": "23d790fe835456f13b3402b57ca30e539dafc97e",
+  "status": "valid_preregistered_unseen_h_gate_miss",
+  "decision": {
+    "analyzer_exit_code": 2,
+    "analyzer_exit_meaning": "valid evidence; registered unseen-H performance gate missed",
+    "selected_policy": "none",
+    "selected_lfru_age_tokens": null,
+    "retained_default_lfru_age_tokens": 0,
+    "promote_to_spark_integration": false,
+    "upstream_submission": "none",
+    "look6_h16": "not_run_by_preregistered_stop_rule",
+    "look6_h64": "not_run_by_preregistered_stop_rule",
+    "final_64_token_comparator": "not_run_by_preregistered_stop_rule",
+    "reason": "Age-four aging improved the unseen-family median by 4.557348759%, below the registered 5% threshold, and reduced unseen-family misses by 7.897406173%, below the registered 10% threshold."
+  },
+  "provenance": {
+    "model_manifest_sha256": "da3232925d8eeaf0df07ee45743f6467c7eecbc4c0e2513899028e788a1a07f2",
+    "baseline_usage_sha256": "e2949e8d14da3c46d766daa99e6b93f946c8cfc0425eba4815450079996899dd",
+    "corpus_sha256": "4fb4ca60d82ed521c0d59732c748a5f99b22f720d35e19d5590b41bc01c423fe",
+    "frozen_inputs_manifest_sha256": "16e507e4b2691c6c8df9facc23807c516dc641231f9a59595aa7535c962a1e93",
+    "calibration_capture_manifest_sha256": "4dcd8d28e6ac90d901f588e179c04b10490f640b833dcaa689801837d2469e31",
+    "pre_heldout_seal_sha256": "4c1bf94fd8a1151c7087ff9c43d7546de8c02d49eee32996404ca42459a7072e",
+    "hotlist_sha256": "6ef8b0e752b4c5e369eae1e088010bb47243f6ee4d1d9470053067c4e85f693e",
+    "runner_sha256": "246c2b8858b1a66d0194cee0d28624b68c7a0fc305d69705dd1dd55b6faf0803",
+    "analyzer_sha256": "483f8ee0d2d8c78c5cc582a5d33c4855e805ef5aa641b0dc0dd359aaf9ac6a7d",
+    "bundled_analysis_sha256": "03f2b2f245db2fe81fb4007071c0c79d27d5053e777573718284cbce4a298eed"
+  },
+  "corpus": {
+    "canonical_file": "docs/gn100/sprint14-heldout-corpus.json",
+    "calibration_a": [
+      "composition_a",
+      "revision_a",
+      "color_value_a",
+      "material_a"
+    ],
+    "within_family_b": [
+      "composition_b",
+      "revision_b",
+      "color_value_b",
+      "material_b"
+    ],
+    "unseen_family_h": [
+      "ambiguity_h",
+      "history_h",
+      "series_h",
+      "display_h"
+    ],
+    "calibration_capture_order": [
+      "composition_a",
+      "revision_a",
+      "color_value_a",
+      "material_a"
+    ],
+    "look0_16_order": [
+      "composition_a",
+      "revision_a",
+      "color_value_a",
+      "material_a",
+      "composition_b",
+      "revision_b",
+      "color_value_b",
+      "material_b",
+      "ambiguity_h",
+      "history_h",
+      "series_h",
+      "display_h"
+    ],
+    "registered_look6_h16_order": [
+      "display_h",
+      "series_h",
+      "history_h",
+      "ambiguity_h"
+    ],
+    "registered_look6_h64_order": [
+      "ambiguity_h",
+      "history_h",
+      "series_h",
+      "display_h"
+    ]
+  },
+  "profile": {
+    "decode_tokens": 16,
+    "repeats": 2,
+    "one_model_load_per_prompt": true,
+    "arm_key": "lfru_age",
+    "arms": [0, 4],
+    "row_order": [[0, 1], [4, 1], [4, 2], [0, 2]],
+    "lookahead": 0,
+    "cuda_decode_only": true,
+    "cpu_prefill": true,
+    "cuda_kda": 1,
+    "cuda_dense": 2,
+    "cuda_vq": 2,
+    "cuda_vq_group": 1,
+    "threads": 10,
+    "cpu_set": "5-9,15-19",
+    "pm_qos_latency_us": 0,
+    "pm_qos_scope": "child",
+    "q8": 1,
+    "sdot": 0,
+    "i8mm": 0,
+    "backend": "auto",
+    "cache_policy": "lfru",
+    "cache_mb": 59340,
+    "cache_slots": 5015,
+    "warm_entries": 5015,
+    "direct_io_effective": 1,
+    "io_threads": 2,
+    "io_depth": 2,
+    "mlock": 0,
+    "purgeable": 0,
+    "verify": 0,
+    "greedy_decode": true
+  },
+  "calibration_hotlist": {
+    "training_split": "A_only",
+    "routed_tokens": 64,
+    "selections": 94208,
+    "entries": 23828,
+    "effective_warm_entries": 5015,
+    "full_output_not_truncated": true,
+    "sealed_before_any_b_or_h_inference": true,
+    "capture_json_sha256": {
+      "composition_a": "2c537b3b0047a6fcbc36b144451e7eed6340a098f87edda58756ddf82ddf352a",
+      "revision_a": "61a85f9a28b5ee3ac253e365e5918fa083fd2ec1370b003fdee9e0d46a28a47d",
+      "color_value_a": "682cfaf8901a2267c9b471d5e4d11dc74654a6915d5989c2ec4648e48a040f36",
+      "material_a": "fcf6f3bcac8b494e4946bf89ead5d93b7c74544193a949a39532db5c58d4bf45"
+    },
+    "capture_logits_sha256": {
+      "composition_a": "14f89836a73fd27493b47aefc924dff342e47265d87c7e5a13ea04e4b2c4a12f",
+      "revision_a": "324cdd14f64daeb699543ca3a7deeaaa2f4a3578a995b84f3bc52b3eaeb38ca9",
+      "color_value_a": "6c6942f736a7f77fba4b96eee80c8e9a6d455a6338bcbc22566fbfc7664caf60",
+      "material_a": "d6f9a31eaa3d4e559420c2c0852a8a8a377fbf916b2ebc320ecbd70255fe8652"
+    }
+  },
+  "exact_row_contract": {
+    "expected_per_16_token_row": {
+      "kda_calls": 8832,
+      "dense_calls": 9280,
+      "vq_experts": 23552,
+      "vq_applications": 70656,
+      "vq_lut_builds": 26496,
+      "cuda_launches": 72128,
+      "cuda_synchronizations": 47104,
+      "fallbacks": 0
+    },
+    "expected_age_events": {"0": 0, "4": 4},
+    "effective_modes": {"cuda_kda": 1, "cuda_dense": 2, "cuda_vq": 2},
+    "all_48_rows_exact": true,
+    "all_rows_child_exit_zero": true
+  },
+  "look0_16_campaign": {
+    "row_fields": [
+      "lfru_age_tokens",
+      "repeat",
+      "seconds",
+      "tok_s",
+      "hits",
+      "misses",
+      "expert_bytes"
+    ],
+    "prompts": {
+      "composition_a": {
+        "split": "A",
+        "rows": [
+          [0, 1, 16.608185, 0.963380, 15665, 7887, 97852305408],
+          [4, 1, 16.775900, 0.953749, 15656, 7896, 97963966464],
+          [4, 2, 16.662578, 0.960236, 15656, 7896, 97963966464],
+          [0, 2, 16.503991, 0.969463, 15665, 7887, 97852305408]
+        ],
+        "median_tok_s": {"0": 0.9664215, "4": 0.9569924999999999},
+        "gain": -0.009756612409802745,
+        "hashes": {"token": "0x09b57e1f6747aa4e", "logit": "0xb604dd7e1454c3b8", "route": "0xfffe67b059bddac0"},
+        "safety": [0, 0, 30962620, 16725212, 16725216, 6, 0]
+      },
+      "revision_a": {
+        "split": "A",
+        "rows": [
+          [0, 1, 17.100345, 0.935654, 14708, 8844, 109725597696],
+          [4, 1, 17.423075, 0.918322, 14672, 8880, 110172241920],
+          [4, 2, 17.363871, 0.921454, 14672, 8880, 110172241920],
+          [0, 2, 17.324066, 0.923571, 14708, 8844, 109725597696]
+        ],
+        "median_tok_s": {"0": 0.9296125, "4": 0.919888},
+        "gain": -0.010460810283854705,
+        "hashes": {"token": "0x9e7adcd1e1fd34e0", "logit": "0x261c8770708bfb7c", "route": "0x4e118156bc09da35"},
+        "safety": [0, 0, 31185132, 16725216, 16725216, 0, 0]
+      },
+      "color_value_a": {
+        "split": "A",
+        "rows": [
+          [0, 1, 19.820616, 0.807240, 11602, 11950, 148261068800],
+          [4, 1, 19.289319, 0.829475, 12310, 11242, 139477065728],
+          [4, 2, 19.257301, 0.830854, 12310, 11242, 139477065728],
+          [0, 2, 19.814222, 0.807501, 11602, 11950, 148261068800]
+        ],
+        "median_tok_s": {"0": 0.8073705, "4": 0.8301645},
+        "gain": 0.02823239144853562,
+        "hashes": {"token": "0xd8bcff529ed734e9", "logit": "0xe10f2189581546cb", "route": "0xf48ae283c806806e"},
+        "safety": [0, 0, 31169904, 16725216, 16725216, 0, 0]
+      },
+      "material_a": {
+        "split": "A",
+        "rows": [
+          [0, 1, 17.016050, 0.940289, 15093, 8459, 104948985856],
+          [4, 1, 16.607152, 0.963440, 15366, 8186, 101561933824],
+          [4, 2, 16.825193, 0.950955, 15366, 8186, 101561933824],
+          [0, 2, 16.899564, 0.946770, 15093, 8459, 104948985856]
+        ],
+        "median_tok_s": {"0": 0.9435295, "4": 0.9571974999999999},
+        "gain": 0.014486033558039235,
+        "hashes": {"token": "0x4162138f88aa6d80", "logit": "0x0204f5edfccfe132", "route": "0x493e1714514071e2"},
+        "safety": [0, 0, 31159792, 16725216, 16725220, 1, 0]
+      },
+      "composition_b": {
+        "split": "B",
+        "rows": [
+          [0, 1, 16.953856, 0.943738, 15048, 8504, 105507291136],
+          [4, 1, 17.128601, 0.934110, 15362, 8190, 101611560960],
+          [4, 2, 16.686249, 0.958873, 15362, 8190, 101611560960],
+          [0, 2, 17.012953, 0.940460, 15048, 8504, 105507291136]
+        ],
+        "median_tok_s": {"0": 0.942099, "4": 0.9464915},
+        "gain": 0.004662461163847942,
+        "hashes": {"token": "0x4162138f88aa6d80", "logit": "0xe1bbc6c0c32b756a", "route": "0x3ee06db2a8e492dc"},
+        "safety": [0, 0, 31073104, 16725220, 16725224, 1, 0]
+      },
+      "revision_b": {
+        "split": "B",
+        "rows": [
+          [0, 1, 17.148287, 0.933038, 14783, 8769, 108795088896],
+          [4, 1, 16.985521, 0.941979, 15149, 8403, 104254205952],
+          [4, 2, 16.912021, 0.946073, 15149, 8403, 104254205952],
+          [0, 2, 17.251696, 0.927445, 14783, 8769, 108795088896]
+        ],
+        "median_tok_s": {"0": 0.9302414999999999, "4": 0.944026},
+        "gain": 0.01481819506010007,
+        "hashes": {"token": "0x4162138f88aa6d80", "logit": "0x1b41ea2a2623638b", "route": "0xa82b494baa4939f1"},
+        "safety": [0, 0, 31170612, 16725224, 16725236, 1, 0]
+      },
+      "color_value_b": {
+        "split": "B",
+        "rows": [
+          [0, 1, 21.124974, 0.757397, 10318, 13234, 164191379456],
+          [4, 1, 20.321630, 0.787338, 11247, 12305, 152665477120],
+          [4, 2, 20.158234, 0.793720, 11247, 12305, 152665477120],
+          [0, 2, 21.056289, 0.759868, 10318, 13234, 164191379456]
+        ],
+        "median_tok_s": {"0": 0.7586325, "4": 0.790529},
+        "gain": 0.04204473180360724,
+        "hashes": {"token": "0x369fd942ef92ec16", "logit": "0x18eac31a3e026452", "route": "0xe278c4c6c62b1368"},
+        "safety": [0, 0, 31169776, 16725236, 16725244, 2, 0]
+      },
+      "material_b": {
+        "split": "B",
+        "rows": [
+          [0, 1, 17.132938, 0.933874, 14822, 8730, 108311224320],
+          [4, 1, 17.064438, 0.937622, 14963, 8589, 106561867776],
+          [4, 2, 17.060366, 0.937846, 14963, 8589, 106561867776],
+          [0, 2, 17.138666, 0.933562, 14822, 8730, 108311224320]
+        ],
+        "median_tok_s": {"0": 0.933718, "4": 0.937734},
+        "gain": 0.00430108448161004,
+        "hashes": {"token": "0x91135ec1e0e621f6", "logit": "0xa6267da9712bc2ca", "route": "0xa732a23d01bc63e6"},
+        "safety": [0, 0, 31166020, 16725244, 16725248, 2, 0]
+      },
+      "ambiguity_h": {
+        "split": "H",
+        "rows": [
+          [0, 1, 21.078122, 0.759081, 10526, 13026, 161610768384],
+          [4, 1, 20.063602, 0.797464, 11395, 12157, 150829273088],
+          [4, 2, 20.032238, 0.798713, 11395, 12157, 150829273088],
+          [0, 2, 20.881389, 0.766233, 10526, 13026, 161610768384]
+        ],
+        "median_tok_s": {"0": 0.762657, "4": 0.7980885},
+        "gain": 0.04645797521035,
+        "hashes": {"token": "0x4e4d48d5cef9502a", "logit": "0x360b7bc9facaac2a", "route": "0xcaa0e2e6b59c3153"},
+        "safety": [0, 0, 31068384, 16725248, 16725256, 3, 0]
+      },
+      "history_h": {
+        "split": "H",
+        "rows": [
+          [0, 1, 20.858886, 0.767059, 10634, 12918, 160270835712],
+          [4, 1, 19.330056, 0.827727, 12176, 11376, 141139574784],
+          [4, 2, 19.493615, 0.820782, 12176, 11376, 141139574784],
+          [0, 2, 20.811804, 0.768794, 10634, 12918, 160270835712]
+        ],
+        "median_tok_s": {"0": 0.7679265, "4": 0.8242545},
+        "gain": 0.07335076989790035,
+        "hashes": {"token": "0xd92a2765509d5920", "logit": "0x8aa58419f0fb69e6", "route": "0x14b1d4f2ec8daf28"},
+        "safety": [0, 0, 31180192, 16725256, 16725264, 1, 0]
+      },
+      "series_h": {
+        "split": "H",
+        "rows": [
+          [0, 1, 21.416091, 0.747102, 9948, 13604, 168781889536],
+          [4, 1, 20.520948, 0.779691, 10884, 12668, 157169139712],
+          [4, 2, 20.628675, 0.775619, 10884, 12668, 157169139712],
+          [0, 2, 21.572754, 0.741676, 9948, 13604, 168781889536]
+        ],
+        "median_tok_s": {"0": 0.744389, "4": 0.777655},
+        "gain": 0.04468899997178899,
+        "hashes": {"token": "0xb2c4724f8ec7b4a3", "logit": "0x296eec93485e2dbb", "route": "0x79bcb341dd8ab241"},
+        "safety": [0, 0, 31163764, 16725264, 16725264, 0, 0]
+      },
+      "display_h": {
+        "split": "H",
+        "rows": [
+          [0, 1, 17.123742, 0.934375, 14793, 8759, 108671021056],
+          [4, 1, 16.897705, 0.946874, 15261, 8291, 102864646144],
+          [4, 2, 16.876552, 0.948061, 15261, 8291, 102864646144],
+          [0, 2, 17.189200, 0.930817, 14793, 8759, 108671021056]
+        ],
+        "median_tok_s": {"0": 0.932596, "4": 0.9474675},
+        "gain": 0.015946347614615553,
+        "hashes": {"token": "0x335b268960d74f53", "logit": "0x16eb8cdac493cc79", "route": "0x524a997ebf805881"},
+        "safety": [0, 0, 31173524, 16725264, 16725268, 0, 0]
+      }
+    },
+    "safety_fields": [
+      "major_faults",
+      "process_swaps",
+      "min_mem_available_kb",
+      "swap_free_before_kb",
+      "swap_free_after_kb",
+      "pswpin_delta",
+      "pswpout_delta"
+    ],
+    "aggregate": {
+      "A": {
+        "age0": {"misses": 74280, "expert_bytes": 921575915520},
+        "age4": {"misses": 72408, "expert_bytes": 898350415872},
+        "median_prompt_gain": 0.002364710574118245,
+        "miss_reduction": 0.025201938610662333,
+        "expert_byte_reduction": 0.025201938610662333
+      },
+      "B": {
+        "age0": {"misses": 78474, "expert_bytes": 973609967616},
+        "age4": {"misses": 74974, "expert_bytes": 930186223616},
+        "median_prompt_gain": 0.009740328111974006,
+        "miss_reduction": 0.044600759487218644,
+        "expert_byte_reduction": 0.044600759487218644
+      },
+      "H": {
+        "age0": {"misses": 96614, "expert_bytes": 1198669029376},
+        "age4": {"misses": 88984, "expert_bytes": 1104005267456},
+        "median_prompt_gain": 0.045573487591069495,
+        "miss_reduction": 0.07897406173018406,
+        "expert_byte_reduction": 0.07897406173018406
+      }
+    }
+  },
+  "registered_unseen_h_gate": {
+    "family_gains": {
+      "ambiguity_h": 0.04645797521035,
+      "history_h": 0.07335076989790035,
+      "series_h": 0.04468899997178899,
+      "display_h": 0.015946347614615553
+    },
+    "median_family_gain": 0.045573487591069495,
+    "checks": {
+      "median_gain_at_least_5pct": false,
+      "no_family_below_minus_2pct": true,
+      "age4_bytes_no_greater": true,
+      "age4_misses_at_least_10pct_lower": false,
+      "identical_hashes_exact_counters_zero_fallback": true,
+      "memory_storage_q0_safety": true
+    },
+    "pass": false
+  },
+  "correctness": {
+    "all_prompt_token_hashes_identical_across_arms_and_repeats": true,
+    "all_prompt_logit_hashes_identical_across_arms_and_repeats": true,
+    "all_prompt_ordered_route_hashes_identical_across_arms_and_repeats": true,
+    "all_registered_counters_exact": true,
+    "all_age_event_counts_exact": true,
+    "fallbacks": 0
+  },
+  "safety": {
+    "minimum_required_mem_available_kb": 25165824,
+    "observed_minimum_mem_available_kb": 30962620,
+    "process_major_faults_all_prompts": 0,
+    "process_swaps_all_prompts": 0,
+    "pswpin_total_delta": 17,
+    "pswpout_total_delta": 0,
+    "swap_free_non_decreasing_each_prompt": true,
+    "q0_child_scope_clean_each_prompt": true,
+    "child_exit_zero_each_prompt": true,
+    "competing_model_server_or_fio_job_at_setup": false,
+    "pass": true
+  },
+  "tests": {
+    "spark_cuda_native": "34 passed, 0 failed, 13 skipped",
+    "focused_python": "22 passed"
+  },
+  "evidence": {
+    "evidence_root": "/home/kevin/waste-gn100-experiment-20260730/validation/sprint14-heldout-aging-20260803",
+    "archive": "gn100-sprint14-evidence-2026-08-03.tar.gz",
+    "archive_sha256": "b3a93ac65c5c3a41dd0da4d8bda9063fd5272df3d745680ccc333db40b3c43a1",
+    "archive_total_files": 210,
+    "artifact_manifest": "artifact-manifest.sha256",
+    "artifact_manifest_sha256": "56980903fe815c0bf0e83477713b5df21cc139cae295122b80ab39f16f4e8dbe",
+    "artifact_manifest_entries": 209,
+    "artifact_manifest_verification": "all_209_entries_ok",
+    "analysis_output": "look0-16-summary.json",
+    "analysis_output_sha256": "03f2b2f245db2fe81fb4007071c0c79d27d5053e777573718284cbce4a298eed"
+  }
+}

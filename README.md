@@ -13,6 +13,12 @@
 > (1.0036 median), but its capture-derived hotlist is an in-sample result and
 > its 64-token endpoint is 0.9441 tok/s. The work remains experimental. See
 > [the GB10 CUDA VQ result](docs/GPU_VQ_GB10.md).
+> A frozen Sprint 14 held-out test of decode-only LFRU aging was a valid
+> near-miss: unseen-family throughput improved 4.56% against a 5% gate and
+> misses fell 7.90% against a 10% gate. The preregistered stop therefore
+> fired before lookahead-six or 64-token testing; no cache policy was selected
+> or promoted. See [the held-out result](docs/GPU_VQ_HELDOUT_GB10.md) and its
+> [machine-readable summary](docs/gn100/sprint14-heldout-aging-summary.json).
 > Start with [GN100 results and reproduction notes](docs/GN100.md), then see
 > [the upstreaming map](docs/UPSTREAMING.md) and
 > [upstream issue #14](https://github.com/sqliteai/waste/issues/14).

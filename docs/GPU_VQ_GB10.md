@@ -164,8 +164,10 @@ Matched two-repeat results are 0.903/0.923 tok/s against 0.803/0.807 tok/s for
 the original hotlist, with 56.92 GB versus 72.96 GB read over eight tokens.
 This is an in-sample ceiling result, not a general cache claim. The converter
 and hotlist are retained because representative recurring prompt families are
-a real target workload; promotion requires a separately captured calibration
-set and held-out prompt-family validation.
+a real target workload. Sprint 14 subsequently used a separately captured
+calibration set and frozen held-out prompt families; its decode-only aging arm
+missed the registered selection gates and was not promoted. See
+[GPU_VQ_HELDOUT_GB10.md](GPU_VQ_HELDOUT_GB10.md).
 
 The remaining mode-2 micro-arm changes scheduling only. Experimental
 `WASTE_CUDA_VQ_GROUP` values 1, 2, 4, 8 and 16 queue already-validated kernels
@@ -285,7 +287,10 @@ CUDA VQ mode 2/group 1 passes the strict arithmetic and engine gates. The
 capture-derived hotlist, larger safe cache, width-six lookahead and ten-thread
 selection together cross 1 tok/s for the measured recurring-prompt workload.
 The claim remains experimental and in-sample; nothing is promoted to
-`spark/integration` or proposed upstream from this sprint. The next honest
-work is held-out prompt-family validation and storage/cache policy, not more
-VQ synchronization machinery. Exact counters, commands, captures and hashes
-are in [the Sprint 13 summary](gn100/sprint13-vq-gpu-summary.json).
+`spark/integration` or proposed upstream from this sprint. That next validation
+was the frozen held-out prompt-family experiment. Its decode-only aging arm
+improved unseen-family throughput by 4.5573% and misses by 7.8974%,
+narrowly missing its respective 5% and 10% gates; it stopped without selecting
+the policy. Exact Sprint 13 counters, commands, captures and hashes are in
+[the Sprint 13 summary](gn100/sprint13-vq-gpu-summary.json); the held-out
+disposition is in [GPU_VQ_HELDOUT_GB10.md](GPU_VQ_HELDOUT_GB10.md).

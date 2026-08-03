@@ -252,3 +252,42 @@ Publication means the experimental branch, a machine-readable result summary,
 exact source/model/corpus/capture/hotlist hashes, and immutable raw evidence.
 It does not promote the aging policy to `spark/integration` or propose it
 upstream automatically.
+
+## Measured result and disposition
+
+The frozen campaign completed all calibration-A, within-family-B, and unseen-H
+lookahead-zero rows. The frozen analyzer returned exit 2: the evidence was
+valid, but the H selection gate did not pass. Median family gains were 0.2365%
+for calibration A and 0.9740% for within-family B; neither diagnostic tier was
+used for selection.
+
+The unseen-family result was:
+
+| H case | family | age-4 throughput gain |
+| --- | --- | ---: |
+| `ambiguity_h` | meaning/ambiguity | 4.6457975% |
+| `history_h` | art history | 7.3350770% |
+| `series_h` | series development | 4.4689000% |
+| `display_h` | display/installation | 1.5946348% |
+| **median** | **selection statistic** | **4.5573488%** |
+
+The median gain missed the required 5%. Across the eight H rows per arm,
+age-four misses fell from 96,614 to 88,984, a 7.8974% reduction against the
+required 10%. Expert bytes moved in the required direction, falling by
+94,663,761,920 bytes from 1,198,669,029,376 to 1,104,005,267,456. No H family
+regressed, so the -2% family floor passed.
+
+All numerical and safety contracts passed: paired arms retained identical
+token, full-logit, and ordered-route hashes; CUDA semantic, launch,
+synchronization, fallback, and aging-event counts were exact; the byte gate,
+memory/storage checks, and clean Q0 teardown passed. The failed throughput and
+miss-reduction thresholds were nevertheless decisive because the gate required
+every condition.
+
+The preregistered stop was honored. The lookahead-six H qualification and the
+64-token H campaign were not run, interval four was not selected, and no part
+of this policy moves to `spark/integration` or an upstream proposal. This is a
+scoped negative result for this frozen corpus, hotlist, cache budget, and aging
+interval; it does not reject cache adaptation as a class. See the
+[machine-readable Sprint 14 summary](gn100/sprint14-heldout-aging-summary.json)
+and [frozen corpus](gn100/sprint14-heldout-corpus.json).
