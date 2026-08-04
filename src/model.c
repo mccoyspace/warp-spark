@@ -4237,8 +4237,13 @@ static int clamp_token(const waste_model *m, int token)
     return 0;
 }
 
+#if defined(WASTE_ENABLE_DIAGNOSTIC_VERIFY)
 static const float *model_prefill_impl(waste_model *m, const int *tokens, int n,
                                        int pos0, float *row_logits)
+#else
+const float *waste_model_prefill(waste_model *m, const int *tokens, int n,
+                                 int pos0)
+#endif
 {
     const waste_config *c = &m->cfg;
     const int hid = c->hidden;
@@ -4246,12 +4251,16 @@ static const float *model_prefill_impl(waste_model *m, const int *tokens, int n,
         ((m->cuda_kda_mode || m->cuda_dense_scope || m->cuda_vq_mode) &&
          m->cuda_kda_failed)) return NULL;
     if (n <= 0) return m->logits;
+#if defined(WASTE_ENABLE_DIAGNOSTIC_VERIFY)
     if (n == 1) {
         const float *one = waste_model_step(m, tokens[0], pos0, NULL);
         if (one && row_logits)
             memcpy(row_logits, one, (size_t)m->cfg.vocab * sizeof(float));
         return one;
     }
+#else
+    if (n == 1) return waste_model_step(m, tokens[0], pos0, NULL);
+#endif
     dump_pos0 = pos0;
     if (n > WASTE_CHUNK_MAX) n = WASTE_CHUNK_MAX;
     /* mla_layer writes one latent per position with no bound of its own,
@@ -4383,6 +4392,7 @@ static const float *model_prefill_impl(waste_model *m, const int *tokens, int n,
                                  m->cx + (size_t)t * hid);
     }
     const float *fnw = waste_find(m, tname("%smodel.norm.weight", c->prefix))->data;
+#if defined(WASTE_ENABLE_DIAGNOSTIC_VERIFY)
     if (row_logits) {
         for (int t = 0; t < n; t++)
             waste_rmsnorm(m->cnorm + (size_t)t * hid,
@@ -4393,24 +4403,26 @@ static const float *model_prefill_impl(waste_model *m, const int *tokens, int n,
         memcpy(m->logits, row_logits + (size_t)(n - 1) * c->vocab,
                (size_t)c->vocab * sizeof(float));
     } else {
-        /* Keep the established prefill path and its arithmetic untouched. */
+#endif
         float *last = m->cnorm;
         waste_rmsnorm(last, m->cx + (size_t)(n - 1) * hid, fnw, hid, c->eps);
         matvec_t(m, m->logits,
                  waste_find(m, tname("%slm_head.weight", c->prefix)), last,
                  c->vocab, hid);
+#if defined(WASTE_ENABLE_DIAGNOSTIC_VERIFY)
     }
+#endif
     memcpy(m->x, m->cx + (size_t)(n - 1) * hid, (size_t)hid * sizeof(float));
     return m->read_error ? NULL : m->logits;
 }
 
+#if defined(WASTE_ENABLE_DIAGNOSTIC_VERIFY)
 const float *waste_model_prefill(waste_model *m, const int *tokens, int n,
                                  int pos0)
 {
     return model_prefill_impl(m, tokens, n, pos0, NULL);
 }
 
-#if defined(WASTE_ENABLE_DIAGNOSTIC_VERIFY)
 const float *waste_model_prefill_diagnostic_rows(
     waste_model *m, const int *tokens, int n, int pos0,
     float *row_logits, size_t row_logits_floats)

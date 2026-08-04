@@ -33,3 +33,4 @@ k3parts.bin
 fuzz-case-*/
 sweep
 /spec_probe
+/spec_probe_diagnostic

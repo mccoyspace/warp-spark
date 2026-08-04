@@ -265,11 +265,14 @@ ifndef WINDOWS
 spec_probe$(EXE): tests/spec_probe.o libwaste.a
 	$(CC) $(CFLAGS) -o $@ $^ $(LDLIBS)
 
-# The verifier hook is intentionally experimental. Force a complete rebuild
-# so an earlier normal spec_probe cannot be mistaken for the diagnostic one.
+# The verifier hook is intentionally experimental. Save it under a distinct
+# name, then force a normal rebuild so shared objects cannot contaminate a
+# later production link. Run the resulting ./spec_probe_diagnostic binary.
 .PHONY: spec_probe_diagnostic
 spec_probe_diagnostic:
 	$(MAKE) -B WASTE_DIAGNOSTIC_VERIFY=1 spec_probe$(EXE)
+	cp spec_probe$(EXE) spec_probe_diagnostic$(EXE)
+	$(MAKE) -B spec_probe$(EXE)
 endif
 test_tokenizer$(EXE): tests/test_tokenizer.o libwaste.a
 	$(CC) $(CFLAGS) -o $@ $^ $(LDLIBS)
@@ -302,6 +305,7 @@ clean:
 	rm -f $(OBJ) $(SHOBJ) cli/*.o tests/*.o $(OBJ:.o=.d) $(SHOBJ:.o=.d) \
 	      src/cuda.o src/cuda.pic.o src/cuda.d src/cuda.pic.d \
 	      cli/*.d tests/*.d libwaste.a waste waste.exe \
+	      spec_probe_diagnostic spec_probe_diagnostic.exe \
 	      $(TESTBINS) $(TESTNAMES) $(addsuffix .exe,$(TESTNAMES)) \
 	      libwaste.dylib libwaste.so libwaste.dll \
 	      libwastevq.dylib libwastevq.so libwastevq.dll
