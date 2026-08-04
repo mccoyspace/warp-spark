@@ -277,39 +277,80 @@ static void print_u64_hex_matrix(const uint64_t *x, int rows, int cols)
     putchar(']');
 }
 
-static int target_mode(int argc, char **argv)
-{
-    if (argc != 7) return -2;
-    int n_prompt = 0;
-    int *prompt = parse_ids(argv[5], &n_prompt);
-    int n_gen = 0;
-    if (!prompt || n_prompt <= 0 || positive_int(argv[6], 4096, &n_gen)) {
-        free(prompt); return -2;
-    }
+typedef struct {
+    waste_model *draft;
+    void *target_rollback;
+    size_t target_rollback_bytes;
+    size_t draft_rollback_bytes;
+    size_t target_prompt_state_bytes;
+    size_t draft_prompt_state_bytes;
+    int draft_prompt_tokens;
+    int draft_cache_slots;
+    int draft_routed_records;
+    int draft_warm_ready;
+    double target_load_seconds;
+    double draft_load_seconds;
+    double touch_seconds;
+    double draft_prefill_seconds;
+    double draft_snapshot_seconds;
+    double target_snapshot_seconds;
+    uint64_t memavailable_before_kib;
+    uint64_t memavailable_after_target_load_kib;
+    uint64_t memavailable_after_draft_load_kib;
+    uint64_t memavailable_after_touch_kib;
+    uint64_t memavailable_after_prompt_snapshots_kib;
+    uint64_t rss_after_prompt_snapshots_kib;
+    struct rusage timed0;
+} resident_control;
 
-    waste_model m;
-    memset(&m, 0, sizeof m);
-    if (load_model(&m, argv[2], argv[3], argv[4])) { free(prompt); return 1; }
-    const int warm_ready = cache_ready(&m.cache);
-    if (!valid_ids(prompt, n_prompt, m.cfg.vocab, "target prompt")) goto fail;
-    const int target_ctx = waste_model_ctx_max(&m);
+static int target_capture(waste_model *m, const int *prompt, int n_prompt,
+                          int n_gen, resident_control *resident)
+{
+    const int warm_ready = cache_ready(&m->cache);
+    if (!valid_ids(prompt, n_prompt, m->cfg.vocab, "target prompt")) return 1;
+    const int target_ctx = waste_model_ctx_max(m);
     if (target_ctx && (n_prompt > target_ctx || n_gen > target_ctx - n_prompt)) {
         fprintf(stderr, "target prompt plus generation exceeds context\n");
-        goto fail;
+        return 1;
     }
-    const uint64_t ph0 = m.cache.hits, pm0 = m.cache.misses, pb0 = m.cache.bytes_read;
+    const uint64_t ph0 = m->cache.hits;
+    const uint64_t pm0 = m->cache.misses;
+    const uint64_t pb0 = m->cache.bytes_read;
     struct rusage timed0, timed1;
     memset(&timed0, 0, sizeof timed0); memset(&timed1, 0, sizeof timed1);
-    getrusage(RUSAGE_SELF, &timed0);
+    if (resident) timed0 = resident->timed0;
+    else getrusage(RUSAGE_SELF, &timed0);
     const double p0 = now();
-    const float *logits = prefill_cpu(&m, prompt, n_prompt);
+    const float *logits = prefill_cpu(m, prompt, n_prompt);
     const double prefill_seconds = now() - p0;
-    if (!logits) { fprintf(stderr, "target prompt failed\n"); goto fail; }
-
-    if (!finite_row(logits, m.cfg.vocab)) {
+    if (!logits) { fprintf(stderr, "target prompt failed\n"); return 1; }
+    if (!finite_row(logits, m->cfg.vocab)) {
         fprintf(stderr, "target prompt produced non-finite logits\n");
-        goto fail;
+        return 1;
     }
+    if (resident) {
+        size_t written = 0;
+        if (waste_model_state_size(m, n_prompt,
+                                   &resident->target_prompt_state_bytes) ||
+            !resident->target_prompt_state_bytes ||
+            resident->target_prompt_state_bytes > resident->target_rollback_bytes) {
+            fprintf(stderr, "target prompt state exceeds resident rollback\n");
+            return 1;
+        }
+        const double snapshot_started = now();
+        if (waste_model_state_export(m, n_prompt, resident->target_rollback,
+                                     resident->target_rollback_bytes, &written) ||
+            written != resident->target_prompt_state_bytes) {
+            fprintf(stderr, "target prompt snapshot failed\n");
+            return 1;
+        }
+        resident->target_snapshot_seconds = now() - snapshot_started;
+        resident->memavailable_after_prompt_snapshots_kib =
+            proc_value_kib("/proc/meminfo", "MemAvailable");
+        resident->rss_after_prompt_snapshots_kib =
+            proc_value_kib("/proc/self/status", "VmRSS");
+    }
+
     int *tokens = (int *)calloc((size_t)n_gen, sizeof *tokens);
     uint64_t *logit_rows = (uint64_t *)calloc((size_t)n_gen + 1, sizeof *logit_rows);
     uint64_t *route_rows = (uint64_t *)calloc((size_t)n_gen, sizeof *route_rows);
@@ -320,51 +361,67 @@ static int target_mode(int argc, char **argv)
     if (!tokens || !logit_rows || !route_rows || !token_prefix ||
         !logit_prefix || !route_prefix || !routed) {
         free(tokens); free(logit_rows); free(route_rows); free(token_prefix);
-        free(logit_prefix); free(route_prefix); free(routed); goto fail;
+        free(logit_prefix); free(route_prefix); free(routed); return 1;
     }
     uint64_t token_hash = UINT64_C(14695981039346656037);
     uint64_t logit_hash = UINT64_C(14695981039346656037);
     uint64_t route_hash = UINT64_C(14695981039346656037);
-    logit_rows[0] = hash_one(logits, (size_t)m.cfg.vocab * sizeof *logits);
+    logit_rows[0] = hash_one(logits, (size_t)m->cfg.vocab * sizeof *logits);
     logit_hash = hash_bytes(logit_hash, logits,
-                            (size_t)m.cfg.vocab * sizeof *logits);
+                            (size_t)m->cfg.vocab * sizeof *logits);
     logit_prefix[0] = logit_hash;
-    const int route_layers = m.cfg.n_layers - m.cfg.first_dense;
-    const size_t route_count = (size_t)route_layers * m.cfg.top_k;
-    const uint64_t h0 = m.cache.hits, mi0 = m.cache.misses;
-    const uint64_t b0 = m.cache.bytes_read;
+    const int route_layers = m->cfg.n_layers - m->cfg.first_dense;
+    const size_t route_count = (size_t)route_layers * m->cfg.top_k;
+    const uint64_t h0 = m->cache.hits, mi0 = m->cache.misses;
+    const uint64_t b0 = m->cache.bytes_read;
     const double started = now();
     for (int i = 0; i < n_gen; i++) {
-        tokens[i] = argmax(logits, m.cfg.vocab);
+        tokens[i] = argmax(logits, m->cfg.vocab);
         token_hash = hash_bytes(token_hash, &tokens[i], sizeof tokens[i]);
         token_prefix[i] = token_hash;
         memset(routed, 0xff, (size_t)WASTE_MAX_LAYERS * 64 * sizeof *routed);
-        logits = waste_model_step(&m, tokens[i], n_prompt + i, routed);
-        if (!logits) { fprintf(stderr, "target step %d failed\n", i); goto target_fail; }
-        if (!finite_row(logits, m.cfg.vocab)) {
+        logits = waste_model_step(m, tokens[i], n_prompt + i, routed);
+        if (!logits) { fprintf(stderr, "target step %d failed\n", i); goto fail; }
+        if (!finite_row(logits, m->cfg.vocab)) {
             fprintf(stderr, "target step %d produced non-finite logits\n", i);
-            goto target_fail;
+            goto fail;
         }
-        waste_ecache_decode_tick(&m.cache);
+        waste_ecache_decode_tick(&m->cache);
         logit_rows[i + 1] = hash_one(logits,
-                                     (size_t)m.cfg.vocab * sizeof *logits);
+                                     (size_t)m->cfg.vocab * sizeof *logits);
         logit_hash = hash_bytes(logit_hash, logits,
-                                (size_t)m.cfg.vocab * sizeof *logits);
+                                (size_t)m->cfg.vocab * sizeof *logits);
         logit_prefix[i + 1] = logit_hash;
-        const int *rr = routed + (size_t)m.cfg.first_dense * m.cfg.top_k;
+        const int *rr = routed + (size_t)m->cfg.first_dense * m->cfg.top_k;
         route_rows[i] = hash_one(rr, route_count * sizeof *rr);
         route_hash = hash_bytes(route_hash, rr, route_count * sizeof *rr);
         route_prefix[i] = route_hash;
     }
-    waste_ecache_drain(&m.cache);
+    waste_ecache_drain(&m->cache);
     const double seconds = now() - started;
     getrusage(RUSAGE_SELF, &timed1);
     const long timed_major_faults = timed1.ru_majflt - timed0.ru_majflt;
     size_t state_bytes = 0;
     uint64_t sh = 0;
-    if (state_hash(&m, n_prompt + n_gen, &sh, &state_bytes)) {
+    if (state_hash(m, n_prompt + n_gen, &sh, &state_bytes)) {
         fprintf(stderr, "target final state export failed\n");
-        goto target_fail;
+        goto fail;
+    }
+    const uint64_t target_fallbacks = waste_model_cuda_kda_fallbacks(m);
+    const uint64_t draft_fallbacks = resident
+        ? waste_model_cuda_kda_fallbacks(resident->draft) : 0;
+    const uint64_t vmswap_kib = proc_value_kib("/proc/self/status", "VmSwap");
+    if (resident && (timed_major_faults != 0 || vmswap_kib != 0 ||
+                     target_fallbacks != 0 || draft_fallbacks != 0 ||
+                     resident->memavailable_after_prompt_snapshots_kib <
+                         UINT64_C(24) * 1024 * 1024)) {
+        fprintf(stderr, "resident target safety gate failed: faults=%ld "
+                "swap=%" PRIu64 " target_fallbacks=%" PRIu64
+                " draft_fallbacks=%" PRIu64 " memavailable=%" PRIu64 " KiB\n",
+                timed_major_faults, vmswap_kib, target_fallbacks,
+                draft_fallbacks,
+                resident->memavailable_after_prompt_snapshots_kib);
+        goto fail;
     }
     printf("{\n  \"schema\":\"waste.gn100.spec_target.v1\",\n");
     printf("  \"model\":\"target\",\"prompt_tokens\":%d,\"generated\":%d,\n",
@@ -384,44 +441,104 @@ static int target_mode(int argc, char **argv)
            prefill_seconds, seconds, n_gen / seconds);
     printf("  \"prefill_hits\":%" PRIu64 ",\"prefill_misses\":%" PRIu64
            ",\"prefill_bytes\":%" PRIu64 ",\n",
-           m.cache.hits - ph0 - (m.cache.hits - h0),
-           m.cache.misses - pm0 - (m.cache.misses - mi0),
+           m->cache.hits - ph0 - (m->cache.hits - h0),
+           m->cache.misses - pm0 - (m->cache.misses - mi0),
            (b0 - pb0));
     printf("  \"decode_hits\":%" PRIu64 ",\"decode_misses\":%" PRIu64
            ",\"decode_bytes\":%" PRIu64 ",\n",
-           m.cache.hits - h0, m.cache.misses - mi0, m.cache.bytes_read - b0);
-    print_process_safety("prefill_plus_decode", timed_major_faults);
+           m->cache.hits - h0, m->cache.misses - mi0,
+           m->cache.bytes_read - b0);
+    if (resident) {
+        printf("  \"resident_control\":{\"enabled\":true,"
+               "\"speculation_enabled\":false,"
+               "\"draft_kept_loaded_during_target_decode\":true,"
+               "\"target_cache_mib\":40502,\"draft_cache_mib\":16926,"
+               "\"target_rollback_bytes\":%zu,\"draft_rollback_bytes\":%zu,"
+               "\"target_prompt_state_bytes\":%zu,"
+               "\"draft_prompt_state_bytes\":%zu,\"draft_prompt_tokens\":%d,"
+               "\"target_load_seconds\":%.9f,\"draft_load_seconds\":%.9f,"
+               "\"touch_seconds\":%.9f,\"draft_prefill_seconds\":%.9f,"
+               "\"draft_snapshot_seconds\":%.9f,"
+               "\"target_snapshot_seconds\":%.9f,"
+               "\"memavailable_before_kib\":%" PRIu64 ","
+               "\"memavailable_after_target_load_kib\":%" PRIu64 ","
+               "\"memavailable_after_draft_load_kib\":%" PRIu64 ","
+               "\"memavailable_after_touch_kib\":%" PRIu64 ","
+               "\"memavailable_after_prompt_snapshots_kib\":%" PRIu64 ","
+               "\"rss_after_prompt_snapshots_kib\":%" PRIu64 ","
+               "\"draft_cache_slots\":%d,\"draft_routed_records\":%d,"
+               "\"draft_warm_ready\":%d,\"draft_fully_resident\":true,"
+               "\"draft_direct_io\":%d,\"draft_readers\":%d,"
+               "\"draft_depth\":%d,\"draft_cuda_kda\":%d,"
+               "\"draft_cuda_dense\":%d,\"draft_cuda_vq\":%d,"
+               "\"draft_cuda_fallbacks\":%" PRIu64 "},\n",
+               resident->target_rollback_bytes, resident->draft_rollback_bytes,
+               resident->target_prompt_state_bytes,
+               resident->draft_prompt_state_bytes, resident->draft_prompt_tokens,
+               resident->target_load_seconds, resident->draft_load_seconds,
+               resident->touch_seconds, resident->draft_prefill_seconds,
+               resident->draft_snapshot_seconds,
+               resident->target_snapshot_seconds,
+               resident->memavailable_before_kib,
+               resident->memavailable_after_target_load_kib,
+               resident->memavailable_after_draft_load_kib,
+               resident->memavailable_after_touch_kib,
+               resident->memavailable_after_prompt_snapshots_kib,
+               resident->rss_after_prompt_snapshots_kib,
+               resident->draft_cache_slots, resident->draft_routed_records,
+               resident->draft_warm_ready, resident->draft->direct_io,
+               waste_ecache_io_threads(&resident->draft->cache),
+               waste_ecache_io_depth(&resident->draft->cache),
+               waste_model_cuda_kda_effective(resident->draft),
+               waste_model_cuda_dense_effective(resident->draft),
+               waste_model_cuda_vq_effective(resident->draft),
+               draft_fallbacks);
+    }
+    print_process_safety(resident
+        ? "draft_prefill_plus_target_prefill_decode" : "prefill_plus_decode",
+        timed_major_faults);
     printf("  \"io\":{\"direct\":%d,\"readers\":%d,\"depth\":%d},\n",
-           m.direct_io, waste_ecache_io_threads(&m.cache),
-           waste_ecache_io_depth(&m.cache));
+           m->direct_io, waste_ecache_io_threads(&m->cache),
+           waste_ecache_io_depth(&m->cache));
     printf("  \"cache\":{\"slots\":%d,\"routed_records\":%d,"
            "\"warm_ready\":%d},\n",
-           m.cache.n_slots, routed_records(&m), warm_ready);
+           m->cache.n_slots, routed_records(m), warm_ready);
     printf("  \"cuda\":{\"kda\":%d,\"dense\":%d,\"vq\":%d,"
            "\"fallbacks\":%" PRIu64 ",\"kda_calls\":%" PRIu64
            ",\"dense_calls\":%" PRIu64 ",\"vq_experts\":%" PRIu64
            ",\"vq_applies\":%" PRIu64 ",\"vq_lut_builds\":%" PRIu64
            ",\"vq_launches\":%" PRIu64 ",\"vq_syncs\":%" PRIu64 "}\n}\n",
-           waste_model_cuda_kda_effective(&m),
-           waste_model_cuda_dense_effective(&m),
-           waste_model_cuda_vq_effective(&m),
-           waste_model_cuda_kda_fallbacks(&m),
-           waste_model_cuda_kda_calls(&m),
-           waste_model_cuda_dense_calls(&m),
-           waste_model_cuda_vq_experts(&m),
-           waste_model_cuda_vq_applies(&m),
-           waste_model_cuda_vq_lut_builds(&m),
-           waste_model_cuda_vq_launches(&m),
-           waste_model_cuda_vq_syncs(&m));
+           waste_model_cuda_kda_effective(m),
+           waste_model_cuda_dense_effective(m),
+           waste_model_cuda_vq_effective(m), target_fallbacks,
+           waste_model_cuda_kda_calls(m),
+           waste_model_cuda_dense_calls(m),
+           waste_model_cuda_vq_experts(m),
+           waste_model_cuda_vq_applies(m),
+           waste_model_cuda_vq_lut_builds(m),
+           waste_model_cuda_vq_launches(m),
+           waste_model_cuda_vq_syncs(m));
     free(tokens); free(logit_rows); free(route_rows); free(token_prefix);
-    free(logit_prefix); free(route_prefix); free(routed);
-    free(prompt); waste_model_free(&m); return 0;
+    free(logit_prefix); free(route_prefix); free(routed); return 0;
 
-target_fail:
-    free(tokens); free(logit_rows); free(route_rows); free(token_prefix);
-    free(logit_prefix); free(route_prefix); free(routed);
 fail:
-    free(prompt); waste_model_free(&m); return 1;
+    free(tokens); free(logit_rows); free(route_rows); free(token_prefix);
+    free(logit_prefix); free(route_prefix); free(routed); return 1;
+}
+
+static int target_mode(int argc, char **argv)
+{
+    if (argc != 7) return -2;
+    int n_prompt = 0, n_gen = 0;
+    int *prompt = parse_ids(argv[5], &n_prompt);
+    if (!prompt || n_prompt <= 0 || positive_int(argv[6], 4096, &n_gen)) {
+        free(prompt); return -2;
+    }
+    waste_model m;
+    memset(&m, 0, sizeof m);
+    if (load_model(&m, argv[2], argv[3], argv[4])) { free(prompt); return 1; }
+    const int rc = target_capture(&m, prompt, n_prompt, n_gen, NULL);
+    free(prompt); waste_model_free(&m); return rc;
 }
 
 static int teacher_mode(int argc, char **argv)
@@ -762,6 +879,148 @@ static void touch_blob(void *blob, size_t bytes)
     volatile uint8_t *p = (volatile uint8_t *)blob;
     for (size_t off = 0; off < bytes; off += 4096) p[off] = 1;
     if (bytes) p[bytes - 1] = 1;
+}
+
+/* R, the resident control: ordinary K3 decode at the registered reduced
+ * cache while one fully-warm, prefilled Kimi-Linear model and both exact
+ * rollback allocations stay live in this process. This measures rent only;
+ * the draft performs no work after K3 decode begins. */
+static int resident_target_mode(int argc, char **argv)
+{
+    enum {
+        TARGET_CACHE_MIB = 40502,
+        DRAFT_CACHE_MIB = 16926,
+    };
+    const size_t target_rollback_bytes = (size_t)512 << 20;
+    const size_t draft_rollback_bytes = (size_t)128 << 20;
+    if (argc != 9) return -2;
+
+    int n_target_prompt = 0, n_draft_prompt = 0, n_gen = 0;
+    int *target_prompt = parse_ids(argv[6], &n_target_prompt);
+    int *draft_prompt = parse_ids(argv[7], &n_draft_prompt);
+    if (!target_prompt || !draft_prompt || n_target_prompt <= 0 ||
+        n_draft_prompt <= 0 || positive_int(argv[8], 4096, &n_gen)) {
+        free(target_prompt); free(draft_prompt); return -2;
+    }
+
+    waste_model target, draft;
+    memset(&target, 0, sizeof target); memset(&draft, 0, sizeof draft);
+    int target_loaded = 0, draft_loaded = 0;
+    void *target_rollback = NULL, *draft_rollback = NULL;
+    resident_control resident;
+    memset(&resident, 0, sizeof resident);
+    resident.memavailable_before_kib =
+        proc_value_kib("/proc/meminfo", "MemAvailable");
+
+    double started = now();
+    if (load_model(&target, argv[2], "40502", argv[3])) goto fail;
+    target_loaded = 1;
+    resident.target_load_seconds = now() - started;
+    resident.memavailable_after_target_load_kib =
+        proc_value_kib("/proc/meminfo", "MemAvailable");
+
+    /* Kimi-Linear has no VQ path. Set this only after K3 has captured its
+     * registered VQ=2 mode in the already-loaded target object. */
+    if (setenv("WASTE_CUDA_VQ", "0", 1)) {
+        fprintf(stderr, "could not select the draft CUDA profile\n");
+        goto fail;
+    }
+    started = now();
+    if (load_model(&draft, argv[4], "16926", argv[5])) goto fail;
+    draft_loaded = 1;
+    resident.draft_load_seconds = now() - started;
+    resident.memavailable_after_draft_load_kib =
+        proc_value_kib("/proc/meminfo", "MemAvailable");
+    resident.draft_cache_slots = draft.cache.n_slots;
+    resident.draft_routed_records = routed_records(&draft);
+    resident.draft_warm_ready = cache_ready(&draft.cache);
+
+    if (resident.draft_cache_slots < resident.draft_routed_records ||
+        resident.draft_warm_ready != resident.draft_routed_records) {
+        fprintf(stderr, "resident draft is not fully warm (%d/%d records)\n",
+                resident.draft_warm_ready, resident.draft_routed_records);
+        goto fail;
+    }
+    if (!valid_ids(draft_prompt, n_draft_prompt, draft.cfg.vocab,
+                   "resident draft prompt"))
+        goto fail;
+    const int draft_ctx = waste_model_ctx_max(&draft);
+    if (draft_ctx && n_draft_prompt > draft_ctx) {
+        fprintf(stderr, "resident draft prompt exceeds context\n");
+        goto fail;
+    }
+    if (waste_model_get_cuda_kda(&target) != 1 ||
+        waste_model_get_cuda_dense(&target) != 2 ||
+        waste_model_get_cuda_vq(&target) != 2 ||
+        waste_model_get_cuda_kda(&draft) != 1 ||
+        waste_model_get_cuda_dense(&draft) != 2 ||
+        waste_model_get_cuda_vq(&draft) != 0 ||
+        waste_ecache_io_threads(&target.cache) != 2 ||
+        waste_ecache_io_depth(&target.cache) != 2 ||
+        waste_ecache_io_threads(&draft.cache) != 2 ||
+        waste_ecache_io_depth(&draft.cache) != 2) {
+        fprintf(stderr, "resident target profile drifted\n");
+        goto fail;
+    }
+
+    target_rollback = calloc(1, target_rollback_bytes);
+    draft_rollback = calloc(1, draft_rollback_bytes);
+    if (!target_rollback || !draft_rollback) {
+        fprintf(stderr, "resident rollback allocation failed\n");
+        goto fail;
+    }
+    started = now();
+    touch_cache(&target.cache); touch_cache(&draft.cache);
+    touch_blob(target_rollback, target_rollback_bytes);
+    touch_blob(draft_rollback, draft_rollback_bytes);
+    resident.touch_seconds = now() - started;
+    resident.memavailable_after_touch_kib =
+        proc_value_kib("/proc/meminfo", "MemAvailable");
+
+    memset(&resident.timed0, 0, sizeof resident.timed0);
+    getrusage(RUSAGE_SELF, &resident.timed0);
+    started = now();
+    const float *draft_logits = prefill_cpu(&draft, draft_prompt, n_draft_prompt);
+    resident.draft_prefill_seconds = now() - started;
+    if (!draft_logits || !finite_row(draft_logits, draft.cfg.vocab)) {
+        fprintf(stderr, "resident draft prompt failed or produced non-finite logits\n");
+        goto fail;
+    }
+    resident.draft_prompt_tokens = n_draft_prompt;
+    if (waste_model_state_size(&draft, n_draft_prompt,
+                               &resident.draft_prompt_state_bytes) ||
+        !resident.draft_prompt_state_bytes ||
+        resident.draft_prompt_state_bytes > draft_rollback_bytes) {
+        fprintf(stderr, "draft prompt state exceeds resident rollback\n");
+        goto fail;
+    }
+    size_t written = 0;
+    started = now();
+    if (waste_model_state_export(&draft, n_draft_prompt, draft_rollback,
+                                 draft_rollback_bytes, &written) ||
+        written != resident.draft_prompt_state_bytes) {
+        fprintf(stderr, "resident draft prompt snapshot failed\n");
+        goto fail;
+    }
+    resident.draft_snapshot_seconds = now() - started;
+
+    resident.draft = &draft;
+    resident.target_rollback = target_rollback;
+    resident.target_rollback_bytes = target_rollback_bytes;
+    resident.draft_rollback_bytes = draft_rollback_bytes;
+    const int rc = target_capture(&target, target_prompt, n_target_prompt,
+                                  n_gen, &resident);
+    free(target_rollback); free(draft_rollback);
+    free(target_prompt); free(draft_prompt);
+    waste_model_free(&draft); waste_model_free(&target);
+    return rc;
+
+fail:
+    free(target_rollback); free(draft_rollback);
+    free(target_prompt); free(draft_prompt);
+    if (draft_loaded) waste_model_free(&draft);
+    if (target_loaded) waste_model_free(&target);
+    return 1;
 }
 
 enum { SHADOW_MAX_THREADS = 10, SHADOW_REPEATS = 7 };
@@ -1221,6 +1480,294 @@ fail:
     free(prompt); free(target); waste_model_free(&m); return 1;
 }
 
+#if defined(WASTE_ENABLE_DIAGNOSTIC_VERIFY)
+/* One representative T=2..4 verifier calibration. This deliberately is not
+ * a speculative runner or a candidate qualifier: each invocation measures
+ * one fresh-process arm from a byte-hashed canonical root. */
+static int verify4_mode(int argc, char **argv)
+{
+    enum { ARM_SERIAL, ARM_CHUNK0, ARM_CHUNK1 } arm;
+    if (argc != 9) return -2;
+    if (!strcmp(argv[2], "serial")) arm = ARM_SERIAL;
+    else if (!strcmp(argv[2], "chunk0")) arm = ARM_CHUNK0;
+    else if (!strcmp(argv[2], "chunk1")) arm = ARM_CHUNK1;
+    else return -2;
+
+    int n_prompt = 0, n_root = 0, n_proposal = 0;
+    int *prompt = parse_ids(argv[6], &n_prompt);
+    int *root = parse_ids(argv[7], &n_root);
+    int *proposal = parse_ids(argv[8], &n_proposal);
+    if (!prompt || n_prompt <= 0 ||
+        (!root && strcmp(argv[7], "-")) ||
+        !proposal || n_proposal < 2 || n_proposal > 4) {
+        free(prompt); free(root); free(proposal); return -2;
+    }
+
+    waste_model m;
+    memset(&m, 0, sizeof m);
+    void *root_blob = NULL;
+    float *rows = NULL;
+    int *routed = NULL;
+    if (waste_model_set_i8mm_diagnostic(0)) {
+        fprintf(stderr, "verify4 could not force diagnostic I8MM off\n");
+        goto fail_unloaded;
+    }
+    if (load_model(&m, argv[3], argv[4], argv[5])) goto fail_unloaded;
+    const int warm_ready = cache_ready(&m.cache);
+    if (!valid_ids(prompt, n_prompt, m.cfg.vocab, "verify4 prompt") ||
+        !valid_ids(root, n_root, m.cfg.vocab, "verify4 root") ||
+        !valid_ids(proposal, n_proposal, m.cfg.vocab, "verify4 proposal"))
+        goto fail;
+    const int state_pos = n_prompt + n_root;
+    const int ctx = waste_model_ctx_max(&m);
+    if (ctx && (state_pos > ctx || n_proposal > ctx - state_pos)) {
+        fprintf(stderr, "verify4 root plus proposal exceeds context\n");
+        goto fail;
+    }
+
+    double started = now();
+    const float *logits = prefill_cpu(&m, prompt, n_prompt);
+    const double prompt_seconds = now() - started;
+    if (!logits || !finite_row(logits, m.cfg.vocab)) {
+        fprintf(stderr, "verify4 prompt failed or produced non-finite logits\n");
+        goto fail;
+    }
+    started = now();
+    for (int i = 0; i < n_root; i++) {
+        if (argmax(logits, m.cfg.vocab) != root[i]) {
+            fprintf(stderr, "verify4 root is not canonical greedy at token %d\n", i);
+            goto fail;
+        }
+        logits = waste_model_step(&m, root[i], n_prompt + i, NULL);
+        if (!logits || !finite_row(logits, m.cfg.vocab)) {
+            fprintf(stderr, "verify4 canonical root step %d failed\n", i);
+            goto fail;
+        }
+        waste_ecache_decode_tick(&m.cache);
+    }
+    waste_ecache_drain(&m.cache);
+    const double root_advance_seconds = now() - started;
+    const uint64_t root_logit_hash =
+        hash_one(logits, (size_t)m.cfg.vocab * sizeof(float));
+    const int root_argmax = argmax(logits, m.cfg.vocab);
+
+    size_t root_bytes = 0, written = 0;
+    if (waste_model_state_size(&m, state_pos, &root_bytes) || !root_bytes ||
+        !(root_blob = malloc(root_bytes))) {
+        fprintf(stderr, "verify4 root snapshot allocation failed\n");
+        goto fail;
+    }
+    started = now();
+    const int snapshot_rc = waste_model_state_export(
+        &m, state_pos, root_blob, root_bytes, &written);
+    const double snapshot_seconds = now() - started;
+    if (snapshot_rc || written != root_bytes) {
+        fprintf(stderr, "verify4 root snapshot failed\n");
+        goto fail;
+    }
+    const uint64_t root_hash = hash_one(root_blob, root_bytes);
+
+    waste_model_reset(&m);
+    int restored_pos = -1;
+    started = now();
+    const int restore_rc = waste_model_state_import(
+        &m, root_blob, root_bytes, &restored_pos);
+    const double restore_seconds = now() - started;
+    written = 0;
+    if (restore_rc || restored_pos != state_pos ||
+        waste_model_state_export(&m, state_pos, root_blob, root_bytes, &written) ||
+        written != root_bytes || hash_one(root_blob, root_bytes) != root_hash) {
+        fprintf(stderr, "verify4 restored root hash mismatch\n");
+        goto fail;
+    }
+
+    if (waste_model_set_i8mm_diagnostic(arm == ARM_CHUNK1)) {
+        fprintf(stderr, "verify4 chunk1 requested unavailable I8MM\n");
+        goto fail;
+    }
+    const int measured_i8mm = waste_model_get_i8mm_diagnostic();
+    uint64_t logit_hashes[4] = {0}, route_hashes[4] = {0};
+    int row_argmax[4] = {0};
+    if (arm == ARM_SERIAL) {
+        routed = (int *)malloc((size_t)WASTE_MAX_LAYERS * 64 * sizeof *routed);
+        if (!routed) {
+            fprintf(stderr, "verify4 route allocation failed\n");
+            goto fail;
+        }
+    } else {
+        if (m.cfg.vocab <= 0 ||
+            (size_t)m.cfg.vocab > SIZE_MAX / (size_t)n_proposal /
+                                  sizeof *rows) {
+            fprintf(stderr, "verify4 row allocation overflow\n");
+            goto fail;
+        }
+        const size_t count = (size_t)n_proposal * (size_t)m.cfg.vocab;
+        rows = (float *)malloc(count * sizeof *rows);
+        if (!rows) {
+            fprintf(stderr, "verify4 row allocation failed\n");
+            goto fail;
+        }
+    }
+
+    const uint64_t h0 = m.cache.hits, mi0 = m.cache.misses;
+    const uint64_t b0 = m.cache.bytes_read, er0 = m.expert_reads;
+    const uint64_t u0 = waste_model_chunk_expert_union(&m);
+    const uint64_t k0 = waste_model_cuda_kda_calls(&m);
+    const uint64_t d0 = waste_model_cuda_dense_calls(&m);
+    const uint64_t ve0 = waste_model_cuda_vq_experts(&m);
+    const uint64_t va0 = waste_model_cuda_vq_applies(&m);
+    const uint64_t vl0 = waste_model_cuda_vq_launches(&m);
+    const uint64_t vs0 = waste_model_cuda_vq_syncs(&m);
+    const uint64_t f0 = waste_model_cuda_kda_fallbacks(&m);
+    struct rusage ru0, ru1;
+    memset(&ru0, 0, sizeof ru0); memset(&ru1, 0, sizeof ru1);
+    getrusage(RUSAGE_SELF, &ru0);
+    started = now();
+    if (arm == ARM_SERIAL) {
+        const size_t route_count =
+            (size_t)(m.cfg.n_layers - m.cfg.first_dense) * m.cfg.top_k;
+        for (int i = 0; i < n_proposal; i++) {
+            memset(routed, 0xff,
+                   (size_t)WASTE_MAX_LAYERS * 64 * sizeof *routed);
+            logits = waste_model_step(&m, proposal[i], state_pos + i, routed);
+            if (!logits || !finite_row(logits, m.cfg.vocab)) {
+                fprintf(stderr, "verify4 serial step %d failed\n", i);
+                goto fail;
+            }
+            logit_hashes[i] = hash_one(
+                logits, (size_t)m.cfg.vocab * sizeof(float));
+            row_argmax[i] = argmax(logits, m.cfg.vocab);
+            route_hashes[i] = hash_one(
+                routed + (size_t)m.cfg.first_dense * m.cfg.top_k,
+                route_count * sizeof(int));
+            waste_ecache_decode_tick(&m.cache);
+        }
+    } else {
+        logits = waste_model_prefill_diagnostic_rows(
+            &m, proposal, n_proposal, state_pos, rows,
+            (size_t)n_proposal * (size_t)m.cfg.vocab);
+        if (!logits) {
+            fprintf(stderr, "verify4 chunk failed\n");
+            goto fail;
+        }
+        for (int i = 0; i < n_proposal; i++) {
+            const float *row = rows + (size_t)i * m.cfg.vocab;
+            if (!finite_row(row, m.cfg.vocab)) {
+                fprintf(stderr, "verify4 chunk row %d is non-finite\n", i);
+                goto fail;
+            }
+            logit_hashes[i] = hash_one(
+                row, (size_t)m.cfg.vocab * sizeof(float));
+            row_argmax[i] = argmax(row, m.cfg.vocab);
+            waste_ecache_decode_tick(&m.cache);
+        }
+    }
+    waste_ecache_drain(&m.cache);
+    const double verifier_seconds = now() - started;
+    getrusage(RUSAGE_SELF, &ru1);
+
+    /* The rollback root stayed resident for the complete timed verifier.
+     * Release it before the separate final-state export to avoid a second
+     * target-sized snapshot inflating peak memory for no measurement value. */
+    free(root_blob);
+    root_blob = NULL;
+    size_t final_bytes = 0;
+    uint64_t final_hash = 0;
+    if (state_hash(&m, state_pos + n_proposal, &final_hash, &final_bytes)) {
+        fprintf(stderr, "verify4 final state export failed\n");
+        goto fail;
+    }
+    printf("{\n  \"schema\":\"waste.gn100.verify4_diagnostic.v1\",\n");
+    printf("  \"representative_diagnostic_only\":true,"
+           "\"candidate_qualifier\":false,\"arm\":\"%s\",\n", argv[2]);
+    printf("  \"prompt_tokens\":%d,\"root_tokens\":%d,"
+           "\"proposal_tokens\":%d,\"state_position\":%d,\n",
+           n_prompt, n_root, n_proposal, state_pos);
+    printf("  \"proposals\":"); print_ints(proposal, n_proposal); puts(",");
+    printf("  \"root\":{\"state_bytes\":%zu,"
+           "\"state_hash\":\"0x%016" PRIx64 "\","
+           "\"logit_hash\":\"0x%016" PRIx64 "\",\"argmax\":%d,"
+           "\"first_proposal_matches\":%s,"
+           "\"rollback_resident_during_verifier\":true},\n",
+           root_bytes, root_hash, root_logit_hash, root_argmax,
+           root_argmax == proposal[0] ? "true" : "false");
+    printf("  \"timing\":{\"prompt_seconds\":%.9f,"
+           "\"root_advance_seconds\":%.9f,\"snapshot_seconds\":%.9f,"
+           "\"restore_seconds\":%.9f,\"verifier_seconds\":%.9f,"
+           "\"positions_per_second\":%.9f},\n",
+           prompt_seconds, root_advance_seconds, snapshot_seconds,
+           restore_seconds, verifier_seconds,
+           verifier_seconds > 0 ? n_proposal / verifier_seconds : 0);
+    printf("  \"logit_row_hashes\":");
+    print_u64_hex(logit_hashes, n_proposal); puts(",");
+    printf("  \"row_argmax\":"); print_ints(row_argmax, n_proposal); puts(",");
+    if (arm == ARM_SERIAL) {
+        printf("  \"ordered_routes_available\":true,"
+               "\"ordered_route_row_hashes\":");
+        print_u64_hex(route_hashes, n_proposal); puts(",");
+    } else {
+        puts("  \"ordered_routes_available\":false,"
+             "\"ordered_route_row_hashes\":null,");
+    }
+    printf("  \"final_state\":{\"bytes\":%zu,"
+           "\"hash\":\"0x%016" PRIx64 "\"},\n", final_bytes, final_hash);
+    printf("  \"cache_delta\":{\"hits\":%" PRIu64
+           ",\"misses\":%" PRIu64 ",\"bytes\":%" PRIu64
+           ",\"physical_expert_reads\":%" PRIu64
+           ",\"chunk_expert_union\":%" PRIu64 "},\n",
+           m.cache.hits - h0, m.cache.misses - mi0, m.cache.bytes_read - b0,
+           m.expert_reads - er0, waste_model_chunk_expert_union(&m) - u0);
+    printf("  \"cuda_delta\":{\"kda_calls\":%" PRIu64
+           ",\"dense_calls\":%" PRIu64 ",\"vq_experts\":%" PRIu64
+           ",\"vq_applies\":%" PRIu64 ",\"vq_launches\":%" PRIu64
+           ",\"vq_syncs\":%" PRIu64 ",\"fallbacks\":%" PRIu64 "},\n",
+           waste_model_cuda_kda_calls(&m) - k0,
+           waste_model_cuda_dense_calls(&m) - d0,
+           waste_model_cuda_vq_experts(&m) - ve0,
+           waste_model_cuda_vq_applies(&m) - va0,
+           waste_model_cuda_vq_launches(&m) - vl0,
+           waste_model_cuda_vq_syncs(&m) - vs0,
+           waste_model_cuda_kda_fallbacks(&m) - f0);
+    print_process_safety("verifier_forward_plus_cache_drain",
+                         ru1.ru_majflt - ru0.ru_majflt);
+    printf("  \"exact_profile\":{\"root_i8mm\":0,\"measured_i8mm\":%d,"
+           "\"prompt_path\":\"cpu_chunk\","
+           "\"root_path\":\"canonical_ordinary_t1\","
+           "\"verifier_path\":\"%s\","
+           "\"cuda_requested\":{\"kda\":%d,\"dense\":%d,\"vq\":%d},"
+           "\"cuda_effective\":{\"kda\":%d,\"dense\":%d,\"vq\":%d},"
+           "\"vq_group\":%d,\"lookahead\":%d,"
+           "\"direct_io\":%d,\"io_threads\":%d,\"io_depth\":%d,"
+           "\"cache_slots\":%d,\"warm_ready_at_load\":%d}\n}\n",
+           measured_i8mm,
+           arm == ARM_SERIAL ? "ordinary_t1" : "cpu_chunk_all_rows",
+           waste_model_get_cuda_kda(&m), waste_model_get_cuda_dense(&m),
+           waste_model_get_cuda_vq(&m), waste_model_cuda_kda_effective(&m),
+           waste_model_cuda_dense_effective(&m),
+           waste_model_cuda_vq_effective(&m),
+           waste_model_get_cuda_vq_group(&m), waste_model_get_lookahead(),
+           m.direct_io, waste_ecache_io_threads(&m.cache),
+           waste_ecache_io_depth(&m.cache), m.cache.n_slots, warm_ready);
+
+    free(routed); free(rows); free(root_blob);
+    free(prompt); free(root); free(proposal); waste_model_free(&m); return 0;
+
+fail:
+    free(routed); free(rows); free(root_blob);
+    free(prompt); free(root); free(proposal); waste_model_free(&m); return 1;
+fail_unloaded:
+    free(prompt); free(root); free(proposal); return 1;
+}
+#else
+static int verify4_mode(int argc, char **argv)
+{
+    if (argc != 9) return -2;
+    (void)argv;
+    fprintf(stderr, "verify4 requires WASTE_ENABLE_DIAGNOSTIC_VERIFY\n");
+    return 1;
+}
+#endif
+
 static uint64_t proc_value_kib(const char *path, const char *key)
 {
     FILE *f = fopen(path, "r");
@@ -1458,11 +2005,15 @@ static void usage(const char *name)
         "usage:\n"
         "  %s prompt DRAFT_MODEL SYSTEM USER\n"
         "  %s target MODEL CACHE_MB USAGE|- PROMPT_IDS N_GEN\n"
+        "  %s resident-target TARGET TARGET_USAGE|- DRAFT DRAFT_USAGE|- "
+        "TARGET_PROMPT_IDS DRAFT_PROMPT_IDS N_GEN\n"
         "  %s teacher MODEL CACHE_MB USAGE|- PROMPT_IDS TARGET_IDS\n"
         "  %s state MODEL CACHE_MB USAGE|- PROMPT_IDS TARGET_IDS\n"
+        "  %s verify4 serial|chunk0|chunk1 MODEL CACHE_MB USAGE|- "
+        "PROMPT_IDS ROOT_IDS|- PROPOSAL_IDS\n"
         "  %s load TARGET TARGET_CACHE_MB USAGE|- DRAFT DRAFT_CACHE_MB "
         "USAGE|- TARGET_ROLLBACK_BYTES DRAFT_ROLLBACK_BYTES\n",
-        name, name, name, name, name);
+        name, name, name, name, name, name, name);
 }
 
 int main(int argc, char **argv)
@@ -1471,8 +2022,11 @@ int main(int argc, char **argv)
     int rc = -2;
     if (!strcmp(argv[1], "prompt")) rc = prompt_mode(argc, argv);
     else if (!strcmp(argv[1], "target")) rc = target_mode(argc, argv);
+    else if (!strcmp(argv[1], "resident-target"))
+        rc = resident_target_mode(argc, argv);
     else if (!strcmp(argv[1], "teacher")) rc = teacher_mode(argc, argv);
     else if (!strcmp(argv[1], "state")) rc = state_mode(argc, argv);
+    else if (!strcmp(argv[1], "verify4")) rc = verify4_mode(argc, argv);
     else if (!strcmp(argv[1], "load")) rc = load_mode(argc, argv);
     if (rc == -2) { usage(argv[0]); return 2; }
     return rc;

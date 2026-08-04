@@ -200,6 +200,11 @@ static inline float dotf(const float *a, const float *b, int n)
 static int q8_off = 1;     /* 1 = keep the trunk stored as int8          */
 static int sdot_on = 0;    /* 1 = also quantize activations (SDOT path)  */
 static int i8mm_on = 0;    /* SMMLA batched matmul; costs activation int8 */
+#if defined(WASTE_ENABLE_DIAGNOSTIC_VERIFY)
+/* verify4 is a single-model, single-thread diagnostic. Keep its counter out
+ * of waste_model so the feature flag cannot alter the public struct layout. */
+static uint64_t diagnostic_chunk_expert_union;
+#endif
 static const char *dump_route = NULL;  /* WASTE_DUMP_ROUTE, see moe_layer */
 static const char *dump_route_margin = NULL; /* WASTE_DUMP_ROUTE_MARGIN */
 /* Absolute position of the first token of the pass being routed. The dump
@@ -3399,6 +3404,9 @@ void waste_model_reset(waste_model *m)
     m->cuda_vq_launches = 0;
     m->cuda_vq_syncs = 0;
     m->cuda_kda_state_dirty = 0;
+#if defined(WASTE_ENABLE_DIAGNOSTIC_VERIFY)
+    diagnostic_chunk_expert_union = 0;
+#endif
     if (!m->cuda_kda_failed) m->cuda_kda_fallbacks = 0;
 }
 
@@ -3413,6 +3421,36 @@ void waste_model_set_lookahead(int n)
     lookahead_n = n;
 }
 int  waste_model_get_lookahead(void)  { return lookahead_n; }
+
+#if defined(WASTE_ENABLE_DIAGNOSTIC_VERIFY)
+/* A quiescent-process diagnostic control, not an engine tuning API. The
+ * production default remains the once-read WASTE_I8MM setting above. */
+int waste_model_set_i8mm_diagnostic(int enabled)
+{
+    if (enabled != 0 && enabled != 1) return -1;
+    pthread_once(&model_opts_once, model_opts_init);
+#if defined(__ARM_FEATURE_MATMUL_INT8)
+    if (enabled && !(waste_cpu_features() & WASTE_CPU_I8MM)) return -1;
+    i8mm_on = enabled;
+    return 0;
+#else
+    if (enabled) return -1;
+    i8mm_on = 0;
+    return 0;
+#endif
+}
+
+int waste_model_get_i8mm_diagnostic(void)
+{
+    pthread_once(&model_opts_once, model_opts_init);
+    return i8mm_on;
+}
+
+uint64_t waste_model_chunk_expert_union(const waste_model *m)
+{
+    return m ? diagnostic_chunk_expert_union : 0;
+}
+#endif
 
 int waste_model_set_cuda_kda(waste_model *m, int mode)
 {
@@ -4091,6 +4129,9 @@ static void moe_chunk(waste_model *m, int L, const float *in, float *out, int nT
     for (int e = 0; e < E; e++)
         for (int i = 0; i < nT * K; i++)
             if (route[i] == e) { used_ids[n_used++] = e; break; }
+#if defined(WASTE_ENABLE_DIAGNOSTIC_VERIFY)
+    diagnostic_chunk_expert_union += (uint64_t)n_used;
+#endif
 
     for (int w = 0; w < n_used; w += WASTE_PF_MAX) {
     const int wn = n_used - w < WASTE_PF_MAX ? n_used - w : WASTE_PF_MAX;
@@ -4196,8 +4237,8 @@ static int clamp_token(const waste_model *m, int token)
     return 0;
 }
 
-const float *waste_model_prefill(waste_model *m, const int *tokens, int n,
-                                 int pos0)
+static const float *model_prefill_impl(waste_model *m, const int *tokens, int n,
+                                       int pos0, float *row_logits)
 {
     const waste_config *c = &m->cfg;
     const int hid = c->hidden;
@@ -4205,7 +4246,12 @@ const float *waste_model_prefill(waste_model *m, const int *tokens, int n,
         ((m->cuda_kda_mode || m->cuda_dense_scope || m->cuda_vq_mode) &&
          m->cuda_kda_failed)) return NULL;
     if (n <= 0) return m->logits;
-    if (n == 1) return waste_model_step(m, tokens[0], pos0, NULL);
+    if (n == 1) {
+        const float *one = waste_model_step(m, tokens[0], pos0, NULL);
+        if (one && row_logits)
+            memcpy(row_logits, one, (size_t)m->cfg.vocab * sizeof(float));
+        return one;
+    }
     dump_pos0 = pos0;
     if (n > WASTE_CHUNK_MAX) n = WASTE_CHUNK_MAX;
     /* mla_layer writes one latent per position with no bound of its own,
@@ -4337,13 +4383,46 @@ const float *waste_model_prefill(waste_model *m, const int *tokens, int n,
                                  m->cx + (size_t)t * hid);
     }
     const float *fnw = waste_find(m, tname("%smodel.norm.weight", c->prefix))->data;
-    float *last = m->cnorm;
-    waste_rmsnorm(last, m->cx + (size_t)(n - 1) * hid, fnw, hid, c->eps);
-    matvec_t(m, m->logits, waste_find(m, tname("%slm_head.weight", c->prefix)), last,
-             c->vocab, hid);
+    if (row_logits) {
+        for (int t = 0; t < n; t++)
+            waste_rmsnorm(m->cnorm + (size_t)t * hid,
+                          m->cx + (size_t)t * hid, fnw, hid, c->eps);
+        waste_matmul_t(m, row_logits,
+                       waste_find(m, tname("%slm_head.weight", c->prefix)),
+                       m->cnorm, c->vocab, hid, n);
+        memcpy(m->logits, row_logits + (size_t)(n - 1) * c->vocab,
+               (size_t)c->vocab * sizeof(float));
+    } else {
+        /* Keep the established prefill path and its arithmetic untouched. */
+        float *last = m->cnorm;
+        waste_rmsnorm(last, m->cx + (size_t)(n - 1) * hid, fnw, hid, c->eps);
+        matvec_t(m, m->logits,
+                 waste_find(m, tname("%slm_head.weight", c->prefix)), last,
+                 c->vocab, hid);
+    }
     memcpy(m->x, m->cx + (size_t)(n - 1) * hid, (size_t)hid * sizeof(float));
     return m->read_error ? NULL : m->logits;
 }
+
+const float *waste_model_prefill(waste_model *m, const int *tokens, int n,
+                                 int pos0)
+{
+    return model_prefill_impl(m, tokens, n, pos0, NULL);
+}
+
+#if defined(WASTE_ENABLE_DIAGNOSTIC_VERIFY)
+const float *waste_model_prefill_diagnostic_rows(
+    waste_model *m, const int *tokens, int n, int pos0,
+    float *row_logits, size_t row_logits_floats)
+{
+    if (!m || !tokens || !row_logits || n < 1 || n > WASTE_CHUNK_MAX ||
+        m->cfg.vocab <= 0 ||
+        (size_t)n > SIZE_MAX / (size_t)m->cfg.vocab ||
+        row_logits_floats < (size_t)n * (size_t)m->cfg.vocab)
+        return NULL;
+    return model_prefill_impl(m, tokens, n, pos0, row_logits);
+}
+#endif
 
 const float *waste_model_step(waste_model *m, int token, int pos, int *routed)
 {

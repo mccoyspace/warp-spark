@@ -257,6 +257,27 @@ int waste_model_ctx_full(const waste_model *m);
  * instead of once per token. */
 const float *waste_model_prefill(waste_model *m, const int *tokens, int n,
                                  int pos0);
+
+#if defined(WASTE_ENABLE_DIAGNOSTIC_VERIFY)
+/* Experimental verifier-calibration hooks. These are compiled only when
+ * WASTE_ENABLE_DIAGNOSTIC_VERIFY is defined and are not a stable public API.
+ *
+ * The rows variant follows the same state transition as waste_model_prefill,
+ * but writes all `n` vocab-sized logit rows to caller-owned storage. `n` must
+ * be in [1, WASTE_CHUNK_MAX], and `row_logits_floats` must hold at least
+ * n * model.cfg.vocab floats. It still returns the model-owned last row.
+ * `row_logits` must not alias storage owned by the model.
+ *
+ * The I8MM switch is process-global, just like WASTE_I8MM. Change it only
+ * while all models are idle; the setter rejects an unavailable I8MM path.
+ * waste_model_reset clears the diagnostic expert-union counter. */
+const float *waste_model_prefill_diagnostic_rows(
+    waste_model *m, const int *tokens, int n, int pos0,
+    float *row_logits, size_t row_logits_floats);
+uint64_t    waste_model_chunk_expert_union(const waste_model *m);
+int         waste_model_set_i8mm_diagnostic(int enabled);
+int         waste_model_get_i8mm_diagnostic(void);
+#endif
 /* Prefill chunk size. Declared here because waste_plan_memory has to size
  * the chunk scratch into the RAM budget, and that must be the same number
  * the engine actually allocates. */

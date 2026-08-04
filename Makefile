@@ -122,6 +122,10 @@ endif
 ifdef WASTE_NATIVE
 CFLAGS += -mcpu=native
 endif
+ifdef WASTE_DIAGNOSTIC_VERIFY
+CFLAGS += -DWASTE_ENABLE_DIAGNOSTIC_VERIFY=1
+CUDAFLAGS += -DWASTE_ENABLE_DIAGNOSTIC_VERIFY=1
+endif
 # Accelerator backends are build-time options, and each needs a source file
 # that registers it. Fail early with a useful message when a selected source
 # is absent instead of reaching an undefined registration symbol at link.
@@ -260,6 +264,12 @@ sweep$(EXE): tests/sweep.o libwaste.a
 ifndef WINDOWS
 spec_probe$(EXE): tests/spec_probe.o libwaste.a
 	$(CC) $(CFLAGS) -o $@ $^ $(LDLIBS)
+
+# The verifier hook is intentionally experimental. Force a complete rebuild
+# so an earlier normal spec_probe cannot be mistaken for the diagnostic one.
+.PHONY: spec_probe_diagnostic
+spec_probe_diagnostic:
+	$(MAKE) -B WASTE_DIAGNOSTIC_VERIFY=1 spec_probe$(EXE)
 endif
 test_tokenizer$(EXE): tests/test_tokenizer.o libwaste.a
 	$(CC) $(CFLAGS) -o $@ $^ $(LDLIBS)
