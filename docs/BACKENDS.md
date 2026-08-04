@@ -267,9 +267,34 @@ activations get quantized per group, which the f32 path deliberately
 avoids. Logits move by 6.8e-02 relative — argmax and top-5 held on the
 prompt tested, but that is a real change, not fp noise.
 
-Hence two switches, both off: build with `make WASTE_NATIVE=1` (the
-default build targets baseline ARM, where `__ARM_FEATURE_MATMUL_INT8` is
-not defined and the kernel compiles away) and run with `WASTE_I8MM=1`.
+Hence two switches, both off: compile a binary in which
+`__ARM_FEATURE_MATMUL_INT8` is actually defined, then run with
+`WASTE_I8MM=1`. On toolchains that correctly expose the host ISA,
+`make WASTE_NATIVE=1` supplies the compile-time half; the default build targets
+baseline ARM and compiles the kernel away.
+
+**Permanent GB10/GCC 13 caveat:** `-mcpu=native` on the Cortex-X925 has twice
+been observed to omit both `__ARM_FEATURE_DOTPROD` and
+`__ARM_FEATURE_MATMUL_INT8`, despite the CPU reporting dotprod and i8mm. Thus
+`WASTE_NATIVE=1` is not proof that either path exists in the binary. Check the
+preprocessor output before benchmarking:
+
+```bash
+cc -mcpu=native -dM -E -x c /dev/null \
+  | grep -E '__ARM_FEATURE_(DOTPROD|MATMUL_INT8)'
+```
+
+If those macros are absent, the explicit experimental build used on the Spark
+is:
+
+```bash
+make clean
+make CC='cc -march=armv8.6-a+dotprod+i8mm -mtune=native'
+```
+
+Confirm the resulting instructions or runtime counters as well; an ISA name
+alone is not evidence that the intended kernel ran.
+
 Turning it on by default would trade measurable accuracy for 1.2%. If
 the VQ path ever gets fast enough that the batched matmul's share grows,
 revisit — and at that point move the kernel into its own translation
