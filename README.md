@@ -27,8 +27,11 @@
 > Sprint 16 priced lossless speculative decoding before building it.
 > Kimi-Linear reached 2.0909 committed tokens per `k=4` verifier block, but
 > draft residency cut target throughput 9.93% by the median case, while the
-> faster of two representative exact-reference blocks took 4.956 s against a
-> generous 1.9835 s block budget. The pre-integration stop preserved H2
+> faster fixed-width exact-reference block took 4.956 s against a generous
+> 1.9835 s block budget. Abort-aware serial verification still cannot amortize
+> target work, while the batched path's measured 33.846 GB unique-miss set
+> couples verifier viability to materially faster storage or residency. The
+> pre-integration stop preserved H2
 > unspent; see
 > [the Sprint 16 result](docs/SPECULATIVE_GB10.md).
 > Start with [GN100 results and reproduction notes](docs/GN100.md), then see

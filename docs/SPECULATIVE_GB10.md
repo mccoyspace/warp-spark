@@ -81,8 +81,11 @@ or a materially smaller draft.
 
 One immediate-rejection block and one full-accept block were measured at
 `k=4`. The serial reference uses four ordinary, CUDA-enabled T=1 K3 steps and
-is exact. The existing chunked prefill path deduplicates experts, but runs on
-the CPU, changes arithmetic, and is not a lossless verifier.
+is exact. This diagnostic deliberately executed all four positions even for
+the immediate-rejection block; it measured a fixed-width exact reference, not
+an abort-aware serial implementation. The existing chunked prefill path
+deduplicates experts, but runs on the CPU, changes arithmetic, and is not a
+lossless verifier.
 
 | arm | full-accept block | immediate-reject block | expert bytes at full accept | exact lossless contract |
 | --- | ---: | ---: | ---: | --- |
@@ -108,15 +111,30 @@ block**.
 That bound deliberately charges zero for snapshots, restores, accepted and
 correction replay, bonus and direct-tail target steps, draft resynchronization,
 CPU/GPU synchronization, and bookkeeping. It also ignores the measured
-cache-rent penalty. Even under those impossible favors, the faster of the two
-representative exact-reference blocks is 4.956 s, or 2.50 times the available
-budget.
+cache-rent penalty. Even under those impossible favors, the faster fixed-width
+exact-reference block is 4.956 s, or 2.50 times the available budget. That
+comparison rejects fixed-width serial execution; it is not an estimate of an
+abort-aware serial verifier.
+
+The fixed four-step serial calibration is not a model of early abort. A real
+serial verifier stops at the first mismatch, but that does not create useful
+amortization: apart from root/bonus bookkeeping, it performs approximately one
+ordinary K3 target step per committed token, reproducing baseline decoding and
+then adding draft and transactional overhead. Any genuine verification gain
+must therefore come from a batched target pass.
 
 The existing chunk path cannot be repaired by launch tuning alone. Its fastest
-row read 33.846 GB. The same Spark SSD's prior uncontended direct-I/O controls
-measured about 13.2-13.4 GB/s, implying a roughly 2.526 s storage floor before
-compute or state work. That floor already exceeds the 1.9835 s block budget.
-This is an inference from the same-host fio controls, not a new fio run.
+row read 33.846 GB after cross-position expert deduplication. For the same
+starting cache state and routes, exact batching can make compute cheaper and
+overlap it with I/O, but it cannot reduce that measured unique-miss set without
+changing effective residency or the record representation. The same Spark
+SSD's prior uncontended direct-I/O controls measured about 13.2-13.4 GB/s,
+implying a roughly 2.526 s storage floor before compute or state work. That
+floor already exceeds the 1.9835 s block budget. Even 16 GB/s would require
+about 2.116 s; 20 GB/s leaves only about 0.291 s inside the budget for all
+verifier compute, while 23 GB/s leaves about 0.512 s. These are inferences from
+the same-host fio controls and this representative block, not a new fio run or
+a universal byte floor for every cache state.
 
 ## Decision
 
@@ -125,15 +143,22 @@ S/R candidate gate. No integrated speculative decoder was built, H2 consumed
 zero model steps, the qualified profile is unchanged, and nothing from Sprint
 16 is proposed upstream.
 
-A future sprint should reopen this only after at least one structural input
-changes:
+A future sprint should reopen integration only after both its draft side and
+verifier side are viable. Draft-side candidates include:
 
 - a native MTP head or substantially higher-agreement draft appears;
-- a smaller draft preserves most of the 59,340 MiB K3 cache;
-- an exact batched CUDA verifier materially reduces both time and expert bytes;
-  or
-- faster storage, such as the contemplated NVMe-oF path, removes the measured
-  verifier I/O floor.
+- a smaller draft preserves most of the 59,340 MiB K3 cache; or
+- a reduced-work K3 self-draft proves both cheap and accurate without a second
+  model allocation.
+
+The verifier side requires an exact batched CUDA path **and** enough storage
+bandwidth or effective residency to service its unique expert set within the
+block budget. Under the measured representative cache state, approximately
+20-25 GB/s is the credible storage range rather than an independent bonus.
+Faster storage remains independently useful without speculation, especially
+on held-out prompt families with weaker calibration-hotlist coverage; any
+storage claim should therefore be paired on held-out families as well as the
+warm studio profile.
 
 The detailed values are in the
 [machine-readable summary](gn100/sprint16-speculative-summary.json). Raw
