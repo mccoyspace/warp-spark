@@ -32,13 +32,50 @@
 #include "waste_backend.h"
 #include "waste_format.h"
 
+static int bank_fetch(void *user, int layer, int expert, uint8_t *dst);
+static void vq_build_lut(waste_model *m, float *lut, int cb_base,
+                         const float *x, int N, int stages, int entries,
+                         int vec_dim);
+
+#if defined(WASTE_ENABLE_CUDA)
+int  waste_cuda_q4_matvec(waste_model *m, float *y,
+                          const waste_tensor *tensor, const float *x,
+                          int out, int in, int mode);
+int  waste_cuda_vq_init(waste_model *m);
+int  waste_cuda_vq_prepare_pair(waste_model *m, int mode, const float *x,
+                                const float *gate_lut, const float *up_lut,
+                                int cb_base, int cols);
+int  waste_cuda_vq_apply_pair(waste_model *m, float *gate_y, float *up_y,
+                              const uint8_t *gate_idx,
+                              const uint8_t *up_idx,
+                              const uint16_t *scale, int rows, int cols);
+int  waste_cuda_vq_apply_down(waste_model *m, int mode, float *y,
+                              const uint8_t *idx, const uint16_t *scale,
+                              const float *x, const float *cpu_lut,
+                              int cb_base, int rows, int cols);
+int  waste_cuda_vq_group_pair_enqueue(
+        waste_model *m, int slot, const uint8_t *gate_idx,
+        const uint8_t *up_idx, const uint16_t *scale, int rows, int cols);
+int  waste_cuda_vq_group_pair_finish(
+        waste_model *m, int count, const float **host_outputs);
+int  waste_cuda_vq_group_down_enqueue(
+        waste_model *m, int slot, const uint8_t *idx, const uint16_t *scale,
+        const float *x, int cb_base, int rows, int cols);
+int  waste_cuda_vq_group_down_finish(
+        waste_model *m, int count, const float **host_outputs);
+int  waste_cuda_vq_group_drain(waste_model *m);
+void waste_cuda_kda_free(waste_model *m);
+#endif
+
 #define MAXP 512
 
 /* ---- lightweight phase profiling (WASTE_PROFILE=1) --------------------- */
 #include <time.h>
 double waste_prof[16];
 uint64_t waste_prof_n[16];
-enum { P_LUTB, P_KDA, P_MLA, P_ROUTE, P_EDEQ, P_EMM, P_HEAD, P_LUTA, P_MM };
+enum { P_LUTB, P_KDA, P_MLA, P_ROUTE, P_EDEQ, P_EMM, P_HEAD, P_LUTA, P_MM,
+       P_KDA_REC, P_KDA_QKV, P_KDA_CONV, P_KDA_AUX, P_KDA_GATE,
+       P_KDA_NORM, P_KDA_OUT };
 static int prof_on = -1;
 static pthread_mutex_t prof_mu = PTHREAD_MUTEX_INITIALIZER;
 static double pnow(void)
@@ -164,6 +201,7 @@ static int q8_off = 1;     /* 1 = keep the trunk stored as int8          */
 static int sdot_on = 0;    /* 1 = also quantize activations (SDOT path)  */
 static int i8mm_on = 0;    /* SMMLA batched matmul; costs activation int8 */
 static const char *dump_route = NULL;  /* WASTE_DUMP_ROUTE, see moe_layer */
+static const char *dump_route_margin = NULL; /* WASTE_DUMP_ROUTE_MARGIN */
 /* Absolute position of the first token of the pass being routed. The dump
  * names each row by the token it belongs to rather than leaving a reader
  * to infer it from where the layer index wraps — which is a heuristic
@@ -190,6 +228,7 @@ static void model_opts_init(void)
     /* Read once rather than per layer per token: moe_layer runs 92
      * times a token and getenv is not free. */
     dump_route = getenv("WASTE_DUMP_ROUTE");
+    dump_route_margin = getenv("WASTE_DUMP_ROUTE_MARGIN");
     /* How many of the next layer's experts to fetch on the router's guess.
      * The layer boundary holds about six reads and the prediction's
      * precision falls off past there, so that is the default. 0 is off. */
@@ -367,6 +406,367 @@ static void matvec_t(waste_model *m, float *y, const waste_tensor *t,
         run_rows(out, 64, waste_k.mvq_rows_f32, &a);
     }
 }
+
+/* One sticky failure domain covers every decode CUDA projection. A token may
+ * already have advanced KDA, convolution, MLA-cache, or block-residual state,
+ * so no CUDA arm is allowed to fall back halfway through it. */
+#if defined(WASTE_ENABLE_CUDA)
+static int cuda_projection_failed(waste_model *m, const char *scope)
+{
+    fprintf(stderr, "waste: CUDA %s operation failed\n", scope);
+    m->cuda_kda_failed = 1;
+    m->cuda_kda_state_dirty = 1;
+    m->cuda_kda_effective = 0;
+    m->cuda_dense_effective = 0;
+    m->cuda_vq_effective = 0;
+    m->cuda_kda_fallbacks++;
+    return -1;
+}
+#endif
+
+/* Decode-only CUDA experiment. Keeping this wrapper separate from matvec_t
+ * prevents an opt-in study from silently moving the router, absorbed kv_b,
+ * lm_head, vision, or chunked prefill onto the device too. */
+static int cuda_q4_matvec_t(waste_model *m, float *y, const waste_tensor *t,
+                            const float *x, int out, int in, int cuda_mode,
+                            int dense)
+{
+#if defined(WASTE_ENABLE_CUDA)
+    if (cuda_mode) {
+        if (m->cuda_kda_failed) return -1;
+        if (!t || !t->q || t->bits != 4 || t->group != 128) {
+            fprintf(stderr,
+                    "waste: CUDA %s requires Q4G/group-128 projections\n",
+                    dense ? "dense" : "KDA");
+            return cuda_projection_failed(m, dense ? "dense" : "KDA");
+        }
+        if (waste_cuda_q4_matvec(m, y, t, x, out, in, cuda_mode) == 0) {
+            if (dense) {
+                m->cuda_dense_effective = m->cuda_dense_scope;
+                m->cuda_dense_calls++;
+            } else {
+                m->cuda_kda_effective = cuda_mode;
+                m->cuda_kda_calls++;
+            }
+            return 0;
+        }
+        return cuda_projection_failed(m, dense ? "dense" : "KDA");
+    }
+#else
+    (void)cuda_mode;
+    (void)dense;
+#endif
+    matvec_t(m, y, t, x, out, in);
+    return 0;
+}
+
+static int kda_matvec_t(waste_model *m, float *y, const waste_tensor *t,
+                        const float *x, int out, int in, int cuda_mode)
+{
+    return cuda_q4_matvec_t(m, y, t, x, out, in, cuda_mode, 0);
+}
+
+static int dense_matvec_scope_t(waste_model *m, float *y,
+                                const waste_tensor *t, const float *x,
+                                int out, int in, int scope, int min_scope)
+{
+    const int mode = scope >= min_scope ? m->cuda_kda_mode : 0;
+    return cuda_q4_matvec_t(m, y, t, x, out, in, mode, 1);
+}
+
+static int dense_matvec_t(waste_model *m, float *y, const waste_tensor *t,
+                          const float *x, int out, int in, int min_scope)
+{
+    return dense_matvec_scope_t(m, y, t, x, out, in,
+                                m->cuda_dense_scope, min_scope);
+}
+
+#if defined(WASTE_ENABLE_CUDA)
+static int cuda_kda_tensor_ok(waste_model *m, int layer, const char *projection,
+                              const waste_tensor **first)
+{
+    char name[160];
+    snprintf(name, sizeof name, "%smodel.layers.%d.self_attn.%s_proj.weight",
+             m->cfg.prefix, layer, projection);
+    const waste_tensor *t = waste_find(m, name);
+    if (!t || !t->q || t->bits != 4 || t->group != 128) {
+        fprintf(stderr, "waste: CUDA KDA cannot offload %s\n", name);
+        return -1;
+    }
+    if (!*first) *first = t;
+    return 0;
+}
+
+static int cuda_dense_tensor_ok(waste_model *m, const char *name,
+                                const waste_tensor **first)
+{
+    const waste_tensor *t = waste_find(m, name);
+    if (!t || !t->q || t->bits != 4 || t->group != 128 || t->ndim != 2) {
+        fprintf(stderr, "waste: CUDA dense cannot offload %s\n", name);
+        return -1;
+    }
+    if (!*first) *first = t;
+    return 0;
+}
+
+/* Validate the complete decode path before it can enter a timed token. The
+ * real launch also creates the CUDA context and warms the selected kernel,
+ * but writes only ordinary scratch; it does not touch recurrent model state. */
+static int cuda_kda_preflight(waste_model *m, int mode)
+{
+    if (!mode) return 0;
+    const waste_tensor *first = NULL;
+    static const char *base[] = {"q", "k", "v", "f_a", "f_b", "b", "o"};
+    int kda_layers = 0;
+    for (int L = 0; L < m->cfg.n_layers; L++) {
+        if (!m->cfg.kda_layer[L]) continue;
+        kda_layers++;
+        for (size_t i = 0; i < sizeof base / sizeof base[0]; i++)
+            if (cuda_kda_tensor_ok(m, L, base[i], &first)) goto fail;
+        if (m->cfg.full_rank_gate) {
+            if (cuda_kda_tensor_ok(m, L, "g", &first)) goto fail;
+        } else {
+            if (cuda_kda_tensor_ok(m, L, "g_a", &first) ||
+                cuda_kda_tensor_ok(m, L, "g_b", &first)) goto fail;
+        }
+    }
+    if (!first || !kda_layers) {
+        fprintf(stderr, "waste: CUDA KDA requested for a model with no KDA layers\n");
+        goto fail;
+    }
+    {
+        const int channels = m->cfg.kda_heads * m->cfg.kda_dim;
+        if (waste_cuda_q4_matvec(m, m->tmp, first, m->x, channels,
+                                 m->cfg.hidden, mode))
+            goto fail;
+    }
+    return 0;
+
+fail:
+    m->cuda_kda_failed = 1;
+    m->cuda_kda_effective = 0;
+    m->cuda_dense_effective = 0;
+    m->cuda_vq_effective = 0;
+    m->cuda_kda_fallbacks++;
+    return -1;
+}
+
+
+/* Scope 1: shared-expert FFNs and latent MoE bridges.
+ * Scope 2: the ordinary MLA projections too (absorbed kv_b stays CPU).
+ * Scope 3: non-MoE dense FFNs too. Router arithmetic stays CPU in all arms. */
+static int cuda_dense_preflight(waste_model *m, int scope)
+{
+    if (!scope) return 0;
+    if (!m->cuda_kda_mode) {
+        fprintf(stderr, "waste: CUDA dense scope requires CUDA KDA mode 1 or 2\n");
+        goto fail;
+    }
+    const waste_config *c = &m->cfg;
+    const waste_tensor *first = NULL;
+    int moe_layers = 0, mla_layers = 0, dense_layers = 0;
+    for (int L = 0; L < c->n_layers; L++) {
+        const char *gate = tname(
+            "%smodel.layers.%d.block_sparse_moe.gate.weight", c->prefix, L);
+        if (waste_find(m, gate)) {
+            moe_layers++;
+            if (c->latent_dim &&
+                (cuda_dense_tensor_ok(m, tname(
+                    "%smodel.layers.%d.block_sparse_moe.routed_expert_down_proj.weight",
+                    c->prefix, L), &first) ||
+                 cuda_dense_tensor_ok(m, tname(
+                    "%smodel.layers.%d.block_sparse_moe.routed_expert_up_proj.weight",
+                    c->prefix, L), &first))) goto fail;
+            if (cuda_dense_tensor_ok(m, tname(
+                    "%smodel.layers.%d.block_sparse_moe.shared_experts.gate_proj.weight",
+                    c->prefix, L), &first) ||
+                cuda_dense_tensor_ok(m, tname(
+                    "%smodel.layers.%d.block_sparse_moe.shared_experts.up_proj.weight",
+                    c->prefix, L), &first) ||
+                cuda_dense_tensor_ok(m, tname(
+                    "%smodel.layers.%d.block_sparse_moe.shared_experts.down_proj.weight",
+                    c->prefix, L), &first)) goto fail;
+        } else if (scope >= 3) {
+            dense_layers++;
+            if (cuda_dense_tensor_ok(m, tname(
+                    "%smodel.layers.%d.mlp.gate_proj.weight", c->prefix, L), &first) ||
+                cuda_dense_tensor_ok(m, tname(
+                    "%smodel.layers.%d.mlp.up_proj.weight", c->prefix, L), &first) ||
+                cuda_dense_tensor_ok(m, tname(
+                    "%smodel.layers.%d.mlp.down_proj.weight", c->prefix, L), &first))
+                goto fail;
+        }
+
+        if (scope >= 2 && !c->kda_layer[L]) {
+            mla_layers++;
+            if (c->q_lora) {
+                if (cuda_dense_tensor_ok(m, tname(
+                        "%smodel.layers.%d.self_attn.q_a_proj.weight", c->prefix, L), &first) ||
+                    cuda_dense_tensor_ok(m, tname(
+                        "%smodel.layers.%d.self_attn.q_b_proj.weight", c->prefix, L), &first))
+                    goto fail;
+            } else if (cuda_dense_tensor_ok(m, tname(
+                    "%smodel.layers.%d.self_attn.q_proj.weight", c->prefix, L), &first))
+                goto fail;
+            if (cuda_dense_tensor_ok(m, tname(
+                    "%smodel.layers.%d.self_attn.kv_a_proj_with_mqa.weight", c->prefix, L), &first) ||
+                (c->mla_output_gate && cuda_dense_tensor_ok(m, tname(
+                    "%smodel.layers.%d.self_attn.g_proj.weight", c->prefix, L), &first)) ||
+                cuda_dense_tensor_ok(m, tname(
+                    "%smodel.layers.%d.self_attn.o_proj.weight", c->prefix, L), &first))
+                goto fail;
+        }
+    }
+    if (!first || !moe_layers || (scope >= 2 && !mla_layers) ||
+        (scope >= 3 && !dense_layers)) {
+        fprintf(stderr, "waste: CUDA dense scope %d has no complete target set\n",
+                scope);
+        goto fail;
+    }
+    if (waste_cuda_q4_matvec(m, m->tmp, first, m->x,
+                             first->shape[0], first->shape[1],
+                             m->cuda_kda_mode))
+        goto fail;
+    return 0;
+
+fail:
+    m->cuda_kda_failed = 1;
+    m->cuda_kda_effective = 0;
+    m->cuda_dense_effective = 0;
+    m->cuda_vq_effective = 0;
+    m->cuda_kda_fallbacks++;
+    return -1;
+}
+
+/* Sprint 13 is deliberately a K3 VQ3R experiment, not a generic promise
+ * about every vector-quantized container. Keep its accepted dense baseline
+ * and exact blocked layout explicit so an opt-in cannot silently execute a
+ * different record geometry. */
+static int cuda_vq_preflight(waste_model *m, int mode)
+{
+    if (!mode) return 0;
+    const waste_config *c = &m->cfg;
+    if (mode < 1 || mode > 2 || m->cuda_kda_mode != 1 ||
+        m->cuda_dense_scope != 2) {
+        fprintf(stderr,
+                "waste: CUDA VQ requires CUDA KDA mode 1 and dense scope 2\n");
+        goto fail;
+    }
+    if (m->stages != 3 || m->vec_dim != 8 || m->cb_entries != 256 ||
+        m->vq_index_block != 64 || c->latent_dim != 3584 ||
+        c->moe_inter != 3072 || c->top_k != 16 || !m->codebooksT ||
+        m->n_books < 9) {
+        fprintf(stderr,
+                "waste: CUDA VQ requires K3 VQ3R 3584/3072, top-16, "
+                "index-block-64 geometry\n");
+        goto fail;
+    }
+    if (waste_cuda_vq_init(m)) {
+        fprintf(stderr, "waste: CUDA VQ initialization failed\n");
+        goto fail;
+    }
+    if (m->cuda_vq_preflight_modes & (1 << mode)) return 0;
+
+    /* Exercise the actual HMM record, both return handoffs and the selected
+     * LUT path before a token can mutate recurrent state. This direct read
+     * is setup work rather than cache demand and its counter is restored. */
+    {
+        int L = -1;
+        for (int i = 0; i < c->n_layers; i++)
+            if (m->bank[i].fd >= 0 && m->bank[i].rec_bytes > 0) {
+                L = i;
+                break;
+            }
+        if (L < 0) {
+            fprintf(stderr, "waste: CUDA VQ found no expert bank to warm\n");
+            goto fail;
+        }
+        const uint64_t reads_before = m->expert_reads;
+        if (bank_fetch(m, L, 0, m->miss_buf)) goto fail;
+        m->expert_reads = reads_before;
+        const waste_expert_hdr *h = (const waste_expert_hdr *)m->miss_buf;
+        if (h->fmt != WQ_VQ3R) {
+            fprintf(stderr, "waste: CUDA VQ requires VQ3R expert records\n");
+            goto fail;
+        }
+        const int lat = c->latent_dim;
+        const int inter = c->moe_inter;
+        const int lut_sz =
+            ((c->hidden > lat ? c->hidden : lat) / m->vec_dim) *
+            m->stages * m->cb_entries;
+        float *gate = m->ff;
+        float *up = gate + inter;
+        float *down = m->e_gate;
+        float *gate_lut = m->lut;
+        float *up_lut = gate_lut + lut_sz;
+        float *down_lut = up_lut + lut_sz;
+        const uint8_t *rec = m->miss_buf;
+        const uint16_t *scale =
+            (const uint16_t *)(rec + h->chan_corr_off);
+        const int grouped = mode == 2 && m->cuda_vq_group > 1;
+        const float *group_pair[1] = { NULL };
+        const float *group_down[1] = { NULL };
+        if (mode == 1) {
+            vq_build_lut(m, gate_lut, h->codebook_id, m->x, lat,
+                         m->stages, m->cb_entries, m->vec_dim);
+            vq_build_lut(m, up_lut, h->codebook_id + m->stages,
+                         m->x, lat, m->stages, m->cb_entries, m->vec_dim);
+        }
+        if (waste_cuda_vq_prepare_pair(
+                m, mode, m->x, gate_lut, up_lut, h->codebook_id, lat))
+            goto fail;
+        if (grouped) {
+            if (waste_cuda_vq_group_pair_enqueue(
+                    m, 0, rec + h->gate_off, rec + h->up_off,
+                    scale, inter, lat) ||
+                waste_cuda_vq_group_pair_finish(m, 1, group_pair))
+                goto fail;
+            gate = (float *)group_pair[0];
+            up = gate + inter;
+        } else if (waste_cuda_vq_apply_pair(
+                       m, gate, up, rec + h->gate_off, rec + h->up_off,
+                       scale, inter, lat)) {
+            goto fail;
+        }
+        for (int i = 0; i < inter; i++)
+            gate[i] = c->act_situ
+                ? waste_situ_pair(gate[i], up[i], c->situ_beta,
+                                  c->situ_linear_beta)
+                : (gate[i] / (1.0f + expf(-gate[i]))) * up[i];
+        if (mode == 1)
+            vq_build_lut(m, down_lut, h->codebook_id + 2 * m->stages,
+                         gate, inter, m->stages, m->cb_entries, m->vec_dim);
+        if (grouped) {
+            if (waste_cuda_vq_group_down_enqueue(
+                    m, 0, rec + h->down_off, scale + 2 * inter, gate,
+                    h->codebook_id + 2 * m->stages, lat, inter) ||
+                waste_cuda_vq_group_down_finish(m, 1, group_down))
+                goto fail;
+            down = (float *)group_down[0];
+            if (waste_cuda_vq_group_drain(m)) goto fail;
+        } else if (waste_cuda_vq_apply_down(
+                       m, mode, down, rec + h->down_off, scale + 2 * inter,
+                       gate, mode == 1 ? down_lut : NULL,
+                       h->codebook_id + 2 * m->stages, lat, inter)) {
+            goto fail;
+        }
+        for (int i = 0; i < inter; i++)
+            if (!isfinite(gate[i]) || !isfinite(up[i])) goto fail;
+        for (int i = 0; i < lat; i++)
+            if (!isfinite(down[i])) goto fail;
+    }
+    m->cuda_vq_preflight_modes |= 1 << mode;
+    return 0;
+
+fail:
+    m->cuda_kda_failed = 1;
+    m->cuda_kda_effective = 0;
+    m->cuda_dense_effective = 0;
+    m->cuda_vq_effective = 0;
+    m->cuda_kda_fallbacks++;
+    return -1;
+}
+#endif
 
 /* Dequantize one row of a trunk tensor into dst[cols].
  *
@@ -876,8 +1276,6 @@ static void cfg_from_json(waste_config *c, const js_doc *d, int cfg)
     }
 }
 
-/* Defined below, next to record_check; the cache needs it at load. */
-static int bank_fetch(void *user, int layer, int expert, uint8_t *dst);
 static void start_readers(waste_model *m);
 
 /* Wire the resident trunk. The cache is the cold part of this engine —
@@ -929,6 +1327,46 @@ int waste_model_load(waste_model *m, const char *dir, int kv_cap,
     m->want_vision = opt->want_vision;
     m->want_direct = opt->direct_io;
     pthread_once(&model_opts_once, model_opts_init);
+#if defined(WASTE_ENABLE_CUDA)
+    {
+        const char *e = getenv("WASTE_CUDA_KDA");
+        int mode = e ? atoi(e) : 0;
+        e = getenv("WASTE_CUDA_DENSE");
+        int scope = e ? atoi(e) : 0;
+        e = getenv("WASTE_CUDA_VQ");
+        int vq_mode = e ? atoi(e) : 0;
+        e = getenv("WASTE_CUDA_VQ_GROUP");
+        int vq_group = e ? atoi(e) : 1;
+        const char *backend = getenv("WASTE_BACKEND");
+        if (backend && !strcmp(backend, "cpu")) {
+            mode = 0;
+            scope = 0;
+            vq_mode = 0;
+            vq_group = 1;
+        }
+        if (mode < 0) mode = 0;
+        if (mode > 2) mode = 2;
+        if (scope < 0) scope = 0;
+        if (scope > 3) scope = 3;
+        if (vq_mode < 0) vq_mode = 0;
+        if (vq_mode > 2) vq_mode = 2;
+        if (vq_group != 1 && vq_group != 2 && vq_group != 4 &&
+            vq_group != 8 && vq_group != 16) {
+            fprintf(stderr,
+                    "waste: WASTE_CUDA_VQ_GROUP must be 1, 2, 4, 8 or 16\n");
+            return -1;
+        }
+        if (vq_mode == 1 && vq_group != 1) {
+            fprintf(stderr,
+                    "waste: grouped CUDA VQ currently requires mode 2\n");
+            return -1;
+        }
+        m->cuda_kda_mode = mode;
+        m->cuda_dense_scope = scope;
+        m->cuda_vq_mode = vq_mode;
+        m->cuda_vq_group = vq_group;
+    }
+#endif
     m->kv_cap = kv_cap;
     m->direct_io = 1;
     waste_backend_init(WASTE_BE_AUTO);
@@ -1002,6 +1440,7 @@ int waste_model_load(waste_model *m, const char *dir, int kv_cap,
     m->stages = (int)js_int(&d, js_get(&d, eq, "stages"), 3);
     m->vec_dim = (int)js_int(&d, js_get(&d, eq, "vec_dim"), 8);
     m->cb_entries = (int)js_int(&d, js_get(&d, eq, "entries"), 256);
+    m->vq_index_block = (int)js_int(&d, js_get(&d, eq, "index_block"), 0);
     /* cfg_sane covers `config`; this block is the other half of the
      * manifest and nothing checked it. All three size the LUT and two of
      * them divide: `"vec_dim": 0` was a division by zero in three places,
@@ -1299,6 +1738,21 @@ int waste_model_load(waste_model *m, const char *dir, int kv_cap,
         else if (!m->latcache[L]) return -1;
     }
     if (c->attn_res_block && !m->blockres) return -1;
+#if defined(WASTE_ENABLE_CUDA)
+    if (m->cuda_vq_mode == 2 && m->cuda_vq_group > 1 &&
+        m->cache.n_slots < m->cuda_vq_group) {
+        fprintf(stderr,
+                "waste: grouped CUDA VQ needs at least %d expert-cache slots\n",
+                m->cuda_vq_group);
+        return -1;
+    }
+    if (m->cuda_kda_mode && cuda_kda_preflight(m, m->cuda_kda_mode))
+        return -1;
+    if (m->cuda_dense_scope &&
+        cuda_dense_preflight(m, m->cuda_dense_scope)) return -1;
+    if (m->cuda_vq_mode &&
+        cuda_vq_preflight(m, m->cuda_vq_mode)) return -1;
+#endif
     return 0;
 }
 
@@ -1315,6 +1769,9 @@ void waste_model_free(waste_model *m)
      * a failed load left behind, so nothing here may assume the load got
      * as far as its own allocation. */
     if (!m->t) m->n_tensors = 0;
+#if defined(WASTE_ENABLE_CUDA)
+    waste_cuda_kda_free(m);
+#endif
     /* Device backends may hold no-copy wrappers keyed by these host
      * addresses.  Drop them while the allocations are still alive. */
     waste_backend_release_host_buffers();
@@ -1591,6 +2048,25 @@ static const uint8_t *read_expert(waste_model *m, int L, int eid)
     m->cache.bytes_read += (size_t)m->bank[L].rec_bytes;
     return bank_fetch(m, L, eid, m->miss_buf) == 0 ? m->miss_buf : NULL;
 }
+
+/* Grouped CUDA work keeps several record pointers live across later cache
+ * accesses. The ordinary read_expert lifetime ends at the next get(), so a
+ * real cache hold is required; the single miss buffer cannot support this
+ * path and is rejected during CUDA VQ configuration. */
+#if defined(WASTE_ENABLE_CUDA)
+static const uint8_t *read_expert_hold(waste_model *m, int L, int eid,
+                                       waste_ecache_hold *hold)
+{
+    if (m->cache.n_slots > 0) {
+        const uint8_t *r = waste_ecache_get_hold(
+            &m->cache, L, eid, bank_fetch, m, hold);
+        if (!r && !m->read_error) bank_fail(m, REC_E_NOSLOT, L, eid);
+        return r;
+    }
+    if (!m->read_error) bank_fail(m, REC_E_NOSLOT, L, eid);
+    return NULL;
+}
+#endif
 
 const char *waste_model_read_error(const waste_model *m, int *layer, int *expert)
 {
@@ -1874,7 +2350,8 @@ static void kda_step_range(int lo, int hi, void *ap)
                      a->u + (size_t)lo * a->V);
 }
 
-static void kda_layer(waste_model *m, int L, const float *in, float *out)
+static int kda_layer(waste_model *m, int L, const float *in, float *out,
+                     int cuda_mode)
 {
     const waste_config *c = &m->cfg;
     const int H = c->kda_heads, D = c->kda_dim, C = H * D, hid = c->hidden;
@@ -1886,24 +2363,47 @@ static void kda_layer(waste_model *m, int L, const float *in, float *out)
     for (int i = 0; i < 3; i++) {
         char b[128];
         snprintf(b, sizeof b, "%smodel.layers.%d.self_attn.%s_proj.weight", c->prefix, L, nm[i]);
-        matvec_t(m, dstv[i], waste_find(m, b), in, C, hid);
+        {
+            PROF_START(P_KDA_QKV);
+            const int failed = kda_matvec_t(
+                m, dstv[i], waste_find(m, b), in, C, hid, cuda_mode);
+            PROF_END(P_KDA_QKV);
+            if (failed) return -1;
+        }
         snprintf(b, sizeof b, "%smodel.layers.%d.self_attn.%s_conv1d.weight", c->prefix, L, nm[i]);
-        waste_k.short_conv_step(C, c->conv_k, waste_find(m, b)->data, NULL,
-                                m->conv[L] + (size_t)i * C * (c->conv_k - 1),
-                                dstv[i], dstv[i]);
+        {
+            PROF_START(P_KDA_CONV);
+            waste_k.short_conv_step(C, c->conv_k, waste_find(m, b)->data, NULL,
+                                    m->conv[L] + (size_t)i * C * (c->conv_k - 1),
+                                    dstv[i], dstv[i]);
+            PROF_END(P_KDA_CONV);
+        }
     }
 
-    matvec_t(m, lo, waste_find(m, tname("%smodel.layers.%d.self_attn.f_a_proj.weight", c->prefix, L)), in, D, hid);
-    matvec_t(m, g, waste_find(m, tname("%smodel.layers.%d.self_attn.f_b_proj.weight", c->prefix, L)), lo, C, D);
-    const waste_tensor *At = waste_find(m, tname("%smodel.layers.%d.self_attn.A_log",
-                                                 c->prefix, L));
-    const float *dt = T(m, "%smodel.layers.%d.self_attn.dt_bias", c->prefix, L);
-    /* A_log is per head, not per channel: the tech report's eq. 5 indexes it
-     * by h, and K3 ships it padded to head_dim (indices 96..127 are exactly
-     * zero on every layer we checked). */
-    waste_kda_decay_gate_ex(g, At->data, dt, H, D, c->gate_lower_bound, 0);
-    matvec_t(m, beta, waste_find(m, tname("%smodel.layers.%d.self_attn.b_proj.weight", c->prefix, L)), in, H, hid);
-    for (int h = 0; h < H; h++) beta[h] = 1.0f / (1.0f + expf(-beta[h]));
+    {
+        PROF_START(P_KDA_AUX);
+        int failed = kda_matvec_t(m, lo, waste_find(m, tname("%smodel.layers.%d.self_attn.f_a_proj.weight", c->prefix, L)), in, D, hid, cuda_mode);
+        if (!failed)
+            failed = kda_matvec_t(m, g, waste_find(m, tname("%smodel.layers.%d.self_attn.f_b_proj.weight", c->prefix, L)), lo, C, D, cuda_mode);
+        if (failed) {
+            PROF_END(P_KDA_AUX);
+            return -1;
+        }
+        const waste_tensor *At = waste_find(m, tname("%smodel.layers.%d.self_attn.A_log",
+                                                     c->prefix, L));
+        const float *dt = T(m, "%smodel.layers.%d.self_attn.dt_bias", c->prefix, L);
+        /* A_log is per head, not per channel: the tech report's eq. 5 indexes it
+         * by h, and K3 ships it padded to head_dim (indices 96..127 are exactly
+         * zero on every layer we checked). */
+        waste_kda_decay_gate_ex(g, At->data, dt, H, D, c->gate_lower_bound, 0);
+        failed = kda_matvec_t(m, beta, waste_find(m, tname("%smodel.layers.%d.self_attn.b_proj.weight", c->prefix, L)), in, H, hid, cuda_mode);
+        if (failed) {
+            PROF_END(P_KDA_AUX);
+            return -1;
+        }
+        for (int h = 0; h < H; h++) beta[h] = 1.0f / (1.0f + expf(-beta[h]));
+        PROF_END(P_KDA_AUX);
+    }
 
     {
         /* Heads own disjoint K x V slices of the recurrent state, so the
@@ -1913,23 +2413,43 @@ static void kda_layer(waste_model *m, int L, const float *in, float *out)
          * version. Worth doing: K3 spends 19% of a decode step in this call,
          * 69 layers x 96 heads, and it was running on one core. */
         kda_par a = { D, D, q, k, v, g, beta, m->S[L], o, m->att };
+        PROF_START(P_KDA_REC);
         waste_parallel_for(H, 1, kda_step_range, &a);
+        PROF_END(P_KDA_REC);
     }
 
     if (c->full_rank_gate) {
-        matvec_t(m, gate, waste_find(m, tname("%smodel.layers.%d.self_attn.g_proj.weight",
-                                              c->prefix, L)), in, C, hid);
+        PROF_START(P_KDA_GATE);
+        const int failed = kda_matvec_t(
+            m, gate, waste_find(m, tname("%smodel.layers.%d.self_attn.g_proj.weight",
+                                         c->prefix, L)), in, C, hid, cuda_mode);
+        PROF_END(P_KDA_GATE);
+        if (failed) return -1;
     } else {
-        matvec_t(m, lo, waste_find(m, tname("%smodel.layers.%d.self_attn.g_a_proj.weight",
-                                            c->prefix, L)), in, D, hid);
-        matvec_t(m, gate, waste_find(m, tname("%smodel.layers.%d.self_attn.g_b_proj.weight",
-                                              c->prefix, L)), lo, C, D);
+        PROF_START(P_KDA_GATE);
+        int failed = kda_matvec_t(
+            m, lo, waste_find(m, tname("%smodel.layers.%d.self_attn.g_a_proj.weight",
+                                       c->prefix, L)), in, D, hid, cuda_mode);
+        if (!failed)
+            failed = kda_matvec_t(
+                m, gate, waste_find(m, tname("%smodel.layers.%d.self_attn.g_b_proj.weight",
+                                             c->prefix, L)), lo, C, D,
+                cuda_mode);
+        PROF_END(P_KDA_GATE);
+        if (failed) return -1;
     }
     const float *onw = T(m, "%smodel.layers.%d.self_attn.o_norm.weight", c->prefix, L);
+    PROF_START(P_KDA_NORM);
     for (int h = 0; h < H; h++)
         waste_k.rmsnorm_gated(D, o + h * D, gate + h * D, onw, c->eps, o + h * D);
+    PROF_END(P_KDA_NORM);
 
-    matvec_t(m, out, waste_find(m, tname("%smodel.layers.%d.self_attn.o_proj.weight", c->prefix, L)), o, hid, C);
+    PROF_START(P_KDA_OUT);
+    const int failed = kda_matvec_t(
+        m, out, waste_find(m, tname("%smodel.layers.%d.self_attn.o_proj.weight",
+                                    c->prefix, L)), o, hid, C, cuda_mode);
+    PROF_END(P_KDA_OUT);
+    return failed ? -1 : 0;
 }
 
 /* MLA with kv_b_proj absorbed into the query and the output.
@@ -2006,7 +2526,8 @@ static void mla_head_range(int lo, int hi, void *ap)
     }
 }
 
-static void mla_layer(waste_model *m, int L, const float *in, float *out, int pos)
+static int mla_layer(waste_model *m, int L, const float *in, float *out,
+                     int pos, int cuda_scope)
 {
     const waste_config *c = &m->cfg;
     const int nh = c->n_heads, qd = c->qk_nope + c->qk_rope, vh = c->v_head;
@@ -2017,18 +2538,22 @@ static void mla_layer(waste_model *m, int L, const float *in, float *out, int po
     if (c->q_lora) {
         /* K3 LoRAs the query too: q_a -> RMSNorm -> q_b */
         float *qa = o + (size_t)nh * vh;
-        matvec_t(m, qa, waste_find(m, tname("%smodel.layers.%d.self_attn.q_a_proj.weight",
-                                            c->prefix, L)), in, c->q_lora, hid);
+        if (dense_matvec_scope_t(m, qa, waste_find(m, tname(
+                "%smodel.layers.%d.self_attn.q_a_proj.weight", c->prefix, L)),
+                in, c->q_lora, hid, cuda_scope, 2)) return -1;
         waste_rmsnorm(qa, qa, waste_find(m, tname("%smodel.layers.%d.self_attn.q_a_layernorm.weight",
                                             c->prefix, L))->data, c->q_lora, c->eps);
-        matvec_t(m, q, waste_find(m, tname("%smodel.layers.%d.self_attn.q_b_proj.weight",
-                                           c->prefix, L)), qa, nh * qd, c->q_lora);
+        if (dense_matvec_scope_t(m, q, waste_find(m, tname(
+                "%smodel.layers.%d.self_attn.q_b_proj.weight", c->prefix, L)),
+                qa, nh * qd, c->q_lora, cuda_scope, 2)) return -1;
     } else {
-        matvec_t(m, q, waste_find(m, tname("%smodel.layers.%d.self_attn.q_proj.weight",
-                                           c->prefix, L)), in, nh * qd, hid);
+        if (dense_matvec_scope_t(m, q, waste_find(m, tname(
+                "%smodel.layers.%d.self_attn.q_proj.weight", c->prefix, L)),
+                in, nh * qd, hid, cuda_scope, 2)) return -1;
     }
-    matvec_t(m, ckv, waste_find(m, tname("%smodel.layers.%d.self_attn.kv_a_proj_with_mqa.weight", c->prefix, L)),
-             in, c->kv_lora + c->qk_rope, hid);
+    if (dense_matvec_scope_t(m, ckv, waste_find(m, tname(
+            "%smodel.layers.%d.self_attn.kv_a_proj_with_mqa.weight", c->prefix, L)),
+            in, c->kv_lora + c->qk_rope, hid, cuda_scope, 2)) return -1;
     waste_rmsnorm(ckv, ckv, T(m, "%smodel.layers.%d.self_attn.kv_a_layernorm.weight", c->prefix, L),
             c->kv_lora, c->eps);
     /* Cache the latent as-is — normalized kpass followed by the raw rope
@@ -2058,28 +2583,33 @@ static void mla_layer(waste_model *m, int L, const float *in, float *out, int po
     if (c->mla_output_gate) {
         /* sigmoid gate on the attention output, before o_proj */
         float *g = o + (size_t)nh * vh + (c->q_lora ? c->q_lora : 0);
-        matvec_t(m, g, waste_find(m, tname("%smodel.layers.%d.self_attn.g_proj.weight",
-                                           c->prefix, L)), in, nh * vh, hid);
+        if (dense_matvec_scope_t(m, g, waste_find(m, tname(
+                "%smodel.layers.%d.self_attn.g_proj.weight", c->prefix, L)),
+                in, nh * vh, hid, cuda_scope, 2)) return -1;
         for (int i = 0; i < nh * vh; i++) o[i] *= 1.0f / (1.0f + expf(-g[i]));
     }
-    matvec_t(m, out, waste_find(m, tname("%smodel.layers.%d.self_attn.o_proj.weight", c->prefix, L)), o, hid, nh * vh);
+    if (dense_matvec_scope_t(m, out, waste_find(m, tname(
+            "%smodel.layers.%d.self_attn.o_proj.weight", c->prefix, L)),
+            o, hid, nh * vh, cuda_scope, 2)) return -1;
+    return 0;
 }
 
-static void ffn(waste_model *m, const waste_tensor *W1, const waste_tensor *W3,
-                const waste_tensor *W2, const float *in, float *out,
-                int inter, int hid, float w, int accum)
+static int ffn(waste_model *m, const waste_tensor *W1, const waste_tensor *W3,
+               const waste_tensor *W2, const float *in, float *out,
+               int inter, int hid, float w, int accum, int cuda_scope)
 {
     float *a = m->ff, *b = a + inter;
-    matvec_t(m, a, W1, in, inter, hid);
-    matvec_t(m, b, W3, in, inter, hid);
+    if (dense_matvec_t(m, a, W1, in, inter, hid, cuda_scope) ||
+        dense_matvec_t(m, b, W3, in, inter, hid, cuda_scope)) return -1;
     if (m->cfg.act_situ)
         for (int i = 0; i < inter; i++)
             a[i] = waste_situ_pair(a[i], b[i], m->cfg.situ_beta, m->cfg.situ_linear_beta);
     else
         for (int i = 0; i < inter; i++) a[i] = silu(a[i]) * b[i];
     float *dst = accum ? m->h : out;
-    matvec_t(m, dst, W2, a, hid, inter);
+    if (dense_matvec_t(m, dst, W2, a, hid, inter, cuda_scope)) return -1;
     if (accum) for (int i = 0; i < hid; i++) out[i] += w * dst[i];
+    return 0;
 }
 
 /* What layer L+1's router says about layer L's hidden state.
@@ -2127,7 +2657,219 @@ static int predict_next_moe(waste_model *m, int L, const float *in, int *out, in
     return n;
 }
 
-static void moe_layer(waste_model *m, int L, const float *in, float *out, int *routed)
+/* Record the decision boundary the real router used, not the renormalized
+ * weights applied after selection. K3 selects on sigmoid(logit) plus its
+ * correction bias, so that is the only score-space margin that can prove a
+ * top-K route is stable under a bounded score perturbation.
+ *
+ * This has its own CSV rather than extending WASTE_DUMP_ROUTE: the native
+ * route trace has a deliberately fixed 3*K shape consumed by
+ * tools/routing_stats.py and by archived campaign scripts. */
+static void route_margin_row(char phase, int pos, int L, int is_kda,
+                             const float *in, int hid,
+                             const float *logit, const float *prob,
+                             const float *bias, int E,
+                             const int *idx, int K)
+{
+    if (!dump_route_margin || !*dump_route_margin || K <= 0 || K >= E) return;
+
+    const int kth = idx[K - 1];
+    int next = -1;
+    float next_score = -INFINITY;
+    for (int e = 0; e < E; e++) {
+        int selected = 0;
+        for (int j = 0; j < K; j++) {
+            if (idx[j] == e) { selected = 1; break; }
+        }
+        if (selected) continue;
+        const float v = prob[e] + (bias ? bias[e] : 0.0f);
+        if (v > next_score) { next_score = v; next = e; }
+    }
+    if (next < 0) return;
+
+    const float kth_bias = bias ? bias[kth] : 0.0f;
+    const float next_bias = bias ? bias[next] : 0.0f;
+    const float kth_score = prob[kth] + kth_bias;
+    int boundary_ties = 0, nonfinite_scores = 0;
+    double score_sum = 0.0, score_sq = 0.0;
+    for (int e = 0; e < E; e++) {
+        const float v = prob[e] + (bias ? bias[e] : 0.0f);
+        if (!isfinite(v)) { nonfinite_scores++; continue; }
+        if (v == kth_score) boundary_ties++;
+        score_sum += v;
+        score_sq += (double)v * (double)v;
+    }
+    const double score_mean = score_sum / (double)(E ? E : 1);
+    double score_var = score_sq / (double)(E ? E : 1) - score_mean * score_mean;
+    if (score_var < 0.0) score_var = 0.0;
+    double ss = 0.0;
+    for (int i = 0; i < hid; i++) ss += (double)in[i] * (double)in[i];
+    const double input_rms = sqrt(ss / (double)(hid ? hid : 1));
+
+    FILE *df = fopen(dump_route_margin, "a");
+    if (!df) return;
+    if (ftell(df) == 0)
+        fputs("schema,phase,pos,layer,attention,top_k,n_experts,"
+              "kth_id,next_id,kth_score,next_score,margin,"
+              "kth_logit,next_logit,kth_prob,next_prob,kth_bias,next_bias,"
+              "boundary_ties,nonfinite_scores,score_std,input_rms\n", df);
+    fprintf(df, "1,%c,%d,%d,%s,%d,%d,%d,%d,%.9g,%.9g,%.9g,%.9g,%.9g,"
+                "%.9g,%.9g,%.9g,%.9g,%d,%d,%.9g,%.9g\n",
+            phase, pos, L, is_kda ? "KDA" : "MLA", K, E, kth, next,
+            kth_score, next_score,
+            kth_score - next_score, logit[kth], logit[next],
+            prob[kth], prob[next], kth_bias, next_bias,
+            boundary_ties, nonfinite_scores, sqrt(score_var), input_rms);
+    fclose(df);
+}
+
+#if defined(WASTE_ENABLE_CUDA)
+static void release_expert_holds(waste_model *m, waste_ecache_hold *hold,
+                                 int n)
+{
+    for (int i = 0; i < n; i++)
+        waste_ecache_release_hold(&m->cache, &hold[i]);
+}
+
+/* Queue several already-validated mode-2 expert kernels between stream
+ * synchronizations. This changes only scheduling: SiTU and the final expert
+ * sum remain the original CPU loops, and that sum consumes j in router order.
+ * Explicit cache holds keep every pageable record pointer valid until CUDA
+ * has drained the group. */
+static int moe_vq_grouped(waste_model *m, int L, const int *idx,
+                          const float *weight, int K, const float *xin,
+                          float *ysum, int lat, int inter)
+{
+    const waste_config *c = &m->cfg;
+    const int group = m->cuda_vq_group;
+    int pair_ready = 0;
+
+    for (int j0 = 0; j0 < K; j0 += group) {
+        const int count = K - j0 < group ? K - j0 : group;
+        const uint8_t *rec[16] = { 0 };
+        const waste_expert_hdr *hdr[16] = { 0 };
+        waste_ecache_hold hold[16];
+        const float *pair_out[16] = { 0 };
+        const float *down_out[16] = { 0 };
+        for (int s = 0; s < 16; s++)
+            hold[s] = (waste_ecache_hold)WASTE_ECACHE_HOLD_INIT;
+
+        for (int s = 0; s < count; s++) {
+            PROF_START(P_EDEQ);
+            rec[s] = read_expert_hold(m, L, idx[j0 + s], &hold[s]);
+            PROF_END(P_EDEQ);
+            if (!rec[s]) {
+                const int cuda_failed = waste_cuda_vq_group_drain(m);
+                release_expert_holds(m, hold, count);
+                return cuda_failed
+                    ? cuda_projection_failed(m, "VQ group read drain") : -1;
+            }
+            hdr[s] = (const waste_expert_hdr *)rec[s];
+            if (hdr[s]->fmt != WQ_VQ3R) {
+                waste_cuda_vq_group_drain(m);
+                release_expert_holds(m, hold, count);
+                return cuda_projection_failed(m, "VQ3R record validation");
+            }
+            if (!pair_ready) {
+                if (waste_cuda_vq_prepare_pair(
+                        m, 2, xin, NULL, NULL, hdr[s]->codebook_id, lat)) {
+                    waste_cuda_vq_group_drain(m);
+                    release_expert_holds(m, hold, count);
+                    return cuda_projection_failed(m, "VQ group prepare");
+                }
+                m->cuda_vq_lut_builds += 2;
+                m->cuda_vq_launches++;
+                pair_ready = 1;
+            }
+            const uint16_t *scale = (const uint16_t *)(
+                rec[s] + hdr[s]->chan_corr_off);
+            {
+                PROF_START(P_LUTA);
+                const int failed = waste_cuda_vq_group_pair_enqueue(
+                    m, s, rec[s] + hdr[s]->gate_off,
+                    rec[s] + hdr[s]->up_off, scale, inter, lat);
+                PROF_END(P_LUTA);
+                if (failed) {
+                    waste_cuda_vq_group_drain(m);
+                    release_expert_holds(m, hold, count);
+                    return cuda_projection_failed(m, "VQ group pair enqueue");
+                }
+            }
+            m->cuda_vq_launches++;
+        }
+
+        PROF_START(P_EMM);
+        {
+            PROF_START(P_LUTA);
+            const int failed = waste_cuda_vq_group_pair_finish(
+                m, count, pair_out);
+            PROF_END(P_LUTA);
+            if (failed) {
+                waste_cuda_vq_group_drain(m);
+                release_expert_holds(m, hold, count);
+                return cuda_projection_failed(m, "VQ group pair finish");
+            }
+        }
+        m->cuda_vq_syncs++;
+
+        for (int s = 0; s < count; s++) {
+            float *gate = (float *)pair_out[s];
+            const float *up = pair_out[s] + inter;
+            if (c->act_situ)
+                for (int i = 0; i < inter; i++)
+                    gate[i] = waste_situ_pair(
+                        gate[i], up[i], c->situ_beta, c->situ_linear_beta);
+            else
+                for (int i = 0; i < inter; i++)
+                    gate[i] = silu(gate[i]) * up[i];
+
+            const uint16_t *scale = (const uint16_t *)(
+                rec[s] + hdr[s]->chan_corr_off);
+            {
+                PROF_START(P_LUTA);
+                const int failed = waste_cuda_vq_group_down_enqueue(
+                    m, s, rec[s] + hdr[s]->down_off, scale + 2 * inter,
+                    gate, hdr[s]->codebook_id + 2 * m->stages,
+                    lat, inter);
+                PROF_END(P_LUTA);
+                if (failed) {
+                    waste_cuda_vq_group_drain(m);
+                    release_expert_holds(m, hold, count);
+                    return cuda_projection_failed(m, "VQ group down enqueue");
+                }
+            }
+            m->cuda_vq_lut_builds++;
+            m->cuda_vq_launches += 2;
+        }
+        {
+            PROF_START(P_LUTA);
+            const int failed = waste_cuda_vq_group_down_finish(
+                m, count, down_out);
+            PROF_END(P_LUTA);
+            if (failed) {
+                waste_cuda_vq_group_drain(m);
+                release_expert_holds(m, hold, count);
+                return cuda_projection_failed(m, "VQ group down finish");
+            }
+        }
+        m->cuda_vq_syncs++;
+
+        for (int s = 0; s < count; s++) {
+            const float wj = weight[j0 + s];
+            const float *expert_out = down_out[s];
+            for (int i = 0; i < lat; i++) ysum[i] += wj * expert_out[i];
+            m->cuda_vq_experts++;
+            m->cuda_vq_applies += 3;
+        }
+        m->cuda_vq_effective = 2;
+        PROF_END(P_EMM);
+        release_expert_holds(m, hold, count);
+    }
+    return 0;
+}
+#endif
+
+static int moe_layer(waste_model *m, int L, const float *in, float *out, int *routed)
 {
     const waste_config *c = &m->cfg;
     const int E = c->n_experts, K = c->top_k, hid = c->hidden;
@@ -2155,6 +2897,8 @@ static void moe_layer(waste_model *m, int L, const float *in, float *out, int *r
         idx[j] = best;
         w[j] = score[best];
     }
+    route_margin_row('D', dump_pos0, L, c->kda_layer[L], in, hid,
+                     sc, score, bias, E, idx, K);
     if (c->renorm && K > 1) {
         float s = 0;
         for (int j = 0; j < K; j++) s += w[j];
@@ -2205,9 +2949,9 @@ static void moe_layer(waste_model *m, int L, const float *in, float *out, int *r
     const float *xin = in;
     float *lat_in = m->ares + hid, *lat_out = lat_in + lat;
     if (c->latent_dim) {
-        matvec_t(m, lat_in, waste_find(m, tname(
-                     "%smodel.layers.%d.block_sparse_moe.routed_expert_down_proj.weight",
-                     c->prefix, L)), in, lat, hid);
+        if (dense_matvec_t(m, lat_in, waste_find(m, tname(
+                    "%smodel.layers.%d.block_sparse_moe.routed_expert_down_proj.weight",
+                    c->prefix, L)), in, lat, hid, 1)) return -1;
         xin = lat_in;
     }
     float *ysum = c->latent_dim ? lat_out : out;
@@ -2215,7 +2959,15 @@ static void moe_layer(waste_model *m, int L, const float *in, float *out, int *r
     const int lut_sz = ((hid > lat ? hid : lat) / m->vec_dim) * m->stages * m->cb_entries;
     float *lut_gate = m->lut, *lut_up = lut_gate + lut_sz, *lut_down = lut_up + lut_sz;
     int lut_ready = 0;
-    for (int j = 0; j < K; j++) {
+    int routed_grouped = 0;
+#if defined(WASTE_ENABLE_CUDA)
+    if (m->cuda_vq_mode == 2 && m->cuda_vq_group > 1) {
+        if (moe_vq_grouped(m, L, idx, w, K, xin, ysum, lat, inter))
+            return -1;
+        routed_grouped = 1;
+    }
+#endif
+    for (int j = 0; j < K && !routed_grouped; j++) {
         PROF_START(P_EDEQ);
         const uint8_t *rec = read_expert(m, L, idx[j]);
         PROF_END(P_EDEQ);
@@ -2224,29 +2976,101 @@ static void moe_layer(waste_model *m, int L, const float *in, float *out, int *r
          * step report it; m->read_error is what carries the reason out. */
         if (!rec) break;
         const waste_expert_hdr *h = (const waste_expert_hdr *)rec;
+#if defined(WASTE_ENABLE_CUDA)
+        if (m->cuda_vq_mode && h->fmt != WQ_VQ3R)
+            return cuda_projection_failed(m, "VQ3R record validation");
+#endif
         const uint16_t *sc = (const uint16_t *)(rec + h->chan_corr_off);
 
         PROF_START(P_EMM);
         /* gate/up see the same input and the same per-layer codebooks for
          * every routed expert, so their tables are built once per token. */
         if (!lut_ready) {
-            vq_build_lut(m, lut_gate, h->codebook_id + 0 * m->stages,
-                         xin, lat, m->stages, m->cb_entries, m->vec_dim);
-            vq_build_lut(m, lut_up, h->codebook_id + 1 * m->stages,
-                         xin, lat, m->stages, m->cb_entries, m->vec_dim);
+            if (m->cuda_vq_mode != 2) {
+                vq_build_lut(m, lut_gate, h->codebook_id + 0 * m->stages,
+                             xin, lat, m->stages, m->cb_entries, m->vec_dim);
+                vq_build_lut(m, lut_up, h->codebook_id + 1 * m->stages,
+                             xin, lat, m->stages, m->cb_entries, m->vec_dim);
+            }
+#if defined(WASTE_ENABLE_CUDA)
+            if (m->cuda_vq_mode) {
+                if (waste_cuda_vq_prepare_pair(
+                        m, m->cuda_vq_mode, xin, lut_gate, lut_up,
+                        h->codebook_id, lat))
+                    return cuda_projection_failed(m, "VQ gate/up prepare");
+                if (m->cuda_vq_mode == 2) {
+                    m->cuda_vq_lut_builds += 2;
+                    m->cuda_vq_launches++;
+                }
+            }
+#endif
             lut_ready = 1;
         }
-        vq_apply(m, ga, rec + h->gate_off, sc, inter, lat, lut_gate);
-        vq_apply(m, ub, rec + h->up_off, sc + inter, inter, lat, lut_up);
+#if defined(WASTE_ENABLE_CUDA)
+        if (m->cuda_vq_mode) {
+            {
+                PROF_START(P_LUTA);
+                const int failed = waste_cuda_vq_apply_pair(
+                    m, ga, ub, rec + h->gate_off, rec + h->up_off,
+                    sc, inter, lat);
+                PROF_END(P_LUTA);
+                if (failed)
+                    return cuda_projection_failed(m, "VQ gate/up apply");
+            }
+            m->cuda_vq_launches++;
+            m->cuda_vq_syncs++;
+        } else
+#endif
+        {
+            vq_apply(m, ga, rec + h->gate_off, sc, inter, lat, lut_gate);
+            vq_apply(m, ub, rec + h->up_off, sc + inter, inter, lat, lut_up);
+        }
         if (c->act_situ)
             for (int i = 0; i < inter; i++)
                 ga[i] = waste_situ_pair(ga[i], ub[i], c->situ_beta, c->situ_linear_beta);
         else
             for (int i = 0; i < inter; i++) ga[i] = silu(ga[i]) * ub[i];
-        vq_matvec(m, acc, rec + h->down_off, sc + 2 * inter, ga, lat, inter,
-                  h->codebook_id + 2 * m->stages, lut_down);
+#if defined(WASTE_ENABLE_CUDA)
+        if (m->cuda_vq_mode) {
+            if (m->cuda_vq_mode == 1)
+                vq_build_lut(m, lut_down,
+                             h->codebook_id + 2 * m->stages,
+                             ga, inter, m->stages, m->cb_entries,
+                             m->vec_dim);
+            {
+                PROF_START(P_LUTA);
+                const int failed = waste_cuda_vq_apply_down(
+                    m, m->cuda_vq_mode, acc, rec + h->down_off,
+                    sc + 2 * inter, ga,
+                    m->cuda_vq_mode == 1 ? lut_down : NULL,
+                    h->codebook_id + 2 * m->stages, lat, inter);
+                PROF_END(P_LUTA);
+                if (failed)
+                    return cuda_projection_failed(m, "VQ down apply");
+            }
+            if (m->cuda_vq_mode == 2) {
+                m->cuda_vq_lut_builds++;
+                m->cuda_vq_launches += 2;
+            } else {
+                m->cuda_vq_launches++;
+            }
+            m->cuda_vq_syncs++;
+        } else
+#endif
+        {
+            vq_matvec(m, acc, rec + h->down_off, sc + 2 * inter,
+                      ga, lat, inter,
+                      h->codebook_id + 2 * m->stages, lut_down);
+        }
         const float wj = w[j];
         for (int i = 0; i < lat; i++) ysum[i] += wj * acc[i];
+#if defined(WASTE_ENABLE_CUDA)
+        if (m->cuda_vq_mode) {
+            m->cuda_vq_effective = m->cuda_vq_mode;
+            m->cuda_vq_experts++;
+            m->cuda_vq_applies += 3;
+        }
+#endif
         PROF_END(P_EMM);
     }
     if (c->latent_dim) {
@@ -2254,9 +3078,9 @@ static void moe_layer(waste_model *m, int L, const float *in, float *out, int *r
             waste_rmsnorm(ysum, ysum, waste_find(m, tname(
                         "%smodel.layers.%d.block_sparse_moe.routed_expert_norm.weight",
                         c->prefix, L))->data, lat, c->eps);
-        matvec_t(m, out, waste_find(m, tname(
-                     "%smodel.layers.%d.block_sparse_moe.routed_expert_up_proj.weight",
-                     c->prefix, L)), ysum, hid, lat);
+        if (dense_matvec_t(m, out, waste_find(m, tname(
+                    "%smodel.layers.%d.block_sparse_moe.routed_expert_up_proj.weight",
+                    c->prefix, L)), ysum, hid, lat, 1)) return -1;
     }
 
     /* The guess goes out last, when this layer's sixteen reads have all
@@ -2271,11 +3095,13 @@ static void moe_layer(waste_model *m, int L, const float *in, float *out, int *r
 
     /* shared expert — on the original hidden state, not the latent */
     float *tmp = m->h;
-    ffn(m, waste_find(m, tname("%smodel.layers.%d.block_sparse_moe.shared_experts.gate_proj.weight", c->prefix, L)),
-        waste_find(m, tname("%smodel.layers.%d.block_sparse_moe.shared_experts.up_proj.weight", c->prefix, L)),
-        waste_find(m, tname("%smodel.layers.%d.block_sparse_moe.shared_experts.down_proj.weight", c->prefix, L)),
-        in, tmp, c->moe_inter * (c->n_shared ? c->n_shared : 1), hid, 1.0f, 0);
+    if (ffn(m, waste_find(m, tname("%smodel.layers.%d.block_sparse_moe.shared_experts.gate_proj.weight", c->prefix, L)),
+            waste_find(m, tname("%smodel.layers.%d.block_sparse_moe.shared_experts.up_proj.weight", c->prefix, L)),
+            waste_find(m, tname("%smodel.layers.%d.block_sparse_moe.shared_experts.down_proj.weight", c->prefix, L)),
+            in, tmp, c->moe_inter * (c->n_shared ? c->n_shared : 1), hid,
+            1.0f, 0, 1)) return -1;
     for (int i = 0; i < hid; i++) out[i] += tmp[i];
+    return 0;
 }
 
 /* ---- Attention Residuals (K3) ------------------------------------------
@@ -2373,6 +3199,10 @@ static int state_add_bytes(uint64_t *total, uint64_t count, uint64_t width)
 int waste_model_state_size(const waste_model *m, int pos, size_t *bytes)
 {
     if (!m || !bytes) return -1;
+    /* A failed CUDA projection may have changed only part of the recurrent
+     * state. Never let that invalid intermediate state escape into a prefix
+     * cache or session file and become valid again in a fresh process. */
+    if (m->cuda_kda_state_dirty) return -1;
     const waste_config *c = &m->cfg;
     const int H = c->kda_heads, D = c->kda_dim, C = H * D;
     const int nb_max = c->attn_res_block
@@ -2554,6 +3384,22 @@ void waste_model_reset(waste_model *m)
         const int nb = c->n_layers / c->attn_res_block + 2;
         memset(m->blockres, 0, (size_t)nb * c->hidden * sizeof(float));
     }
+    /* Never carry an old effective mode or call count into a new session.
+     * A CUDA failure remains sticky: part of the recurrent state may have
+     * changed before the error, so only reloading the model may re-enable
+     * CUDA. CPU mode can still be selected for a reset model. */
+    m->cuda_kda_effective = 0;
+    m->cuda_dense_effective = 0;
+    m->cuda_vq_effective = 0;
+    m->cuda_kda_calls = 0;
+    m->cuda_dense_calls = 0;
+    m->cuda_vq_experts = 0;
+    m->cuda_vq_applies = 0;
+    m->cuda_vq_lut_builds = 0;
+    m->cuda_vq_launches = 0;
+    m->cuda_vq_syncs = 0;
+    m->cuda_kda_state_dirty = 0;
+    if (!m->cuda_kda_failed) m->cuda_kda_fallbacks = 0;
 }
 
 /* The one tuning knob a sweep varies between arms in a single process.
@@ -2567,6 +3413,150 @@ void waste_model_set_lookahead(int n)
     lookahead_n = n;
 }
 int  waste_model_get_lookahead(void)  { return lookahead_n; }
+
+int waste_model_set_cuda_kda(waste_model *m, int mode)
+{
+    if (!m || mode < 0 || mode > 2) return -1;
+#if defined(WASTE_ENABLE_CUDA)
+    const char *backend = getenv("WASTE_BACKEND");
+    if (mode && backend && !strcmp(backend, "cpu")) return -1;
+    if (!mode && (m->cuda_dense_scope || m->cuda_vq_mode)) return -1;
+    if (m->cuda_vq_mode && mode != 1) return -1;
+    if (mode && m->cuda_kda_failed) return -1;
+    m->cuda_kda_mode = mode;
+    m->cuda_kda_effective = 0;
+    m->cuda_kda_calls = 0;
+    if (!m->cuda_kda_failed) m->cuda_kda_fallbacks = 0;
+    if (mode && cuda_kda_preflight(m, mode)) return -1;
+    return 0;
+#else
+    m->cuda_kda_mode = 0;
+    return mode ? -1 : 0;
+#endif
+}
+
+int waste_model_get_cuda_kda(const waste_model *m)
+{
+    return m ? m->cuda_kda_mode : 0;
+}
+
+int waste_model_cuda_kda_effective(const waste_model *m)
+{
+    return m ? m->cuda_kda_effective : 0;
+}
+
+uint64_t waste_model_cuda_kda_fallbacks(const waste_model *m)
+{
+    return m ? m->cuda_kda_fallbacks : 0;
+}
+
+uint64_t waste_model_cuda_kda_calls(const waste_model *m)
+{
+    return m ? m->cuda_kda_calls : 0;
+}
+
+int waste_model_set_cuda_dense(waste_model *m, int scope)
+{
+    if (!m || scope < 0 || scope > 3) return -1;
+#if defined(WASTE_ENABLE_CUDA)
+    const char *backend = getenv("WASTE_BACKEND");
+    if (scope && backend && !strcmp(backend, "cpu")) return -1;
+    if (scope && (!m->cuda_kda_mode || m->cuda_kda_failed)) return -1;
+    if (m->cuda_vq_mode && scope != 2) return -1;
+    m->cuda_dense_scope = scope;
+    m->cuda_dense_effective = 0;
+    m->cuda_dense_calls = 0;
+    if (!m->cuda_kda_failed) m->cuda_kda_fallbacks = 0;
+    if (scope && cuda_dense_preflight(m, scope)) return -1;
+    return 0;
+#else
+    m->cuda_dense_scope = 0;
+    return scope ? -1 : 0;
+#endif
+}
+
+int waste_model_get_cuda_dense(const waste_model *m)
+{
+    return m ? m->cuda_dense_scope : 0;
+}
+
+int waste_model_cuda_dense_effective(const waste_model *m)
+{
+    return m ? m->cuda_dense_effective : 0;
+}
+
+uint64_t waste_model_cuda_dense_calls(const waste_model *m)
+{
+    return m ? m->cuda_dense_calls : 0;
+}
+
+int waste_model_set_cuda_vq(waste_model *m, int mode)
+{
+    if (!m || mode < 0 || mode > 2) return -1;
+#if defined(WASTE_ENABLE_CUDA)
+    const char *backend = getenv("WASTE_BACKEND");
+    if (mode && backend && !strcmp(backend, "cpu")) return -1;
+    if (mode && (m->cuda_kda_mode != 1 || m->cuda_dense_scope != 2 ||
+                 m->cuda_kda_failed))
+        return -1;
+    if (mode == 1 && m->cuda_vq_group != 1) return -1;
+    if (mode == 2 && m->cuda_vq_group > 1 &&
+        m->cache.n_slots < m->cuda_vq_group) return -1;
+    m->cuda_vq_mode = mode;
+    m->cuda_vq_effective = 0;
+    m->cuda_vq_experts = 0;
+    m->cuda_vq_applies = 0;
+    m->cuda_vq_lut_builds = 0;
+    m->cuda_vq_launches = 0;
+    m->cuda_vq_syncs = 0;
+    if (!m->cuda_kda_failed) m->cuda_kda_fallbacks = 0;
+    if (mode && cuda_vq_preflight(m, mode)) return -1;
+    return 0;
+#else
+    m->cuda_vq_mode = 0;
+    return mode ? -1 : 0;
+#endif
+}
+
+int waste_model_get_cuda_vq(const waste_model *m)
+{
+    return m ? m->cuda_vq_mode : 0;
+}
+
+int waste_model_get_cuda_vq_group(const waste_model *m)
+{
+    return m && m->cuda_vq_group > 0 ? m->cuda_vq_group : 1;
+}
+
+int waste_model_cuda_vq_effective(const waste_model *m)
+{
+    return m ? m->cuda_vq_effective : 0;
+}
+
+uint64_t waste_model_cuda_vq_experts(const waste_model *m)
+{
+    return m ? m->cuda_vq_experts : 0;
+}
+
+uint64_t waste_model_cuda_vq_applies(const waste_model *m)
+{
+    return m ? m->cuda_vq_applies : 0;
+}
+
+uint64_t waste_model_cuda_vq_lut_builds(const waste_model *m)
+{
+    return m ? m->cuda_vq_lut_builds : 0;
+}
+
+uint64_t waste_model_cuda_vq_launches(const waste_model *m)
+{
+    return m ? m->cuda_vq_launches : 0;
+}
+
+uint64_t waste_model_cuda_vq_syncs(const waste_model *m)
+{
+    return m ? m->cuda_vq_syncs : 0;
+}
 
 /* Read-ahead. The internal SSD reaches 12.89 GB/s at queue depth 2 against
  * 10.73 at depth 1, so two readers is the whole of the bandwidth story; the
@@ -3045,6 +4035,9 @@ static void moe_chunk(waste_model *m, int L, const float *in, float *out, int nT
             }
             idx[j] = best; w[j] = score[best];
         }
+        route_margin_row('P', dump_pos0 + t, L, c->kda_layer[L],
+                         in + (size_t)t * hid, hid,
+                         sc, score, bias, E, idx, K);
         if (c->renorm && K > 1) {
             float s = 0;
             for (int j = 0; j < K; j++) s += w[j];
@@ -3208,6 +4201,9 @@ const float *waste_model_prefill(waste_model *m, const int *tokens, int n,
 {
     const waste_config *c = &m->cfg;
     const int hid = c->hidden;
+    if (m->cuda_kda_state_dirty ||
+        ((m->cuda_kda_mode || m->cuda_dense_scope || m->cuda_vq_mode) &&
+         m->cuda_kda_failed)) return NULL;
     if (n <= 0) return m->logits;
     if (n == 1) return waste_model_step(m, tokens[0], pos0, NULL);
     dump_pos0 = pos0;
@@ -3275,10 +4271,11 @@ const float *waste_model_prefill(waste_model *m, const int *tokens, int n,
 
         /* attention: per token, but on the batched norm buffer */
         for (int t = 0; t < n; t++) {
-            if (c->kda_layer[L]) kda_layer(m, L, m->cnorm + (size_t)t * hid,
-                                           m->cresid + (size_t)t * hid);
-            else mla_layer(m, L, m->cnorm + (size_t)t * hid,
-                           m->cresid + (size_t)t * hid, pos0 + t);
+            if (c->kda_layer[L])
+                (void)kda_layer(m, L, m->cnorm + (size_t)t * hid,
+                                m->cresid + (size_t)t * hid, 0);
+            else (void)mla_layer(m, L, m->cnorm + (size_t)t * hid,
+                                 m->cresid + (size_t)t * hid, pos0 + t, 0);
         }
 
         if (ares_on) {
@@ -3353,6 +4350,9 @@ const float *waste_model_step(waste_model *m, int token, int pos, int *routed)
     dump_pos0 = pos;
     const waste_config *c = &m->cfg;
     const int hid = c->hidden;
+    if (m->cuda_kda_state_dirty ||
+        ((m->cuda_kda_mode || m->cuda_dense_scope || m->cuda_vq_mode) &&
+         m->cuda_kda_failed)) return NULL;
     {   /* see waste_model_prefill */
         const int cm = waste_model_ctx_max(m);
         if (cm && (pos < 0 || pos >= cm)) { m->ctx_full = 1; return NULL; }
@@ -3381,7 +4381,10 @@ const float *waste_model_step(waste_model *m, int token, int pos, int *routed)
     m->n_blockres = 0;
 
     for (int L = 0; L < c->n_layers; L++) {
-        if (m->read_error) break;        /* see waste_model_prefill */
+        if (m->read_error ||
+            ((m->cuda_kda_mode || m->cuda_dense_scope || m->cuda_vq_mode) &&
+             m->cuda_kda_failed))
+            break;                       /* see waste_model_prefill */
         char b[128];
         if (ares_on) {
             memcpy(ps, m->x, (size_t)hid * sizeof(float));
@@ -3402,8 +4405,20 @@ const float *waste_model_step(waste_model *m, int token, int pos, int *routed)
 
         snprintf(b, sizeof b, "%smodel.layers.%d.input_layernorm.weight", c->prefix, L);
         waste_rmsnorm(norm, m->x, waste_find(m, b)->data, hid, c->eps);
-        if (c->kda_layer[L]) { PROF_START(P_KDA); kda_layer(m, L, norm, resid); PROF_END(P_KDA); }
-        else { PROF_START(P_MLA); mla_layer(m, L, norm, resid, pos); PROF_END(P_MLA); }
+        if (c->kda_layer[L]) {
+            PROF_START(P_KDA);
+            const int failed = kda_layer(m, L, norm, resid,
+                                         m->cuda_kda_mode);
+            PROF_END(P_KDA);
+            if (failed) break;
+        }
+        else {
+            PROF_START(P_MLA);
+            const int failed = mla_layer(m, L, norm, resid, pos,
+                                         m->cuda_dense_scope);
+            PROF_END(P_MLA);
+            if (failed) break;
+        }
 
         if (ares_on) {
             if (ps_live) for (int i = 0; i < hid; i++) ps[i] += resid[i];
@@ -3421,14 +4436,17 @@ const float *waste_model_step(waste_model *m, int token, int pos, int *routed)
         snprintf(b, sizeof b, "%smodel.layers.%d.block_sparse_moe.gate.weight", c->prefix, L);
         if (waste_find(m, b)) {
             PROF_START(P_ROUTE);
-            moe_layer(m, L, norm, resid, routed ? routed + (size_t)L * c->top_k : NULL);
+            const int failed = moe_layer(
+                m, L, norm, resid,
+                routed ? routed + (size_t)L * c->top_k : NULL);
             PROF_END(P_ROUTE);
+            if (failed) break;
         }
-        else
-            ffn(m, waste_find(m, tname("%smodel.layers.%d.mlp.gate_proj.weight", c->prefix, L)),
+        else if (ffn(m, waste_find(m, tname("%smodel.layers.%d.mlp.gate_proj.weight", c->prefix, L)),
                 waste_find(m, tname("%smodel.layers.%d.mlp.up_proj.weight", c->prefix, L)),
                 waste_find(m, tname("%smodel.layers.%d.mlp.down_proj.weight", c->prefix, L)),
-                norm, resid, c->dense_inter, hid, 1.0f, 0);
+                norm, resid, c->dense_inter, hid, 1.0f, 0, 3))
+            break;
 
         if (ares_on) {
             for (int i = 0; i < hid; i++) ps[i] += resid[i];
@@ -3445,6 +4463,12 @@ const float *waste_model_step(waste_model *m, int token, int pos, int *routed)
             if (df) { fwrite(m->x, sizeof(float), (size_t)hid, df); fclose(df); }
         }
     }
+    if ((m->cuda_kda_mode || m->cuda_dense_scope || m->cuda_vq_mode) &&
+        m->cuda_kda_failed) {
+        free(resid);
+        free(norm);
+        return NULL;
+    }
     /* One last AttnRes: the output layer attends over every block
      * representation before the final norm (tech report §2.2, "the final
      * output layer then aggregates all N block representations"). */
@@ -3459,5 +4483,8 @@ const float *waste_model_step(waste_model *m, int token, int pos, int *routed)
     PROF_END(P_HEAD);
     free(resid);
     free(norm);
-    return m->read_error ? NULL : m->logits;
+    return (m->read_error ||
+            ((m->cuda_kda_mode || m->cuda_dense_scope || m->cuda_vq_mode) &&
+             m->cuda_kda_failed))
+         ? NULL : m->logits;
 }

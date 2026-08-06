@@ -1,0 +1,14 @@
+campaign=GN100 Sprint 12 experimental dense CUDA expansion
+report_ref=gn100-sprint12-results-2026-08-02
+branch=exp/cuda-dense-gb10
+parent_commit=32541d9e21ae793ec999b31561863a7459333928
+implementation_commit=1bca4d403f67c07d1a543a58438ba723eecba716
+host=gn100-77bd
+kernel=Linux 6.17.0-1021-nvidia aarch64
+model_manifest_sha256=da3232925d8eeaf0df07ee45743f6467c7eecbc4c0e2513899028e788a1a07f2
+usage_sha256=e2949e8d14da3c46d766daa99e6b93f946c8cfc0425eba4815450079996899dd
+accepted_cuda_kda=1
+accepted_cuda_dense=2
+evidence_root=/home/kevin/waste-gn100-experiment-20260730/validation/sprint12-dense-q4-20260802
+evidence_archive=gn100-sprint12-evidence-2026-08-02.tar.gz
+evidence_sha256=a38522b49866a3aa93b551560b69ade282bb960f6f26c1aea7050e4e5bfd65a0

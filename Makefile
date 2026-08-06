@@ -9,6 +9,10 @@
 .DEFAULT_GOAL := all
 
 CC      ?= cc
+CUDA_HOME ?= /usr/local/cuda
+NVCC    ?= $(CUDA_HOME)/bin/nvcc
+CUDAFLAGS ?= -O3 -std=c++17 -arch=native -fmad=false \
+             -Xcompiler=-ffp-contract=off -Xcompiler=-pthread
 # gnu11, not c11: with -std=c11 glibc sets __STRICT_ANSI__ and hides every
 # POSIX extension, so pread, fcntl, posix_memalign and pthread_* would all
 # be implicitly declared on Linux. Only model.c defines _GNU_SOURCE itself.
@@ -92,6 +96,7 @@ CFLAGS  += -MMD -MP
 SRC := src/model.c src/kda.c src/backend.c src/ecache.c src/version.c \
        src/tokenizer.c src/waste.c src/vq.c src/vision.c src/image.c \
        src/crc32.c src/memory.c
+CUDASRC :=
 # Match what backend.c tests for. Linux/aarch64 reports "aarch64", which
 # does not contain "arm" — the old findstring left kda_neon.c out of the
 # build while backend.c still emitted the call to it, so the link failed
@@ -118,11 +123,8 @@ ifdef WASTE_NATIVE
 CFLAGS += -mcpu=native
 endif
 # Accelerator backends are build-time options, and each needs a source file
-# that registers it. Metal has one — src/metal.m, so WASTE_ENABLE_METAL=1
-# builds and `waste version` then reports `backend Metal`. CUDA and BLAS do
-# not, and before these checks existed their flags were reachable and
-# produced only "Undefined symbols: _waste_register_cuda" at link time.
-# Fail early and say why instead.
+# that registers it. Fail early with a useful message when a selected source
+# is absent instead of reaching an undefined registration symbol at link.
 #
 # Metal keeps its check even though it passes: the guard is about the file
 # being there, not about the backend being unfinished, and it is what turns
@@ -147,8 +149,9 @@ backend is not implemented. Build without the flag: CPU+NEON is the \
 default, and Metal is the only accelerator this engine has)
 endif
 CFLAGS += -DWASTE_ENABLE_CUDA=1
-SRC    += src/cuda.cu
-LDLIBS += -lcudart
+CUDASRC := src/cuda.cu
+CUDAFLAGS += -DWASTE_ENABLE_CUDA=1 -I src
+LDLIBS += -L$(CUDA_HOME)/lib64 -Wl,-rpath,$(CUDA_HOME)/lib64 -lcudart -lstdc++
 endif
 ifdef WASTE_ENABLE_BLAS
 ifeq (,$(wildcard src/blas.c))
@@ -161,10 +164,13 @@ SRC    += src/blas.c
 LDLIBS += -lblas
 endif
 
-OBJ := $(SRC:.c=.o) $(OBJCSRC:.m=.o)
+OBJ := $(SRC:.c=.o) $(OBJCSRC:.m=.o) $(CUDASRC:.cu=.o)
 
 src/metal.o: src/metal.m
 	$(CC) $(CFLAGS) -fobjc-arc -c -o $@ $<
+
+%.o: %.cu
+	$(NVCC) $(CUDAFLAGS) -MMD -MP -c -o $@ $<
 
 # `override`, and it is load-bearing. A plain target-specific `CFLAGS +=`
 # is discarded whenever CFLAGS arrives from the command line — which is
@@ -196,13 +202,16 @@ libwaste.a: $(OBJ)
 # than through a second copy of the engine in Python. Built from its own
 # objects because -fPIC is not in CFLAGS for the static path: mixing a
 # non-PIC libwaste.a into a shared object fails to link on Linux.
-SHOBJ := $(SRC:.c=.pic.o) $(OBJCSRC:.m=.pic.o)
+SHOBJ := $(SRC:.c=.pic.o) $(OBJCSRC:.m=.pic.o) $(CUDASRC:.cu=.pic.o)
 
 %.pic.o: %.c
 	$(CC) $(CFLAGS) $(PICFLAG) -c -o $@ $<
 
 src/metal.pic.o: src/metal.m
 	$(CC) $(CFLAGS) $(PICFLAG) -fobjc-arc -c -o $@ $<
+
+%.pic.o: %.cu
+	$(NVCC) $(CUDAFLAGS) -MMD -MP -Xcompiler=$(PICFLAG) -c -o $@ $<
 
 src/simd_avx2.pic.o:   override CFLAGS += -mavx2 -mfma
 src/simd_avx512.pic.o: override CFLAGS += -mavx512f -mavx512bw
@@ -274,6 +283,7 @@ test_abi$(EXE): tests/test_abi.o libwaste.a
 
 clean:
 	rm -f $(OBJ) $(SHOBJ) cli/*.o tests/*.o $(OBJ:.o=.d) $(SHOBJ:.o=.d) \
+	      src/cuda.o src/cuda.pic.o src/cuda.d src/cuda.pic.d \
 	      cli/*.d tests/*.d libwaste.a waste waste.exe \
 	      $(TESTBINS) $(TESTNAMES) $(addsuffix .exe,$(TESTNAMES)) \
 	      libwaste.dylib libwaste.so libwaste.dll \

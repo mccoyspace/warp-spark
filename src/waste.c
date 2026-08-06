@@ -928,6 +928,14 @@ static waste_status read_error_report(waste_ctx *c)
      * rather than the container's, and reporting it as an I/O error
      * would send someone to re-download 900 GB over a full context. */
     if (waste_model_ctx_full(&c->m)) return ctx_full_report(c);
+    if (c->m.cuda_kda_state_dirty ||
+        ((c->m.cuda_kda_mode || c->m.cuda_dense_scope) &&
+         c->m.cuda_kda_failed)) {
+        snprintf(c->detail, sizeof c->detail,
+                 "CUDA decode projection failed; reset and reload the model "
+                 "before retrying CUDA");
+        return WASTE_E_IO;
+    }
     int layer = 0, expert = 0;
     const char *why = waste_model_read_error(&c->m, &layer, &expert);
     /* Past the context check, the forward pass returns no logits for

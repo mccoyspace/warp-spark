@@ -115,18 +115,43 @@ int main(int argc, char **argv)
         cur = best;
     }
 
+    printf("cuda kda: requested %d, effective %d, fallbacks %llu, calls %llu\n",
+           waste_model_get_cuda_kda(&m),
+           waste_model_cuda_kda_effective(&m),
+           (unsigned long long)waste_model_cuda_kda_fallbacks(&m),
+           (unsigned long long)waste_model_cuda_kda_calls(&m));
+    printf("cuda dense: requested %d, effective %d, calls %llu\n",
+           waste_model_get_cuda_dense(&m),
+           waste_model_cuda_dense_effective(&m),
+           (unsigned long long)waste_model_cuda_dense_calls(&m));
+    printf("cuda vq: requested %d, effective %d, group %d, experts %llu, applies %llu, "
+           "lut builds %llu, launches %llu, syncs %llu\n",
+           waste_model_get_cuda_vq(&m),
+           waste_model_cuda_vq_effective(&m),
+           waste_model_get_cuda_vq_group(&m),
+           (unsigned long long)waste_model_cuda_vq_experts(&m),
+           (unsigned long long)waste_model_cuda_vq_applies(&m),
+           (unsigned long long)waste_model_cuda_vq_lut_builds(&m),
+           (unsigned long long)waste_model_cuda_vq_launches(&m),
+           (unsigned long long)waste_model_cuda_vq_syncs(&m));
+
     extern double waste_prof[16];
     if (getenv("WASTE_PROFILE")) {
         /* indented names are sub-totals of the line above and are excluded
          * from `tot`, so the percentages add to 100 */
-        const char *names[9] = {"  LUT build","kda","mla","moe(all)",
-                                "  expert I/O","  expert mm","lm_head",
-                                "  LUT apply","  batched mm"};
+        const char *names[16] = {"  LUT build","kda","mla","moe(all)",
+                                 "  expert I/O","  expert mm","lm_head",
+                                 "  LUT apply","  batched mm",
+                                 "  kda recurrence","  kda qkv projections",
+                                 "  kda short conv","  kda auxiliaries",
+                                 "  kda output gate","  kda output norm",
+                                 "  kda output projection"};
         double tot = 0;
-        for (int i = 0; i < 9; i++)
-            tot += (i == 0 || i == 4 || i == 5 || i == 7 || i == 8) ? 0 : waste_prof[i];
+        for (int i = 0; i < 16; i++)
+            tot += (i == 0 || i == 4 || i == 5 || i == 7 || i >= 8)
+                 ? 0 : waste_prof[i];
         printf("\n-- profile (s, %d steps) --\n", n + n_gen);
-        for (int i = 0; i < 9; i++)
+        for (int i = 0; i < 16; i++)
             if (waste_prof[i] > 0)
                 printf("  %-14s %7.2f  %5.1f%%\n", names[i], waste_prof[i],
                        100.0 * waste_prof[i] / tot);

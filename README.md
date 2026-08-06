@@ -6,12 +6,13 @@
 > uses eight compute threads on pinned performance CPUs, child-scoped Q0, two
 > direct-I/O readers at depth two, Q8, and no router lookahead, and measures
 > **0.34–0.35 tok/s**.
-> Separately, the quarantined
-> [`exp/cuda-dense-gb10`](https://github.com/mccoyspace/waste-spark/tree/exp/cuda-dense-gb10)
-> branch reaches **0.6735 tok/s** on the fixed 64-token corpus versus
-> 0.4899 tok/s for KDA-only CUDA, with zero ordered-route changes. It remains
-> experimental and is not part of `spark/integration`; see the
-> [Sprint 12 evidence release](https://github.com/mccoyspace/waste-spark/releases/tag/gn100-sprint12-results-2026-08-02).
+> The separate `exp/cuda-vq-gb10` branch now extends the opt-in CUDA path
+> through expert VQ gather. Mode 2/group 1 passed a byte-exact 64-token gate
+> at **0.9018 tok/s** versus **0.7079 tok/s** with VQ on the CPU. A tuned
+> single-user studio profile then repeated at **1.0042 and 1.0030 tok/s**
+> (1.0036 median), but its capture-derived hotlist is an in-sample result and
+> its 64-token endpoint is 0.9441 tok/s. The work remains experimental. See
+> [the GB10 CUDA VQ result](docs/GPU_VQ_GB10.md).
 > Start with [GN100 results and reproduction notes](docs/GN100.md), then see
 > [the upstreaming map](docs/UPSTREAMING.md) and
 > [upstream issue #14](https://github.com/sqliteai/waste/issues/14).
@@ -195,7 +196,7 @@ Every token answered by a cloud service is paid for twice: once on the invoice, 
 
 ## Project status
 
-The format and API are not frozen. K3 is the main target and the best-tested model. The CPU path is currently the fastest measured implementation for this workload, but it is not assumed to be the final answer. CUDA, Metal, and other hardware-specific optimizations remain to be explored and may provide significant gains. Current backend results are documented in [docs/BACKENDS.md](docs/BACKENDS.md), while open directions are tracked in [docs/RESEARCH.md](docs/RESEARCH.md). Read [docs/LEARNED.md](docs/LEARNED.md) before proposing an optimization: failed ideas and negative results are kept there deliberately.
+The format and API are not frozen. K3 is the main target and the best-tested model. The CPU path remains the qualified default. An opt-in GB10 CUDA experiment is now the fastest measured path on that machine, but it has not been promoted from its experimental branch. CUDA beyond that narrow path, Metal, and other hardware-specific optimizations remain open. Current backend results are documented in [docs/BACKENDS.md](docs/BACKENDS.md), while open directions are tracked in [docs/RESEARCH.md](docs/RESEARCH.md). Read [docs/LEARNED.md](docs/LEARNED.md) before proposing an optimization: failed ideas and negative results are kept there deliberately.
 
 Contributors are more than welcome. New experiments, support for additional hardware, and open discussion about how to improve performance are all encouraged—even when an idea produces a negative result.
 

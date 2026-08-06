@@ -103,7 +103,7 @@ typedef struct {
     int n_tensors;
     float *codebooks;                /* [n_books][256][8]                   */
     float *codebooksT;               /* [n_books][8][256], for the LUT build*/
-    int n_books, vec_dim, cb_entries, stages;
+    int n_books, vec_dim, cb_entries, stages, vq_index_block;
     /* 1 << fmt for every trunk format the language model actually uses,
      * recorded at load because the tensors left on disk never reach the
      * branch that fills in t->bits. */
@@ -146,6 +146,20 @@ typedef struct {
     int8_t  *mmxq;                  /* int8 activations for the SMMLA path */
     float   *mmxs;
     size_t   mmx_cap, mms_cap;
+    /* Experimental decode-only Q4 offload. The context is opaque so a
+     * normal build has no CUDA headers or runtime dependency. KDA mode 0 is
+     * CPU, 1 is the fast reduction, and 2 uses a four-lane/group reduction.
+     * Dense scope is cumulative: 0 KDA-only, 1 shared+latent MoE, 2 ordinary
+     * MLA projections too, 3 the non-MoE dense FFN too. */
+    void    *cuda_kda_ctx;
+    int      cuda_kda_mode, cuda_kda_effective, cuda_kda_failed;
+    int      cuda_dense_scope, cuda_dense_effective;
+    int      cuda_vq_mode, cuda_vq_effective, cuda_vq_preflight_modes;
+    int      cuda_vq_group;          /* experts between mode-2 stream syncs */
+    int      cuda_kda_state_dirty;
+    uint64_t cuda_kda_fallbacks, cuda_kda_calls, cuda_dense_calls;
+    uint64_t cuda_vq_experts, cuda_vq_applies, cuda_vq_lut_builds;
+    uint64_t cuda_vq_launches, cuda_vq_syncs;
     int      trunk_fd;              /* stays open for the on-disk tensors  */
     int8_t  *embrow;                /* one embedding row, read per token   */
     uint16_t *embsc;
@@ -205,6 +219,24 @@ void        waste_model_reset(waste_model *m);
 int         waste_model_resize_cache(waste_model *m, size_t cache_bytes);
 void        waste_model_set_lookahead(int n);
 int         waste_model_get_lookahead(void);
+int         waste_model_set_cuda_kda(waste_model *m, int mode);
+int         waste_model_get_cuda_kda(const waste_model *m);
+int         waste_model_cuda_kda_effective(const waste_model *m);
+uint64_t    waste_model_cuda_kda_fallbacks(const waste_model *m);
+uint64_t    waste_model_cuda_kda_calls(const waste_model *m);
+int         waste_model_set_cuda_dense(waste_model *m, int scope);
+int         waste_model_get_cuda_dense(const waste_model *m);
+int         waste_model_cuda_dense_effective(const waste_model *m);
+uint64_t    waste_model_cuda_dense_calls(const waste_model *m);
+int         waste_model_set_cuda_vq(waste_model *m, int mode);
+int         waste_model_get_cuda_vq(const waste_model *m);
+int         waste_model_get_cuda_vq_group(const waste_model *m);
+int         waste_model_cuda_vq_effective(const waste_model *m);
+uint64_t    waste_model_cuda_vq_experts(const waste_model *m);
+uint64_t    waste_model_cuda_vq_applies(const waste_model *m);
+uint64_t    waste_model_cuda_vq_lut_builds(const waste_model *m);
+uint64_t    waste_model_cuda_vq_launches(const waste_model *m);
+uint64_t    waste_model_cuda_vq_syncs(const waste_model *m);
 const char *waste_model_read_error(const waste_model *m, int *layer, int *expert);
 /* Clears both sticky per-call flags: the record error and the context
  * one. Called to arm a fresh eval or generate. */
