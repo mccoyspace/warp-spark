@@ -124,7 +124,8 @@ examples:
     g.add_argument("--performance-profile", choices=PROFILE_NAMES,
                    default=None, metavar="NAME",
                    help="explicit opt-in operating profile; spark-q0 "
-                        "requires the request-scoped PM-QoS launcher")
+                        "requires the request-scoped PM-QoS launcher; "
+                        "spark-cuda uses the child-scoped CUDA launcher")
 
     s = ap.add_argument_group("serving")
     s.add_argument("--max-tokens", type=bounded_int(1, (1 << 32) - 1),
@@ -236,9 +237,9 @@ examples:
             allow_concurrent_open=args.allow_concurrent_open,
             host_reserved_bytes=args.prefix_cache)
         effective_direct_io = bool(engine.stats()["direct_io"])
-        if profile.request_qos_required and not effective_direct_io:
+        if profile.strict and not effective_direct_io:
             raise ProfileError(
-                "spark-q0 requires effective direct I/O; the model or "
+                f"{profile.name} requires effective direct I/O; the model or "
                 "filesystem fell back to buffered reads")
         public_profile = profile.public()
         public_profile["engine"]["direct_io_effective"] = effective_direct_io
@@ -249,11 +250,11 @@ examples:
         storage["effective_configuration_reported"] = True
         storage["effective_read_ahead_threads"] = effective_threads
         storage["effective_read_ahead_depth"] = effective_depth
-        if profile.request_qos_required and (
+        if profile.strict and (
                 effective_threads != storage["requested_read_ahead_threads"] or
                 effective_depth != storage["requested_read_ahead_depth"]):
             raise ProfileError(
-                "spark-q0 requires effective read-ahead "
+                f"{profile.name} requires effective read-ahead "
                 f"{storage['requested_read_ahead_threads']}/"
                 f"{storage['requested_read_ahead_depth']}; engine reported "
                 f"{effective_threads}/{effective_depth}")

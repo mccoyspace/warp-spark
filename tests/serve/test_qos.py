@@ -33,8 +33,8 @@ if os.name != "posix":
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
-from serve.profiles import (ProfileError, SPARK_Q0_ENVIRONMENT,  # noqa: E402
-                            resolve_profile)
+from serve.profiles import (ProfileError, SPARK_CUDA_ENVIRONMENT,  # noqa: E402
+                            SPARK_Q0_ENVIRONMENT, resolve_profile)
 from serve.qos import (PROTOCOL, QosError, RequestQos,            # noqa: E402
                        discard_control_from_env)
 from tools.pm_qos_exec import (HOLDER_SIGNALS, PMQosDevice,       # noqa: E402
@@ -231,6 +231,33 @@ class TestProfiles(unittest.TestCase):
                 "spark-q0", threads=6, cache="lfru", no_direct_io=False,
                 verify=False, environ=environment)
         self.assertEqual(environment, {"WASTE_IO_DEPTH": "4"})
+
+    def test_spark_cuda_is_the_exact_promoted_configuration(self):
+        environment = {"UNRELATED": "kept"}
+        profile = resolve_profile(
+            "spark-cuda", threads=10, cache="lfru", no_direct_io=False,
+            verify=False, environ=environment)
+        self.assertEqual(profile.threads, 10)
+        self.assertFalse(profile.request_qos_required)
+        self.assertTrue(profile.strict)
+        self.assertEqual(profile.environment, SPARK_CUDA_ENVIRONMENT)
+        self.assertEqual(profile.public()["storage"], {
+            "requested_read_ahead_threads": 2,
+            "requested_read_ahead_depth": 2,
+            "requested_router_lookahead": 0,
+            "effective_configuration_reported": False,
+            "effective_read_ahead_threads": None,
+            "effective_read_ahead_depth": None})
+        for key, value in SPARK_CUDA_ENVIRONMENT.items():
+            self.assertEqual(environment[key], value)
+
+    def test_spark_cuda_rejects_profile_drift_atomically(self):
+        environment = {"WASTE_CUDA_VQ": "1"}
+        with self.assertRaisesRegex(ProfileError, "WASTE_CUDA_VQ"):
+            resolve_profile(
+                "spark-cuda", threads=8, cache="lfru",
+                no_direct_io=False, verify=False, environ=environment)
+        self.assertEqual(environment, {"WASTE_CUDA_VQ": "1"})
 
     def test_spark_q0_rejects_undeclared_engine_or_debug_environment(self):
         for key in ("WASTE_MLOCK", "WASTE_DUMP_HIDDEN", "WASTE_VIS_STAGE",

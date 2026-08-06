@@ -18,7 +18,8 @@ from typing import MutableMapping, Optional
 
 DEFAULT_PROFILE = "default"
 SPARK_Q0_PROFILE = "spark-q0"
-PROFILE_NAMES = (SPARK_Q0_PROFILE,)
+SPARK_CUDA_PROFILE = "spark-cuda"
+PROFILE_NAMES = (SPARK_Q0_PROFILE, SPARK_CUDA_PROFILE)
 
 
 class ProfileError(ValueError):
@@ -49,6 +50,26 @@ SPARK_Q0_ENVIRONMENT = {
     # On the GN100, Q0 plus the reader won its matched current-upstream
     # qualification without speculative router lookahead or its extra I/O.
     "WASTE_LOOKAHEAD": "0",
+}
+
+SPARK_CUDA_ENVIRONMENT = {
+    "WASTE_PROFILE": "0",
+    "WASTE_Q8": "1",
+    "WASTE_SDOT": "0",
+    "WASTE_I8MM": "0",
+    "WASTE_VERIFY": "0",
+    "WASTE_BACKEND": "auto",
+    "WASTE_DIRECT": "1",
+    "WASTE_THREADS": "10",
+    "WASTE_MLOCK": "0",
+    "WASTE_PURGEABLE": "0",
+    "WASTE_IO_THREADS": "2",
+    "WASTE_IO_DEPTH": "2",
+    "WASTE_LOOKAHEAD": "0",
+    "WASTE_CUDA_KDA": "1",
+    "WASTE_CUDA_DENSE": "2",
+    "WASTE_CUDA_VQ": "2",
+    "WASTE_CUDA_VQ_GROUP": "1",
 }
 
 STORAGE_ENVIRONMENT = (
@@ -83,6 +104,7 @@ class ResolvedProfile:
     request_qos_required: bool
     request_qos_us: Optional[int]
     environment: dict[str, str]
+    strict: bool
 
     def public(self) -> dict:
         io_threads = _c_atoi(
@@ -139,20 +161,29 @@ def resolve_profile(name: Optional[str], *, threads: Optional[int], cache: str,
             verify_records=verify, request_qos_required=False,
             request_qos_us=None,
             environment={key: environ[key] for key in STORAGE_ENVIRONMENT
-                         if key in environ})
-    if name != SPARK_Q0_PROFILE:
+                         if key in environ}, strict=False)
+    if name == SPARK_Q0_PROFILE:
+        expected_environment = SPARK_Q0_ENVIRONMENT
+        expected_threads = 8
+        request_qos_required = True
+    elif name == SPARK_CUDA_PROFILE:
+        expected_environment = SPARK_CUDA_ENVIRONMENT
+        expected_threads = 10
+        request_qos_required = False
+    else:
         raise ProfileError(f"unknown performance profile: {name}")
 
     conflicts: list[str] = []
-    if threads not in (None, 8):
-        conflicts.append(f"--threads={threads} (spark-q0 requires 8)")
+    if threads not in (None, expected_threads):
+        conflicts.append(
+            f"--threads={threads} ({name} requires {expected_threads})")
     if cache != "lfru":
-        conflicts.append(f"--cache={cache} (spark-q0 requires lfru)")
+        conflicts.append(f"--cache={cache} ({name} requires lfru)")
     if no_direct_io:
-        conflicts.append("--no-direct-io (spark-q0 requires direct I/O)")
+        conflicts.append(f"--no-direct-io ({name} requires direct I/O)")
     if verify:
-        conflicts.append("--verify (spark-q0 fixes record verification off)")
-    for key, expected in SPARK_Q0_ENVIRONMENT.items():
+        conflicts.append(f"--verify ({name} fixes record verification off)")
+    for key, expected in expected_environment.items():
         actual = environ.get(key)
         if actual is not None and actual != expected:
             conflicts.append(f"{key}={actual!r} (requires {expected!r})")
@@ -164,14 +195,15 @@ def resolve_profile(name: Optional[str], *, threads: Optional[int], cache: str,
     # descriptor are service plumbing and remain allowed but hidden.
     for key in sorted(environ):
         if key.startswith("WASTE_") and \
-                key not in SPARK_Q0_ENVIRONMENT and \
+                key not in expected_environment and \
                 key not in SPARK_Q0_SERVICE_ENVIRONMENT:
-            conflicts.append(f"{key} is not permitted by spark-q0")
+            conflicts.append(f"{key} is not permitted by {name}")
     if conflicts:
-        raise ProfileError("spark-q0 conflicts with " + "; ".join(conflicts))
+        raise ProfileError(f"{name} conflicts with " + "; ".join(conflicts))
 
-    environ.update(SPARK_Q0_ENVIRONMENT)
+    environ.update(expected_environment)
     return ResolvedProfile(
-        name=SPARK_Q0_PROFILE, threads=8, cache="lfru", direct_io=True,
-        verify_records=False, request_qos_required=True, request_qos_us=0,
-        environment=dict(SPARK_Q0_ENVIRONMENT))
+        name=name, threads=expected_threads, cache="lfru", direct_io=True,
+        verify_records=False, request_qos_required=request_qos_required,
+        request_qos_us=0 if request_qos_required else None,
+        environment=dict(expected_environment), strict=True)
