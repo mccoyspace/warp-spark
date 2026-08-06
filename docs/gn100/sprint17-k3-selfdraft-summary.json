@@ -1,0 +1,86 @@
+{
+  "schema": "waste.gn100.k3_selfdraft_campaign.v1",
+  "date": "2026-08-06",
+  "machine": "Acer Veriton GN100 / NVIDIA GB10",
+  "host": "gn100-77bd",
+  "branch": "exp/k3-self-draft-gb10",
+  "instrument_commit": "9e562b9",
+  "status": "draft_viable_strict_campaign_gate_miss_integrated_decoder_deferred",
+  "candidate": {
+    "draft_experts": 4,
+    "target_experts": 16,
+    "width": 4,
+    "first_proposal_reuses_exact_root_logits": true,
+    "second_model_residency_bytes": 0,
+    "target_cache_mib": 59340
+  },
+  "agreement": {
+    "target_tokens": 256,
+    "verifier_blocks": 67,
+    "proposals": 261,
+    "marginal_matches": 200,
+    "marginal_agreement": 0.7662835249,
+    "accepted_proposals": 194,
+    "committed_tokens_per_block": 3.8208955224,
+    "survival_counts": [67, 54, 41, 32],
+    "eligible_counts": [67, 67, 65, 62],
+    "prefix_survival": [1.0, 0.8059701493, 0.6307692308, 0.5161290323],
+    "rejection_histogram_accepted_prefix_0_to_4": [0, 13, 13, 9, 32]
+  },
+  "cost": {
+    "draft_forward_steps": 194,
+    "draft_branch_seconds": 115.110681795,
+    "draft_branch_bytes": 258780700672,
+    "draft_branch_gib": 241.0083084106,
+    "state_snapshot_seconds": 2.15902766,
+    "state_restore_seconds": 1.231379775,
+    "full_cache_baseline_seconds": 302.954579022,
+    "maximum_seconds_for_15pct_throughput_gain": 263.438764367,
+    "registered_hypothetical_verifier_seconds_per_block": 1.5,
+    "optimistic_candidate_seconds": 215.610681795,
+    "optimistic_projected_throughput_gain": 0.4051000465,
+    "prior_representative_same_ssd_floor_seconds_per_block": 2.5257990113,
+    "projection_with_prior_storage_floor_and_zero_other_overhead_seconds": 284.339215555,
+    "projection_with_prior_storage_floor_throughput_gain": 0.0654688571
+  },
+  "correctness_and_safety": {
+    "canonical_final_state_hashes_exact": 8,
+    "canonical_final_state_hashes_total": 8,
+    "process_swap_kib_max": 0,
+    "cuda_fallbacks": 0,
+    "major_faults_by_case": {
+      "composition_a": 1,
+      "revision_a": 0,
+      "color_value_a": 0,
+      "material_a": 0,
+      "composition_b": 0,
+      "revision_b": 0,
+      "color_value_b": 0,
+      "material_b": 0
+    },
+    "q0_closed_cleanly": true,
+    "leftover_waste_spec_or_fio_jobs": 0
+  },
+  "gate": {
+    "optimistic_time_within_budget": true,
+    "all_final_state_hashes_exact": true,
+    "all_swap_and_fallback_checks_pass": true,
+    "all_major_fault_counts_zero": false,
+    "literal_preregistered_pass": false,
+    "engineering_draft_side_viable": true,
+    "integrated_decoder_authorized": false
+  },
+  "scope": {
+    "h1_model_steps": 0,
+    "h2_model_steps": 0,
+    "nvme_of_hardware": "deferred",
+    "runtime_profile_promoted": false,
+    "upstream_submission": "none"
+  },
+  "evidence": {
+    "remote_root": "/home/kevin/waste-gn100-experiment-20260730/validation/sprint17-k3-selfdraft-20260806",
+    "archive": "sprint17-k3-selfdraft-evidence-20260806.tar.gz",
+    "archive_size_bytes": 6557,
+    "archive_sha256": "e11623f07cb7381652519b65b60bca5e2cec4f6aee921247260c3fedfc56465a"
+  }
+}

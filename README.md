@@ -34,6 +34,14 @@
 > pre-integration stop preserved H2
 > unspent; see
 > [the Sprint 16 result](docs/SPECULATIVE_GB10.md).
+> Sprint 17 then removed the separate-draft rent with a top-4-expert K3
+> self-draft. On frozen A+B it matched 76.63% of proposals and committed 3.8209
+> tokens per verifier block; its deliberately optimistic 1.5 s/block model
+> projects a 40.51% gain. All target state hashes were exact, but the present
+> SSD/exact-verifier path still cannot realize that projection, and the first
+> row's single major fault kept the literal all-zero campaign gate false. No
+> integrated decoder or H-tier run followed. See
+> [the Sprint 17 result](docs/K3_SELF_DRAFT_GB10.md).
 > Start with [GN100 results and reproduction notes](docs/GN100.md), then see
 > [the upstreaming map](docs/UPSTREAMING.md) and
 > [upstream issue #14](https://github.com/sqliteai/waste/issues/14).
