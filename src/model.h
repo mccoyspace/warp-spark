@@ -284,6 +284,14 @@ const float *waste_model_prefill(waste_model *m, const int *tokens, int n,
 const float *waste_model_prefill_diagnostic_rows(
     waste_model *m, const int *tokens, int n, int pos0,
     float *row_logits, size_t row_logits_floats);
+/* Exact width-N verifier used by the GB10 speculative pilot. It schedules
+ * positions layer-by-layer for cache locality, but every projection and
+ * routed-expert reduction follows waste_model_step arithmetic. Routes are
+ * laid out [n][cfg.n_layers][cfg.top_k]. */
+const float *waste_model_verify_exact_rows(
+    waste_model *m, const int *tokens, int n, int pos0,
+    float *row_logits, size_t row_logits_floats,
+    int *ordered_routes, size_t ordered_route_ints);
 uint64_t    waste_model_chunk_expert_union(const waste_model *m);
 int         waste_model_set_i8mm_diagnostic(int enabled);
 int         waste_model_get_i8mm_diagnostic(void);

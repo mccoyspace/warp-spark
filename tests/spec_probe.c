@@ -1780,11 +1780,12 @@ fail:
  * one fresh-process arm from a byte-hashed canonical root. */
 static int verify4_mode(int argc, char **argv)
 {
-    enum { ARM_SERIAL, ARM_CHUNK0, ARM_CHUNK1 } arm;
+    enum { ARM_SERIAL, ARM_CHUNK0, ARM_CHUNK1, ARM_EXACT } arm;
     if (argc != 9) return -2;
     if (!strcmp(argv[2], "serial")) arm = ARM_SERIAL;
     else if (!strcmp(argv[2], "chunk0")) arm = ARM_CHUNK0;
     else if (!strcmp(argv[2], "chunk1")) arm = ARM_CHUNK1;
+    else if (!strcmp(argv[2], "exact")) arm = ARM_EXACT;
     else return -2;
 
     int n_prompt = 0, n_root = 0, n_proposal = 0;
@@ -1901,6 +1902,16 @@ static int verify4_mode(int argc, char **argv)
             fprintf(stderr, "verify4 row allocation failed\n");
             goto fail;
         }
+        if (arm == ARM_EXACT) {
+            const size_t routes = (size_t)n_proposal * m.cfg.n_layers *
+                                  m.cfg.top_k;
+            routed = (int *)malloc(routes * sizeof *routed);
+            if (!routed) {
+                fprintf(stderr, "verify4 exact route allocation failed\n");
+                goto fail;
+            }
+            memset(routed, 0xff, routes * sizeof *routed);
+        }
     }
 
     const uint64_t h0 = m.cache.hits, mi0 = m.cache.misses;
@@ -1933,6 +1944,34 @@ static int verify4_mode(int argc, char **argv)
             row_argmax[i] = argmax(logits, m.cfg.vocab);
             route_hashes[i] = hash_one(
                 routed + (size_t)m.cfg.first_dense * m.cfg.top_k,
+                route_count * sizeof(int));
+            waste_ecache_decode_tick(&m.cache);
+        }
+    } else if (arm == ARM_EXACT) {
+        const size_t route_ints = (size_t)n_proposal * m.cfg.n_layers *
+                                  m.cfg.top_k;
+        logits = waste_model_verify_exact_rows(
+            &m, proposal, n_proposal, state_pos, rows,
+            (size_t)n_proposal * (size_t)m.cfg.vocab,
+            routed, route_ints);
+        if (!logits) {
+            fprintf(stderr, "verify4 exact batch failed\n");
+            goto fail;
+        }
+        const size_t route_count =
+            (size_t)(m.cfg.n_layers - m.cfg.first_dense) * m.cfg.top_k;
+        for (int i = 0; i < n_proposal; i++) {
+            const float *row = rows + (size_t)i * m.cfg.vocab;
+            if (!finite_row(row, m.cfg.vocab)) {
+                fprintf(stderr, "verify4 exact row %d is non-finite\n", i);
+                goto fail;
+            }
+            logit_hashes[i] = hash_one(
+                row, (size_t)m.cfg.vocab * sizeof(float));
+            row_argmax[i] = argmax(row, m.cfg.vocab);
+            route_hashes[i] = hash_one(
+                routed + ((size_t)i * m.cfg.n_layers + m.cfg.first_dense) *
+                         m.cfg.top_k,
                 route_count * sizeof(int));
             waste_ecache_decode_tick(&m.cache);
         }
@@ -1995,7 +2034,7 @@ static int verify4_mode(int argc, char **argv)
     printf("  \"logit_row_hashes\":");
     print_u64_hex(logit_hashes, n_proposal); puts(",");
     printf("  \"row_argmax\":"); print_ints(row_argmax, n_proposal); puts(",");
-    if (arm == ARM_SERIAL) {
+    if (arm == ARM_SERIAL || arm == ARM_EXACT) {
         printf("  \"ordered_routes_available\":true,"
                "\"ordered_route_row_hashes\":");
         print_u64_hex(route_hashes, n_proposal); puts(",");
@@ -2034,7 +2073,9 @@ static int verify4_mode(int argc, char **argv)
            "\"direct_io\":%d,\"io_threads\":%d,\"io_depth\":%d,"
            "\"cache_slots\":%d,\"warm_ready_at_load\":%d}\n}\n",
            measured_i8mm,
-           arm == ARM_SERIAL ? "ordinary_t1" : "cpu_chunk_all_rows",
+           arm == ARM_SERIAL ? "ordinary_t1" :
+           (arm == ARM_EXACT ? "exact_layer_major_cuda_rows" :
+                               "cpu_chunk_all_rows"),
            waste_model_get_cuda_kda(&m), waste_model_get_cuda_dense(&m),
            waste_model_get_cuda_vq(&m), waste_model_cuda_kda_effective(&m),
            waste_model_cuda_dense_effective(&m),
@@ -2304,7 +2345,7 @@ static void usage(const char *name)
         "  %s teacher MODEL CACHE_MB USAGE|- PROMPT_IDS TARGET_IDS\n"
         "  %s selfdraft MODEL CACHE_MB USAGE|- PROMPT_IDS TARGET_IDS\n"
         "  %s state MODEL CACHE_MB USAGE|- PROMPT_IDS TARGET_IDS\n"
-        "  %s verify4 serial|chunk0|chunk1 MODEL CACHE_MB USAGE|- "
+        "  %s verify4 serial|chunk0|chunk1|exact MODEL CACHE_MB USAGE|- "
         "PROMPT_IDS ROOT_IDS|- PROPOSAL_IDS\n"
         "  %s load TARGET TARGET_CACHE_MB USAGE|- DRAFT DRAFT_CACHE_MB "
         "USAGE|- TARGET_ROLLBACK_BYTES DRAFT_ROLLBACK_BYTES\n",

@@ -4448,6 +4448,247 @@ const float *waste_model_prefill_diagnostic_rows(
         return NULL;
     return model_prefill_impl(m, tokens, n, pos0, row_logits);
 }
+
+/* Exact layer-major verifier. The ordinary chunk path earns speed by
+ * changing projection and expert-reduction arithmetic; this path earns only
+ * scheduling locality. Every row calls the same attention, dense, routed VQ,
+ * and head routines as waste_model_step, while positions at one layer remain
+ * adjacent so an expert shared by several proposals can stay resident. */
+const float *waste_model_verify_exact_rows(
+    waste_model *m, const int *tokens, int n, int pos0,
+    float *row_logits, size_t row_logits_floats,
+    int *ordered_routes, size_t ordered_route_ints)
+{
+    if (!m || !tokens || !row_logits || !ordered_routes || n < 1 ||
+        n > WASTE_CHUNK_MAX || m->cfg.vocab <= 0 ||
+        (size_t)n > SIZE_MAX / (size_t)m->cfg.vocab ||
+        row_logits_floats < (size_t)n * (size_t)m->cfg.vocab ||
+        (size_t)n > SIZE_MAX / (size_t)m->cfg.n_layers /
+                    (size_t)m->cfg.top_k ||
+        ordered_route_ints < (size_t)n * (size_t)m->cfg.n_layers *
+                             (size_t)m->cfg.top_k)
+        return NULL;
+    if (m->cuda_kda_state_dirty ||
+        ((m->cuda_kda_mode || m->cuda_dense_scope || m->cuda_vq_mode) &&
+         m->cuda_kda_failed)) return NULL;
+    {
+        const int cm = waste_model_ctx_max(m);
+        if (cm && (pos0 < 0 || pos0 > cm - n)) {
+            m->ctx_full = 1;
+            return NULL;
+        }
+    }
+    if (n == 1) {
+        const float *one = waste_model_step(m, tokens[0], pos0,
+                                             ordered_routes);
+        if (one)
+            memcpy(row_logits, one,
+                   (size_t)m->cfg.vocab * sizeof(float));
+        return one;
+    }
+    if (prefill_alloc(m, n)) return NULL;
+
+    const waste_config *c = &m->cfg;
+    const int hid = c->hidden, K = c->top_k;
+    memset(ordered_routes, 0xff,
+           (size_t)n * c->n_layers * K * sizeof *ordered_routes);
+    for (int t = 0; t < n; t++) {
+        float *dst = m->cx + (size_t)t * hid;
+        if (m->media && m->media_used < m->media_n &&
+            tokens[t] == m->cfg_media_token) {
+            memcpy(dst, m->media + (size_t)m->media_used * hid,
+                   (size_t)hid * sizeof(float));
+            m->media_used++;
+        } else {
+            waste_embed_row(m, tokens[t], dst);
+        }
+    }
+
+    const int ares_on = c->attn_res_block > 0;
+    int nb = 0, ps_live = 0;
+    for (int L = 0; L < c->n_layers; L++) {
+        if (m->read_error ||
+            ((m->cuda_kda_mode || m->cuda_dense_scope || m->cuda_vq_mode) &&
+             m->cuda_kda_failed))
+            break;
+        if (ares_on) {
+            memcpy(m->cprefix, m->cx, (size_t)n * hid * sizeof(float));
+            ps_live = 1;
+            if (nb > 0) {
+                const float *nw = waste_find(m, tname(
+                    "%smodel.layers.%d.self_attention_res_norm.weight",
+                    c->prefix, L))->data;
+                const float *pw = waste_find(m, tname(
+                    "%smodel.layers.%d.self_attention_res_proj.weight",
+                    c->prefix, L))->data;
+                const int stride =
+                    (c->n_layers / c->attn_res_block + 2) * hid;
+                for (int t = 0; t < n; t++)
+                    waste_apply_attn_res(
+                        m, m->cblockres + (size_t)t * stride, nb,
+                        m->cprefix + (size_t)t * hid, nw, pw,
+                        m->cx + (size_t)t * hid);
+            }
+            if (L % c->attn_res_block == 0) {
+                const int stride =
+                    (c->n_layers / c->attn_res_block + 2) * hid;
+                for (int t = 0; t < n; t++)
+                    memcpy(m->cblockres + (size_t)t * stride +
+                                               (size_t)nb * hid,
+                           m->cprefix + (size_t)t * hid,
+                           (size_t)hid * sizeof(float));
+                nb++;
+                ps_live = 0;
+            }
+        }
+
+        const float *iln = waste_find(m, tname(
+            "%smodel.layers.%d.input_layernorm.weight",
+            c->prefix, L))->data;
+        for (int t = 0; t < n; t++)
+            waste_rmsnorm(m->cnorm + (size_t)t * hid,
+                          m->cx + (size_t)t * hid, iln, hid, c->eps);
+
+        for (int t = 0; t < n; t++) {
+            dump_pos0 = pos0 + t;
+            const int failed = c->kda_layer[L]
+                ? kda_layer(m, L, m->cnorm + (size_t)t * hid,
+                            m->cresid + (size_t)t * hid,
+                            m->cuda_kda_mode)
+                : mla_layer(m, L, m->cnorm + (size_t)t * hid,
+                            m->cresid + (size_t)t * hid, pos0 + t,
+                            m->cuda_dense_scope);
+            if (failed) return NULL;
+        }
+
+        if (ares_on) {
+            if (ps_live) {
+                for (int i = 0; i < n * hid; i++)
+                    m->cprefix[i] += m->cresid[i];
+            } else {
+                memcpy(m->cprefix, m->cresid,
+                       (size_t)n * hid * sizeof(float));
+                ps_live = 1;
+            }
+            const float *nw = waste_find(m, tname(
+                "%smodel.layers.%d.mlp_res_norm.weight",
+                c->prefix, L))->data;
+            const float *pw = waste_find(m, tname(
+                "%smodel.layers.%d.mlp_res_proj.weight",
+                c->prefix, L))->data;
+            const int stride =
+                (c->n_layers / c->attn_res_block + 2) * hid;
+            for (int t = 0; t < n; t++)
+                waste_apply_attn_res(
+                    m, m->cblockres + (size_t)t * stride, nb,
+                    m->cprefix + (size_t)t * hid, nw, pw,
+                    m->cx + (size_t)t * hid);
+        } else {
+            for (int i = 0; i < n * hid; i++) m->cx[i] += m->cresid[i];
+        }
+
+        const float *pln = waste_find(m, tname(
+            "%smodel.layers.%d.post_attention_layernorm.weight",
+            c->prefix, L))->data;
+        for (int t = 0; t < n; t++)
+            waste_rmsnorm(m->cnorm + (size_t)t * hid,
+                          m->cx + (size_t)t * hid, pln, hid, c->eps);
+
+        if (waste_find(m, tname(
+                "%smodel.layers.%d.block_sparse_moe.gate.weight",
+                c->prefix, L))) {
+            PROF_START(P_ROUTE);
+            for (int t = 0; t < n; t++) {
+                dump_pos0 = pos0 + t;
+                int *rr = ordered_routes +
+                    ((size_t)t * c->n_layers + L) * K;
+                if (moe_layer(m, L, m->cnorm + (size_t)t * hid,
+                              m->cresid + (size_t)t * hid, rr)) {
+                    PROF_END(P_ROUTE);
+                    return NULL;
+                }
+            }
+            PROF_END(P_ROUTE);
+            for (int e = 0; e < c->n_experts; e++) {
+                int found = 0;
+                for (int t = 0; t < n && !found; t++) {
+                    const int *rr = ordered_routes +
+                        ((size_t)t * c->n_layers + L) * K;
+                    for (int j = 0; j < K; j++)
+                        if (rr[j] == e) { found = 1; break; }
+                }
+                if (found) diagnostic_chunk_expert_union++;
+            }
+        } else {
+            for (int t = 0; t < n; t++)
+                if (ffn(m,
+                        waste_find(m, tname(
+                            "%smodel.layers.%d.mlp.gate_proj.weight",
+                            c->prefix, L)),
+                        waste_find(m, tname(
+                            "%smodel.layers.%d.mlp.up_proj.weight",
+                            c->prefix, L)),
+                        waste_find(m, tname(
+                            "%smodel.layers.%d.mlp.down_proj.weight",
+                            c->prefix, L)),
+                        m->cnorm + (size_t)t * hid,
+                        m->cresid + (size_t)t * hid,
+                        c->dense_inter, hid, 1.0f, 0, 3))
+                    return NULL;
+        }
+
+        if (ares_on) {
+            for (int i = 0; i < n * hid; i++)
+                m->cprefix[i] += m->cresid[i];
+            memcpy(m->cx, m->cprefix, (size_t)n * hid * sizeof(float));
+        } else {
+            for (int i = 0; i < n * hid; i++) m->cx[i] += m->cresid[i];
+        }
+    }
+    if (m->read_error ||
+        ((m->cuda_kda_mode || m->cuda_dense_scope || m->cuda_vq_mode) &&
+         m->cuda_kda_failed))
+        return NULL;
+
+    if (ares_on) {
+        const int stride =
+            (c->n_layers / c->attn_res_block + 2) * hid;
+        memcpy(m->blockres,
+               m->cblockres + (size_t)(n - 1) * stride,
+               (size_t)nb * hid * sizeof(float));
+    }
+    m->n_blockres = nb;
+    if (ares_on && nb > 0) {
+        const float *onw = waste_find(m, tname(
+            "%smodel.output_attn_res_norm.weight", c->prefix))->data;
+        const float *opw = waste_find(m, tname(
+            "%smodel.output_attn_res_proj.weight", c->prefix))->data;
+        const int stride =
+            (c->n_layers / c->attn_res_block + 2) * hid;
+        for (int t = 0; t < n; t++)
+            waste_apply_attn_res(
+                m, m->cblockres + (size_t)t * stride, nb,
+                m->cx + (size_t)t * hid, onw, opw,
+                m->cx + (size_t)t * hid);
+    }
+
+    const float *fnw = waste_find(m, tname(
+        "%smodel.norm.weight", c->prefix))->data;
+    for (int t = 0; t < n; t++) {
+        float *norm = m->cnorm + (size_t)t * hid;
+        float *row = row_logits + (size_t)t * c->vocab;
+        waste_rmsnorm(norm, m->cx + (size_t)t * hid,
+                      fnw, hid, c->eps);
+        matvec_t(m, row,
+                 waste_find(m, tname("%slm_head.weight", c->prefix)),
+                 norm, c->vocab, hid);
+    }
+    memcpy(m->logits, row_logits + (size_t)(n - 1) * c->vocab,
+           (size_t)c->vocab * sizeof(float));
+    memcpy(m->x, m->cx + (size_t)(n - 1) * hid,
+           (size_t)hid * sizeof(float));
+    return m->logits;
+}
 #endif
 
 const float *waste_model_step(waste_model *m, int token, int pos, int *routed)
