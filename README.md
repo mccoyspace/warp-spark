@@ -42,6 +42,14 @@
 > row's single major fault kept the literal all-zero campaign gate false. No
 > integrated decoder or H-tier run followed. See
 > [the Sprint 17 result](docs/K3_SELF_DRAFT_GB10.md).
+> Sprint 18 built the exact width-four diagnostic verifier and measured it at
+> all 67 A+B roots with the full 59,340-MiB cache. Direct serial pilots were
+> byte-exact, and cross-position locality reduced physical reads, but the full
+> campaign still averaged 4.470 s and 26.459 GiB per block. The favorable
+> draft+verify+transaction lower bound was 421.947 s versus a 263.439 s gate,
+> or 28.20% less throughput than ordinary decode before unimplemented replay
+> and integration costs. The path remains diagnostic; see
+> [the Sprint 18 result](docs/EXACT_BATCH_VERIFIER_GB10.md).
 > Start with [GN100 results and reproduction notes](docs/GN100.md), then see
 > [the upstreaming map](docs/UPSTREAMING.md) and
 > [upstream issue #14](https://github.com/sqliteai/waste/issues/14).

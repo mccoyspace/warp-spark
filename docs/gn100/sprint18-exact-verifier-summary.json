@@ -1,0 +1,104 @@
+{
+  "schema": "waste.gn100.exact_verifier_result.v1",
+  "date": "2026-08-06",
+  "machine": "Acer Veriton GN100 / NVIDIA GB10",
+  "host": "gn100-77bd",
+  "branch": "exp/exact-batch-verifier-gb10",
+  "instrument_commit": "30badae",
+  "status": "exactness_pass_verifier_viability_miss",
+  "candidate": {
+    "width": 4,
+    "target_experts": 16,
+    "target_cache_mib": 59340,
+    "schedule": "causal_layer_major_exact_cuda_t1_rows",
+    "router": "cpu",
+    "expert_accumulation": "original_router_order",
+    "fused_multirow_cuda_kernels": false
+  },
+  "pilot": {
+    "case": "color_value_a",
+    "rejection_block": {
+      "serial_seconds": 4.810105539,
+      "exact_seconds": 4.757866253,
+      "serial_misses": 2841,
+      "exact_misses": 2737,
+      "serial_bytes": 35247673344,
+      "exact_bytes": 33957367808,
+      "expert_union": 3929,
+      "time_gain": 0.0109795617,
+      "byte_reduction": 0.0366068286
+    },
+    "full_accept_block": {
+      "serial_seconds": 4.511062512,
+      "exact_seconds": 4.531221171,
+      "serial_misses": 2503,
+      "exact_misses": 2410,
+      "serial_bytes": 31054180352,
+      "exact_bytes": 29900349440,
+      "expert_union": 3572,
+      "time_gain": -0.0044488358,
+      "byte_reduction": 0.0371554135
+    },
+    "full_logit_rows_exact": 8,
+    "ordered_route_rows_exact": 8,
+    "argmax_rows_exact": 8,
+    "final_state_hashes_exact": 2,
+    "vq_launches_per_arm": 18032,
+    "vq_syncs_per_arm": 11776
+  },
+  "campaign": {
+    "cases": 8,
+    "tokens": 256,
+    "blocks": 67,
+    "draft_seconds": 117.753958458,
+    "verifier_seconds": 299.480691735,
+    "verifier_seconds_per_block": 4.4698610707,
+    "verifier_seconds_per_block_range": [4.086708353, 5.1269014579],
+    "verifier_misses": 153424,
+    "verifier_misses_per_block": 2289.9104477612,
+    "verifier_bytes": 1903498428416,
+    "verifier_gib": 1772.7710571289,
+    "verifier_gib_per_block": 26.4592695094,
+    "verifier_gib_per_block_range": [23.6452860832, 31.6264186859],
+    "expert_union": 259712,
+    "physical_miss_fraction_of_union": 0.5907466732,
+    "effective_physical_gib_per_second": 5.9194836464,
+    "snapshot_and_restore_seconds": 4.711876327,
+    "draft_plus_verifier_lower_bound_seconds": 417.234650193,
+    "lower_bound_plus_transaction_seconds": 421.94652652,
+    "full_cache_baseline_seconds": 302.954579022,
+    "maximum_seconds_for_15pct_throughput_gain": 263.438764367,
+    "projected_throughput_gain_before_replay_and_sync": -0.2820071739
+  },
+  "correctness_and_safety": {
+    "direct_serial_equivalence_blocks": 2,
+    "direct_serial_equivalence_passed": true,
+    "canonical_final_state_hashes_exact": 8,
+    "canonical_final_state_hashes_total": 8,
+    "timed_verifier_major_faults": 0,
+    "process_swap_kib_max": 0,
+    "cuda_fallbacks": 0,
+    "q0_closed_cleanly": true,
+    "leftover_waste_spec_or_fio_jobs": 0
+  },
+  "gate": {
+    "exactness_and_safety_pass": true,
+    "time_within_budget": false,
+    "literal_preregistered_pass": false,
+    "integrated_decoder_authorized": false
+  },
+  "scope": {
+    "h1_model_steps": 0,
+    "h2_model_steps": 0,
+    "nvme_of_hardware": "deferred",
+    "runtime_profile_promoted": false,
+    "upstream_submission": "none"
+  },
+  "evidence": {
+    "remote_pilot_root": "/home/kevin/waste-gn100-experiment-20260730/validation/sprint18-exact-verifier-pilot-20260806",
+    "remote_campaign_root": "/home/kevin/waste-gn100-experiment-20260730/validation/sprint18-exact-verifier-campaign-20260806",
+    "archive": "sprint18-exact-verifier-evidence-20260806.tar.gz",
+    "archive_size_bytes": 17829,
+    "archive_sha256": "3b3ef93dfffa7ab095807ec6caeb16994d7f4be83a834d9dde7982146f3942df"
+  }
+}
