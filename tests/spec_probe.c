@@ -247,6 +247,18 @@ static void print_doubles(const double *x, int n)
     putchar(']');
 }
 
+#if defined(WASTE_ENABLE_DIAGNOSTIC_VERIFY)
+static void print_longs(const long *x, int n)
+{
+    putchar('[');
+    for (int i = 0; i < n; i++) {
+        if (i) putchar(',');
+        printf("%ld", x[i]);
+    }
+    putchar(']');
+}
+#endif
+
 static void print_int_matrix(const int *x, int rows, int cols)
 {
     putchar('[');
@@ -811,10 +823,16 @@ fail:
  * root logits supply proposal one and only the subsequent proposal steps run
  * the first four experts, with the original top-16 routes and normalized
  * weights left unchanged. */
-static int selfdraft_mode(int argc, char **argv)
+static int selfdraft_mode(int argc, char **argv, int exact_verify)
 {
     enum { DRAFT_EXPERTS = 4, WIDTH = 4 };
     if (argc != 7) return -2;
+#if !defined(WASTE_ENABLE_DIAGNOSTIC_VERIFY)
+    if (exact_verify) {
+        fprintf(stderr, "selfdraft-exact requires WASTE_ENABLE_DIAGNOSTIC_VERIFY\n");
+        return 1;
+    }
+#endif
     int n_prompt = 0, n_target = 0;
     int *prompt = parse_ids(argv[5], &n_prompt);
     int *target = parse_ids(argv[6], &n_target);
@@ -830,6 +848,16 @@ static int selfdraft_mode(int argc, char **argv)
     int *proposals = NULL;
     double *branch_seconds = NULL;
     uint64_t *branch_hits = NULL, *branch_misses = NULL, *branch_bytes = NULL;
+#if defined(WASTE_ENABLE_DIAGNOSTIC_VERIFY)
+    float *verify_rows = NULL;
+    int *verify_routes = NULL;
+    double *verify_seconds = NULL, *verify_restore_seconds = NULL;
+    uint64_t *verify_hits = NULL, *verify_misses = NULL, *verify_bytes = NULL;
+    uint64_t *verify_union = NULL, *verify_state_hashes = NULL;
+    size_t *verify_state_bytes = NULL;
+    long *verify_major_faults = NULL;
+    uint64_t *verify_logit_hashes = NULL, *verify_route_hashes = NULL;
+#endif
     int rc = 1;
     if (load_model(&m, argv[2], argv[3], argv[4])) goto out;
     if (m.cfg.top_k != 16 || DRAFT_EXPERTS >= m.cfg.top_k) {
@@ -859,6 +887,45 @@ static int selfdraft_mode(int argc, char **argv)
         fprintf(stderr, "selfdraft allocation failed\n");
         goto out;
     }
+#if defined(WASTE_ENABLE_DIAGNOSTIC_VERIFY)
+    if (exact_verify) {
+        verify_rows = (float *)malloc(
+            (size_t)WIDTH * m.cfg.vocab * sizeof *verify_rows);
+        verify_routes = (int *)malloc(
+            (size_t)WIDTH * m.cfg.n_layers * m.cfg.top_k *
+            sizeof *verify_routes);
+        verify_seconds = (double *)calloc((size_t)n_target,
+                                           sizeof *verify_seconds);
+        verify_restore_seconds = (double *)calloc(
+            (size_t)n_target, sizeof *verify_restore_seconds);
+        verify_hits = (uint64_t *)calloc((size_t)n_target,
+                                          sizeof *verify_hits);
+        verify_misses = (uint64_t *)calloc((size_t)n_target,
+                                            sizeof *verify_misses);
+        verify_bytes = (uint64_t *)calloc((size_t)n_target,
+                                           sizeof *verify_bytes);
+        verify_union = (uint64_t *)calloc((size_t)n_target,
+                                           sizeof *verify_union);
+        verify_state_hashes = (uint64_t *)calloc(
+            (size_t)n_target, sizeof *verify_state_hashes);
+        verify_state_bytes = (size_t *)calloc(
+            (size_t)n_target, sizeof *verify_state_bytes);
+        verify_major_faults = (long *)calloc(
+            (size_t)n_target, sizeof *verify_major_faults);
+        verify_logit_hashes = (uint64_t *)calloc(
+            (size_t)n_target * WIDTH, sizeof *verify_logit_hashes);
+        verify_route_hashes = (uint64_t *)calloc(
+            (size_t)n_target * WIDTH, sizeof *verify_route_hashes);
+        if (!verify_rows || !verify_routes || !verify_seconds ||
+            !verify_restore_seconds || !verify_hits || !verify_misses ||
+            !verify_bytes || !verify_union || !verify_state_hashes ||
+            !verify_state_bytes || !verify_major_faults ||
+            !verify_logit_hashes || !verify_route_hashes) {
+            fprintf(stderr, "selfdraft exact verifier allocation failed\n");
+            goto out;
+        }
+    }
+#endif
     for (int i = 0; i < n_target * WIDTH; i++) proposals[i] = -1;
 
     struct rusage ru0, ru1;
@@ -883,6 +950,16 @@ static int selfdraft_mode(int argc, char **argv)
     uint64_t draft_vq_experts = 0, draft_vq_applies = 0;
     uint64_t draft_vq_launches = 0, draft_vq_syncs = 0;
     uint64_t draft_fallbacks = 0;
+#if defined(WASTE_ENABLE_DIAGNOSTIC_VERIFY)
+    double verify_seconds_total = 0, verify_restore_seconds_total = 0;
+    uint64_t verify_hits_total = 0, verify_misses_total = 0;
+    uint64_t verify_bytes_total = 0, verify_union_total = 0;
+    uint64_t verify_kda_calls = 0, verify_dense_calls = 0;
+    uint64_t verify_vq_experts = 0, verify_vq_applies = 0;
+    uint64_t verify_vq_launches = 0, verify_vq_syncs = 0;
+    uint64_t verify_fallbacks = 0;
+    long verify_major_faults_total = 0;
+#endif
 
     for (int pos = 0; pos < n_target; ) {
         if (argmax(logits, m.cfg.vocab) != target[pos]) {
@@ -983,6 +1060,87 @@ static int selfdraft_mode(int argc, char **argv)
         }
         restore_seconds += now() - started;
 
+#if defined(WASTE_ENABLE_DIAGNOSTIC_VERIFY)
+        if (exact_verify) {
+            const uint64_t vh0 = m.cache.hits, vm0 = m.cache.misses;
+            const uint64_t vb0 = m.cache.bytes_read;
+            const uint64_t vu0 = waste_model_chunk_expert_union(&m);
+            const uint64_t vk0 = waste_model_cuda_kda_calls(&m);
+            const uint64_t vd0 = waste_model_cuda_dense_calls(&m);
+            const uint64_t vve0 = waste_model_cuda_vq_experts(&m);
+            const uint64_t vva0 = waste_model_cuda_vq_applies(&m);
+            const uint64_t vvl0 = waste_model_cuda_vq_launches(&m);
+            const uint64_t vvs0 = waste_model_cuda_vq_syncs(&m);
+            const uint64_t vf0 = waste_model_cuda_kda_fallbacks(&m);
+            struct rusage vru0, vru1;
+            memset(&vru0, 0, sizeof vru0);
+            memset(&vru1, 0, sizeof vru1);
+            getrusage(RUSAGE_SELF, &vru0);
+            started = now();
+            const float *verified = waste_model_verify_exact_rows(
+                &m, proposals + (size_t)n_blocks * WIDTH, width,
+                n_prompt + pos, verify_rows,
+                (size_t)width * m.cfg.vocab,
+                verify_routes,
+                (size_t)width * m.cfg.n_layers * m.cfg.top_k);
+            waste_ecache_drain(&m.cache);
+            verify_seconds[n_blocks] = now() - started;
+            getrusage(RUSAGE_SELF, &vru1);
+            if (!verified) {
+                fprintf(stderr, "selfdraft exact verifier failed at %d\n", pos);
+                goto out;
+            }
+            verify_hits[n_blocks] = m.cache.hits - vh0;
+            verify_misses[n_blocks] = m.cache.misses - vm0;
+            verify_bytes[n_blocks] = m.cache.bytes_read - vb0;
+            verify_union[n_blocks] = waste_model_chunk_expert_union(&m) - vu0;
+            verify_major_faults[n_blocks] = vru1.ru_majflt - vru0.ru_majflt;
+            verify_seconds_total += verify_seconds[n_blocks];
+            verify_hits_total += verify_hits[n_blocks];
+            verify_misses_total += verify_misses[n_blocks];
+            verify_bytes_total += verify_bytes[n_blocks];
+            verify_union_total += verify_union[n_blocks];
+            verify_major_faults_total += verify_major_faults[n_blocks];
+            verify_kda_calls += waste_model_cuda_kda_calls(&m) - vk0;
+            verify_dense_calls += waste_model_cuda_dense_calls(&m) - vd0;
+            verify_vq_experts += waste_model_cuda_vq_experts(&m) - vve0;
+            verify_vq_applies += waste_model_cuda_vq_applies(&m) - vva0;
+            verify_vq_launches += waste_model_cuda_vq_launches(&m) - vvl0;
+            verify_vq_syncs += waste_model_cuda_vq_syncs(&m) - vvs0;
+            verify_fallbacks += waste_model_cuda_kda_fallbacks(&m) - vf0;
+
+            const size_t route_count =
+                (size_t)(m.cfg.n_layers - m.cfg.first_dense) * m.cfg.top_k;
+            for (int j = 0; j < width; j++) {
+                verify_logit_hashes[(size_t)n_blocks * WIDTH + j] =
+                    hash_one(verify_rows + (size_t)j * m.cfg.vocab,
+                             (size_t)m.cfg.vocab * sizeof(float));
+                verify_route_hashes[(size_t)n_blocks * WIDTH + j] =
+                    hash_one(verify_routes +
+                        ((size_t)j * m.cfg.n_layers + m.cfg.first_dense) *
+                        m.cfg.top_k, route_count * sizeof(int));
+            }
+            if (state_hash(&m, n_prompt + pos + width,
+                           &verify_state_hashes[n_blocks],
+                           &verify_state_bytes[n_blocks])) {
+                fprintf(stderr, "selfdraft exact state hash failed at %d\n", pos);
+                goto out;
+            }
+
+            restored_pos = -1;
+            started = now();
+            if (waste_model_state_import(&m, snapshot, snapshot_bytes,
+                                         &restored_pos) ||
+                restored_pos != n_prompt + pos) {
+                fprintf(stderr,
+                        "selfdraft post-verifier restore failed at %d\n", pos);
+                goto out;
+            }
+            verify_restore_seconds[n_blocks] = now() - started;
+            verify_restore_seconds_total += verify_restore_seconds[n_blocks];
+        }
+#endif
+
         int commit = prefix < width ? prefix + 1 : width;
         if (prefix == width && pos + width < n_target) commit++;
         if (commit > n_target - pos) commit = n_target - pos;
@@ -1069,6 +1227,50 @@ static int selfdraft_mode(int argc, char **argv)
            draft_kda_calls, draft_dense_calls, draft_vq_experts,
            draft_vq_applies, draft_vq_launches, draft_vq_syncs,
            draft_fallbacks);
+#if defined(WASTE_ENABLE_DIAGNOSTIC_VERIFY)
+    if (exact_verify) {
+        printf("  \"exact_verifier\":{\"blocks\":%d,"
+               "\"seconds\":%.9f,\"seconds_per_block\":%.9f,"
+               "\"hits\":%" PRIu64 ",\"misses\":%" PRIu64
+               ",\"bytes\":%" PRIu64 ",\"expert_union\":%" PRIu64
+               ",\"post_verifier_restore_seconds\":%.9f,"
+               "\"timed_major_faults\":%ld},\n",
+               n_blocks, verify_seconds_total,
+               n_blocks ? verify_seconds_total / n_blocks : 0,
+               verify_hits_total, verify_misses_total, verify_bytes_total,
+               verify_union_total, verify_restore_seconds_total,
+               verify_major_faults_total);
+        printf("  \"exact_verifier_seconds\":");
+        print_doubles(verify_seconds, n_blocks); puts(",");
+        printf("  \"exact_verifier_hits\":");
+        print_u64s(verify_hits, n_blocks); puts(",");
+        printf("  \"exact_verifier_misses\":");
+        print_u64s(verify_misses, n_blocks); puts(",");
+        printf("  \"exact_verifier_bytes\":");
+        print_u64s(verify_bytes, n_blocks); puts(",");
+        printf("  \"exact_verifier_union\":");
+        print_u64s(verify_union, n_blocks); puts(",");
+        printf("  \"exact_verifier_major_faults\":");
+        print_longs(verify_major_faults, n_blocks); puts(",");
+        printf("  \"exact_verifier_logit_hashes\":");
+        print_u64_hex_matrix(verify_logit_hashes, n_blocks, WIDTH); puts(",");
+        printf("  \"exact_verifier_route_hashes\":");
+        print_u64_hex_matrix(verify_route_hashes, n_blocks, WIDTH); puts(",");
+        printf("  \"exact_verifier_state_hashes\":");
+        print_u64_hex(verify_state_hashes, n_blocks); puts(",");
+        printf("  \"exact_verifier_cuda_delta\":{\"kda_calls\":%" PRIu64
+               ",\"dense_calls\":%" PRIu64 ",\"vq_experts\":%" PRIu64
+               ",\"vq_applies\":%" PRIu64 ",\"vq_launches\":%" PRIu64
+               ",\"vq_syncs\":%" PRIu64 ",\"fallbacks\":%" PRIu64 "},\n",
+               verify_kda_calls, verify_dense_calls, verify_vq_experts,
+               verify_vq_applies, verify_vq_launches, verify_vq_syncs,
+               verify_fallbacks);
+    } else {
+        puts("  \"exact_verifier\":null,");
+    }
+#else
+    (void)exact_verify;
+#endif
     printf("  \"final_state\":{\"bytes\":%zu,"
            "\"hash\":\"0x%016" PRIx64 "\"},\n",
            final_state_bytes, final_state_hash);
@@ -1094,6 +1296,13 @@ out:
     free(snapshot); free(roots); free(widths); free(accepted); free(committed);
     free(proposals); free(branch_seconds); free(branch_hits);
     free(branch_misses); free(branch_bytes); free(prompt); free(target);
+#if defined(WASTE_ENABLE_DIAGNOSTIC_VERIFY)
+    free(verify_rows); free(verify_routes); free(verify_seconds);
+    free(verify_restore_seconds); free(verify_hits); free(verify_misses);
+    free(verify_bytes); free(verify_union); free(verify_state_hashes);
+    free(verify_state_bytes); free(verify_major_faults);
+    free(verify_logit_hashes); free(verify_route_hashes);
+#endif
     waste_model_free(&m);
     return rc;
 }
@@ -2344,12 +2553,13 @@ static void usage(const char *name)
         "TARGET_PROMPT_IDS DRAFT_PROMPT_IDS N_GEN\n"
         "  %s teacher MODEL CACHE_MB USAGE|- PROMPT_IDS TARGET_IDS\n"
         "  %s selfdraft MODEL CACHE_MB USAGE|- PROMPT_IDS TARGET_IDS\n"
+        "  %s selfdraft-exact MODEL CACHE_MB USAGE|- PROMPT_IDS TARGET_IDS\n"
         "  %s state MODEL CACHE_MB USAGE|- PROMPT_IDS TARGET_IDS\n"
         "  %s verify4 serial|chunk0|chunk1|exact MODEL CACHE_MB USAGE|- "
         "PROMPT_IDS ROOT_IDS|- PROPOSAL_IDS\n"
         "  %s load TARGET TARGET_CACHE_MB USAGE|- DRAFT DRAFT_CACHE_MB "
         "USAGE|- TARGET_ROLLBACK_BYTES DRAFT_ROLLBACK_BYTES\n",
-        name, name, name, name, name, name, name, name);
+        name, name, name, name, name, name, name, name, name);
 }
 
 int main(int argc, char **argv)
@@ -2361,7 +2571,10 @@ int main(int argc, char **argv)
     else if (!strcmp(argv[1], "resident-target"))
         rc = resident_target_mode(argc, argv);
     else if (!strcmp(argv[1], "teacher")) rc = teacher_mode(argc, argv);
-    else if (!strcmp(argv[1], "selfdraft")) rc = selfdraft_mode(argc, argv);
+    else if (!strcmp(argv[1], "selfdraft"))
+        rc = selfdraft_mode(argc, argv, 0);
+    else if (!strcmp(argv[1], "selfdraft-exact"))
+        rc = selfdraft_mode(argc, argv, 1);
     else if (!strcmp(argv[1], "state")) rc = state_mode(argc, argv);
     else if (!strcmp(argv[1], "verify4")) rc = verify4_mode(argc, argv);
     else if (!strcmp(argv[1], "load")) rc = load_mode(argc, argv);
