@@ -23,7 +23,7 @@
     "h2_model_steps": 0,
     "promote_to_spark_integration": false,
     "upstream_submission": "none",
-    "reason": "After charging only measured draft work and granting every other speculative overhead a zero cost, the registered 15% modeled-gain threshold allowed 1.983497939 seconds per verifier block. The faster of two representative exact-reference blocks took 4.955751710 seconds; the existing chunked path was slower and not byte exact."
+    "reason": "After charging only measured draft work and granting every other speculative overhead a zero cost, the registered 15% modeled-gain threshold allowed 1.983497939 seconds per verifier block. The faster fixed-width four-step exact-reference diagnostic took 4.955751710 seconds; an abort-aware serial verifier still performs approximately one target step per committed token and cannot amortize baseline decode. The existing chunked path was slower and not byte exact."
   },
   "provenance": {
     "target_manifest_sha256": "da3232925d8eeaf0df07ee45743f6467c7eecbc4c0e2513899028e788a1a07f2",
@@ -150,6 +150,8 @@
     "width": 4,
     "representative_blocks": ["immediate_rejection", "full_acceptance"],
     "serial_exact": {
+      "fixed_width_all_four_positions_even_on_immediate_rejection": true,
+      "abort_aware_cost_measurement": false,
       "immediate_rejection_seconds": 4.955751710,
       "full_acceptance_seconds": 5.118750635,
       "full_acceptance_bytes": 39180623872,
@@ -206,6 +208,9 @@
     "fastest_chunk_over_budget_ratio": 4.768855896546893,
     "same_host_uncontended_fio_upper_gb_s": 13.4,
     "fastest_chunk_expert_bytes": 33845706752,
+    "fastest_chunk_bytes_are_representative_unique_misses_after_cross_position_deduplication": true,
+    "exact_batching_alone_cannot_remove_same_cache_state_unique_miss_bytes": true,
+    "exact_batching_requires_residency_or_storage_bandwidth_for_the_registered_time_budget": true,
     "inferred_storage_floor_seconds": 2.5257990113432838,
     "storage_floor_over_budget_ratio": 1.2734064206454596,
     "representative_diagnostic_only": true,

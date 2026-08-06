@@ -804,6 +804,300 @@ fail:
     free(prompt); free(target); waste_model_free(&m); return 1;
 }
 
+/* Focused reduced-expert K3 self-draft screen. This is an offline trajectory
+ * probe, not an integrated speculative decoder: TARGET_IDS is the already
+ * frozen greedy K3 continuation. Canonical prompt and target advancement use
+ * the complete top-16 model. At each selected k=4 block root, the known exact
+ * root logits supply proposal one and only the subsequent proposal steps run
+ * the first four experts, with the original top-16 routes and normalized
+ * weights left unchanged. */
+static int selfdraft_mode(int argc, char **argv)
+{
+    enum { DRAFT_EXPERTS = 4, WIDTH = 4 };
+    if (argc != 7) return -2;
+    int n_prompt = 0, n_target = 0;
+    int *prompt = parse_ids(argv[5], &n_prompt);
+    int *target = parse_ids(argv[6], &n_target);
+    if (!prompt || !target || n_prompt <= 0 || n_target <= 0) {
+        free(prompt); free(target); return -2;
+    }
+
+    waste_model m;
+    memset(&m, 0, sizeof m);
+    void *snapshot = NULL;
+    size_t snapshot_cap = 0;
+    int *roots = NULL, *widths = NULL, *accepted = NULL, *committed = NULL;
+    int *proposals = NULL;
+    double *branch_seconds = NULL;
+    uint64_t *branch_hits = NULL, *branch_misses = NULL, *branch_bytes = NULL;
+    int rc = 1;
+    if (load_model(&m, argv[2], argv[3], argv[4])) goto out;
+    if (m.cfg.top_k != 16 || DRAFT_EXPERTS >= m.cfg.top_k) {
+        fprintf(stderr, "selfdraft requires a top-16 target model\n");
+        goto out;
+    }
+    if (!valid_ids(prompt, n_prompt, m.cfg.vocab, "selfdraft prompt") ||
+        !valid_ids(target, n_target, m.cfg.vocab, "selfdraft target"))
+        goto out;
+    const int ctx = waste_model_ctx_max(&m);
+    if (ctx && (n_prompt > ctx || n_target > ctx - n_prompt)) {
+        fprintf(stderr, "selfdraft prompt plus target exceeds context\n");
+        goto out;
+    }
+
+    roots = (int *)calloc((size_t)n_target, sizeof *roots);
+    widths = (int *)calloc((size_t)n_target, sizeof *widths);
+    accepted = (int *)calloc((size_t)n_target, sizeof *accepted);
+    committed = (int *)calloc((size_t)n_target, sizeof *committed);
+    proposals = (int *)malloc((size_t)n_target * WIDTH * sizeof *proposals);
+    branch_seconds = (double *)calloc((size_t)n_target, sizeof *branch_seconds);
+    branch_hits = (uint64_t *)calloc((size_t)n_target, sizeof *branch_hits);
+    branch_misses = (uint64_t *)calloc((size_t)n_target, sizeof *branch_misses);
+    branch_bytes = (uint64_t *)calloc((size_t)n_target, sizeof *branch_bytes);
+    if (!roots || !widths || !accepted || !committed || !proposals ||
+        !branch_seconds || !branch_hits || !branch_misses || !branch_bytes) {
+        fprintf(stderr, "selfdraft allocation failed\n");
+        goto out;
+    }
+    for (int i = 0; i < n_target * WIDTH; i++) proposals[i] = -1;
+
+    struct rusage ru0, ru1;
+    memset(&ru0, 0, sizeof ru0); memset(&ru1, 0, sizeof ru1);
+    getrusage(RUSAGE_SELF, &ru0);
+    double started = now();
+    const float *logits = prefill_cpu(&m, prompt, n_prompt);
+    const double prefill_seconds = now() - started;
+    if (!logits || !finite_row(logits, m.cfg.vocab)) {
+        fprintf(stderr, "selfdraft prompt failed\n");
+        goto out;
+    }
+
+    int n_blocks = 0, total_accepted = 0, total_committed = 0;
+    int proposal_slots = 0, marginal_matches = 0, draft_steps = 0;
+    int survival[WIDTH] = {0};
+    int eligible[WIDTH] = {0};
+    int rejection_hist[WIDTH + 1] = {0};
+    double snapshot_seconds = 0, restore_seconds = 0;
+    double target_seconds = 0, draft_seconds_total = 0;
+    uint64_t draft_kda_calls = 0, draft_dense_calls = 0;
+    uint64_t draft_vq_experts = 0, draft_vq_applies = 0;
+    uint64_t draft_vq_launches = 0, draft_vq_syncs = 0;
+    uint64_t draft_fallbacks = 0;
+
+    for (int pos = 0; pos < n_target; ) {
+        if (argmax(logits, m.cfg.vocab) != target[pos]) {
+            fprintf(stderr, "selfdraft canonical target drift at %d\n", pos);
+            goto out;
+        }
+        const int width = n_target - pos < WIDTH ? n_target - pos : WIDTH;
+        roots[n_blocks] = pos;
+        widths[n_blocks] = width;
+
+        size_t snapshot_bytes = 0, written = 0;
+        if (waste_model_state_size(&m, n_prompt + pos, &snapshot_bytes)) {
+            fprintf(stderr, "selfdraft snapshot size failed at %d\n", pos);
+            goto out;
+        }
+        if (snapshot_bytes > snapshot_cap) {
+            void *grown = realloc(snapshot, snapshot_bytes);
+            if (!grown) {
+                fprintf(stderr, "selfdraft snapshot allocation failed\n");
+                goto out;
+            }
+            snapshot = grown;
+            snapshot_cap = snapshot_bytes;
+        }
+        started = now();
+        if (waste_model_state_export(&m, n_prompt + pos, snapshot,
+                                     snapshot_cap, &written) ||
+            written != snapshot_bytes) {
+            fprintf(stderr, "selfdraft snapshot export failed at %d\n", pos);
+            goto out;
+        }
+        snapshot_seconds += now() - started;
+
+        const uint64_t h0 = m.cache.hits, mi0 = m.cache.misses;
+        const uint64_t b0 = m.cache.bytes_read;
+        const uint64_t k0 = waste_model_cuda_kda_calls(&m);
+        const uint64_t d0 = waste_model_cuda_dense_calls(&m);
+        const uint64_t ve0 = waste_model_cuda_vq_experts(&m);
+        const uint64_t va0 = waste_model_cuda_vq_applies(&m);
+        const uint64_t vl0 = waste_model_cuda_vq_launches(&m);
+        const uint64_t vs0 = waste_model_cuda_vq_syncs(&m);
+        const uint64_t f0 = waste_model_cuda_kda_fallbacks(&m);
+        if (waste_model_set_routed_expert_limit(&m, DRAFT_EXPERTS)) {
+            fprintf(stderr, "selfdraft could not select four experts\n");
+            goto out;
+        }
+        const float *branch_logits = logits;
+        int prefix = 0;
+        started = now();
+        for (int j = 0; j < width; j++) {
+            const int proposal = argmax(branch_logits, m.cfg.vocab);
+            proposals[(size_t)n_blocks * WIDTH + j] = proposal;
+            proposal_slots++;
+            eligible[j]++;
+            if (proposal == target[pos + j]) marginal_matches++;
+            if (prefix == j && proposal == target[pos + j]) {
+                prefix++;
+                survival[j]++;
+            }
+            if (j + 1 < width) {
+                branch_logits = waste_model_step(
+                    &m, proposal, n_prompt + pos + j, NULL);
+                if (!branch_logits || !finite_row(branch_logits, m.cfg.vocab)) {
+                    fprintf(stderr, "selfdraft branch failed at %d/%d\n", pos, j);
+                    goto out;
+                }
+                draft_steps++;
+            }
+        }
+        waste_ecache_drain(&m.cache);
+        branch_seconds[n_blocks] = now() - started;
+        draft_seconds_total += branch_seconds[n_blocks];
+        branch_hits[n_blocks] = m.cache.hits - h0;
+        branch_misses[n_blocks] = m.cache.misses - mi0;
+        branch_bytes[n_blocks] = m.cache.bytes_read - b0;
+        draft_kda_calls += waste_model_cuda_kda_calls(&m) - k0;
+        draft_dense_calls += waste_model_cuda_dense_calls(&m) - d0;
+        draft_vq_experts += waste_model_cuda_vq_experts(&m) - ve0;
+        draft_vq_applies += waste_model_cuda_vq_applies(&m) - va0;
+        draft_vq_launches += waste_model_cuda_vq_launches(&m) - vl0;
+        draft_vq_syncs += waste_model_cuda_vq_syncs(&m) - vs0;
+        draft_fallbacks += waste_model_cuda_kda_fallbacks(&m) - f0;
+        accepted[n_blocks] = prefix;
+        rejection_hist[prefix]++;
+        total_accepted += prefix;
+
+        if (waste_model_set_routed_expert_limit(&m, 0)) {
+            fprintf(stderr, "selfdraft could not restore full experts\n");
+            goto out;
+        }
+        int restored_pos = -1;
+        started = now();
+        if (waste_model_state_import(&m, snapshot, snapshot_bytes,
+                                     &restored_pos) ||
+            restored_pos != n_prompt + pos) {
+            fprintf(stderr, "selfdraft restore failed at %d\n", pos);
+            goto out;
+        }
+        restore_seconds += now() - started;
+
+        int commit = prefix < width ? prefix + 1 : width;
+        if (prefix == width && pos + width < n_target) commit++;
+        if (commit > n_target - pos) commit = n_target - pos;
+        committed[n_blocks] = commit;
+        total_committed += commit;
+        for (int j = 0; j < commit; j++) {
+            /* State import restores the recurrent state, not the caller's
+             * view of the logits scratch buffer: the reduced branch has
+             * overwritten that storage. The root argmax was checked before
+             * branching; after the first canonical step, each returned row
+             * is again the exact row for the following target token. */
+            if (j > 0 && argmax(logits, m.cfg.vocab) != target[pos + j]) {
+                fprintf(stderr, "selfdraft target replay drift at %d\n", pos + j);
+                goto out;
+            }
+            started = now();
+            logits = waste_model_step(&m, target[pos + j],
+                                      n_prompt + pos + j, NULL);
+            target_seconds += now() - started;
+            if (!logits || !finite_row(logits, m.cfg.vocab)) {
+                fprintf(stderr, "selfdraft target replay failed at %d\n", pos + j);
+                goto out;
+            }
+            waste_ecache_decode_tick(&m.cache);
+        }
+        waste_ecache_drain(&m.cache);
+        pos += commit;
+        n_blocks++;
+    }
+    getrusage(RUSAGE_SELF, &ru1);
+
+    size_t final_state_bytes = 0;
+    uint64_t final_state_hash = 0;
+    if (state_hash(&m, n_prompt + n_target, &final_state_hash,
+                   &final_state_bytes)) {
+        fprintf(stderr, "selfdraft final state export failed\n");
+        goto out;
+    }
+    printf("{\n  \"schema\":\"waste.gn100.k3_selfdraft.v1\",\n");
+    printf("  \"offline_trajectory_probe\":true,"
+           "\"integrated_decoder\":false,"
+           "\"draft_experts\":%d,\"target_experts\":%d,"
+           "\"width\":%d,\n", DRAFT_EXPERTS, m.cfg.top_k, WIDTH);
+    printf("  \"prompt_tokens\":%d,\"target_tokens\":%d,"
+           "\"blocks\":%d,\n", n_prompt, n_target, n_blocks);
+    printf("  \"block_roots\":"); print_ints(roots, n_blocks); puts(",");
+    printf("  \"block_widths\":"); print_ints(widths, n_blocks); puts(",");
+    printf("  \"accepted_prefix\":"); print_ints(accepted, n_blocks); puts(",");
+    printf("  \"committed\":"); print_ints(committed, n_blocks); puts(",");
+    printf("  \"proposals\":");
+    print_int_matrix(proposals, n_blocks, WIDTH); puts(",");
+    printf("  \"survival_counts\":"); print_ints(survival, WIDTH); puts(",");
+    printf("  \"eligible_counts\":"); print_ints(eligible, WIDTH); puts(",");
+    printf("  \"rejection_histogram_accepted_prefix_0_to_4\":");
+    print_ints(rejection_hist, WIDTH + 1); puts(",");
+    printf("  \"agreement\":{\"marginal_matches\":%d,"
+           "\"proposal_slots\":%d,\"marginal\":%.9f,"
+           "\"accepted_proposals\":%d,\"committed_tokens\":%d,"
+           "\"committed_per_block\":%.9f},\n",
+           marginal_matches, proposal_slots,
+           proposal_slots ? (double)marginal_matches / proposal_slots : 0,
+           total_accepted, total_committed,
+           n_blocks ? (double)total_committed / n_blocks : 0);
+    printf("  \"timing\":{\"prefill_seconds\":%.9f,"
+           "\"draft_branch_seconds\":%.9f,\"draft_forward_steps\":%d,"
+           "\"seconds_per_draft_forward\":%.9f,"
+           "\"seconds_per_block\":%.9f,\"target_replay_seconds\":%.9f,"
+           "\"target_tok_s\":%.9f,\"snapshot_seconds\":%.9f,"
+           "\"restore_seconds\":%.9f},\n",
+           prefill_seconds, draft_seconds_total, draft_steps,
+           draft_steps ? draft_seconds_total / draft_steps : 0,
+           n_blocks ? draft_seconds_total / n_blocks : 0,
+           target_seconds, target_seconds > 0 ? n_target / target_seconds : 0,
+           snapshot_seconds, restore_seconds);
+    printf("  \"branch_seconds\":");
+    print_doubles(branch_seconds, n_blocks); puts(",");
+    printf("  \"branch_hits\":"); print_u64s(branch_hits, n_blocks); puts(",");
+    printf("  \"branch_misses\":"); print_u64s(branch_misses, n_blocks); puts(",");
+    printf("  \"branch_bytes\":"); print_u64s(branch_bytes, n_blocks); puts(",");
+    printf("  \"draft_cuda_delta\":{\"kda_calls\":%" PRIu64
+           ",\"dense_calls\":%" PRIu64 ",\"vq_experts\":%" PRIu64
+           ",\"vq_applies\":%" PRIu64 ",\"vq_launches\":%" PRIu64
+           ",\"vq_syncs\":%" PRIu64 ",\"fallbacks\":%" PRIu64 "},\n",
+           draft_kda_calls, draft_dense_calls, draft_vq_experts,
+           draft_vq_applies, draft_vq_launches, draft_vq_syncs,
+           draft_fallbacks);
+    printf("  \"final_state\":{\"bytes\":%zu,"
+           "\"hash\":\"0x%016" PRIx64 "\"},\n",
+           final_state_bytes, final_state_hash);
+    print_process_safety("selfdraft_complete_probe", ru1.ru_majflt - ru0.ru_majflt);
+    printf("  \"profile\":{\"full_top_k_restored\":%s,"
+           "\"preserved_top16_selection_and_weights\":true,"
+           "\"direct_io\":%d,\"io_threads\":%d,\"io_depth\":%d,"
+           "\"cuda_requested\":{\"kda\":%d,\"dense\":%d,\"vq\":%d},"
+           "\"cuda_effective\":{\"kda\":%d,\"dense\":%d,\"vq\":%d},"
+           "\"fallbacks\":%" PRIu64 "}\n}\n",
+           waste_model_get_routed_expert_limit(&m) == 0 ? "true" : "false",
+           m.direct_io, waste_ecache_io_threads(&m.cache),
+           waste_ecache_io_depth(&m.cache), waste_model_get_cuda_kda(&m),
+           waste_model_get_cuda_dense(&m), waste_model_get_cuda_vq(&m),
+           waste_model_cuda_kda_effective(&m),
+           waste_model_cuda_dense_effective(&m),
+           waste_model_cuda_vq_effective(&m),
+           waste_model_cuda_kda_fallbacks(&m));
+    rc = 0;
+
+out:
+    if (m.cfg.top_k) waste_model_set_routed_expert_limit(&m, 0);
+    free(snapshot); free(roots); free(widths); free(accepted); free(committed);
+    free(proposals); free(branch_seconds); free(branch_hits);
+    free(branch_misses); free(branch_bytes); free(prompt); free(target);
+    waste_model_free(&m);
+    return rc;
+}
+
 static int append_tokens(const waste_tok *tok, int32_t *out, int cap, int *n,
                          const char *text, int special)
 {
@@ -2008,12 +2302,13 @@ static void usage(const char *name)
         "  %s resident-target TARGET TARGET_USAGE|- DRAFT DRAFT_USAGE|- "
         "TARGET_PROMPT_IDS DRAFT_PROMPT_IDS N_GEN\n"
         "  %s teacher MODEL CACHE_MB USAGE|- PROMPT_IDS TARGET_IDS\n"
+        "  %s selfdraft MODEL CACHE_MB USAGE|- PROMPT_IDS TARGET_IDS\n"
         "  %s state MODEL CACHE_MB USAGE|- PROMPT_IDS TARGET_IDS\n"
         "  %s verify4 serial|chunk0|chunk1 MODEL CACHE_MB USAGE|- "
         "PROMPT_IDS ROOT_IDS|- PROPOSAL_IDS\n"
         "  %s load TARGET TARGET_CACHE_MB USAGE|- DRAFT DRAFT_CACHE_MB "
         "USAGE|- TARGET_ROLLBACK_BYTES DRAFT_ROLLBACK_BYTES\n",
-        name, name, name, name, name, name, name);
+        name, name, name, name, name, name, name, name);
 }
 
 int main(int argc, char **argv)
@@ -2025,6 +2320,7 @@ int main(int argc, char **argv)
     else if (!strcmp(argv[1], "resident-target"))
         rc = resident_target_mode(argc, argv);
     else if (!strcmp(argv[1], "teacher")) rc = teacher_mode(argc, argv);
+    else if (!strcmp(argv[1], "selfdraft")) rc = selfdraft_mode(argc, argv);
     else if (!strcmp(argv[1], "state")) rc = state_mode(argc, argv);
     else if (!strcmp(argv[1], "verify4")) rc = verify4_mode(argc, argv);
     else if (!strcmp(argv[1], "load")) rc = load_mode(argc, argv);

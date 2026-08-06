@@ -2878,6 +2878,8 @@ static int moe_layer(waste_model *m, int L, const float *in, float *out, int *ro
 {
     const waste_config *c = &m->cfg;
     const int E = c->n_experts, K = c->top_k, hid = c->hidden;
+    const int execute_k = m->routed_expert_limit > 0
+                        ? m->routed_expert_limit : K;
     /* K3's Stable LatentMoE: experts run on a narrower projection of the
      * hidden state. `in` still drives the router and the shared experts. */
     const int lat = c->latent_dim ? c->latent_dim : hid;
@@ -2947,7 +2949,7 @@ static int moe_layer(waste_model *m, int L, const float *in, float *out, int *ro
     /* Every id this layer will read is known here, before the first read.
      * Handing them over lets the cache keep reads in flight while the
      * matmuls below run; without read-ahead it does nothing. */
-    waste_ecache_hint(&m->cache, L, idx, K);
+    waste_ecache_hint(&m->cache, L, idx, execute_k);
 
     const int inter = c->moe_inter;
     float *ga = m->ff, *ub = ga + inter, *acc = m->e_gate;
@@ -2967,12 +2969,12 @@ static int moe_layer(waste_model *m, int L, const float *in, float *out, int *ro
     int routed_grouped = 0;
 #if defined(WASTE_ENABLE_CUDA)
     if (m->cuda_vq_mode == 2 && m->cuda_vq_group > 1) {
-        if (moe_vq_grouped(m, L, idx, w, K, xin, ysum, lat, inter))
+        if (moe_vq_grouped(m, L, idx, w, execute_k, xin, ysum, lat, inter))
             return -1;
         routed_grouped = 1;
     }
 #endif
-    for (int j = 0; j < K && !routed_grouped; j++) {
+    for (int j = 0; j < execute_k && !routed_grouped; j++) {
         PROF_START(P_EDEQ);
         const uint8_t *rec = read_expert(m, L, idx[j]);
         PROF_END(P_EDEQ);
@@ -3594,6 +3596,18 @@ uint64_t waste_model_cuda_vq_launches(const waste_model *m)
 uint64_t waste_model_cuda_vq_syncs(const waste_model *m)
 {
     return m ? m->cuda_vq_syncs : 0;
+}
+
+int waste_model_set_routed_expert_limit(waste_model *m, int limit)
+{
+    if (!m || limit < 0 || limit > m->cfg.top_k) return -1;
+    m->routed_expert_limit = limit;
+    return 0;
+}
+
+int waste_model_get_routed_expert_limit(const waste_model *m)
+{
+    return m ? m->routed_expert_limit : 0;
 }
 
 /* Read-ahead. The internal SSD reaches 12.89 GB/s at queue depth 2 against

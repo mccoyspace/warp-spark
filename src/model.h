@@ -156,6 +156,12 @@ typedef struct {
     int      cuda_dense_scope, cuda_dense_effective;
     int      cuda_vq_mode, cuda_vq_effective, cuda_vq_preflight_modes;
     int      cuda_vq_group;          /* experts between mode-2 stream syncs */
+    /* Experimental self-draft control. Zero executes the model's complete
+     * routed top-K. A positive value preserves the complete top-K selection,
+     * normalization, and ordering but evaluates only this many leading
+     * experts. It is intentionally decode-only: canonical prompt prefill and
+     * verification keep using the complete model. */
+    int      routed_expert_limit;
     int      cuda_kda_state_dirty;
     uint64_t cuda_kda_fallbacks, cuda_kda_calls, cuda_dense_calls;
     uint64_t cuda_vq_experts, cuda_vq_applies, cuda_vq_lut_builds;
@@ -237,6 +243,10 @@ uint64_t    waste_model_cuda_vq_applies(const waste_model *m);
 uint64_t    waste_model_cuda_vq_lut_builds(const waste_model *m);
 uint64_t    waste_model_cuda_vq_launches(const waste_model *m);
 uint64_t    waste_model_cuda_vq_syncs(const waste_model *m);
+/* Experimental probe hook, not a generation-quality control. `limit=0`
+ * restores the model's complete routed top-K. */
+int         waste_model_set_routed_expert_limit(waste_model *m, int limit);
+int         waste_model_get_routed_expert_limit(const waste_model *m);
 const char *waste_model_read_error(const waste_model *m, int *layer, int *expert);
 /* Clears both sticky per-call flags: the record error and the context
  * one. Called to arm a fresh eval or generate. */
