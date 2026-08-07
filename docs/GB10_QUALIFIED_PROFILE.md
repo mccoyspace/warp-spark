@@ -68,6 +68,22 @@ clock, and utilization context.
 Both values are reported together. The loaded-idle value is measured in the
 same session as the workload it qualifies.
 
+## Measured power
+
+The 2026-08-07 consolidation campaign used a same-session 63.66 W
+resident-server baseline. For matched fresh-server, cold-cache requests with
+74 prompt and 64 generated tokens, CPU-only averaged 0.1112 full-request tok/s
+at 114.35 W and 1,018.39 total J/generated token. The qualified CUDA profile
+averaged 0.2125 tok/s at 130.49 W and 609.61 total J/generated token. CUDA
+therefore raised mean wall power by 16.14 W while improving throughput 91.05%
+and reducing total J/generated token 40.14%.
+
+Two exact 192-token family-root hits averaged 0.3842 full-request tok/s and
+338.31 total J/generated token. The complete table, prefill normalization,
+ambient reading, and safety record are in the
+[machine-readable power summary](gn100/consolidation-task2-power-summary.json)
+and [GN100 result narrative](GN100.md#power-characterization-2026-08-07).
+
 ## Promotion evidence
 
 The frozen source at `ed0834e` completed 50/50 exact 64-token trajectories over

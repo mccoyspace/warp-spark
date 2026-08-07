@@ -7,8 +7,12 @@
 > performance CPUs, child-scoped Q0, two direct-I/O readers at depth two, Q8,
 > and no router lookahead. A 4.52-hour promotion soak completed 50/50 exact
 > trajectories; its 24 CLI rows sustained **0.654 tok/s mean** (0.64–0.68)
-> on the development corpus. The held-out absolute number is reserved for the
-> consolidation Task 4 campaign. See the
+> on the development corpus. In a same-session, cold-cache full-request power
+> comparison, CUDA delivered **0.2125 vs 0.1112 tok/s** for CPU-only while
+> raising mean wall power by 16.14 W and **reducing total J/token by 40.14%**.
+> Exact family-root hits averaged 0.3842 tok/s and 338.31 total J/token. The
+> held-out absolute number is reserved for the consolidation Task 4 campaign.
+> See the
 > [qualified profile](docs/GB10_QUALIFIED_PROFILE.md) and
 > [promotion record](docs/GN100.md#qualified-cuda-promotion-2026-08-07).
 > Start with [GN100 results and reproduction notes](docs/GN100.md), then see

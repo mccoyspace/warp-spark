@@ -1,0 +1,114 @@
+{
+  "schema": "waste.gn100.consolidation_task2.public_summary.v1",
+  "campaign": "consolidation-task2-power-20260807-v1",
+  "completed_date": "2026-08-07",
+  "source_commit": "321bc511c93bbb1a637a2c4b0ec895e2aabf9a77",
+  "conditions": {
+    "ordinary_throughput": "generated tokens / full HTTP request wall time",
+    "ordinary_cache_state": "fresh server and cold runtime expert cache per repetition",
+    "ordinary_prompt_tokens": 74,
+    "ordinary_generated_tokens": 64,
+    "prefill_prompt_tokens": 1102,
+    "prefill_generated_tokens": 16,
+    "ambient_temperature_c": 26.1111111111,
+    "ambient_temperature_f": 79.0
+  },
+  "loaded_idle": {
+    "seconds": 600.0000939369,
+    "mean_wall_w": 63.6552051973,
+    "peak_wall_w": 72.6,
+    "mean_nvml_w": 11.4753390947,
+    "peak_nvml_w": 11.6
+  },
+  "arms": {
+    "cpu": {
+      "n": 2,
+      "mean_seconds": 575.4035749435,
+      "mean_tokens_per_second": 0.1112263074,
+      "mean_wall_w": 114.3500564884,
+      "peak_wall_w": 123.6,
+      "mean_total_j_per_generated_token": 1018.3900366969,
+      "mean_marginal_j_per_generated_token": 455.7804486143,
+      "mean_nvml_w": 13.6556135474
+    },
+    "cuda": {
+      "n": 2,
+      "mean_seconds": 301.193266511,
+      "mean_tokens_per_second": 0.2124935507,
+      "mean_wall_w": 130.4873829091,
+      "peak_wall_w": 141.9,
+      "mean_total_j_per_generated_token": 609.609375,
+      "mean_marginal_j_per_generated_token": 314.5125017795,
+      "mean_nvml_w": 20.3072841214
+    },
+    "prefill": {
+      "n": 2,
+      "mean_seconds": 3043.5157661438,
+      "mean_tokens_per_second": 0.0052570781,
+      "mean_wall_w": 134.3373835945,
+      "peak_wall_w": 145.2,
+      "mean_total_j_per_generated_token": 25347.1425466086,
+      "mean_marginal_j_per_generated_token": 13445.1513932236,
+      "mean_total_j_per_prompt_token": 368.0165886985,
+      "mean_marginal_j_per_prompt_token": 195.2109095205
+    },
+    "warm_family_root_hit": {
+      "n": 2,
+      "restored_tokens": 192,
+      "mean_seconds": 166.5944812298,
+      "mean_tokens_per_second": 0.3841923109,
+      "mean_wall_w": 131.9419720952,
+      "peak_wall_w": 139.1,
+      "mean_total_j_per_generated_token": 338.3118514794,
+      "mean_marginal_j_per_generated_token": 177.7430138032
+    }
+  },
+  "cpu_cuda_comparison": {
+    "cuda_throughput_increase": 0.9104612547,
+    "cuda_time_reduction": 0.4765530149,
+    "cuda_mean_wall_power_increase_w": 16.1373264207,
+    "cuda_total_j_per_generated_token_reduction": 0.4013989208,
+    "cuda_marginal_j_per_generated_token_reduction": 0.3099473601,
+    "content_exact": true,
+    "expert_traffic_exact": true
+  },
+  "warm_seed_context": {
+    "formal_arm": false,
+    "seconds": 693.5864071846,
+    "tokens_per_second": 0.0922740113,
+    "total_j_per_generated_token": 1426.89375,
+    "warm_hit_speedup": 4.1636025719,
+    "warm_hit_total_j_per_generated_token_reduction": 0.7629032635,
+    "attribution_note": "The seed-to-hit delta includes expert-cache warming and is not attributed to prefix restoration alone."
+  },
+  "integrity": {
+    "wall_samples": 9887,
+    "wall_maximum_gap_seconds": 1.0883009434,
+    "nvml_samples": 39535,
+    "nvml_maximum_gap_seconds": 0.2590000629,
+    "host_samples": 9600,
+    "host_maximum_gap_seconds": 1.0385780334,
+    "logger_returncodes_clean": true,
+    "q0_holders_clean": 7,
+    "prefill_content_exact": true
+  },
+  "safety": {
+    "maximum_process_swap_kib": 0,
+    "maximum_host_swap_kib": 0,
+    "swap_in_delta_pages": 0,
+    "swap_out_delta_pages": 0,
+    "minimum_memavailable_gib": 28.1028175354,
+    "maximum_gpu_temperature_c": 69.0,
+    "maximum_nvme_temperature_c": 72.85
+  },
+  "evidence": {
+    "archive": "waste-gn100-consolidation-task2-power-evidence-2026-08-07.tar.gz",
+    "archive_sha256": "c0dbf9bde2b66da5a8dd0134e1864bd2b893c45b5f0cb6d8cb1dda799b978437",
+    "raw_contract_sha256": "50eb2c302320fe3360c7306fa85cd29df9c27c25ee907494c34b6a2ba341191d",
+    "raw_summary_sha256": "9d8c942e3d87f2e10201a10c02d79a59fca89869c6288d6906f4acae6bbcc2b0",
+    "analysis_summary_sha256": "905587da50a5ba83cd91654b644c00e0950928c0735d3c3254ab1d43ada02815",
+    "results_csv_sha256": "31f416538664e05718d3e5574706ff21e805e7d522c4f757515badf8fff59832"
+  },
+  "h2_status": "sealed_not_used",
+  "upstream_submission": "none"
+}
