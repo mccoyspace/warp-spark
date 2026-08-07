@@ -68,7 +68,7 @@ The three portable candidates were replayed on this base:
   checks on macOS;
 - `pr/in-memory-state-snapshots` (`6fba880`) applied without conflicts and
   passed `30 passed, 0 failed, 13 skipped` plus 173 server checks; and
-- `pr/server-prefix-cache` (`0c53bc7`), stacked on snapshots, applied without
+- `pr/server-prefix-cache` (`9799a6f`), stacked on snapshots, applied without
   conflicts and passed `30 passed, 0 failed, 13 skipped` plus 202 server
   checks.
 
