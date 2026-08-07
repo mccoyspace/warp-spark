@@ -1,4 +1,4 @@
-# Draft comment for upstream issue #11
+# GB10 end-to-end CUDA result
 
 CUDA is viable for K3 on the NVIDIA GB10, and we now have an engine-level
 result rather than a kernel projection. The qualified VQ3R path is
