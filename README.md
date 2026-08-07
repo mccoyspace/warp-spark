@@ -2,21 +2,19 @@
 
 > **NVIDIA GB10 / DGX Spark / Acer Veriton GN100 lab fork.** `main` mirrors
 > upstream; green, combined GB10 work lives on `spark/integration`; measured
-> milestones and raw evidence stay immutable. The current qualified K3 profile
-> uses eight compute threads on pinned performance CPUs, child-scoped Q0, two
-> direct-I/O readers at depth two, Q8, and no router lookahead, and measures
-> **0.34–0.35 tok/s**.
-> The separate `exp/cuda-vq-gb10` branch now extends the opt-in CUDA path
-> through expert VQ gather. Mode 2/group 1 passed a byte-exact 64-token gate
-> at **0.9018 tok/s** versus **0.7079 tok/s** with VQ on the CPU. A tuned
-> single-user studio profile then repeated at **1.0042 and 1.0030 tok/s**
-> (1.0036 median), but its capture-derived hotlist is an in-sample result and
-> its 64-token endpoint is 0.9441 tok/s. The work remains experimental. See
-> [the GB10 CUDA VQ result](docs/GPU_VQ_GB10.md).
+> milestones and raw evidence stay immutable. The qualified K3 profile now
+> combines CUDA KDA, dense projections, and expert VQ gather with ten pinned
+> performance CPUs, child-scoped Q0, two direct-I/O readers at depth two, Q8,
+> and no router lookahead. A 4.52-hour promotion soak completed 50/50 exact
+> trajectories; its 24 CLI rows sustained **0.654 tok/s mean** (0.64–0.68)
+> on the development corpus. The held-out absolute number is reserved for the
+> consolidation Task 4 campaign. See the
+> [qualified profile](docs/GB10_QUALIFIED_PROFILE.md) and
+> [promotion record](docs/GN100.md#qualified-cuda-promotion-2026-08-07).
 > Start with [GN100 results and reproduction notes](docs/GN100.md), then see
 > [the upstreaming map](docs/UPSTREAMING.md) and
 > [upstream issue #14](https://github.com/sqliteai/waste/issues/14).
-> `tools/spark_serve.sh` is the single-user GN100 launch path.
+> `tools/spark_cuda_serve.sh` is the qualified single-user GN100 server path.
 
 WASTE is an embeddable inference engine written in C, with no third-party runtime dependencies. It keeps the model trunk in memory, streams selected experts directly from disk, and uses the remaining RAM as a bounded expert cache.
 

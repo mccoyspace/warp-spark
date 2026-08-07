@@ -1,8 +1,9 @@
 # Qualified GB10 CUDA operating profile
 
-This file is the frozen execution header for the GB10 consolidation soak. It
-promotes only the CUDA work qualified through Sprint 13; later cache-policy and
-speculative-decoding experiments remain on their own branches.
+This file is the promoted GB10 operating profile. It includes only the CUDA
+work qualified through Sprint 13 and accepted by the 2026-08-07 consolidation
+soak; later cache-policy and speculative-decoding experiments remain on their
+own branches.
 
 ## Engine profile
 
@@ -66,3 +67,13 @@ clock, and utilization context.
 
 Both values are reported together. The loaded-idle value is measured in the
 same session as the workload it qualifies.
+
+## Promotion evidence
+
+The frozen source at `ed0834e` completed 50/50 exact 64-token trajectories over
+4.52 hours. The 24 CLI rows sustained 0.654 tok/s mean (0.64–0.68) across the
+A+B+H1 development corpus. The fail-closed probe refused an invalid CUDA mode
+combination before generation; process and host swap deltas were zero; GPU and
+NVMe temperatures remained bounded. See
+[GN100.md](GN100.md#qualified-cuda-promotion-2026-08-07) and the compact
+[machine-readable summary](gn100/consolidation-task1-v9-summary.json).

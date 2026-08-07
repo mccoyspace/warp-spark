@@ -1,0 +1,57 @@
+{
+  "schema": "waste.gn100.consolidation_task1.public_summary.v1",
+  "campaign": "consolidation-task1-soak-20260806-v9",
+  "completed_date": "2026-08-07",
+  "source_commit": "ed0834e0c6d0912128fce99c537f11f493b34be2",
+  "duration_hours": 4.52,
+  "trajectory_count": 50,
+  "correctness": {
+    "retained_32_prefix_matches": 24,
+    "retained_64_matches": 50,
+    "q0_clean_trajectories": 50,
+    "cuda_fallbacks": 0,
+    "fail_closed_refused_before_generation": true
+  },
+  "cli_decode": {
+    "n": 24,
+    "tokens_per_trajectory": 64,
+    "mean_tokens_per_second": 0.6541666667,
+    "median_tokens_per_second": 0.65,
+    "minimum_tokens_per_second": 0.64,
+    "maximum_tokens_per_second": 0.68,
+    "mean_decode_seconds": 97.8316666667
+  },
+  "ordinary_server_end_to_end": {
+    "n": 24,
+    "mean_tokens_per_second": 0.2139251236,
+    "minimum_tokens_per_second": 0.2040889274,
+    "maximum_tokens_per_second": 0.2242288957,
+    "includes_prompt_prefill": true
+  },
+  "family_root_fixture": {
+    "content_sha256": "33332a7f62658dac10117a04d0e5a361bccc3eab1b7bf2df94ef21009cda5cf9",
+    "cold_seconds": 697.861218885,
+    "restored_seconds": 168.462262431,
+    "restored_tokens": 192,
+    "wall_speedup": 4.1425373779,
+    "expert_cache_warming_is_a_confounder": true
+  },
+  "safety": {
+    "process_swap_growth_kib": 0,
+    "host_swap_in_pages": 0,
+    "host_swap_out_pages": 0,
+    "minimum_memavailable_gib": 27.4512710571,
+    "maximum_gpu_temperature_c": 70.0,
+    "maximum_nvme_temperature_c": 74.85,
+    "active_gpu_clock_median_mhz": 2470.0,
+    "active_gpu_clock_first_percentile_mhz": 2450.0
+  },
+  "evidence": {
+    "archive": "waste-gn100-consolidation-task1-v9-evidence-2026-08-07.tar.gz",
+    "archive_sha256": "10ed8eba82dbf1da9e4c98c8597e46bfaf6de674d401a7b588f2cdfe652098d2",
+    "summary_raw_sha256": "afe4556e5144ec4188bc703087755b5174dc28cfaba82b9ba099b02d08176e4d",
+    "contract_sha256": "77a7badb291d20a5c83c12c3e2b16321e85fb7367a40dcc3c949b3fdb685ee44",
+    "evidence_manifest_sha256": "9b823ef5249a4a02eb5d29a6c98341416adee4611951060f8c51de397b8a1e02"
+  },
+  "held_out_absolute_number": "reserved for consolidation Task 4"
+}
