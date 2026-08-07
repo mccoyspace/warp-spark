@@ -1,0 +1,81 @@
+{
+  "schema": "waste.gn100.consolidation_task3.public_summary.v1",
+  "campaign": "consolidation-task3-storage-20260807-v1",
+  "completed_date": "2026-08-07",
+  "source_commit": "321bc511c93bbb1a637a2c4b0ec895e2aabf9a77",
+  "conditions": {
+    "host": "Acer Veriton GN100 / NVIDIA GB10",
+    "storage": "internal Samsung MZALC4T0HBL1-00B07 NVMe, ext4",
+    "ambient_temperature_f": 79.0,
+    "fio": "12 MiB random O_DIRECT reads, libaio, one job, 60 s after 10 s ramp",
+    "engine": "qualified CUDA profile, 59340 MiB expert cache, direct I/O, two readers at depth two, lookahead zero, child-scoped Q0",
+    "ordinary_decode": "composition_a, 64 greedy tokens, promoted Sprint 12 hotlist",
+    "exact_verifier": "frozen Sprint 18 color_value_a block 1, Sprint 14 calibration hotlist"
+  },
+  "fio_sweep": [
+    {"queue_depth": 1, "gb_per_second": 7.790240574, "gib_per_second": 7.2552269083},
+    {"queue_depth": 2, "gb_per_second": 13.243492860, "gib_per_second": 12.3339638673},
+    {"queue_depth": 4, "gb_per_second": 13.264650665, "gib_per_second": 12.3536686087},
+    {"queue_depth": 8, "gb_per_second": 13.358558032, "gib_per_second": 12.4411266595}
+  ],
+  "fio_ceiling": {
+    "queue_depth": 8,
+    "gb_per_second": 13.358558032,
+    "gib_per_second": 12.4411266595
+  },
+  "ordinary_decode": {
+    "tokens_per_second": 0.65,
+    "decode_seconds": 98.03,
+    "physical_expert_read_bytes": 804902518784,
+    "effective_read_gib_per_second": 7.6468824453,
+    "fraction_of_fio_ceiling": 0.6146454943,
+    "reader_window_fraction_with_reads_inflight": 0.6636384044,
+    "reader_window_scope": "first emitted byte through process completion",
+    "experts_hit": 29332,
+    "experts_missed": 64876,
+    "content_sha256": "d30f2a16b86acec8121473c2400a65a99cbeac32eb5286b717fbedd78b9605d0"
+  },
+  "exact_verifier_block": {
+    "verifier_seconds": 4.708007306,
+    "physical_expert_read_bytes": 29900349440,
+    "effective_read_gib_per_second": 5.9147891268,
+    "fraction_of_fio_ceiling": 0.4754223061,
+    "historical_sprint18_aggregate_gib_per_second": 5.9194836464,
+    "final_state_hash": "0xad287c4471f49b17",
+    "vmswap_kib": 0,
+    "timed_major_faults_delta": 0
+  },
+  "contention": {
+    "fio_before_gb_per_second": 13.206374507,
+    "fio_paired_gb_per_second": 7.650155490,
+    "fio_after_gb_per_second": 13.370576035,
+    "ordinary_decode_tokens_per_second": 0.65,
+    "contended_decode_tokens_per_second": 0.52,
+    "decode_throughput_change": -0.20,
+    "contended_effective_read_gib_per_second": 6.0409693457,
+    "content_exact": true,
+    "expert_traffic_exact": true
+  },
+  "safety": {
+    "minimum_memavailable_gib": 28.5896415710,
+    "maximum_process_swap_kib": 0,
+    "swap_in_delta_pages": 0,
+    "swap_out_delta_pages": 0,
+    "maximum_gpu_temperature_c": 69.0,
+    "maximum_nvme_temperature_c": 75.85,
+    "host_monitor_clean": true
+  },
+  "disposition": {
+    "characterization_only": true,
+    "reader_or_depth_retuning_selected": false,
+    "plain_result": "Ordinary decode used 61.46% of the measured fio ceiling; storage has headroom, but decode is not continuously I/O-saturating."
+  },
+  "evidence": {
+    "archive": "waste-gn100-consolidation-task3-storage-evidence-2026-08-07.tar.gz",
+    "archive_sha256": "8d3f38def55e79c2940deab8e48e2ee8836feebdc3811afdbdc140e09768530f",
+    "raw_contract_sha256": "5df68e246e1b6c5e2ce9a7896bc1e0b45173aa386866f75427ce3eec47ff9cb2",
+    "raw_summary_sha256": "be79a137c54a75e0e0b905a3f284baf56eef8f2fc973166d71abe01651cd94de"
+  },
+  "h2_status": "sealed_not_used",
+  "upstream_submission": "none"
+}
