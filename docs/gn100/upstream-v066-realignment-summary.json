@@ -1,0 +1,78 @@
+{
+  "schema": "waste.gn100.upstream_v066_realignment.v1",
+  "date": "2026-08-07",
+  "source": {
+    "upstream_commit": "d9b919a791148b571e643d0af666bf19b4d733ab",
+    "candidate_branch": "spark/upstream-v066-port",
+    "tested_merge_commit": "5071d97b8a58aa96d8d564c4a5e5e07fdd8df7d5",
+    "previous_qualified_commit": "0f059b6f383804faeb5323a4446ab2e80406d4f6"
+  },
+  "inputs": {
+    "model_manifest_sha256": "da3232925d8eeaf0df07ee45743f6467c7eecbc4c0e2513899028e788a1a07f2",
+    "usage_sha256": "bc05755addf7f2ee5cfb755e1d40adeae5619c03d1016a0d42be3dec402d8531",
+    "expert_cache_mib": 59340,
+    "generated_tokens": 16,
+    "performance_cpus": "5-9,15-19"
+  },
+  "model_free_suites": {
+    "macos": {"passed": 37, "failed": 0, "skipped": 13},
+    "linux_arm64_cuda": {"passed": 36, "failed": 0, "skipped": 13}
+  },
+  "k3_cpu_vq_vs_cuda_vq": {
+    "compared_logit_rows": 17,
+    "compared_routed_rows": 1472,
+    "selected_expert_slots": 23552,
+    "byte_changed_logit_rows": 0,
+    "max_abs_logit_difference": 0.0,
+    "changed_route_rows": 0,
+    "first_token_divergence": null,
+    "cuda_fallbacks": 0,
+    "all_cuda_counters_exact": true
+  },
+  "matched_previous_vs_candidate": {
+    "previous_tok_s": 0.6023196343,
+    "candidate_tok_s": 0.6010259564,
+    "candidate_change_percent": -0.2147826320,
+    "token_hash_equal": true,
+    "logit_hash_equal": true,
+    "route_hash_equal": true,
+    "expert_traffic_equal": true
+  },
+  "cuda_xpar_axis": {
+    "xpar_0_tok_s": 0.6010259564,
+    "xpar_1_tok_s": 0.6088039267,
+    "apparent_change_percent": 1.2941150455,
+    "execution_policy": "WASTE_XPAR is explicitly ignored while CUDA VQ owns routed-expert scheduling",
+    "token_hash_equal": true,
+    "logit_hash_equal": true,
+    "route_hash_equal": true
+  },
+  "cpu_placement": {
+    "taskset": {
+      "observed_threads": 14,
+      "thread_masks": {"5-9,15-19": 14},
+      "expert_reader_masks": ["5-9,15-19", "5-9,15-19"]
+    },
+    "cpus_option": {
+      "observed_threads": 14,
+      "stable_thread_masks": {"5-9,15-19": 9, "0-19": 4},
+      "main_thread_transition": ["0-19", "5-9,15-19"],
+      "expert_reader_masks": ["0-19", "0-19"]
+    },
+    "qualified_policy": "external taskset owns the whole process; --cpus remains available to default-profile users"
+  },
+  "vq_contract": {
+    "metadata_interface": "upstream generalized VQ metadata",
+    "cuda_supported": "VQ3R",
+    "vq4p_probe": "rejected before generation with an explicit pending-contract diagnostic"
+  },
+  "q0_cleanup": {
+    "runs": 3,
+    "all_child_scoped": true,
+    "all_latency_us": 0,
+    "all_fd_open_close_counts_exact": true,
+    "all_fd_inactive_after_exit": true,
+    "all_child_returncodes_zero": true
+  },
+  "interpretation": "This bounded run validates realignment, exactness and placement. It does not replace the consolidated 64-token performance and power evidence."
+}

@@ -9,7 +9,7 @@ against the new base before opening the next PR.
 
 | Candidate | Fork branch | Draft | State |
 | --- | --- | --- | --- |
-| POSIX model-container ownership | [`pr/posix-model-lock`](https://github.com/mccoyspace/waste-spark/tree/pr/posix-model-lock) | [Description](posix-model-lock.md) | Rebased on upstream `d9b919a`; macOS and GN100 suites pass |
+| POSIX model-container ownership | [`pr/posix-model-lock`](https://github.com/mccoyspace/waste-spark/tree/pr/posix-model-lock) | [Description](posix-model-lock.md) | Open upstream as [PR #29](https://github.com/sqliteai/waste/pull/29); mergeable and awaiting review |
 | In-memory state snapshots | [`pr/in-memory-state-snapshots`](https://github.com/mccoyspace/waste-spark/tree/pr/in-memory-state-snapshots) | [Description](in-memory-state-snapshots.md) | Rebased on upstream `d9b919a`; macOS/GN100 suites and real-K3 exact round-trip pass |
 | Exact server prefix cache | [`pr/server-prefix-cache`](https://github.com/mccoyspace/waste-spark/tree/pr/server-prefix-cache) | [Description](server-prefix-cache.md) | Rebased on upstream `d9b919a`; macOS and GN100 suites pass; real-K3 evidence retained |
 | GCC AArch64 native-feature note | [`pr/gcc-aarch64-native-note`](https://github.com/mccoyspace/waste-spark/tree/pr/gcc-aarch64-native-note) | Branch diff | Documentation-only current-base candidate; not submitted upstream |

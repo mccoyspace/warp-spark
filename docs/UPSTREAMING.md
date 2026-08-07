@@ -43,8 +43,8 @@ converter reclaim, explicit `--cpus` placement, a corrected direct-I/O disk
 bench, and server/converter fixes.  VQ3R remains the default format, so the
 qualified GN100 container does not need conversion or another download.
 
-A no-commit merge into `spark/integration` found 14 textual conflicts.  Most
-are documentation or build-list combinations; the production work is
+A trial merge into `spark/integration` found 14 textual conflicts. Most were
+documentation or build-list combinations; the production work was
 concentrated in four interfaces:
 
 1. combine upstream's batch expert holds with the CUDA path's epoch-scoped
@@ -56,10 +56,31 @@ concentrated in four interfaces:
 4. reconcile the fork's API-2 additions and version string with upstream's
    new public CPU-list field.
 
-This is a focused integration and requalification project, not a container
-format migration.  Keep the consolidated-results tag immutable; perform the
-merge on a new candidate branch and promote it only after model-free suites,
-the retained K3 exactness check, and a short matched throughput run pass.
+That work is complete on `spark/upstream-v066-port` at tested merge commit
+`5071d97`. The result keeps one epoch-scoped cache hold mechanism, consumes
+upstream's generalized VQ metadata in the CUDA dispatch, rejects VQ4P before
+execution, preserves upstream `--cpus` for the default profile, and preserves
+whole-process `taskset` ownership for the qualified Spark profiles.
+
+The model-free suite passed 37/0/13 on macOS and 36/0/13 on native Linux ARM64
+with CUDA enabled; the Linux CPU-binding test ran rather than skipped. A
+focused real-K3 capture compared the CPU and CUDA VQ paths over 17 logit rows,
+1,472 routed layer rows and 23,552 selected expert slots: logits were
+byte-identical, no route or token changed, all CUDA counters were exact, and
+there was no fallback. Against the previous qualified source, the same
+16-token CUDA arm measured 0.60232 versus 0.60103 tok/s (−0.21%) with identical
+traffic and hashes. This short, low-hit run is a realignment regression check,
+not a replacement for the consolidated 64-token throughput campaign.
+
+Upstream `WASTE_XPAR=1` was also requested under the CUDA configuration. It is
+explicitly ignored while CUDA VQ owns routed-expert scheduling; the on/off
+captures were byte-identical, and the observed +1.29% is below the noise floor.
+An OS-level placement probe correlated the actual `pread64` thread IDs with
+their affinity masks. External `taskset` placed all 14 observed threads,
+including both readers, on `5-9,15-19`; `--cpus` placed the nine compute workers
+there while both readers remained eligible on `0-19`. The qualified launcher
+therefore continues to use `taskset`. Compact evidence is in
+[`gn100/upstream-v066-realignment-summary.json`](gn100/upstream-v066-realignment-summary.json).
 
 The three portable candidates were replayed on this base:
 
@@ -89,7 +110,7 @@ The order below follows dependencies, not the historical sprint order.
 | ---: | --- | --- | --- |
 | 0 | Linux 4 KiB `O_DIRECT` eligibility and transfer probing | Portable correctness | Already implemented upstream; no duplicate PR |
 | 1 | Auto-budget from Linux `MemAvailable` and cgroup-v2 headroom | Generic safety; preserve other platforms | Issue #14 is closed; upstream has stable cgroup capacity and the GN100 pressure row rejects the remaining hard ceiling |
-| 2 | POSIX model-container ownership lock with explicit opt-out | Generic safety/policy | Rebased on `d9b919a`; macOS and GN100 suites pass at `pr/posix-model-lock` |
+| 2 | POSIX model-container ownership lock with explicit opt-out | Generic safety/policy | Open upstream as [PR #29](https://github.com/sqliteai/waste/pull/29); mergeable and awaiting review |
 | 3 | Explicit CPU-list affinity | Generic configuration | Implemented upstream in v0.6.6 as `--cpus`; no duplicate PR |
 | 4 | Final phase/layer trace and request-boundary flushing | Generic observability | Reconcile with upstream cache traces |
 | 5 | Transactional in-memory state export/import and caller-owned budget reservation | Generic engine API | Rebased cleanly on `d9b919a`; macOS/GN100 suites and real-K3 bit-exact round-trip pass |
@@ -126,13 +147,15 @@ PM QoS, fixed CPU sets, thermal/CPPC/NVML/PMU collection, `bpftrace` sidecars,
 cooldown gates, and fixed K3 prompts/budgets are Spark integration and evidence
 tools.  They do not belong in the portable engine PRs.
 
-The CUDA work is not a PR candidate on this pass.  Upstream issue
+The CUDA work is not a PR candidate on this pass. Upstream issue
 [#11](https://github.com/sqliteai/waste/issues/11) is already the active CUDA
 design thread, and upstream VQ4P arrived after the qualified GB10 VQ3R path.
 The least noisy contribution is one concise results comment there: exactness,
 engine-level CPU/CUDA and held-out results, power and storage bounds, the
 consolidated release link, and an offer to discuss the source.  A CUDA PR
 should wait for maintainer interest and a decision about VQ4P coverage.
+The prepared, unposted text is in
+[`upstream-drafts/issue-11-gb10-cuda.md`](upstream-drafts/issue-11-gb10-cuda.md).
 
 `pr/gcc-aarch64-native-note` is a separate documentation-only candidate.  It
 records the observed GCC 13 failure mode where `-mcpu=native` accepts the GB10
