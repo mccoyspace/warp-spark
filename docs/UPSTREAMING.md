@@ -118,6 +118,37 @@ The order below follows dependencies, not the historical sprint order.
 | 7 | Exact, renderer-delimited family-root server cache | Generic server feature | Rebased cleanly on `d9b919a`; macOS/GN100 suites pass; depends on state snapshots |
 | 8 | Mutable conversation-head reuse | Generic follow-on | Implemented on `spark/sprint7`; exact next-turn state/output, divergent-history, replacement, and shared-budget gates pass |
 
+### Submission recommendation after realignment
+
+Do not open the stack as a batch. PR #29 is the only active upstream request;
+wait for its review before creating another notification.
+
+1. **State snapshots remain the best next PR.** They are one commit and one
+   engine primitive, passed real-K3 bit-exact restore, and enable more than the
+   server cache. Rebase it onto whatever upstream looks like after PR #29 is
+   resolved, then rerun its focused suite. It does not logically depend on the
+   lock, but both append public config/ABI surface, so sequential review avoids
+   needless conflict.
+2. **Prefix caching is viable but should be discuss-first.** The implementation
+   is useful and opt-in, but its current stacked diff is 24 files and roughly
+   2,000 added lines with renderer and server policy. After snapshots receive a
+   favorable response, show the maintainer the exact miss-hit-hit behavior and
+   measured 3.44–3.46x persistent-server request improvement, then ask whether
+   they want that policy in-tree before opening it.
+3. **CUDA belongs in issue #11, not a surprise PR.** Post the prepared concise
+   result only after owner review. The generalized VQ realignment improves a
+   future landing shape: one pluggable CUDA implementation with a documented
+   VQ3R contract and an explicit VQ4P refusal, rather than a parallel format
+   parser.
+4. **The GCC native-feature note is valid but low priority.** Keep its clean
+   branch available; offer it as a small follow-up or fold it into a maintainer-
+   requested build-doc pass instead of opening another unsolicited PR now.
+
+The `--cpus` reader-placement result is not an upstream bug report: it matches
+the documented compute-only scope. It is a Spark operating-profile finding.
+Likewise PM QoS, fixed whole-process affinity, pressure policy, hotlists and
+the held-out corpus remain fork policy or evidence, not upstream requests.
+
 Sprint 9 produced one additional discuss-first candidate: measurement
 correctness for the one-load sweep. Keep it as one narrow patch that drains
 speculative reads before timing ends or cache state is cleared, resets all
