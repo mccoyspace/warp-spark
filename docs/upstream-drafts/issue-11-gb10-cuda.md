@@ -1,11 +1,20 @@
 # Draft comment for upstream issue #11
 
-CUDA is viable for K3 on the unified-memory GB10, and we now have an
-engine-level result rather than a kernel projection. The qualified VQ3R path
-is byte-identical to the CPU path. In a matched fresh-server request it raised
+CUDA is viable for K3 on the NVIDIA GB10, and we now have an engine-level
+result rather than a kernel projection. The qualified VQ3R path is
+byte-identical to the CPU path. In a matched fresh-server request it raised
 full-request throughput from **0.1112 to 0.2125 tok/s (+91.05%)** while reducing
 wall energy from **1,018.39 to 609.61 J/generated token (−40.14%)**. It was
 promoted only after a **4.52-hour soak with 50/50 exact 64-token trajectories**.
+
+Scope first: this does **not** close gate 4 for a discrete card. GB10 is a third
+regime between the Apple result and the PCIe measurements already in this
+thread: its CPU and GPU share coherent LPDDR5x, so routed expert records do not
+pay a per-token H2D copy, while its NVIDIA GPU still requires explicit CUDA
+kernels and synchronization. What it establishes is narrower and useful: the
+original conclusion that CUDA must begin as a whole-forward, residual-resident
+engine is not universal. On GB10, incremental kernel-class offload paid while
+attention state, routing and final expert accumulation remained on the CPU.
 
 The acceptance arc was:
 
@@ -43,6 +52,8 @@ previous qualified source.
 
 The compact public evidence and raw-archive links are in the
 [consolidated GN100 release](https://github.com/mccoyspace/waste-spark/releases/tag/gn100-consolidated-results-2026-08-07),
+and the current-upstream compatibility check is in the
+[v0.6.6 realignment release](https://github.com/mccoyspace/waste-spark/releases/tag/gn100-upstream-v066-realignment-2026-08-07),
 with the operating profile in
 [`docs/GB10_QUALIFIED_PROFILE.md`](https://github.com/mccoyspace/waste-spark/blob/spark/integration/docs/GB10_QUALIFIED_PROFILE.md).
 I am happy to walk through or separate the CUDA source if that would be useful;
