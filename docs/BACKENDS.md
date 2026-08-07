@@ -274,6 +274,22 @@ revisit — and at that point move the kernel into its own translation
 unit so runtime dispatch can pick it, instead of requiring a native
 build.
 
+On AArch64, verify what `-mcpu=native` actually enabled rather than
+inferring it from the CPU. GCC 13 on a GB10 accepted that option but did
+not define `__ARM_FEATURE_DOTPROD` or `__ARM_FEATURE_MATMUL_INT8`; both
+optimized kernels were therefore compiled out even though Linux reported
+the corresponding hardware features. A quick build-host check is:
+
+```sh
+cc -mcpu=native -dM -E -x c /dev/null |
+  grep -E '__ARM_FEATURE_(DOTPROD|MATMUL_INT8)'
+```
+
+If either intended macro is absent, use explicit architecture extensions
+supported by that compiler and target, then repeat the check. The runtime
+`WASTE_SDOT` and `WASTE_I8MM` switches cannot enable code that was removed
+by the preprocessor.
+
 ## First Linux runs (2026-07-28)
 
 The engine had never been built on Linux. Docker, both architectures,
