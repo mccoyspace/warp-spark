@@ -324,6 +324,47 @@ more of the network than the client can. Local filesystem paths are off by
 default too, behind `--allow-local-images`, since they let any client read
 files the server can reach.
 
+## Open-WebUI
+
+Point it at `http://<host>:8000/v1` — with the `/v1`, since `/v1/models` is
+how the client discovers what to put in its model list.
+
+There is no compatibility mode to turn on. Open-WebUI probes
+`GET /v1/models`, then streams `POST /v1/chat/completions`, and it sends a
+bearer token whether or not one is configured — accepted when `--api-key`
+is unset. Fields it sends that this server has no notion of
+(`frequency_penalty`, `presence_penalty`, `user`) are ignored rather than
+refused: validation checks the fields it knows and leaves the rest alone,
+because a 400 for an unrecognised sampling knob makes a working client look
+broken.
+
+Four things are worth setting before the first message.
+
+**`--max-tokens`.** Open-WebUI does not send `max_tokens` unless you set it
+in the model's advanced parameters, so every reply stops at the server
+default — 4096, and worth raising for a model asked to write at length,
+since a reply that ends at the cap reads as a truncated model rather than a
+hit limit. Raising `--ctx` does not help and cannot: context only ever
+*lowers* the cap, to the room left after the prompt.
+
+**`--host`.** The default `127.0.0.1` is loopback on the machine running
+the server; Open-WebUI in a container is not on it, and needs
+`--host 0.0.0.0` — and then `--api-key`, per Security below.
+
+**Open-WebUI's task model.** It issues background requests for the
+conversation title, tags and follow-up suggestions on top of the chat
+itself. Those queue behind the reply on the lock every generation takes, so
+naming the conversation costs a whole generation at this engine's speeds,
+and the client may time it out while the answer it is waiting for is still
+streaming. Turn them off in its admin settings, or point its task model at
+a smaller backend.
+
+**The think channel.** Reasoning comes back as `reasoning_content`, on the
+message and on each SSE delta. A client that does not know that field shows
+nothing while the model reasons — which, on a model whose reasoning can be
+most of the reply, looks like a server that has stopped. `--no-thinking`
+makes the default answer-only, and a request can still ask for reasoning.
+
 ## Security
 
 - `--host` defaults to `127.0.0.1`. Binding anywhere else without
@@ -378,6 +419,9 @@ python3 -m serve MODEL [options]
   --budget SIZE      hard RAM ceiling, e.g. 48G (0 = the engine chooses)
   --ctx N            context tokens
   --threads N        compute threads (0 = one per core)
+  --cpus LIST        restrict them to a cpu list, e.g. 0-5 or 0-2,6-8;
+                     --threads 0 then means one per CPU listed. Linux and
+                     Windows — see docs/ENGINE.md, "Thread placement"
   --cache {lfru,lru} expert-cache eviction policy
   --no-direct-io     keep the page cache in the way (the bypass is on)
   --vision           load the vision tower
@@ -387,7 +431,7 @@ python3 -m serve MODEL [options]
                      opt out of the POSIX per-container process lock
   --performance-profile spark-q0
                      strict GN100 request-scoped Q0 profile
-  --max-tokens N     default cap when a request does not set one
+  --max-tokens N     default cap when a request does not set one (4096)
   --no-thinking      answer without the think channel unless asked
   --allow-local-images
   --prefix-cache SIZE          exact-prefix snapshot bytes (off by default)

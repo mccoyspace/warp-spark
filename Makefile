@@ -80,6 +80,17 @@ LDLIBS  += $(STATIC)
 SHLDFLAGS := -Wl,--export-all-symbols
 else ifeq ($(shell uname -s),Darwin)
 SOEXT   := dylib
+# Same rule as the Windows branch above, from the other direction: the
+# archiver has to match the target, and here PATH is what gets it wrong.
+# Apple's ld requires every 64-bit Mach-O member of an archive to begin on
+# an 8-byte boundary, which Apple's ar arranges by padding the member's
+# name field (`#1/20` for a 10-character name). GNU ar writes the short
+# name form instead, putting the first member at offset 68, and the build
+# then gets all the way to the link before failing with "64-bit mach-o
+# member 'kda_neon.o' not 8-byte aligned in 'libwaste.a'" — issue #16, on a
+# machine with Homebrew's binutils ahead of /usr/bin. Name the system
+# archiver rather than trusting PATH. A command-line AR= still overrides.
+AR      := $(if $(wildcard /usr/bin/ar),/usr/bin/ar,ar)
 else
 SOEXT   := so
 endif
@@ -226,8 +237,8 @@ waste$(EXE): cli/main.o libwaste.a
 # the two failures tests/run.sh was written to catch, so a binary that
 # `test` builds and `clean` forgets defeats the check meant to notice it.
 TESTNAMES := test_kda test_container test_forward test_tokenizer test_k3parts \
-             test_state test_vision test_image test_lock test_memory test_abi test_ecache \
-             sweep
+             test_state test_vision test_image test_lock test_memory test_cpus \
+             test_abi test_ecache sweep
 TESTBINS  := $(addsuffix $(EXE),$(TESTNAMES))
 
 test: $(TESTBINS)
@@ -273,6 +284,12 @@ test_lock$(EXE): tests/test_lock.o libwaste.a
 test_memory$(EXE): tests/test_memory.o src/memory.o
 	$(CC) $(CFLAGS) -o $@ $^ $(LDLIBS)
 test_abi$(EXE): tests/test_abi.o libwaste.a
+	$(CC) $(CFLAGS) -o $@ $^ $(LDLIBS)
+
+# The pool is a header, so this links no engine at all — which is the point:
+# it can check placement without a container, and the parse half of it runs
+# on the platforms that cannot bind a thread.
+test_cpus$(EXE): tests/test_cpus.o
 	$(CC) $(CFLAGS) -o $@ $^ $(LDLIBS)
 
 %.o: %.c

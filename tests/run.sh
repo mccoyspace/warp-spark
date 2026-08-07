@@ -118,6 +118,26 @@ else
     no "one-load sweep synthetic container"
 fi
 
+# The cpu list, in two halves with different reaches. Parsing runs
+# everywhere and is the half that matters most: a typo in a cpu list is
+# indistinguishable from the option not helping. Binding needs a platform
+# that has the call, so it is a SKIP on macOS rather than a pass — exit 77,
+# the one code this suite reads as "did not run".
+if ./test_cpus parse >/dev/null 2>&1; then
+    ok "cpu list parsing, including the typos that must be refused"
+else
+    no "cpu list parsing"
+    ./test_cpus parse 2>&1 | head -3
+fi
+
+./test_cpus bind >"$TMP/cpus.log" 2>&1
+case $? in
+    0)  ok "compute pool binds to a cpu list ($(cat "$TMP/cpus.log"))" ;;
+    77) sk "compute pool binds to a cpu list" \
+           "$(sed 's/^SKIP: //' "$TMP/cpus.log" | head -1)" ;;
+    *)  no "compute pool binds to a cpu list"; head -3 "$TMP/cpus.log" ;;
+esac
+
 if command -v uv >/dev/null 2>&1; then
     ./test_k3parts "$TMP/k3parts.bin" >/dev/null 2>&1
     if uv run --quiet --with torch --no-project python tools/k3parts_ref.py \

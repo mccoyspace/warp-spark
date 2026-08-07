@@ -116,6 +116,7 @@ typedef struct {
     int media_inlined;              /* the media block is already in the
                                        prompt string, inside the user turn */
     uint64_t seed;
+    const char *cpus;               /* --cpus: cpu list for the pool */
     const char *file, *stop, *system;
     const char *image[WASTE_MAX_IMAGES_CLI];
     int n_image;
@@ -149,6 +150,7 @@ static int parse_opts(int argc, char **argv, int from, opts *o)
         if (!strcmp(a, "--budget") || !strcmp(a, "--ctx") || !strcmp(a, "-n") ||
             !strcmp(a, "--temp") || !strcmp(a, "--top-p") || !strcmp(a, "--top-k") ||
             !strcmp(a, "--seed") || !strcmp(a, "--threads") ||
+            !strcmp(a, "--cpus") ||
             !strcmp(a, "--file") || !strcmp(a, "--stop") ||
             !strcmp(a, "--system") || !strcmp(a, "--image")) {
             need = 1;
@@ -172,6 +174,7 @@ static int parse_opts(int argc, char **argv, int from, opts *o)
         else if (!strcmp(a, "--top-k")) bad = parse_nonnegative_int(v, &o->top_k);
         else if (!strcmp(a, "--seed")) bad = parse_u64(v, &o->seed);
         else if (!strcmp(a, "--threads")) bad = parse_nonnegative_int(v, &o->threads);
+        else if (!strcmp(a, "--cpus")) o->cpus = v;
         else if (!strcmp(a, "--file")) o->file = v;
         else if (!strcmp(a, "--stop")) o->stop = v;
         else if (!strcmp(a, "--system")) o->system = v;
@@ -263,6 +266,7 @@ static waste_status open_model(const char *path, const opts *o, waste_ctx **ctx)
     cfg.ram_budget_bytes = o->budget;
     cfg.ctx_tokens = o->ctx;
     cfg.n_threads = o->threads;
+    cfg.cpu_list = o->cpus;
     /* The tower is 434 MB that a text prompt would never touch, so it is
      * loaded only when there is an image to put through it. */
     cfg.vision = o->n_image > 0;
@@ -271,7 +275,17 @@ static waste_status open_model(const char *path, const opts *o, waste_ctx **ctx)
      * and has not been read since. */
     cfg.verify_records = o->verify;
     cfg.allow_concurrent_open = o->allow_concurrent;
-    return waste_open(path, &cfg, ctx);
+    const waste_status st = waste_open(path, &cfg, ctx);
+    /* Two statuses that say nothing useful on their own when --cpus is
+     * what produced them, and it usually is: nothing else here can be
+     * malformed, and nothing else is refused for being unsupported on a
+     * platform that otherwise runs. */
+    if (o->cpus && st == WASTE_E_ARG)
+        fprintf(stderr, "--cpus: not a cpu list: %s\n", o->cpus);
+    else if (o->cpus && st == WASTE_E_UNSUPPORTED)
+        fprintf(stderr, "--cpus: this platform does not bind threads to "
+                        "CPUs (Linux and Windows only)\n");
+    return st;
 }
 
 static int fail(const char *what, waste_status s)
@@ -1224,8 +1238,8 @@ int main(int argc, char **argv)
                "The prompt may be an argument, a file (--file F), or stdin —\n"
                "given as - or simply piped in.\n\n"
                "options: --budget 8G  --ctx N  -n N  --temp F  --top-p F\n"
-               "         --top-k N  --seed N  --threads N  --stop STR\n"
-               "         --file F  --json  -q  --learn  --verify\n"
+               "         --top-k N  --seed N  --threads N  --cpus LIST\n"
+               "         --file F  --stop STR  --json  -q  --learn  --verify\n"
                "         --allow-concurrent-open\n"
          "  --stop  ends generation when the text appears\n"
          "  --json  machine-readable output for eval, tokenize, plan,\n"
@@ -1233,6 +1247,11 @@ int main(int argc, char **argv)
          "  --learn records which experts the run used, so the next open\n"
          "  starts with a warm cache instead of an empty one\n"
          "  --threads sets the compute pool; 0 (default) is one per core\n"
+         "  --cpus restricts that pool to a cpu list — \"0-5\", \"0-2,6-8\" —\n"
+         "  and then --threads 0 means one per CPU listed. Worth it where\n"
+         "  the cores differ: on a two-die Ryzen, six threads on one die\n"
+         "  measured 16-25%% faster than six split across both. Linux and\n"
+         "  Windows; the default is to leave placement to the OS\n"
          "  --allow-concurrent-open opts out of the POSIX container lock\n"
          "  --verify checks each expert record's checksum as it is read,\n"
          "  for a container you have not read since copying it. Costs ~5%%\n"

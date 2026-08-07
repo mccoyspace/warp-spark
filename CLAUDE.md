@@ -59,9 +59,11 @@ hardcoded port fails on a machine already using it, and it fails as
 "resume" rather than as "that port is taken".
 
 Env it reads: `WASTE_REF_MODEL` (container — **point it at a default
-`convert.py` conversion**, i.e. a 4-bit trunk; a `--trunk8` container is a
-shape nobody ships, and running the suite on one is how the Q4G load path
-stayed broken through green runs), `WASTE_REF_SRC` (source safetensors, for
+`convert.py` conversion**, i.e. a 4-bit trunk *and* VQ3R experts; a
+`--trunk8` container is a shape nobody ships, and running the suite on one
+is how the Q4G load path stayed broken through green runs — the same
+applies to `--index-bits 6`, which exercises a different kernel and a
+different record fmt), `WASTE_REF_SRC` (source safetensors, for
 the round-trip), `WASTE_ORACLE` (logits from `tools/kimi_ref.py` — **must be
 the same token ids run.sh uses**, or a mismatched dump looks exactly like an
 engine bug; setting it also turns off both generating an oracle from the
@@ -92,10 +94,29 @@ torch is never a repo dependency and never in the inference path.
 `WASTE_PROFILE=1` (phase timings), `WASTE_CACHE_MB=N` (expert cache size in
 the test harness), `WASTE_BACKEND=cpu` (disable SIMD/accelerator dispatch,
 for bisecting numeric diffs), `WASTE_VERIFY=1` (crc32 every record on the
-read path), `WASTE_THREADS`, `WASTE_DIRECT=0` (keep the page cache),
+read path), `WASTE_THREADS`, `WASTE_CPUS` (cpu list the pool binds to —
+`--cpus` on the CLI and the server, Linux and Windows; refused rather than
+ignored elsewhere, see docs/ENGINE.md "Thread placement"),
+`WASTE_DIRECT=0` (keep the page cache),
 `WASTE_Q8=0` (dequantize the trunk to f32 at load, any width — 8x the RAM
 on a 4-bit trunk, so it is out of reach on K3), `WASTE_I8MM=1`,
 `WASTE_TOK_PLAIN=1`, `WASTE_VIS_STAGE`, `WASTE_DUMP_LATENT/HIDDEN`.
+
+MoE scheduling and the VQ4P kernel: `WASTE_XPAR=1` (one task per routed
+expert instead of one per row range — **off by default**: worth ~1.18x on
+Kimi-Linear and a regression on K3, because the batch that gives it
+parallelism is the same batch that barriers the read-ahead, LEARNED §44),
+`WASTE_XPAR_BATCH=N` (experts held at a time, default 4),
+`WASTE_P6_CHUNK=N` (rows per chunk in the VQ4P apply, in index blocks,
+default 16). **These three and `WASTE_THREADS` interact, and the best
+setting inverts between models** — on Kimi-Linear `WASTE_XPAR=1` is worth
+1.24x and six threads beat eighteen; on K3 six threads are 34% *worse* than
+the default because its applies are large enough to use the E-cores too.
+LEARNED §47 has the table; do not carry a setting from one model to the
+other. Building with `-DWASTE_P6_SCALAR` drops the VQ4P kernel to its
+portable path; the two are meant to be **bit-identical**, not merely close,
+and that is checkable rather than asserted — see LEARNED §43 for why an
+int8 lookup table raises the bar that far.
 
 Profiling a decode step:
 `WASTE_PROFILE=1 WASTE_CACHE_MB=17735 ./test_forward MODEL ids out.bin 5`.
@@ -120,7 +141,7 @@ logging, signal handling and config files belong to the host, not the API.
 | `model.c` | container load + forward pass; one token per call (prefill is repeated steps, so decode is the only path) |
 | `ecache.c` | bounded LFRU expert cache over the per-layer banks |
 | `kda.c`, `kda_neon.c` | Kimi Delta Attention recurrence |
-| `vq.c` | 3-stage residual VQ decode; also built standalone as `libwastevq` for `convert.py` |
+| `vq.c` | residual VQ decode; also built standalone as `libwastevq` for `convert.py` |
 | `vision.c`, `image.c` | the 27-layer ViT + projector, and file → patch tensor |
 | `tokenizer.c` | tiktoken BPE in C, Unicode classes coded directly (no regex engine) |
 | `backend.c`, `simd_*.c`, `metal.m` | kernel dispatch |
@@ -225,6 +246,14 @@ parser that reads replies back into reasoning / content / `tool_calls`;
   `tools/*.{py,sh}` — CI fails the build without it.
 - Python (`tools/`) converts and validates models. It never runs alongside
   the engine, and torch is never a dependency of the inference path.
+- **`convert.py --reclaim on` deletes source shards as it consumes them**,
+  which is what lets K3 convert on one disk instead of two (1.42 TB of
+  staging beside a 982 GB container). It is safe because every tensor has
+  exactly one consumer, it refuses before deleting rather than during, and
+  it is **not reversible** — a reclaimed shard has to be downloaded again
+  and `verify_container.py` can no longer check the container against its
+  source. Prove a recipe with `--reclaim dry` first; docs/K3.md has the
+  refusals and the ledger discipline.
 - Comments here explain *why*, usually with the failure that motivated
   them. Match that: a comment that only restates the code is noise, but the
   Makefile's and CI's explanations of past breakage are load-bearing.

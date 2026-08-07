@@ -56,7 +56,7 @@ Shipped in 0.5.0, nine commands: `run`, `chat` (state kept across turns,
 `/reset`, `/stats`, `/save`, `/load`, `/image`), `eval`, `tokenize`,
 `detokenize`, `bench`, `plan`, `info`, `version` — the full surface is
 tabulated at the end of this document, and it is still those nine in the
-0.7.0-spark.1 integration.
+0.7.0-spark.2 integration.
 Still to come as *subcommands*: `serve` and `convert`.
 
 Both exist; neither is a `waste` subcommand, and for related reasons. The
@@ -369,7 +369,72 @@ stale test binary. So it rebuilds first, and a missing prerequisite is
 reported as SKIP, never as a pass.
 
 
-## CLI surface (2026-08-02)
+## Thread placement (2026-08-04)
+
+The compute pool has a size (`--threads`, `waste_cfg.n_threads`) and now a
+place: `--cpus LIST`, `waste_cfg.cpu_list`, `WASTE_CPUS`. A Linux-style cpu
+list — `0-5`, `0-2,6-8`, `3`. The default is unchanged and stays unchanged:
+**the engine names no CPUs and the OS places the threads.**
+
+**Why it exists.** On a machine whose cores are interchangeable, placement
+is not worth an option. On one whose cores are not, it is worth more than
+the thread count. Third-party measurement on a Ryzen 9 9900X — Zen 5, two
+6-core CCDs with separate 32 MB L3 — running Kimi-Linear-48B, thread count
+and CPU count held constant so only locality differs
+([issue #23](https://github.com/sqliteai/waste/issues/23)):
+
+| 6 threads on | median tok/s |
+|---|---|
+| `0-5`, one CCD | 16.0 |
+| `0-2,6-8`, split 3+3 | 12.1 |
+| `0-23`, all CPUs | 14.5 |
+
+Every run reports identical `bytes_read` and identical hit counts, so it is
+the same work in a different place: −25% for crossing the die, and −10% for
+handing six threads twenty-four CPUs to migrate between. The other CCD
+alone reproduces the first row to 0.5%, and the penalty survives
+`WASTE_XPAR=1` unchanged (−24.9% against −25.0%), so it is a property of
+where the threads run rather than of how the work is cut.
+
+`docs/LEARNED.md` §47 is the same mechanism on a different axis — a pool
+spanning P-cores and E-cores, where the slow participant is slow by speed
+rather than by distance. Both come back to the same structure:
+`waste_parallel_for` cuts `[0,n)` into `ceil(n/nthreads)` chunks, one per
+thread, so a participant that cannot keep up is a straggler the barrier
+waits for on every dispatch.
+
+**Why it is not a default.** §47 measured capping the pool at the fast
+cores as a 25% win on Kimi-Linear and a 34% *loss* on K3, whose applies are
+4.7x larger and do use every core the machine has. A default chosen here is
+a default tuned for one model against the other, so the engine chooses
+nothing and this option is how a host that knows its machine says so.
+
+**What it does, exactly.** The pool's threads bind to the list. So does the
+thread that calls into the engine, on its first parallel region — it is a
+worker too, and with six threads an unbound caller is one of the six, which
+is the straggler the option exists to remove. It binds lazily rather than
+at open so that a server, where the thread that opens a model is rarely the
+thread that decodes on it, restricts the right threads. The expert cache's
+reader threads are deliberately left out: they spend their lives blocked in
+`pread`, and putting them on the same CPUs as the kernels they feed is
+contention for nothing.
+
+`--threads 0` with a cpu list means one thread per CPU **listed**, not per
+CPU in the machine. An explicit `--threads` still wins.
+
+**Refused, not ignored.** A malformed list is `WASTE_E_ARG`; a well-formed
+list on a platform with no such call — macOS, which has no way to bind a
+thread to a core — is `WASTE_E_UNSUPPORTED`. Neither is silently dropped,
+because a run that quietly did not pin looks exactly like pinning that did
+not help, and that is the one answer this option must never give. Linux
+binds with `sched_setaffinity`, Windows with `SetThreadAffinityMask` (one
+processor group, so a CPU past 64 is refused rather than truncated).
+
+`tests/test_cpus.c` checks both halves: the parse table runs everywhere,
+including the platforms that cannot bind, and the binding check reads each
+participant's mask back and SKIPs where it cannot.
+
+## CLI surface (2026-08-07)
 
 Nine commands. This table maps the CLI-facing library calls; it is not a
 claim that every embedding API needs a shell command. The server also uses

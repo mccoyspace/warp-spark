@@ -222,7 +222,8 @@ class TestProfiles(unittest.TestCase):
             "effective_read_ahead_threads": None,
             "effective_read_ahead_depth": None})
         self.assertEqual(public["cpu_affinity"], {
-            "managed": False, "effective_cpu_list": None})
+            "managed": False, "scope": "external",
+            "effective_cpu_list": None})
 
     def test_spark_q0_rejects_cli_or_environment_drift_atomically(self):
         environment = {"WASTE_IO_DEPTH": "4"}

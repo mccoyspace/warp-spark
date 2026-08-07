@@ -50,6 +50,14 @@ typedef struct {
     int kv_lora, q_lora, qk_nope, qk_rope, v_head;
     int kda_heads, kda_dim, conv_k;
 #define WASTE_MAX_LAYERS 128
+
+/* Vector positions sharing one fp32 scale in the int8 LUT (WQ_VQ4P).
+ * Bounds the int16 accumulator: 4 stages x 32 positions x 127 = 16256, so
+ * a block cannot overflow before it is folded into fp32. It is also what
+ * keeps the quantization honest — |LUT| tracks ||x_v||, which varies a lot
+ * across a hidden state, and one global scale would flatten the small
+ * positions to zero. */
+#define WASTE_VQ_LUT_BLK 32
     int kda_layer[WASTE_MAX_LAYERS]; /* 1 if layer is KDA                   */
     float eps, routed_scale;
     int renorm;
@@ -103,7 +111,29 @@ typedef struct {
     int n_tensors;
     float *codebooks;                /* [n_books][256][8]                   */
     float *codebooksT;               /* [n_books][8][256], for the LUT build*/
-    int n_books, vec_dim, cb_entries, stages, vq_index_block;
+    int n_books, vec_dim, cb_entries, stages;
+    /* 8 = one whole byte of index per stage (VQ3R/VQ2R). 6 = WQ_VQ4P, four
+     * indices packed into three bytes, which is what lets a stage table be
+     * 64 bytes and so live in a NEON register. Sets the per-row stride of
+     * the index stream: `stages` bytes when 8, always 3 when 6. */
+    int index_bits;
+    /* int8 view of `lut`, built alongside it when index_bits == 6: the
+     * table-lookup kernels index bytes, not floats. One fp32 scale per
+     * VQ_LUT_BLK vector positions — see vq_quant_lut. */
+    int8_t *lut8;
+    float  *lut8_scale;
+    int8_t *cq8;                     /* the same shadow for m->cq          */
+    float  *cq8_scale;
+
+    /* Per-expert scratch for the expert-parallel MoE path: one slice each
+     * for the top_k experts, so k threads can run a whole expert — gate,
+     * up, activation, down — without sharing a buffer. The row-parallel
+     * path dispatches three times per expert and the arithmetic between
+     * dispatches is microseconds; this trades that for one dispatch a
+     * layer. NULL when top_k is 1 or the allocation was declined. */
+    float *xga, *xub, *xacc, *xlut, *xqs;
+    int8_t *xlut8;
+    size_t xlut_sz, xnsc;            /* floats per down LUT, scales per it */
     /* 1 << fmt for every trunk format the language model actually uses,
      * recorded at load because the tensors left on disk never reach the
      * branch that fills in t->bits. */
@@ -191,7 +221,11 @@ typedef struct {
  *
  *   cache_bytes  hard ceiling for the expert cache; 0 = no cache
  *   want_vision  load the vision tower (434 MB of weights)
- *   n_threads    compute pool size; 0 = WASTE_THREADS, else hardware
+ *   n_threads    compute pool size; 0 = WASTE_THREADS, else the CPUs the
+ *                pool may use
+ *   cpus         cpu list the pool binds to ("0-5"); NULL = WASTE_CPUS,
+ *                else the OS decides. Validated by waste_open — a loader
+ *                called directly ignores one it cannot parse or honour.
  *   policy       waste_cache_policy: 0 = LFRU, 1 = LRU
  *   direct_io    ask for the page-cache bypass on the expert banks
  */
@@ -199,6 +233,7 @@ typedef struct {
     size_t cache_bytes;
     int    want_vision;
     int    n_threads;
+    const char *cpus;
     int    policy;
     int    direct_io;
 } waste_load_opts;

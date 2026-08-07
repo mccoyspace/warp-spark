@@ -53,7 +53,7 @@ of this section can stay about the mechanism:
 | AVX2 | `simd_avx2.c` | verified on Linux/x86_64 |
 | AVX-512 | `simd_avx512.c` | compiled and dispatched, never executed — CI runner is Zen 3, confirmed 2026-07-29 |
 | Metal | `metal.m` | correct, off by default, 22% slower |
-| CUDA | `cuda.cu` | experimental GB10 decode-KDA Q4 path, off by default |
+| CUDA | `cuda.cu` | qualified GB10 VQ3R path, off by default; VQ4P rejected explicitly |
 | BLAS, ROCm | — | not implemented; the flag refuses to build |
 | SVE, RVV | — | not implemented |
 
@@ -463,6 +463,89 @@ instead of six, with the residual stream never returning to the host — a
 different engine, not a backend. The code stays, off by default, because
 it is correct and because that argument should be re-run if the CPU path
 ever stops being bandwidth-bound.
+
+**That re-run has since happened, on NVIDIA hardware, and it splits this
+paragraph in two.** The "different engine, not a backend" conclusion
+survives. The reasoning under it — no headroom, plus a round-trip per call
+— does not transfer to a discrete card unchanged. The next section is what
+replaced it; read the two together.
+
+## CUDA: the gates, answered off-repo (2026-08-04)
+
+Everything here is **third-party and not reproduced on this machine**,
+which is why issue #11 was written as a set of gates for someone else to
+run rather than as a plan. `ssarthak15` ran gate 1 on a dual EPYC 7J13
+bare-metal node with K3; `fab2s` ran gates 1, 2 and 3 on a Ryzen 9 9900X
+(Zen 5, AVX-512) with an RTX 5060 Ti, on Kimi-Linear-48B. Method, sample
+spreads and the byte-accounting checks that make them trustworthy are in
+`docs/LEARNED.md` §48 and §50; what follows is only what it means for this
+document.
+
+**The round-trip clause does not transfer.** On the RTX 5060 Ti (sm_120,
+15.5 GB usable, PCIe Gen5 x8), against that machine's own CPU time for the
+same tensor:
+
+| | CPU (AVX-512) | GPU, full round trip |
+|---|---|---|
+| `lm_head`, 383 MB Q8G | 6.600 ms, 58.1 GB/s | **1.056 ms** |
+
+6.25x, with the kernel itself at 85-90% of theoretical VRAM bandwidth and
+an empty-kernel dispatch floor of 4.39 us — so 27 dispatches per token cost
+0.1 ms. Dispatch overhead is not what would stop a restructured engine. It
+is what stops *this* one: at the current shape, 624 dispatches per token is
+7.13 ms of pure overhead.
+
+**The bandwidth clause holds for the kernel and not for the step.** Both
+contributors reproduce "the CPU matvec runs at the machine's bandwidth" on
+x86 — 98.7% of a matched host scan on EPYC/AVX2, 73-76% of ceiling on
+Zen 5/AVX-512. But `lm_head` is 0.2% of a K3 decode step and 4.9-7.3% of a
+Kimi-Linear one. Varying core clock and DRAM speed independently puts ~84%
+of the step on the core clock and ~23% on DRAM: the step is bound by the
+LUT path's dependent gather chains, which is *latency*, not bandwidth and
+not vector width.
+
+**What actually decides it is a term Metal never had: the expert stream.**
+
+| | |
+|---|---|
+| H2D, 544 MiB = one token's routed experts | **19.8 ms at 28.8 GB/s** |
+| the same bytes, already in host RAM | 63-80 GB/s |
+| expert bank vs usable VRAM | 16.5 GiB vs 15.5 GiB — does not fit |
+
+28.8 GB/s is 90% of Gen5 x8, so the link is healthy; it is simply **slower
+than the host's own memory**. A discrete card is structurally on a worse
+path to the bytes this engine spends its time moving. GPUDirect Storage
+does not rescue it either — `nvidia_fs` was unavailable on that host, and
+at a 98.1% cache hit rate it could touch ~2% of reads regardless.
+
+With the VQ expert matmul implemented and measured on-device rather than
+substituted from an int8 kernel (13.9 ms/token, not the 3.7 ms a `matvec_q8g`
+stand-in implies), a fully restructured on-device engine projects to
+**~37.5 ms/token against a measured 62.7 ms — about 1.7x**, before KDA and
+MLA, which are a further 24% of CPU time and would need kernels of their
+own.
+
+**And the configuration that would remove the transfer term fails the
+quality gate.** A 2-stage container's expert bank is 11.04 GiB and fits
+VRAM with 3.25 GiB to spare, but its reconstruction error is 33% against
+VQ3R's 19.5% — `verify_container.py` FAILs it at the 0.30 threshold, which
+independently reproduces `docs/GATES.md` Gate 3 on other hardware. The only
+shape that fits does not pass; the shape that passes misses VRAM by
+2.27 GiB.
+
+**So nothing changes here.** `src/cuda.cu` still does not exist,
+`WASTE_ENABLE_CUDA=1` still stops the build, and filling the
+`waste_backend` slots with CUDA kernels would still reproduce the Metal
+result on different silicon. What has changed is that this is now a
+measured position rather than an argument by analogy from Apple silicon.
+
+**What would move it**, stated so it can be tested rather than argued: a
+card with enough VRAM to hold the experts resident — VQ3R's 17.77 GiB total
+fits a 24 GB part comfortably — which turns 19.8 ms of per-token H2D into a
+one-time load and deletes the deciding row. That is still one dispatch per
+layer with the residual never returning to the host, i.e. still a different
+engine and not a backend. The GPU VQ-decode throughput measured above
+applies to it unchanged.
 
 ## CI
 

@@ -4,7 +4,7 @@
 __main__.py — `python3 -m serve MODEL`.
 
 Flags mirror the CLI's where they mean the same thing (--budget, --ctx,
---threads, --vision), because a person who has run `waste run` should not
+--threads, --cpus, --vision), because a person who has run `waste run` should not
 have to learn a second vocabulary to serve the same container.
 """
 
@@ -23,6 +23,7 @@ if __package__ in (None, ""):                    # python3 serve/__main__.py
 
 from . import api                                            # noqa: E402
 from .engine import (CACHE_LFRU, CACHE_LRU,                  # noqa: E402
+                     WASTE_E_ARG, WASTE_E_UNSUPPORTED,
                      Engine, EngineError, build_info, physical_ram,
                      usable_ram, memory_ceiling, plan_memory)
 from .prefix_cache import CONTROLLER_OVERHEAD_BYTES          # noqa: E402
@@ -106,6 +107,12 @@ examples:
     g.add_argument("--threads", type=bounded_int(0, (1 << 31) - 1),
                    default=None, metavar="N",
                    help="compute threads (0 = one per core)")
+    g.add_argument("--cpus", default=None, metavar="LIST",
+                   help="restrict the compute pool to a cpu list, e.g. 0-5 "
+                        "or 0-2,6-8; --threads 0 then means one per CPU "
+                        "listed. Linux and Windows. Worth it where cores "
+                        "differ: on a two-die Ryzen, six threads on one die "
+                        "measured 16-25%% faster than six split across both")
     g.add_argument("--cache", choices=sorted(POLICIES), default="lfru")
     g.add_argument("--no-direct-io", action="store_true",
                    help="keep the page cache in the way. The bypass is on "
@@ -129,8 +136,11 @@ examples:
 
     s = ap.add_argument_group("serving")
     s.add_argument("--max-tokens", type=bounded_int(1, (1 << 32) - 1),
-                   default=512,
-                   help="default cap when a request does not set one")
+                   default=4096,
+                   help="default cap when a request does not set one "
+                        "(default 4096). Most clients never set one, and a "
+                        "reply that stops at the cap is indistinguishable "
+                        "from a model that stopped on its own")
     s.add_argument("--no-thinking", action="store_true",
                    help="answer without the think channel unless a request "
                         "asks for it. K3's reasoning can be most of a reply, "
@@ -181,6 +191,7 @@ examples:
     try:
         profile = resolve_profile(
             args.performance_profile, threads=args.threads,
+            cpus=args.cpus,
             cache=args.cache, no_direct_io=args.no_direct_io,
             verify=args.verify, environ=os.environ)
     except ProfileError as e:
@@ -229,6 +240,7 @@ examples:
             ram_budget_bytes=args.budget,
             ctx_tokens=args.ctx,
             n_threads=profile.threads,
+            cpu_list=profile.cpu_list,
             cache_policy=POLICIES[profile.cache],
             direct_io=profile.direct_io,
             vision=args.vision,
@@ -263,6 +275,14 @@ examples:
         if engine is not None:
             engine.close()
         print(f"{e}", file=sys.stderr)
+        # Two statuses that say nothing useful on their own when --cpus is
+        # what produced them, and here it usually is.
+        status = getattr(e, "status", None)
+        if args.cpus and status == WASTE_E_ARG:
+            print(f"--cpus: not a cpu list: {args.cpus}", file=sys.stderr)
+        elif args.cpus and status == WASTE_E_UNSUPPORTED:
+            print("--cpus: this platform does not bind threads to CPUs "
+                  "(Linux and Windows only)", file=sys.stderr)
         return 1
 
     try:

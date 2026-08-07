@@ -28,6 +28,17 @@
 #include <arm_neon.h>
 #endif
 
+/* The encoder has no waste_cfg to read, so WASTE_CPUS is the only way in.
+ * A list this platform cannot bind, or cannot parse, leaves placement to
+ * the OS — the strict refusal belongs at the engine's front door, where a
+ * caller asked for it explicitly and can be told. */
+static void vq_pool_init(int nthreads)
+{
+    waste_cpumask cpus;
+    const int cr = waste_cpus_resolve(NULL, &cpus);
+    waste_pool_init(nthreads, cr == WASTE_CPUS_OK ? &cpus : NULL);
+}
+
 typedef struct {
     const float *X;        /* [n][dim]                                     */
     const float *books;    /* [stages][entries][dim]                       */
@@ -88,7 +99,7 @@ static void vq_range(int b, int e, void *p)
 void waste_vq_encode(const float *X, int n, const float *books, int stages,
                      int entries, int dim, uint8_t *out, int nthreads)
 {
-    waste_pool_init(nthreads);
+    vq_pool_init(nthreads);
     vq_job j = { X, books, out, dim, entries, stages };
     waste_parallel_for(n, 4096, vq_range, &j);
 }
@@ -100,7 +111,7 @@ int waste_vq_lloyd(const float *X, int n, float *C, int entries, int dim,
 {
     uint8_t *asg = (uint8_t *)malloc((size_t)n);
     if (!asg) return -1;
-    waste_pool_init(nthreads);
+    vq_pool_init(nthreads);
     vq_job j = { X, C, asg, dim, entries, 1 };
     waste_parallel_for(n, 4096, vq_range, &j);
 

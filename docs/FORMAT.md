@@ -85,7 +85,7 @@ fuzzer in `tools/fuzz_container.py` exists for this file). Keys:
 | `arch` | descriptive; the engine derives its own from `config` |
 | `tensor_prefix` | `language_model.` on K3, `""` on Kimi-Linear |
 | `config` | the release's own config verbatim, with the multimodal wrapper under `_outer` |
-| `expert_quant` | `stages`, `vec_dim`, `entries`, `index_block`, `bits_per_weight` |
+| `expert_quant` | `stages`, `vec_dim`, `entries`, `index_block`, `index_bits`, `bits_per_weight` |
 | `layers` | per MoE layer: `file`, `experts`, `bytes`, `codebook_base` |
 | `trunk` | per tensor: `name`, `fmt`, `off`, `shape`, `group`, `scale_off`, `bytes` |
 
@@ -158,11 +158,15 @@ built.
 | 5 | **VQ2R** | 2.00 (2 stages x 256 entries, dim 8) | only where Gate 3 quality allows |
 | 6 | **SUB1** | ~1.0 direct VQ | cache-miss substitutes — specified, not written |
 | 7 | **Q3G** | 3 (+f16 scale /g128) | implemented, default for nothing — see below |
+| 8 | **VQ4P** | 3.00 (4 stages x 64 entries, dim 8, 6-bit packed) | experts, where the arithmetic is the budget — see below |
 
 The bits/weight column for VQxR is exact — one byte of index per 8-dim
 vector per stage — plus one f16 scale per output row, i.e. 16/n_in
-amortized. A reader must take `stages`/`vec_dim`/`entries` from the
-manifest rather than from the format id.
+amortized. VQ4P instead spends `index_bits` per stage, so its rate is
+`stages * index_bits / vec_dim` = 3.00. A reader must take
+`stages`/`vec_dim`/`entries`/`index_bits` from the manifest rather than
+from the format id; `index_bits` is absent in containers written before
+VQ4P and means 8 there.
 
 **Q3G exists and is not recommended.** The trunk is the RAM floor and the
 floor is what the expert cache does not get, so a 3-bit trunk looks like
@@ -202,6 +206,46 @@ microbenchmark did not model 12 threads sharing L2 — and finding that out
 cost a full reconversion. The layout stays because containers are written
 in it and it is not worse; do not repeat the 1.44x as a result.
 [LEARNED.md](LEARNED.md) §7.
+
+**VQ4P record**: the same residual VQ and the same blocked layout, at the
+same 3.00 bits/weight and the same record size, with four stages of 64
+entries instead of three of 256. Only the trailing per-row run changes,
+from `stages` whole bytes to three packed ones:
+
+`[row_block][vector_position][row_in_block][3 bytes]`
+
+Four 6-bit fields, little-endian, LSB of stage 0 at bit 0:
+
+```
+byte0 = s0 | s1<<6      byte1 = s1>>2 | s2<<4      byte2 = s2>>4 | s3<<2
+```
+
+so `s0 = b0 & 0x3f`, `s1 = (b0>>6) | (b1&0x0f)<<2`,
+`s2 = (b1>>4) | (b2&0x03)<<4`, `s3 = b2>>2`. The engine's unpack is a
+shift and a mask per stage, which is why the order is this one and not a
+tidier big-endian packing.
+
+**Why it exists.** A 64-entry stage table is 64 bytes — exactly one NEON
+`vqtbl4q` — where VQ3R's 256-entry table is sixteen vector registers on a
+machine with thirty-two and cannot be held at all. That is the whole
+reason the VQ3R gather is scalar. Measured on K3's gate shape, the kernel
+is **3.32x** the scalar one; the cost is **+2.7% perplexity** on
+Kimi-Linear, all of it from the smaller codebook. The int8 quantization of
+the runtime lookup table, which is what lets a byte shuffle index it at
+all, measured free. [LEARNED.md](LEARNED.md) §41.
+
+**It is a distinct fmt on purpose.** A VQ4P payload is byte-for-byte the
+same size as a VQ3R one for the same matrix, so a reader that took these
+three bytes for three one-byte indices would decode silently and wrongly —
+no bounds check would fire. The engine additionally refuses a record whose
+fmt byte disagrees with the manifest's `index_bits`.
+
+**Where it is worth it.** Where the apply is dispatch-bound and small:
+**1.18x on Kimi-Linear**. On K3 it is **1.09x** — measured, both containers
+on the same disk — which is real and is not a reason to reconvert 982 GB.
+The kernel is 3.88x in isolation even against a gigabyte of indices; it
+does not scale with threads inside the engine and why is an open question.
+[LEARNED.md](LEARNED.md) §46.
 
 ### Shared low-rank: on probation — specified, NOT implemented in v0
 

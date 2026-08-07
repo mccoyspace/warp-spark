@@ -2182,7 +2182,7 @@ in §30 through §36 was drawn through a harness that added more variance than
 the effects being measured, and two of them came out wrong. Building the
 harness first would have been cheaper than any of the re-runs.
 
-## 41. The cache floor was a property of a demand-only cache (2026-08-01)
+## Spark A. The cache floor was a property of a demand-only cache (2026-08-01)
 
 §4 is the oldest load-bearing measurement in this file, and §16 and the
 budget resolver are both built on it: **the cache floor is one token's
@@ -2248,7 +2248,7 @@ and nothing about §4 was wrong.** A measurement can be perfectly reproduced
 and still stop describing the system, when what changes is not the number
 but which mechanism the number was about.
 
-## 42. A sweep must reset state and time its speculative tail (2026-08-02)
+## Spark B. A sweep must reset state and time its speculative tail (2026-08-02)
 
 One model load removes a large source of process-to-process variance, but it
 does not make every arm equivalent by itself. The first version of the sweep
@@ -2274,12 +2274,12 @@ and no swap I/O. The pairwise timing effects were mixed, so the finding is not
 that lookahead is universally slower. It is that this configuration did not
 earn promotion on this hardware and workload; the Spark default remains zero.
 
-That does not erase §40 or §41. Their Mac cache sizes and storage path made
+That does not erase §40 or Spark A. Their Mac cache sizes and storage path made
 lookahead's timing and byte economics different. It establishes the missing
 boundary: a prefetch policy is qualified together with its cache, reader,
 storage, and harness, not inherited from another machine's hit-rate table.
 
-## 43. The machine the resolver was sizing against was not ours (2026-08-02)
+## Spark C. The machine the resolver was sizing against was not ours (2026-08-02)
 
 The default budget has one machine number in it, and until now that number
 was `waste_physical_ram()`. On Linux it is `sysconf(_SC_PHYS_PAGES) *
@@ -2372,3 +2372,853 @@ structure have `_v2` symbols. Old binaries using those calls fail to resolve
 them; current dynamic bindings check API identity and exact structure sizes
 first. A fork can carry different policy, but it cannot safely borrow
 upstream's ABI name.
+
+## 41. The 256-entry table was the reason the gather was scalar (2026-08-03)
+
+§25 established that the VQ3R gather is a `load -> address -> load`
+dependency and unrolled it eight ways. What it did not ask is why the
+lookup had to touch memory at all. NEON has `tbl`: 16 lookups in one
+instruction, from a table held in registers. The reason VQ3R cannot use it
+is arithmetic, not effort — a 256-entry stage table is 256 bytes, sixteen
+vector registers, on a machine with thirty-two. It does not fit, and no
+amount of blocking makes it fit.
+
+This is the same constraint the vector-search literature hit and solved:
+[Quick ADC](https://arxiv.org/pdf/1704.07355) and FAISS FastScan both
+force 4-bit sub-quantizers precisely so the table lives in a register, and
+[T-MAC](https://arxiv.org/abs/2407.00088) reports 4.7x on ARM at 3 bits
+doing the same thing for LLM weights. `vq_apply` is an ADC scan — a sum of
+per-sub-quantizer table lookups over a database of codes — so the mapping
+is exact rather than analogical.
+
+**Bits per weight is `stages * log2(entries) / vec_dim`, and three shapes
+hit 3.00.** 3x256, 4x64 and 6x16 all spend 24 bits per 8-weight vector, so
+all three are the same record size. They differ only in whether a stage
+table is addressable in registers. Swept single-threaded on K3's gate
+shape (M=3072, nv=448), medians of seven runs:
+
+| kernel | ms | vs current |
+|---|---|---|
+| scalar 3x256 fp32 (VQ3R) | 0.504 | 1.00x |
+| `vqtbl4q` split-table 3x256 int8 | 0.407 | 1.24x |
+| `vqtbl4q` 4x64 int8 | 0.152 | **3.32x** |
+| `vqtbl1q` 6x16 int8 | 0.118 | 4.27x |
+
+The split-table variant is the one that needs no format change — 256
+entries as four 64-byte tables, four `vqtbl4q` and three `orr` — and it
+buys 1.24x, because sixteen table registers still have to be reloaded per
+stage. It is not worth a kernel.
+
+**4x64 rather than 6x16, and the reason is quality, not speed.** Residual
+k-means fitted the way `convert.py` fits it, against real weights taken
+from the Q8G trunk of `kimi-linear-q8.waste` (the expert banks are already
+VQ3R and would hand 3x256 a target it can hit exactly):
+
+| shape | mean relative error | vs 3x256 |
+|---|---|---|
+| 3x256 | 19.97% | 1.000x |
+| 4x64 | 21.47% | 1.075x |
+| 6x16 | 23.60% | 1.182x |
+
+On a real routed expert the same comparison reads 19.29% -> 20.85%
+(+8.1%), so the trunk proxy was sound. 6x16 is a third faster and more
+than twice the quality cost; 4x64 is the shape.
+
+**End to end on Kimi-Linear, 1023 tokens of two different texts:**
+
+| container | perplexity |
+|---|---|
+| VQ3R 3x256 | 10.937 |
+| 4x64, byte indices, fp32 LUT | 11.248 |
+| VQ4P, 6-bit packed, int8 LUT | **11.237** |
+
+**The int8 table is free.** All of the +2.7% is the codebook shape;
+quantizing the table — which is what makes a byte shuffle possible at all
+— costs nothing measurable, and the packed container is marginally the
+better of the two. One scale per 32 vector positions is why: a LUT entry
+is `dot(x_v, centroid)` and its magnitude tracks `||x_v||`, which varies by
+orders of magnitude across a hidden state, so a single global scale would
+round the quiet positions to zero.
+
+The container is the same size to the byte: 18 GB on Kimi-Linear, 982 GB
+on K3, 3.00 b/w both.
+
+## 42. A table built once and quantized sixteen times (2026-08-03)
+
+The kernel above wants an int8 table. The first implementation quantized
+it inside `vq_apply`, on the argument that a pass over `stages*entries`
+against an apply that does `M` times as much is about 2%.
+
+**It was about 140%.** `LUT apply` went from 0.85s to 1.48s — with the
+kernel that had just measured 3.3x faster in isolation.
+
+Two mistakes, and the estimate hid both. Gate and up are built *once per
+token* and applied *once per routed expert*, so the pass ran top_k times
+over a table that had not changed. And it ran serially, next to an apply
+that was threaded, so its share of wall-clock was its share of one thread's
+work — not one core's worth of a parallel region.
+
+Moving it into `vq_build_lut` fixed the redundancy and left `LUT build` at
+0.51s against VQ3R's 0.28s. Vectorizing the pass with NEON changed nothing
+(0.52 -> 0.52), which is the measurement that identified what it actually
+was: **not arithmetic, dispatch.** 260 builds a token, each 4 to 9 scale
+blocks, ~79us of fork-join for ~7us of work.
+
+Serial and vectorized, `LUT build` is 0.28s — parity with VQ3R while doing
+the extra pass. `vq_quant_lut` is therefore deliberately not threaded, and
+that is the note that keeps someone from "fixing" it.
+
+**The general form:** a pass that is 2% of a kernel's *work* is not 2% of
+its *time* if it runs once per caller instead of once per input, or on one
+thread instead of the pool. Both were visible in the profile within a
+minute of looking, and neither was visible in the estimate.
+
+## 43. An int8 table makes the engine discontinuous (2026-08-03)
+
+Weighting each expert inside its own task (`part[i] = w[j] * acc[i]`) and
+summing afterwards, instead of `ysum[i] += w[j] * acc[i]` in the caller,
+moved a VQ3R logit by 5.7e-06 and a **VQ4P logit by 0.68**.
+
+Both paths were correct. Per layer they agreed to 1.9e-06 — *identically*
+for the two formats. The asymmetry is downstream: `vq_quant_lut` takes its
+scale from `max|lut|`, so the int8 table is a step function of its input. A
+perturbation of 1e-8 moves the scale, and every entry sitting near a
+rounding boundary moves by one LSB. VQ4P amplifies float noise about five
+orders of magnitude harder than VQ3R does.
+
+The perturbation itself was FMA contraction: `ysum[i] += w[j] * acc[i]`
+fuses into a single rounding, and rounding the product first does not. The
+fix is to leave `acc` unweighted and let the caller apply `w[j]` in the
+same expression the serial loop uses, so the compiler contracts it the
+same way.
+
+**For VQ4P, "numerically equivalent" is not a good enough standard for two
+code paths — they have to be bit-identical**, and that is now checked:
+row-parallel against expert-parallel, one thread against eight, NEON
+against `-DWASTE_P6_SCALAR`, all `cmp`-clean. The int8 table is what
+raises the bar, and it will raise it for any future path that touches
+these kernels.
+
+## 44. A batch is both the parallelism and the barrier (2026-08-03)
+
+At Kimi-Linear's expert shapes one `vq_apply` is a few microseconds of
+arithmetic against a fork-join that costs tens, and a token spends ~900
+dispatches. Giving each routed expert its own task instead — one dispatch a
+layer, 26 a token — is worth 1.15x on VQ3R and 1.18x on VQ4P, and it
+removes the thread-count cliff: row-parallel was *worst* at the default
+thread count and needed `WASTE_THREADS=6` to look good, expert-parallel is
+best at the default.
+
+**On K3 it is a regression, and no batch size fixes it.** Holding a
+layer's records before computing is a barrier against the read-ahead; the
+hint has already queued all sixteen reads, and waiting for the last one
+before starting the first expert stops them overlapping the multiplies they
+were issued to hide behind. Batching the holds bounds the barrier — but the
+batch is also how many experts can run at once. 15 steps, K3, VQ3R,
+internal disk:
+
+| mode | expert I/O | expert mm | accounted | s/token |
+|---|---|---|---|---|
+| row-parallel | 3.71 | 12.78 | **37.24** | **1.61** |
+| expert, batch 1 | 0.78 | 51.44 | 81.80 | 4.00 |
+| expert, batch 2 | 1.11 | 27.20 | 49.01 | 2.46 |
+| expert, batch 4 | 4.10 | 15.62 | 42.16 | 1.87 |
+| expert, batch 8 | 9.66 | 10.68 | 46.25 | 2.03 |
+| expert, batch 16 | 15.69 | **6.15** | 56.33 | 1.87 |
+
+Read the two interior columns against each other: batch 1 overlaps the I/O
+perfectly and leaves one thread working, batch 16 does the arithmetic
+2.1x better than row-parallel and pays 15.7s of stall for it. Row-parallel
+declines the trade — it pipelines one expert at a time while putting every
+thread on that expert's rows.
+
+**So `WASTE_XPAR` is off by default.** The two strategies suit opposite
+regimes and the regime is set by which of dispatch and disk is the budget,
+which is a property of the model and the machine, not something the engine
+can read off the container.
+
+What would get both is a task granularity of (expert, row range) with a
+small expert batch, staged so the gate/up applies, the down LUT builds and
+the down applies are three dispatches per batch instead of one. That
+decouples the parallelism width from the barrier width. It is not written,
+and it is the obvious next thing here.
+
+## 45. The disk contaminates the buckets that do not touch it (2026-08-03)
+
+The K3 VQ4P container went to the external disk because the internal one
+had 691 GB free against a 982 GB container. The reasoning for accepting
+that was: `WASTE_PROFILE` separates expert I/O from arithmetic, so
+`LUT apply` and `expert mm` stay comparable even at 0.94 GB/s instead of
+12.78. **That reasoning is wrong, and `kda` is the control that shows it.**
+
+10 decode steps, row-parallel, same prompt, same step count:
+
+| container | LUT build | LUT apply | kda | mla | expert I/O | expert mm | accounted |
+|---|---|---|---|---|---|---|---|
+| VQ3R, internal | 1.03 | 7.55 | 9.14 | 1.61 | 2.47 | 8.79 | 28.66 |
+| VQ4P, external | 1.37 | 8.77 | **15.60** | 2.96 | 131.38 | 10.36 | 171.63 |
+
+`kda` reads no expert record at all — it is trunk arithmetic — and it is
+71% slower. A profile taken while the disk is saturated is not a profile of
+the arithmetic with one column swapped out; the whole run is slower and
+every bucket carries some of it.
+
+**"71% slower than one other run" is not the evidence, though, and saying
+so was sloppy.** Five repetitions of the same internal baseline put `kda`
+between 8.65s and 14.52s over 15 steps — a 68% spread on identical work,
+this being a desktop with a window server on it. A single pair of readings
+cannot clear that band. What clears it is the rate: 0.58–0.97 s/step across
+six internal runs against **1.56 s/step external**, 61% above the highest
+internal observation rather than 71% above one of them. The conclusion
+stands; the argument for it needed a noise band, and the first version
+would have gone in the file as a fact that the next five runs contradicted.
+
+The rest of that spread is worth knowing on its own: `s/token` is stable to
+±1.5% (1.62–1.67) while `accounted` swings 38% and `kda` 68%. **Compare
+decode s/token; treat a single bucket reading as an estimate** unless it is
+a median of several.
+
+**So there is still no clean number for the VQ4P kernel on K3.** The
+normalized estimate (LUT apply relative to `kda`: 0.826 -> 0.562, about
+1.47x) is arithmetic on two contaminated readings and is recorded here as
+the reason not to quote it. Getting the real one means the container on the
+same class of storage as its baseline, which on this machine means deleting
+the 982 GB VQ3R container first — and §46 is why that is now worth doing.
+
+**The rule.** Before measuring a container on different storage than the
+one it is compared against: don't. Copy it, free space, or measure
+something else. If it cannot be avoided, put a bucket in the profile that
+touches no expert bytes and read that one first — that check costs one
+column and would have saved this run.
+
+## 46. The stall bucket is not the disk floor (2026-08-03)
+
+**Do not derive the disk floor from the `expert I/O` bucket.** That was
+tried twice in one afternoon, in two different ways, and both were wrong in
+opposite directions.
+
+The first read §10's 9.9 GB/s — a throughput *observed during a run*, not
+the device's capability — and concluded the floor was ~1.43s against a
+1.87s step, so any compute win was capped near 1.3x.
+
+The second reasoned that if reads pipeline behind arithmetic then the stall
+is exactly the excess, so `disk = compute + stall`. On the K3 row-parallel
+run (34.64s accounted, 3.11s stall) that gives disk 34.64s against compute
+31.53s, i.e. the disk already binding and *any* arithmetic win worth
+nothing. It is a tidy derivation and it inverts the moment the pipelining
+is imperfect, which is the case it was invented to reason about.
+
+**Measured instead, with `tools/diskbench.c`, at the pattern the engine
+actually uses** — 12 MB records, random, cache-bypassed, 8 reader threads,
+on the internal SSD:
+
+| | |
+|---|---|
+| seq write / seq read | 11.10 / 10.55 GB/s |
+| random, 1 thread | 10.82 GB/s |
+| random, 8 threads | **12.87 GB/s** |
+
+That settles it. The same run reads 223.86 GB over 15 steps, so the disk
+owes 17.4s against 31.5s of arithmetic: **K3 decode at a 17.7 GB cache is
+compute-bound, by about 1.8x.** The 3.11s of stall is not the disk running
+out of headroom, it is reads that failed to hide behind arithmetic there
+was plenty of.
+
+Per token that is a 1.16s floor under a 1.61s step — **1.39x of headroom**,
+and §41's kernel takes `LUT apply` from ~0.51s to ~0.15s, which would land
+at ~1.28x. That prediction was worth the measurement it cost, because it
+was also wrong.
+
+**Measured: 1.09x.** The VQ4P container was copied onto the internal disk
+(the VQ3R baseline moved out to make room, measured first and restored
+after), so both sides sit on the same storage with the same build. Medians,
+13 VQ4P runs against 5 VQ3R:
+
+| | VQ3R | VQ4P | |
+|---|---|---|---|
+| **s/token** | **1.65** | **1.52** | **1.086x** |
+| LUT apply | 11.21 | ~9.6 | 1.17x |
+| expert I/O | 3.15 | 3.69 | slightly more exposed |
+| `kda` (control) | 10.35 | 10.52 | unchanged |
+
+`kda` unchanged is what says the two are comparable this time, which is the
+check §45 was written about.
+
+**The kernel is not the problem, and neither is cache residency.** The
+obvious suspicion was that §41's 3.32x lived in a 3.94 MB index buffer hot
+in L2 while the engine streams ~17 GB of index per token. Sized up, one
+pass, no repetition:
+
+| index working set | VQ3R | VQ4P | speedup |
+|---|---|---|---|
+| 3.9 MB | 1.268 ms | 0.290 ms | 4.37x |
+| 63 MB | 9.882 | 2.478 | 3.99x |
+| 252 MB | 37.178 | 9.630 | 3.86x |
+| 1008 MB | 151.029 | 38.880 | **3.88x** |
+
+It holds at 3.88x against a gigabyte. So that hypothesis is dead too — the
+third of the day, and the reason this section says what is measured and
+stops. The instrument is `tools/lutbw.c`, which exists so the next person
+to suspect a cache artefact can settle it in a minute instead of a day.
+
+**What is left is a scaling failure nobody has explained.** Converting the
+buckets to throughput over the ~17.4 GB of index a token touches:
+
+| | one thread | in-engine, ~10 threads | scaling |
+|---|---|---|---|
+| VQ3R | 6.5 GB/s | 23.3 GB/s | 3.6x |
+| VQ4P | 25.3 GB/s | 27.2 GB/s | **1.07x** |
+
+VQ4P in the engine runs at its single-thread rate. It is not the chunk
+size — `WASTE_P6_CHUNK` was swept 1..16 on K3 and every value landed inside
+the run-to-run noise — and 25 GB/s is far too low to be a memory ceiling on
+this machine. Recorded as an open question rather than a guess; §47
+answers it.
+
+**So the standing recommendation is unchanged, for a new reason.** VQ4P is
+worth having where the apply is dispatch-bound and small (Kimi-Linear,
+1.18x) and is worth 1.09x on K3 — real, but not a reason to reconvert
+982 GB, and nowhere near what the kernel does in isolation. The gap between
+3.88x on a bench and 1.17x in place is the whole finding.
+
+**This also dents the standing model.** "Disk I/O is the budget" and "~53%
+of a K3 decode step is expert reads" were true when they were written and
+are not true here: §35's lookahead, the reader pool and a 17.7 GB cache
+have moved K3 to the other side of the line. The claim is worth re-checking
+against `diskbench` whenever it is leaned on, rather than inherited.
+
+**The rule.** Before claiming anything is disk-bound, run `diskbench` and
+divide. The stall bucket says how much I/O failed to overlap; that is a
+different question and it does not answer this one.
+
+## 47. The fast kernel is the one the E-cores hurt (2026-08-04)
+
+§46 left a hole: the VQ4P kernel is 3.88x standalone and 1.17x in the
+engine, it is not cache residency and it is not memory bandwidth, and the
+throughputs said it runs at its single-thread rate however many threads the
+pool has. Three things, and the third inverts between models.
+
+The instrument is `tools/lutmt.c` — the same two kernels driven through the
+engine's own `waste_parallel_for`, with thread count and chunk from argv,
+so the dispatch under test is the real one and the engine's noise is not.
+
+**One: 3.88x is a single-thread ratio, and the slow kernel parallelizes
+better.** K3's gate shape, index buffers rotated so no pass re-reads the
+last one's bytes:
+
+| threads | VQ3R | VQ4P | ratio |
+|---|---|---|---|
+| 1 | 6.6 GB/s | 26.1 | **3.94x** |
+| 4 | 20.0 | 74.5 | 3.72x |
+| 6 | 27.9 | **91.3** | 3.28x |
+| 8 | 28.7 | 88.4 | 3.08x |
+| 10 | 29.8 | 73.2 | 2.45x |
+
+So the ceiling in a threaded engine was never 3.9x. It is ~3.3x, and only
+at one thread count.
+
+**Two: this machine is 6 P-cores and 12 E-cores, and the pool takes all
+18.** VQ4P peaks exactly on the P-cores and *degrades* past them — 91.3 down
+to 73.2. VQ3R does not: it keeps improving to 8-10. The asymmetry is that
+VQ3R is latency-bound, so a slow core costs it proportionally little, while
+VQ4P is wide and fast and an E-core running the same chunk is a straggler
+the barrier waits for. `waste_parallel_for` cuts work into `ceil(n/nthreads)`
+— one task per thread, nothing left to steal — so the straggler is
+structural rather than unlucky. Oversubscribing helps (12 tasks on 10
+threads: 73.1 GB/s against 56.3 at 48 tasks and 66.7 at 4) and does not
+recover the 6-thread peak.
+
+Not bandwidth: a 788 MB working set, cold, measures 91.3 GB/s at 6 threads
+against 90.5 warm. Not cache residency either — that was already dead in
+§46.
+
+**Three: an apply can be too small to pay for a fork-join.** At
+Kimi-Linear's shapes one task is ~9 us of arithmetic against tens of us of
+dispatch. `WASTE_P6_CHUNK=16` was worse than useless there in a way worth
+naming: `min_chunk` of 1024 against M=1024 hits
+`if (n <= min_chunk) { fn(0, n, arg); return; }`, so **the apply ran
+serially**, and it won its own sweep because with 18 threads every
+alternative was worse. A default chosen that way is a default chosen by a
+bug in the setup.
+
+**What is actually achievable**, Kimi-Linear, three runs each, stable to the
+last digit:
+
+| | accounted |
+|---|---|
+| VQ3R, engine default today | 1.84 |
+| VQ3R, best (`WASTE_XPAR=1`) | **1.31** |
+| VQ4P, row-parallel, 6 threads, chunk 1 | 1.30 |
+| VQ4P, best (`WASTE_XPAR=1`) | **1.06** |
+
+Best against best is **1.24x**, and against what the engine does untouched,
+**1.74x**. Both are better than the 1.18x §41 recorded, and the difference
+is entirely configuration.
+
+**And then K3 inverts it.**
+
+| K3, VQ3R | s/token |
+|---|---|
+| default (18 threads) | **1.68** |
+| 6 threads | 2.25 |
+| 8 threads | 2.35 |
+| `WASTE_XPAR=1`, 6 threads | 1.89 |
+
+Fewer threads is 34% *worse* on K3. Its applies are 4.7x larger, so they
+amortize the dispatch and genuinely use every core the machine has,
+E-cores included. "Cap the pool at the P-cores" is a 25% win on one model
+and a 34% loss on the other.
+
+**So no default changes.** `WASTE_P6_CHUNK=16` is wrong at 6 threads and
+right at 18; `WASTE_XPAR` is right on Kimi-Linear and wrong on K3; the
+thread count that is best on one is worst on the other. Any default picked
+here is tuned for one model against the other, which is why these are
+switches and why the tuning table above is the deliverable rather than a
+commit that moves a constant.
+
+What would deserve building, if this comes back: a pool that knows which
+cores are performance cores and sizes SIMD-heavy work to them while leaving
+the latency-bound kernels the whole machine. That is a real change to
+`threads.h` and it is not justified by one kernel on one laptop.
+
+## 48. Gate 1 answered, on hardware this repo does not have (2026-08-04)
+
+**Third-party measurement. Not reproduced here, and it cannot be** — there
+is no x86 server and no NVIDIA card on this machine, which is the reason
+issue #11 was written as a set of gates for someone else to run rather than
+as a plan.
+
+`ssarthak15` ran gate 1 on one Oracle bare-metal DenseIO node, dual EPYC
+7J13 (Zen 3, 32 cores, two-socket NUMA interleave), K3 with direct expert
+I/O from NVMe. `lm_head` medians over 33 measured decodes after 16 warm
+ones, in each of three fresh processes, against a matched host scan on the
+same cores, affinity mask and NUMA policy over 32 GiB — 64x the node's
+512 MiB aggregate LLC:
+
+| | `lm_head` | effective | matched host | ratio |
+|---|---|---|---|---|
+| 1 | 7.100 ms | 168.0 GB/s | 170.2 GB/s | **98.7%** |
+| 2 | 8.827 | 135.1 | 171.7 | 78.7% |
+| 3 | 8.688 | 137.3 | 164.9 | 83.2% |
+
+Threshold declared before the run was 70%. **The x86 path is bandwidth-bound
+too.**
+
+**Why it is trustworthy without being reproducible.** The byte accounting
+is what would give away a number that had not been measured, and it
+reconciles exactly with this repo's own format. 1,174,405,120 payload bytes
+against 18,350,080 bytes of fp16 scales is 128 elements per scale, which is
+`quantize_q8g(W, group=128)`; the payload is 163840 x 7168, K3's vocab by
+its hidden, so it is that tensor and not a stand-in; and `lm_head` does
+keep 8 bits in a default conversion while the trunk goes to 4, so it is
+also the same width `docs/BACKENDS.md` measured Metal against. Every
+derived figure divides back out, including 1/1947 ms against the pooled
+0.5139 tok/s.
+
+**The AVX2/AVX-512 gap is smaller than it looks.** Gate 1 asked about
+AVX-512 and this is AVX2. A wider ISA moves the same bytes with fewer
+instructions, so a kernel already at 79-99% of achievable bandwidth has
+nowhere to go but 100% — the answer's *direction* does not depend on the
+ISA, only its exact value does. Zen 3 has no AVX-512 at all, so it was not
+measurable on that node regardless.
+
+**Against the Metal row it replaces**, same tensor, same width, same one
+dispatch per token:
+
+| | `lm_head` | effective |
+|---|---|---|
+| Apple silicon, NEON (2026-07-28) | 6 ms | 195 GB/s |
+| dual EPYC 7J13, AVX2 | 7.10 ms | 168 GB/s |
+
+The laptop beats the 16-channel dual-socket server on this kernel. Both are
+at their machine's bandwidth, which is the finding.
+
+**What it settles.** The clause in `docs/BACKENDS.md` — "the CPU path is
+already running at the machine's memory bandwidth, and this is a
+bandwidth-bound matvec" — was an Apple-silicon observation being asked to
+carry an argument about accelerators in general. It now has an x86 leg. So
+filling the `waste_backend` slots with CUDA kernels reproduces the Metal
+result on different hardware, and issue #11's gate 1 branch where the host
+had headroom to reclaim is closed.
+
+**What it does not settle.** Nothing about the "different engine" — one
+dispatch per layer, residual resident in VRAM, which is where a discrete
+card's bandwidth advantage would actually live. That is gate 2, the
+end-to-end cost of one dependent matvec over PCIe against this 7.10 ms, and
+it remains unmeasured.
+
+**And gate 3's premise has moved since the issue was written.** It bounded
+an accelerator at roughly 2x by Amdahl on "~53% of a K3 decode step is
+expert reads". §46 measured the disk at the engine's real access pattern
+and found K3 decode compute-bound by about 1.8x at a 17.7 GB cache. Gate 3
+is more open than it was posed, not less.
+
+**One decode number worth keeping**, from the same run and the same
+caveats — K3, 99 tokens in 192.645 s, one serial stream, 32 threads, greedy,
+automatic budget:
+
+| | |
+|---|---|
+| pooled | 0.514 tok/s |
+| median forward | 1947 ms/token |
+| suite range | 0.47-0.55 tok/s |
+
+It stays here and not in `README.md`. Every number there was measured on
+the commit it ships with, and dual EPYC is a class of machine this repo
+cannot verify on.
+
+## 49. The bench that certified the disk was reading RAM (2026-08-05)
+
+§14 found `O_DIRECT` in a comment and nowhere in the code, and fixed the
+engine. It did not look at `tools/diskbench.c`, which carries the same
+sentence in its own header — "with the page cache bypassed (F_NOCACHE /
+O_DIRECT)" — and had the same hole: `nocache()`'s body was `#ifdef
+__APPLE__` with nothing else in it, and all three opens were unqualified.
+
+Reported by `fab2s` as PR #22, **on hardware this repo does not have** —
+Samsung 970 PRO, PCIe Gen3 x4, Ubuntu 26.04, 16 GB file, 3 MB records:
+
+| | before | after | link ceiling |
+|---|---|---|---|
+| seq read | 44.67 GB/s | 3.15 GB/s | 3.94 GB/s |
+| random, 1 thread | 36.75 | 2.91 | |
+| random, saturated | 65.72 | 3.33 | |
+
+11x and 17x over the link. The tell was there in every run and nobody
+divided: a Gen3 x4 drive cannot deliver 65 GB/s whatever the benchmark
+says, and after the fix it saturates at two threads and 85% of the
+ceiling, which is what that drive should do.
+
+**What it cost.** §46 ends with a rule — before claiming anything is
+disk-bound, run `diskbench` and divide. On Linux that rule returned a
+fiction from 2026-07-28 until now. No published number moves: every
+`diskbench` figure in `docs/GATES.md`, `docs/EFFICIENCY.md` and §44/§46
+was measured here, on macOS, where `F_NOCACHE` did work. But the rule had
+no force on the platform most users are on, and Gate H is exactly the
+class of decision — 1.5 TB onto the wrong device — it exists to protect.
+
+**The general form: the engine's rules bind the tools that measure the
+engine.** `bank_open` bounds its bypass, probes it with a real transfer
+and reports when it did not get it. `diskbench` asserted one in a header
+comment. That is now three instances of one bug class in this repo —
+issue #4 (an alignment test that was false for every container that
+exists), §14 (the flag that lived only in a comment), and now the tool the
+disk-bound claim rests on.
+
+**`F_NOCACHE` does not evict, and that is not a detail.** Reviewing the
+fix, the write looked like it should stay buffered: row 1 stands for the
+download and the conversion landing, and those write through the page
+cache like everything else. On Linux that holds — a subsequent `O_DIRECT`
+read writes back and invalidates the range first, so the leftovers cannot
+flatter the read rows (reasoned, not measured; no Linux here). On macOS it
+is wrong, and measurably so. `F_NOCACHE` stops *new* pages being cached; it
+does not evict resident ones. A buffered write leaves the whole file in
+the UBC and every read row below then measures RAM. Same binary, 1 GB
+working file, 4 MB records, internal SSD, differing only in whether the
+write fd got the bypass:
+
+| | write bypassed | write buffered |
+|---|---|---|
+| seq read | 7.9-8.1 GB/s | **26.04 GB/s** |
+| random, 1 thread | 6.8-7.0 | **24.34** |
+
+3.2x and 3.5x of pure fiction, on the row that sets tok/s. The original
+`nocache()` on the write fd was load-bearing and looked ornamental. The
+bypass covers the whole file's lifetime or it covers nothing.
+
+**So the fix is not the flag.** `O_DIRECT` is accepted at open and refused
+at transfer — tmpfs does this, and so would a device wanting a bigger
+block than the tool aligns to — so a bare flag turns a refusing filesystem
+into `short read -1` and a table of zeroes with no cause given. It now
+does what `bank_open` does: probe with one aligned transfer, fall back to
+a plain open plus `POSIX_FADV_RANDOM`, and label every row `(cache
+bypassed)` or `(PAGE CACHE, not the disk)` with a trailer explaining it.
+A measurement that quietly means something different is worse than one
+that is missing — §14 said that about the engine and it is truer of the
+tool, because the tool is what the claim rests on.
+
+**What is verified, and what is not.** macOS is unchanged against `main`
+within noise. The Linux body compiles and runs here only against stubs for
+`O_DIRECT` and `posix_fadvise` — covering both the probe-succeeds and the
+probe-refused paths, and confirming the write probe restores the file byte
+for byte — which is the same limitation §14 recorded for the engine, for
+the same reason. The three-column table above is the reporter's. **The
+platform still has not been measured from here.**
+
+## 50. Gate 2 measured: the GPU wins the matvec and loses the transfer (2026-08-05)
+
+**Third-party measurement, second contributor, and again not reproduced
+here.** `fab2s` ran gates 1, 2 and 3 on a consumer desktop — Ryzen 9 9900X
+(Zen 5, AVX-512, two 6-core CCDs with separate 32 MB L3) and an RTX 5060 Ti
+(sm_120, 36 SMs, 15.5 GB usable, 448 GB/s theoretical, PCIe Gen5 x8
+confirmed under load), on Kimi-Linear-48B with a default VQ3R container.
+§48 could not cover AVX-512 (Zen 3 has none), could not cover a second
+model, and — the part that changes its conclusion — measured one isolated
+kernel rather than the aggregate step.
+
+### Gate 1, re-answered with levers: the *step* is not bandwidth-bound
+
+Instead of a ratio against a STREAM ceiling, one resource varied at a time
+over byte-identical work — same container, same pinning, same `-n`, with
+`bench --json` reporting identical `bytes_read` and hit/miss counts, and
+clocks sampled *during* the load over the pinned cpuset:
+
+| lever | change applied | throughput | Amdahl f |
+|---|---|---|---|
+| core clock, max-freq cap, 3629 → 5327 MHz in-load | +46.8% | 11.73 → 15.99 (+36.4%) | **0.84** (0.79-0.84) |
+| DRAM, JEDEC 4800 → EXPO 6000 | +25.9% bandwidth | 14.90 → 15.63 (+4.9%) | **0.23** (0.21-0.26) |
+
+Solving `1/(1+y) = (1-f) + f/(1+x)` on each side. The two fractions come
+from independent levers on different boots and approximately partition the
+step. Samples were medians of 3-5 with cooldowns and the first run
+discarded; the DRAM sides are non-overlapping with under 0.6% spread each,
+and the measured bandwidth change matches the nominal DIMM change (63.4 →
+79.8 GB/s).
+
+Four corroborations, none of which rely on a cross-session absolute:
+
+- **Throughput does not scale with parallelism** past one CCD's physical
+  cores: 6 threads 15.94 tok/s, 12 threads 15.54, 24 threads 12.67.
+- **One core cannot saturate DRAM** — the same DIMM change moves STREAM read
+  +1.8% at 1 thread and +25.9% at 6, so the aggregate is not bounded by a
+  single core's outstanding-miss capacity.
+- **The fractions are complementary**, 0.84 + 0.23, from two levers measured
+  on separate boots.
+- **The ratio against the streaming ceiling gets *worse* as bandwidth
+  improves.** Per-token traffic is ~1.61 GB (1.04 GB of trunk re-read every
+  token, plus 214 expert records at 2.54 MiB, measured at `-n 256` with
+  prefill and read-ahead included against a nominal 26 x top-8 = 208):
+  24.0 GB/s of 63.4 (38%) at 4800, 25.2 of 79.8 (32%) at 6000. If bandwidth
+  were binding, raising it would pull the workload *toward* the ceiling.
+
+The 84% is not SIMD arithmetic. It is the LUT path's dependent
+load → address → load gather chains — cache-hit latency counted in core
+cycles, the same mechanism §7 and §41 kept arriving at from the ARM side.
+That is work a wider vector unit does not touch.
+
+**And the isolated kernel reproduces §48 exactly.** `lm_head.weight` here is
+383,385,600 B (Q8G group 128, `[163840, 2304]`, 0.321x K3's tensor and
+matching hidden 2304/7168): **6.600 ms/call, 58.1 GB/s, 73-76% of ceiling**,
+identical across three repeats, clearing the 70% bar §48 declared in
+advance — now on AVX-512.
+
+**So §48's kernel number stands and its generalization does not.** "The x86
+path is bandwidth-bound too" was inferred from a kernel the profiler puts at
+4.9% of decode at `-n 5`, 7.3% at `-n 45`, and `docs/TECHNICAL.md` puts at
+0.2% on K3. Both hold at once: **the kernel is bandwidth-bound, and it is
+0.2-7.3% of the budget.** The other 93-99% is core-clock-scaled. Read §48 as
+answering the question about `lm_head` and this as answering it about the
+step.
+
+That cuts both ways, and it is worth being explicit because issue #11
+predicted otherwise. #11 said a host that is *not* bandwidth-bound has
+headroom to reclaim, which weakens the accelerator case. But the host cannot
+reclaim it: threads stop scaling at one CCD, and the bound is gather latency,
+not width. Abundant thread-level parallelism is exactly what a GPU has. The
+gate-1 branch that closes is "fill the `waste_backend` slots" — the same
+branch §48 closed, for a different reason.
+
+### Gate 2 — the first end-to-end PCIe measurement this project has
+
+Correctness checked against a CPU reference at rel L2 1.02e-07 before any
+timing. Empty-kernel dispatch floor: **4.39 us** launch+sync, 1.30 us
+launch-only.
+
+| | `lm_head` 383 MB | one expert matrix [1024x2304], 2.4 MB |
+|---|---|---|
+| kernel only | 0.9940 ms → 385.7 GB/s | 0.0059 ms → 405.3 GB/s |
+| full round trip | 1.0561 ms | 0.0194 ms |
+| dependent chain | 1.0011 ms | 0.0114 ms |
+| queued chain | 0.9962 ms | 0.0059 ms |
+| dependency cost | (noise floor) | 5.5 us |
+
+85-90% of theoretical VRAM bandwidth, and against the CPU's 6.600 ms the
+**full GPU round trip is 6.25x faster**. The clause carried over from Metal —
+that the round-trip eats the win — does **not** transfer to a discrete card.
+Dispatch is not the obstacle for a restructured engine either: 27
+dispatches/token is 0.1 ms. It only binds the backend-shim shape, at 624
+dispatches x 11.4 us = 7.13 ms/token.
+
+**The deciding term is the expert stream:**
+
+| | |
+|---|---|
+| H2D pinned, 544 MiB = one token's routed experts | **19.807 ms → 28.8 GB/s** |
+| H2D pageable | 20.812 ms → 27.4 GB/s |
+| share of a measured 62.7 ms CPU token | **31.6%** |
+| expert set vs usable VRAM | 16.5 GiB vs 15.5 GiB — does not fit |
+
+28.8 GB/s is 90% of Gen5 x8, so the link is behaving. **It is also slower
+than this CPU's own RAM at 63-80 GB/s.** The card is structurally on a worse
+path to the same bytes: read experts into host RAM, then push them across a
+link at half the speed the host already had them at.
+
+**The expert matmul was implemented and measured, not substituted.** Taking
+the term from `matvec_q8g` would have been wrong — experts are residual VQ,
+not int8, and 16.53 GiB of 3-bit experts is ~88 GB at f16, so they must be
+decoded every token. One expert's gate+up+down, indices and codebooks
+straight out of the container, checked against a CPU reference at 3e-07:
+
+| per token, 26 layers x top-8, kernels only | decode-then-matvec | LUT, as the engine amortizes it |
+|---|---|---|
+| **VQ3R** (stages=3) | **13.86 ms** | 15.85 ms |
+| VQ2R (stages=2) | 12.48 ms | **9.70 ms** |
+
+`vq_apply` scales with stages (0.0428 → 0.0712 ms per expert, +66% for +50%
+lookups); reconstructing the weights and doing an ordinary matvec is nearly
+flat (0.0600 → 0.0666, +11%) because its M x N MAC term does not depend on
+stages. **The two cross between 2 and 3 stages, and the GPU picks the
+opposite algorithm from the CPU.** The reason is §41's, seen from the other
+side: the LUT exists to save FLOPs, its table is 864 KB at three stages and
+cannot leave L2, while the codebook is 24 KiB and sits in shared memory. On
+a GPU the FLOPs are free and the gathers are not.
+
+**Scope, and it matters: that is a 256-entry result, and `WQ_VQ4P` likely
+inverts it.** VQ4P's table is 288 KB fp32 and **72 KB int8** against VQ3R's
+864 KB, and 72 KB fits shared memory — which is the only reason
+reconstruction won here. The crossover is a property of the codebook shape,
+not of the device. Measuring it needs a 64-entry path in the benchmark, a
+fresh conversion and 0.6.4. Not run.
+
+Against the CPU's expert-matmul time — the profiler's share (48.7% VQ3R,
+52.9% VQ2R) applied to the 62.7 / 67.9 ms bench medians, approximate because
+profile and bench ran different read-ahead settings — that is **2.2x and
+3.7x**. Real, and far from the 6.25x the contiguous `lm_head` matvec gets.
+
+**Which corrects the projection.** With the expert term measured at 13.9 ms
+instead of the 3.7 ms an int8 stand-in implied:
+
+| term | ms/token |
+|---|---|
+| expert H2D | **19.8** |
+| trunk read at 379 GB/s | 2.7 |
+| expert decode + matvec, measured | **13.9** (was 3.7) |
+| dispatch, 27 x 4.39 us | 0.1 |
+| `lm_head` | 1.0 |
+| total | **~37.5 ms/token, ~27 tok/s** |
+
+**~1.7x** over the measured 62.7 ms / ~16 tok/s, not the ~2.3x the stand-in
+implied, with transfer falling from 73% to 53% of the budget because the
+compute term grew. Still a projection — there is no CUDA backend to measure
+— and it ignores KDA and MLA, a further 24% of CPU time that would need
+kernels of their own.
+
+### Gate 3 — no, and it would not have helped
+
+`gdscheck -p`, GDS 1.16.1.26, reports compat mode on all transports:
+disk → host RAM → `cudaMemcpy`. The hop is not avoided. Three reasons that
+is settled rather than pending:
+
+1. **Not silicon.** The card reports `supports GDS`, BAR1 at the full
+   16384 MiB, platform verification passes. `nvidia_fs` (min 2.12) is simply
+   absent.
+2. **Hostile to obtain.** `nvidia-fs-dkms` pulls a driver DKMS package at a
+   different version than the prebuilt driver in use; prebuilt
+   `linux-modules-nvidia-fs-*` target `-nvidia` kernel flavours rather than
+   `-generic`; and GDS is not guaranteed with `iommu=on/pt`, which that
+   machine needs.
+3. **Amdahl-bounded anyway.** 98.1% of expert reads are served from the RAM
+   cache, so GDS could touch ~2%, and on a miss the disk is the slow link
+   (3.4 GB/s there), not the bounce buffer.
+
+Note this is the opposite regime from the one §48 flagged: "~53% of a K3
+decode step is expert reads" is cold-cache and K3-scale, which is also the
+scale a 16 GB card cannot serve at all. The two do not overlap.
+
+### The configuration that would invert gate 2, built and killed
+
+The expert set misses VRAM by 1 GB. If it fit, the PCIe hop would become a
+one-time load and the per-token transfer term would vanish. So a VQ2R
+container was built with `convert.py --stages 2`, everything else default.
+
+**It fits, with room to spare:**
+
+| | VQ3R | VQ2R |
+|---|---|---|
+| expert bank | 16.53 GiB | **11.04 GiB** |
+| per-expert record | 2.543 MiB | 1.699 MiB |
+| resident (trunk + state + scratch) | 1.24 GiB | 1.21 GiB |
+| total on device | 17.77 GiB | **12.25 GiB** |
+| fits 15.5 GiB usable | no, by 2.27 GiB | **yes, by 3.25 GiB** |
+
+The bank ratio is 0.6682 against a bits-per-weight ratio of 0.6667; the
+difference is per-row f16 scales and index-block padding, which do not scale
+with stages.
+
+**On the CPU it is slower, by 7.7%**, medians of 3, 6 threads pinned to one
+CCD, `-n 512`, 96.5% hit rate in every case:
+
+| container | budget | median tok/s |
+|---|---|---|
+| VQ3R | 22G | **15.9601** |
+| VQ2R | 22G | 14.7337 |
+| VQ2R | record-scaled 15.78G | 14.6873 |
+
+The scaled budget holds cache capacity constant in *records* — without it
+the smaller container simply gets a bigger cache and the comparison measures
+hit rate instead of format. Both VQ2R runs agree to 0.3%, so it is intrinsic.
+`WASTE_PROFILE=1` says where it goes: expert I/O falls 22% as expected
+(0.69 → 0.54 s, 15.1% → 11.5%) and expert mm rises 11% (2.22 → 2.47 s,
+48.7% → 52.9%) and cancels it. That was an implementation artifact on 0.6.3
+— `vq_rows` had an `if (st == 3)` fast path and `st == 2` fell through to the
+generic one-row loop, so VQ2R issued 33% fewer lookups and still lost. §41
+has since reworked that path around a 64-entry table, so treat it as context
+for the numbers above rather than a standing gap.
+
+**Quality is what actually closes the loophole, and it reproduces
+`docs/GATES.md` Gate 3 independently.** Reconstruction error against source
+weights, 312 tensors each: VQ3R median **19.51%** (19.39-22.08), VQ2R median
+**33.19%** (33.05-37.63) — against the 19.4% at 3 bits and "2-bit VQ stays
+unsafe at 33%" recorded there, on different hardware and a different model.
+`verify_container.py` FAILs the VQ2R container at its 0.30 threshold, which
+is that same operating point; the parse itself is clean. The logit proxy
+agrees the damage is real without being dramatic at one step: top-1 agrees,
+KL 0.0179 nats, but top-10 overlap is 7/10, logit rel L2 is 9.42%, and greedy
+continuations diverge at the third token.
+
+**So gate 2's answer holds for every configuration that meets this project's
+own quality bar.** The only shape whose expert bank fits 15.5 GiB is the one
+Gate 3 rules out; the shape that passes Gate 3 misses VRAM by 2.27 GiB. The
+two do not overlap — the same structure as the gate 3 answer above.
+
+### Method notes worth keeping, independent of CUDA
+
+- **On `amd_pstate` in active mode the governor is not a clock lever.** Under
+  sustained load powersave boosts to 5332 MHz against performance's 5327 —
+  identical. A governor toggle compares idle-clock labels on same-speed runs.
+  A clock lever must be a max-frequency cap, verified in-load, on both sides.
+- **Pin threads within one CCD.** Splitting 6 threads across both CCDs costs
+  **16-25%** at identical thread count and identical work. That is `--cpus` /
+  `WASTE_CPUS` measured from the outside by someone who did not know it was
+  landing, and it is the strongest argument yet that the flag is not
+  optional tuning.
+- **Hold `-n` fixed** when sweeping — `--threads` also sizes the reader pool,
+  so at low token counts the ranking between thread counts inverts.
+- **Use `-n 1024`+.** Misses are unique-expert first touches, a fixed cost,
+  so hit rate rises with length: 94.0 / 96.5 / 98.1% at 256 / 512 / 1024.
+- **Check `bytes_read` matches** before comparing throughput at all.
+- Over a long back-to-back campaign (32 runs, ~30 min) that machine produced
+  occasional ~30% low outliers on byte-identical work — not thermal, not
+  competing processes, not huge-page fallback, not fragmentation, cause
+  unidentified. Short series showed none. Anything measured over a long
+  campaign needs medians and within-round ratios.
+- Gate 2 needs no host CUDA install if a CUDA >= 12.8 image is available
+  (12.8 added sm_120).
+
+### What it settles
+
+A discrete consumer card is answered, and for a **different reason than
+Metal was**. Metal died on the round trip; here the round trip is 6.25x
+favourable and the kernels hit 85-90% of VRAM bandwidth. What kills it is
+expert-transfer bandwidth plus VRAM capacity: PCIe is slower than the host's
+own RAM, and the experts do not fit.
+
+That names the condition under which it flips, which is the useful part.
+**VQ3R's 17.77 GiB fits a 24 GB part comfortably** — and then the H2D term
+becomes a one-time load rather than 19.8 ms every token, which is the whole
+deciding row. The GPU VQ-decode throughput measured above applies unchanged
+to that case.
+
+Not measured: bandwidth against DRAM latency separately, GDS in GDS mode,
+KDA and MLA on a GPU, the VQ4P 64-entry crossover, VQ2R quality on a real
+eval, gate 4, contexts beyond 4096, prefill as distinct from decode.

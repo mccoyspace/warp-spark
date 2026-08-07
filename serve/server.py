@@ -79,7 +79,7 @@ class ChatServer(ThreadingHTTPServer):
 
     def __init__(self, addr, handler, *, engine: Engine, model_id: str,
                  api_key: Optional[str] = None,
-                 default_max_tokens: int = 512,
+                 default_max_tokens: int = 4096,
                  default_thinking: bool = True,
                  allow_local_images: bool = False,
                  log_requests: bool = True,
@@ -646,7 +646,7 @@ class Handler(BaseHTTPRequestHandler):
 
 def serve(engine: Engine, *, host: str = "127.0.0.1", port: int = 8000,
           model_id: str = "waste", api_key: Optional[str] = None,
-          default_max_tokens: int = 512, default_thinking: bool = True,
+          default_max_tokens: int = 4096, default_thinking: bool = True,
           allow_local_images: bool = False, log_requests: bool = True,
           ready: Optional[threading.Event] = None,
           prefix_cache_bytes: int = 0,

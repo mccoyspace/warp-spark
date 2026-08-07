@@ -54,14 +54,31 @@ typedef enum {
                   * end to end and not the default for anything: measured
                   * on K3's trunk it buys cache and loses more to the
                   * unpack, and the output collapses — docs/LEARNED.md §13 */
+    WQ_VQ4P = 8, /* 3.00 b/w: 4 residual stages, 8-dim vectors, 64/stage,
+                  * indices packed 4x6 bits into 3 bytes.
+                  *
+                  * Same bit rate as VQ3R and the same three bytes per
+                  * vector — what changes is that a 64-entry stage table is
+                  * 64 bytes, which is one NEON vqtbl4q, while VQ3R's
+                  * 256-entry table is 16 vector registers and cannot be
+                  * held in a register file that has 32. That is the whole
+                  * reason the VQ3R gather is scalar.
+                  *
+                  * A distinct fmt rather than a manifest flag alone
+                  * because the payload is byte-for-byte the same size as
+                  * VQ3R's: a reader that took these three bytes for three
+                  * one-byte indices would decode silently and wrongly,
+                  * which is the failure a format code exists to prevent. */
 } waste_fmt;
 
 /* Bits per weight for VQxR is exactly `stages` — one byte of index per
  * 8-dim vector per stage — plus one f16 scale per output row, i.e.
- * 16/n_in amortized. The manifest's expert_quant block carries the real
- * values (`stages`, `vec_dim`, `entries`, `bits_per_weight`); nothing
- * should hardcode them. WQ_SUB1 is specified and not written by the
- * converter in v0. */
+ * 16/n_in amortized. VQ4P instead spends `index_bits` per stage, so its
+ * rate is stages*index_bits/vec_dim: 4*6/8 = 3.00. The manifest's
+ * expert_quant block carries the real values (`stages`, `vec_dim`,
+ * `entries`, `index_bits`, `bits_per_weight`); nothing should hardcode
+ * them. `index_bits` is absent in v0 containers and reads as 8. WQ_SUB1
+ * is specified and not written by the converter in v0. */
 
 /* record flags */
 #define WF_BF16      (1u << 0) /* f16 payloads are bf16                    */

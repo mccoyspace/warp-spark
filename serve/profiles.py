@@ -70,6 +70,10 @@ SPARK_CUDA_ENVIRONMENT = {
     "WASTE_CUDA_DENSE": "2",
     "WASTE_CUDA_VQ": "2",
     "WASTE_CUDA_VQ_GROUP": "1",
+    # Upstream expert-parallelism and the CUDA grouped-expert path are two
+    # owners of the same routed work. The qualified profile keeps one owner;
+    # the realignment experiment measures XPAR separately.
+    "WASTE_XPAR": "0",
 }
 
 STORAGE_ENVIRONMENT = (
@@ -98,6 +102,7 @@ class ResolvedProfile:
 
     name: str
     threads: int
+    cpu_list: Optional[str]
     cache: str
     direct_io: bool
     verify_records: bool
@@ -136,7 +141,11 @@ class ResolvedProfile:
                 "effective_read_ahead_threads": None,
                 "effective_read_ahead_depth": None,
             },
-            "cpu_affinity": {"managed": False, "effective_cpu_list": None},
+            "cpu_affinity": {
+                "managed": self.cpu_list is not None,
+                "scope": "compute_only" if self.cpu_list is not None else "external",
+                "effective_cpu_list": self.cpu_list,
+            },
             "pm_qos": {
                 "required": self.request_qos_required,
                 "scope": "request" if self.request_qos_required else "off",
@@ -145,7 +154,8 @@ class ResolvedProfile:
         }
 
 
-def resolve_profile(name: Optional[str], *, threads: Optional[int], cache: str,
+def resolve_profile(name: Optional[str], *, threads: Optional[int],
+                    cpus: Optional[str] = None, cache: str,
                     no_direct_io: bool, verify: bool,
                     environ: MutableMapping[str, str]) -> ResolvedProfile:
     """Resolve one server profile and apply its exact environment.
@@ -157,7 +167,7 @@ def resolve_profile(name: Optional[str], *, threads: Optional[int], cache: str,
     if not name:
         return ResolvedProfile(
             name=DEFAULT_PROFILE, threads=0 if threads is None else threads,
-            cache=cache, direct_io=not no_direct_io,
+            cpu_list=cpus, cache=cache, direct_io=not no_direct_io,
             verify_records=verify, request_qos_required=False,
             request_qos_us=None,
             environment={key: environ[key] for key in STORAGE_ENVIRONMENT
@@ -177,6 +187,10 @@ def resolve_profile(name: Optional[str], *, threads: Optional[int], cache: str,
     if threads not in (None, expected_threads):
         conflicts.append(
             f"--threads={threads} ({name} requires {expected_threads})")
+    if cpus is not None:
+        conflicts.append(
+            f"--cpus={cpus} ({name} keeps whole-process placement in its "
+            "qualified external taskset launcher)")
     if cache != "lfru":
         conflicts.append(f"--cache={cache} ({name} requires lfru)")
     if no_direct_io:
@@ -203,7 +217,8 @@ def resolve_profile(name: Optional[str], *, threads: Optional[int], cache: str,
 
     environ.update(expected_environment)
     return ResolvedProfile(
-        name=name, threads=expected_threads, cache="lfru", direct_io=True,
+        name=name, threads=expected_threads, cpu_list=None, cache="lfru",
+        direct_io=True,
         verify_records=False, request_qos_required=request_qos_required,
         request_qos_us=0 if request_qos_required else None,
         environment=dict(expected_environment), strict=True)

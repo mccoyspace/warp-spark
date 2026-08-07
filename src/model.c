@@ -35,7 +35,7 @@
 static int bank_fetch(void *user, int layer, int expert, uint8_t *dst);
 static void vq_build_lut(waste_model *m, float *lut, int cb_base,
                          const float *x, int N, int stages, int entries,
-                         int vec_dim);
+                         int vec_dim, int8_t *q, float *qs);
 
 #if defined(WASTE_ENABLE_CUDA)
 int  waste_cuda_q4_matvec(waste_model *m, float *y,
@@ -208,6 +208,9 @@ static const char *dump_route_margin = NULL; /* WASTE_DUMP_ROUTE_MARGIN */
  * that has to be rewritten correctly in every script that reads one. */
 static int dump_pos0 = 0;
 static int lookahead_n = 0;            /* WASTE_LOOKAHEAD, see moe_layer  */
+static int p6_chunk = 4;               /* WASTE_P6_CHUNK, see vq_apply    */
+static int xpar_on = 0;                /* WASTE_XPAR=1 opts in; see below   */
+static int xpar_batch = 4;             /* WASTE_XPAR_BATCH, see moe_layer  */
 static pthread_once_t model_opts_once = PTHREAD_ONCE_INIT;
 
 static void model_opts_init(void)
@@ -232,6 +235,33 @@ static void model_opts_init(void)
     /* How many of the next layer's experts to fetch on the router's guess.
      * The layer boundary holds about six reads and the prediction's
      * precision falls off past there, so that is the default. 0 is off. */
+    /* Rows per parallel_for chunk in the VQ4P apply, in whole index
+     * blocks. The kernel is several times faster than the VQ3R gather it
+     * replaces, so the same chunk size hands the pool work that finishes
+     * before the dispatch that scheduled it: at Kimi-Linear's shapes one
+     * apply is ~3us of arithmetic spread over ten threads. Bigger chunks,
+     * fewer of them. */
+    /* One task per routed expert instead of one per row range.
+     *
+     * Off by default, and that is a measurement rather than caution: it is
+     * worth ~1.18x on Kimi-Linear, where one apply is microseconds and the
+     * step is ~900 fork-joins, and it is a regression on K3, where the
+     * batch that gives it its parallelism is the same batch that barriers
+     * the read-ahead. No batch size wins both — docs/LEARNED.md §44 has
+     * the sweep. Which regime a run is in depends on the model and the
+     * machine, not on anything the container states, so it is a switch. */
+    { const char *e2 = getenv("WASTE_XPAR");
+      xpar_on = e2 && *e2 != '0'; }
+    /* Experts held — and so barriered — at a time. Small keeps the reads
+     * overlapping the arithmetic; large gives the pool more to chew on. */
+    { const char *e2 = getenv("WASTE_XPAR_BATCH");
+      xpar_batch = e2 ? atoi(e2) : 4;
+      if (xpar_batch < 1) xpar_batch = 1;
+      if (xpar_batch > WASTE_PF_MAX) xpar_batch = WASTE_PF_MAX; }
+    { const char *e2 = getenv("WASTE_P6_CHUNK");
+      p6_chunk = e2 ? atoi(e2) : 16;
+      if (p6_chunk < 1) p6_chunk = 1;
+      if (p6_chunk > 64) p6_chunk = 64; }
     { const char *e2 = getenv("WASTE_LOOKAHEAD");
       lookahead_n = e2 ? atoi(e2) : 6;
       if (lookahead_n < 0) lookahead_n = 0;
@@ -638,10 +668,9 @@ fail:
     return -1;
 }
 
-/* Sprint 13 is deliberately a K3 VQ3R experiment, not a generic promise
- * about every vector-quantized container. Keep its accepted dense baseline
- * and exact blocked layout explicit so an opt-in cannot silently execute a
- * different record geometry. */
+/* The CUDA dispatch consumes the same manifest-described VQ scheme as the
+ * CPU path, but only VQ3R has completed its numerical and performance gates.
+ * Fail closed on every other pluggable scheme until it has its own contract. */
 static int cuda_vq_preflight(waste_model *m, int mode)
 {
     if (!mode) return 0;
@@ -652,13 +681,19 @@ static int cuda_vq_preflight(waste_model *m, int mode)
                 "waste: CUDA VQ requires CUDA KDA mode 1 and dense scope 2\n");
         goto fail;
     }
+    if (m->index_bits != 8) {
+        fprintf(stderr,
+                "waste: CUDA VQ is VQ3R-complete; VQ4P is rejected "
+                "pending its own correctness contract\n");
+        goto fail;
+    }
     if (m->stages != 3 || m->vec_dim != 8 || m->cb_entries != 256 ||
-        m->vq_index_block != 64 || c->latent_dim != 3584 ||
+        c->latent_dim != 3584 ||
         c->moe_inter != 3072 || c->top_k != 16 || !m->codebooksT ||
         m->n_books < 9) {
         fprintf(stderr,
                 "waste: CUDA VQ requires K3 VQ3R 3584/3072, top-16, "
-                "index-block-64 geometry\n");
+                "3-stage/256-entry geometry\n");
         goto fail;
     }
     if (waste_cuda_vq_init(m)) {
@@ -708,9 +743,10 @@ static int cuda_vq_preflight(waste_model *m, int mode)
         const float *group_down[1] = { NULL };
         if (mode == 1) {
             vq_build_lut(m, gate_lut, h->codebook_id, m->x, lat,
-                         m->stages, m->cb_entries, m->vec_dim);
+                         m->stages, m->cb_entries, m->vec_dim, NULL, NULL);
             vq_build_lut(m, up_lut, h->codebook_id + m->stages,
-                         m->x, lat, m->stages, m->cb_entries, m->vec_dim);
+                         m->x, lat, m->stages, m->cb_entries, m->vec_dim,
+                         NULL, NULL);
         }
         if (waste_cuda_vq_prepare_pair(
                 m, mode, m->x, gate_lut, up_lut, h->codebook_id, lat))
@@ -735,7 +771,8 @@ static int cuda_vq_preflight(waste_model *m, int mode)
                 : (gate[i] / (1.0f + expf(-gate[i]))) * up[i];
         if (mode == 1)
             vq_build_lut(m, down_lut, h->codebook_id + 2 * m->stages,
-                         gate, inter, m->stages, m->cb_entries, m->vec_dim);
+                         gate, inter, m->stages, m->cb_entries, m->vec_dim,
+                         NULL, NULL);
         if (grouped) {
             if (waste_cuda_vq_group_down_enqueue(
                     m, 0, rec + h->down_off, scale + 2 * inter, gate,
@@ -1317,7 +1354,10 @@ static void wire_trunk(waste_model *m)
 int waste_model_load(waste_model *m, const char *dir, int kv_cap,
                      const waste_load_opts *opt)
 {
-    static const waste_load_opts defaults = { 0, 0, 0, 0, 1 };
+    /* Named rather than positional: this used to be `{ 0, 0, 0, 0, 1 }`,
+     * and a field added in the middle of the struct silently moved the 1
+     * from direct_io onto cache_policy. */
+    static const waste_load_opts defaults = { .direct_io = 1 };
     if (!opt) opt = &defaults;
     const size_t cache_bytes = opt->cache_bytes;
     memset(m, 0, sizeof *m);
@@ -1377,8 +1417,16 @@ int waste_model_load(waste_model *m, const char *dir, int kv_cap,
          * initialises once — the first model in wins, which is why the
          * header says so. */
         const char *e = getenv("WASTE_THREADS");
+        /* Same rule for the cpuset, and the same escape hatch. waste_open
+         * already refused a list that is malformed or that this platform
+         * cannot bind, so anything but OK here means the caller came in
+         * through waste_model_load directly: leave placement to the OS
+         * rather than guess at what half of a bad list meant. */
+        waste_cpumask cpus;
+        const int cr = waste_cpus_resolve(opt->cpus, &cpus);
         waste_pool_init(opt->n_threads > 0 ? opt->n_threads
-                                           : (e ? atoi(e) : 0));
+                                           : (e ? atoi(e) : 0),
+                        cr == WASTE_CPUS_OK ? &cpus : NULL);
     }
 
     char path[MAXP];
@@ -1440,7 +1488,9 @@ int waste_model_load(waste_model *m, const char *dir, int kv_cap,
     m->stages = (int)js_int(&d, js_get(&d, eq, "stages"), 3);
     m->vec_dim = (int)js_int(&d, js_get(&d, eq, "vec_dim"), 8);
     m->cb_entries = (int)js_int(&d, js_get(&d, eq, "entries"), 256);
-    m->vq_index_block = (int)js_int(&d, js_get(&d, eq, "index_block"), 0);
+    /* Absent in every v0 container written before VQ4P, and 8 is what those
+     * mean: one whole byte of index per stage. */
+    m->index_bits = (int)js_int(&d, js_get(&d, eq, "index_bits"), 8);
     /* cfg_sane covers `config`; this block is the other half of the
      * manifest and nothing checked it. All three size the LUT and two of
      * them divide: `"vec_dim": 0` was a division by zero in three places,
@@ -1453,6 +1503,19 @@ int waste_model_load(waste_model *m, const char *dir, int kv_cap,
         fprintf(stderr, "waste: manifest expert_quant is out of range "
                         "(%d stages, vec_dim %d, %d entries)\n",
                 m->stages, m->vec_dim, m->cb_entries);
+        js_free(&d); free(src);
+        return -2;                        /* -> WASTE_E_FORMAT */
+    }
+    /* The packing and its unpack are 4x6-into-3 and nothing else. Refuse
+     * any other combination here rather than let a mis-declared container
+     * reach a kernel that would read the right number of bytes and decode
+     * the wrong indices out of them. */
+    if (m->index_bits != 8 &&
+        (m->index_bits != 6 || m->stages != 4 || m->cb_entries != 64)) {
+        fprintf(stderr, "waste: manifest expert_quant index_bits %d is only "
+                        "supported as 6 with 4 stages and 64 entries "
+                        "(got %d stages, %d entries)\n",
+                m->index_bits, m->stages, m->cb_entries);
         js_free(&d); free(src);
         return -2;                        /* -> WASTE_E_FORMAT */
     }
@@ -1708,8 +1771,42 @@ int waste_model_load(waste_model *m, const char *dir, int kv_cap,
         const int lt = c->latent_dim ? c->latent_dim : c->hidden;
         int nmax = c->hidden > c->moe_inter ? c->hidden : c->moe_inter;
         if (lt > nmax) nmax = lt;
-        m->lut = (float *)malloc((size_t)3 * (nmax / m->vec_dim + 1) *
+        const size_t nvmax = (size_t)(nmax / m->vec_dim + 1);
+        m->lut = (float *)malloc((size_t)3 * nvmax *
                                  m->stages * m->cb_entries * sizeof(float));
+        /* An int8 shadow of m->lut, region for region, filled by
+         * vq_build_lut. Same element count as the float table and a
+         * quarter of the bytes. */
+        const size_t reg = nvmax * (size_t)m->stages * m->cb_entries;
+        const size_t nsc = nvmax / WASTE_VQ_LUT_BLK + 2;
+        if (m->index_bits == 6) {
+            m->lut8 = (int8_t *)malloc(3 * reg);
+            m->lut8_scale = (float *)malloc(3 * nsc * sizeof(float));
+        }
+        /* Per-expert slices for the expert-parallel path. Declining the
+         * allocation is not fatal: moe_layer falls back to the row-parallel
+         * loop, which needs none of this. */
+        const int K = c->top_k;
+        if (K > 1 && K <= WASTE_PF_MAX) {
+            const int lt2 = c->latent_dim ? c->latent_dim : c->hidden;
+            m->xlut_sz = reg;
+            m->xnsc = nsc;
+            m->xga  = (float *)malloc((size_t)K * c->moe_inter * sizeof(float));
+            m->xub  = (float *)malloc((size_t)K * c->moe_inter * sizeof(float));
+            m->xacc = (float *)malloc((size_t)K * lt2 * sizeof(float));
+            m->xlut = (float *)malloc((size_t)K * reg * sizeof(float));
+            if (m->index_bits == 6) {
+                m->xlut8 = (int8_t *)malloc((size_t)K * reg);
+                m->xqs = (float *)malloc((size_t)K * nsc * sizeof(float));
+            }
+            if (!m->xga || !m->xub || !m->xacc || !m->xlut ||
+                (m->index_bits == 6 && (!m->xlut8 || !m->xqs))) {
+                free(m->xga); free(m->xub); free(m->xacc);
+                free(m->xlut); free(m->xlut8); free(m->xqs);
+                m->xga = m->xub = m->xacc = m->xlut = m->xqs = NULL;
+                m->xlut8 = NULL;
+            }
+        }
     }
     {   /* expert cache, sized by the caller's budget */
         int64_t rec = 0;
@@ -1733,6 +1830,7 @@ int waste_model_load(waste_model *m, const char *dir, int kv_cap,
         !m->xq || !m->xs || !m->qabs || !m->cacc || !m->mrow ||
         !m->prefix_sum || !m->ares || !m->mmxq || !m->mmxs)
         return -1;
+    if (m->index_bits == 6 && (!m->lut8 || !m->lut8_scale)) return -1;
     for (int L = 0; L < c->n_layers; L++) {
         if (c->kda_layer[L]) { if (!m->S[L] || !m->conv[L]) return -1; }
         else if (!m->latcache[L]) return -1;
@@ -1752,6 +1850,10 @@ int waste_model_load(waste_model *m, const char *dir, int kv_cap,
         cuda_dense_preflight(m, m->cuda_dense_scope)) return -1;
     if (m->cuda_vq_mode &&
         cuda_vq_preflight(m, m->cuda_vq_mode)) return -1;
+    if (m->cuda_vq_mode && xpar_on)
+        fprintf(stderr,
+                "waste: WASTE_XPAR ignored while CUDA VQ owns routed-expert "
+                "scheduling\n");
 #endif
     return 0;
 }
@@ -1791,11 +1893,15 @@ void waste_model_free(waste_model *m)
     }
     free(m->x); free(m->h); free(m->tmp); free(m->att); free(m->logits);
     free(m->ff); free(m->e_gate); free(m->e_up); free(m->e_down); free(m->lut);
+    free(m->lut8); free(m->lut8_scale);
+    free(m->xga); free(m->xub); free(m->xacc);
+    free(m->xlut); free(m->xlut8); free(m->xqs);
     free(m->xq); free(m->xs); waste_dio_free(m->miss_buf);
     free(m->blockres); free(m->prefix_sum); free(m->ares);
     free(m->cx); free(m->cnorm); free(m->cresid); free(m->cq); free(m->ckv);
     free(m->clat); free(m->cff); free(m->cexp); free(m->cblockres);
     free(m->cprefix); free(m->croute); free(m->crw); free(m->cused);
+    free(m->cq8); free(m->cq8_scale);
     waste_ecache_free(&m->cache);
     pthread_mutex_destroy(&m->fetch_mu);
 }
@@ -1954,7 +2060,13 @@ static rec_status record_check(const waste_model *m, int layer, int expert,
     if (h->layer != (uint16_t)layer || h->expert_id != (uint16_t)expert)
         return REC_E_HEADER;
     if ((size_t)h->rec_4k_blocks * WASTE_ALIGN != rec_bytes) return REC_E_HEADER;
-    if (h->fmt != WQ_VQ3R && h->fmt != WQ_VQ2R) return REC_E_HEADER;
+    /* The fmt byte and the manifest have to agree, not merely each be
+     * legal: VQ4P and VQ3R records are the same size for the same matrix,
+     * so a container that mixes them would read the right bytes and decode
+     * the wrong indices without ever failing a bounds check. */
+    if (h->fmt != (m->index_bits == 6 ? WQ_VQ4P : WQ_VQ3R) &&
+        !(m->index_bits == 8 && h->fmt == WQ_VQ2R))
+        return REC_E_HEADER;
     if (h->lowrank_id != 0) return REC_E_HEADER;             /* v0 */
     /* codebook_id indexes the table three stage-groups deep and nothing
      * downstream bounds it. */
@@ -2049,11 +2161,9 @@ static const uint8_t *read_expert(waste_model *m, int L, int eid)
     return bank_fetch(m, L, eid, m->miss_buf) == 0 ? m->miss_buf : NULL;
 }
 
-/* Grouped CUDA work keeps several record pointers live across later cache
- * accesses. The ordinary read_expert lifetime ends at the next get(), so a
- * real cache hold is required; the single miss buffer cannot support this
- * path and is rejected during CUDA VQ configuration. */
-#if defined(WASTE_ENABLE_CUDA)
+/* Grouped work keeps several record pointers live across later cache accesses.
+ * The ordinary read_expert lifetime ends at the next get(), so a real cache
+ * hold is required; the single miss buffer cannot support this path. */
 static const uint8_t *read_expert_hold(waste_model *m, int L, int eid,
                                        waste_ecache_hold *hold)
 {
@@ -2066,7 +2176,6 @@ static const uint8_t *read_expert_hold(waste_model *m, int L, int eid,
     if (!m->read_error) bank_fail(m, REC_E_NOSLOT, L, eid);
     return NULL;
 }
-#endif
 
 const char *waste_model_read_error(const waste_model *m, int *layer, int *expert)
 {
@@ -2157,9 +2266,17 @@ void waste_lutb_range(int lo, int hi, void *p)
     }
 }
 
+static void vq_quant_lut(const float *lut, int nv, int st, int en,
+                         int8_t *q, float *scale);
+
+/* q/qs are the int8 shadow of `lut` and its per-block scales, or NULL when
+ * the container is not VQ4P. Quantizing here rather than in vq_apply is not
+ * a tidiness point: gate and up are built once per token and applied once
+ * per routed expert, so doing it there ran the same pass top_k times over
+ * a table that had not changed. */
 static void vq_build_lut(waste_model *m, float *lut, int cb_base,
                          const float *x, int N, int stages, int entries,
-                         int vec_dim)
+                         int vec_dim, int8_t *q, float *qs)
 {
     PROF_START(P_LUTB);
     lutb_arg a = { lut, m->codebooksT, x, cb_base, stages, entries, vec_dim };
@@ -2167,6 +2284,7 @@ static void vq_build_lut(waste_model *m, float *lut, int cb_base,
      * it used the pool, and on K3 it is 8.0 GFLOP per token — 7.0 of them
      * for the down projections, which are rebuilt once per routed expert. */
     waste_parallel_for(N / vec_dim, 16, waste_k.lutb_range, &a);
+    if (q) vq_quant_lut(lut, N / vec_dim, stages, entries, q, qs);
     PROF_END(P_LUTB);
 }
 
@@ -2271,24 +2389,336 @@ static void vq_rows(int b, int e, void *p)
     }
 }
 
+/* ---- WQ_VQ4P ------------------------------------------------------------
+ * Four 6-bit indices per row per vector position, and a 64-entry stage
+ * table that is 64 bytes — one vqtbl4q_s8. VQ3R's 256-entry table is 16
+ * vector registers on a machine with 32, which is why its gather stayed
+ * scalar however it was unrolled (docs/LEARNED.md §25).
+ *
+ * The table has to be int8 for a byte shuffle to index it, so the fp32 LUT
+ * is quantized first. One scale per WASTE_VQ_LUT_BLK positions rather than
+ * one global scale: a LUT entry is dot(x_v, centroid) and its magnitude
+ * follows ||x_v||, which varies by orders of magnitude across a hidden
+ * state. A single scale would round the quiet positions to zero. Blocking
+ * also bounds the int16 accumulator, so the fold to fp32 is the only place
+ * precision is spent.
+ */
+typedef struct {
+    const float *lut; int8_t *q; float *scale; int nv, st, en;
+} lutq_arg;
+
+/* One scale block per call, so the pass rides the same pool as everything
+ * around it. It was serial to begin with, which cost more than the kernel
+ * it was feeding saved: at Kimi-Linear's shapes the quantization is ~12% of
+ * a *threaded* apply, so serial it was over 100% of one. */
+static void vq_quant_range(int b, int e, void *p)
+{
+    const lutq_arg *a = (const lutq_arg *)p;
+    const int st = a->st, en = a->en;
+    for (int blk = b; blk < e; blk++) {
+        const int v0 = blk * WASTE_VQ_LUT_BLK;
+        int v1 = v0 + WASTE_VQ_LUT_BLK;
+        if (v1 > a->nv) v1 = a->nv;
+        const size_t n = (size_t)(v1 - v0) * st * en;
+        const float *src = a->lut + (size_t)v0 * st * en;
+        int8_t *dst = a->q + (size_t)v0 * st * en;
+        size_t i = 0;
+        float mx = 0;
+#if defined(__ARM_NEON) || defined(__aarch64__)
+        {   /* Scalar this pass was ~0.4s a run on Kimi-Linear — more than
+             * the kernel it feeds was saving — and almost all of it was
+             * lrintf and the two clamp branches per value. */
+            float32x4_t m0 = vdupq_n_f32(0), m1 = vdupq_n_f32(0);
+            for (; i + 8 <= n; i += 8) {
+                m0 = vmaxq_f32(m0, vabsq_f32(vld1q_f32(src + i)));
+                m1 = vmaxq_f32(m1, vabsq_f32(vld1q_f32(src + i + 4)));
+            }
+            mx = vmaxvq_f32(vmaxq_f32(m0, m1));
+        }
+#endif
+        for (; i < n; i++) {
+            const float f = fabsf(src[i]);
+            if (f > mx) mx = f;
+        }
+        a->scale[blk] = mx / 127.0f;
+        const float inv = mx > 0 ? 127.0f / mx : 0.0f;
+        i = 0;
+#if defined(__ARM_NEON) || defined(__aarch64__)
+        {
+            const float32x4_t vinv = vdupq_n_f32(inv);
+            const int32x4_t hi = vdupq_n_s32(127), lo = vdupq_n_s32(-127);
+            for (; i + 16 <= n; i += 16) {
+                int32x4_t c[4];
+                for (int k = 0; k < 4; k++) {
+                    /* vcvtnq rounds to nearest, ties to even — the same
+                     * rule lrintf follows in the default mode, so the two
+                     * paths agree value for value. The explicit clamp is
+                     * what keeps -128 out; a saturating narrow alone would
+                     * let it through and break the table's symmetry. */
+                    const float32x4_t f = vmulq_f32(vld1q_f32(src + i + k * 4), vinv);
+                    c[k] = vminq_s32(vmaxq_s32(vcvtnq_s32_f32(f), lo), hi);
+                }
+                const int16x8_t s0 = vcombine_s16(vmovn_s32(c[0]), vmovn_s32(c[1]));
+                const int16x8_t s1 = vcombine_s16(vmovn_s32(c[2]), vmovn_s32(c[3]));
+                vst1q_s8(dst + i, vcombine_s8(vmovn_s16(s0), vmovn_s16(s1)));
+            }
+        }
+#endif
+        for (; i < n; i++) {
+            /* -127 rather than -128 keeps the table symmetric. */
+            int t = (int)lrintf(src[i] * inv);
+            if (t > 127) t = 127;
+            else if (t < -127) t = -127;
+            dst[i] = (int8_t)t;
+        }
+    }
+}
+
+/* Serial on purpose. A build is 4 to 9 scale blocks, which vectorized is a
+ * few microseconds of work; handing that to the pool measured ~79us of
+ * dispatch for ~7us of arithmetic, and 260 builds a token turned a pass
+ * that should cost 0.06s into 0.41s. Threading it was tried both ways —
+ * the numbers are in docs/LEARNED.md. */
+static void vq_quant_lut(const float *lut, int nv, int st, int en,
+                         int8_t *q, float *scale)
+{
+    lutq_arg a = { lut, q, scale, nv, st, en };
+    vq_quant_range(0, (nv + WASTE_VQ_LUT_BLK - 1) / WASTE_VQ_LUT_BLK, &a);
+}
+
+typedef struct {
+    float *y; const uint8_t *idx; const uint16_t *scale;
+    const int8_t *lut8; const float *lscale;
+    int nv;
+} vqp_arg;
+
+/* Unpack of the converter's little-endian 4x6 packing. Kept as one macro so
+ * the scalar path and the NEON path cannot drift apart. */
+#define P6_J0(b0, b1, b2) ((b0) & 0x3f)
+#define P6_J1(b0, b1, b2) ((((b0) >> 6) | ((b1) << 2)) & 0x3f)
+#define P6_J2(b0, b1, b2) ((((b1) >> 4) | ((b2) << 4)) & 0x3f)
+#define P6_J3(b0, b1, b2) (((b2) >> 2) & 0x3f)
+
+static void vq_rows_p6(int b, int e, void *p)
+{
+    vqp_arg *a = (vqp_arg *)p;
+    const int nv = a->nv;
+    const int en = 64;              /* validated at load; the tbl4 width   */
+    float acc[VQ_TILE];
+
+    for (int r0 = b; r0 < e; r0 += VQ_TILE) {
+        const int nr = (r0 + VQ_TILE <= e) ? VQ_TILE : e - r0;
+        for (int r = 0; r < nr; r++) acc[r] = 0.0f;
+
+        for (int v0 = 0; v0 < nv; v0 += WASTE_VQ_LUT_BLK) {
+            int v1 = v0 + WASTE_VQ_LUT_BLK;
+            if (v1 > nv) v1 = nv;
+            /* int16 is enough: 4 stages x 32 positions x 127 = 16256. */
+            int16_t sum[VQ_TILE];
+            memset(sum, 0, sizeof sum);
+
+/* -DWASTE_P6_SCALAR drops to the portable path. The two are meant to agree
+ * exactly — the accumulation is integer until the per-block fold, so there
+ * is no reordering for float addition to notice — and that is only worth
+ * claiming if it can be checked. */
+#if (defined(__ARM_NEON) || defined(__aarch64__)) && !defined(WASTE_P6_SCALAR)
+            if (nr == VQ_TILE) {
+                int16x8_t s[8];
+                for (int i = 0; i < 8; i++) s[i] = vdupq_n_s16(0);
+                for (int v = v0; v < v1; v++) {
+                    const int8_t *T = a->lut8 + (size_t)v * 4 * en;
+                    int8x16x4_t T0, T1, T2, T3;
+                    for (int k = 0; k < 4; k++) {
+                        T0.val[k] = vld1q_s8(T +   0 + k * 16);
+                        T1.val[k] = vld1q_s8(T +  64 + k * 16);
+                        T2.val[k] = vld1q_s8(T + 128 + k * 16);
+                        T3.val[k] = vld1q_s8(T + 192 + k * 16);
+                    }
+                    const uint8_t *ix = a->idx +
+                        ((size_t)(r0 / VQ_TILE) * nv + v) * VQ_TILE * 3;
+                    for (int g = 0; g < 4; g++) {
+                        const uint8x16x3_t I = vld3q_u8(ix + g * 48);
+                        const uint8x16_t j0 =
+                            vandq_u8(I.val[0], vdupq_n_u8(0x3f));
+                        const uint8x16_t j1 = vandq_u8(
+                            vorrq_u8(vshrq_n_u8(I.val[0], 6),
+                                     vshlq_n_u8(I.val[1], 2)), vdupq_n_u8(0x3f));
+                        const uint8x16_t j2 = vandq_u8(
+                            vorrq_u8(vshrq_n_u8(I.val[1], 4),
+                                     vshlq_n_u8(I.val[2], 4)), vdupq_n_u8(0x3f));
+                        const uint8x16_t j3 = vshrq_n_u8(I.val[2], 2);
+                        /* Each lookup is widened on its own rather than
+                         * summed in int8 first: two int8 tables can add to
+                         * 254 and the table is worth a bit more than the
+                         * two instructions that would save. */
+                        const int8x16_t r0v = vqtbl4q_s8(T0, j0);
+                        const int8x16_t r1v = vqtbl4q_s8(T1, j1);
+                        const int8x16_t r2v = vqtbl4q_s8(T2, j2);
+                        const int8x16_t r3v = vqtbl4q_s8(T3, j3);
+                        int16x8_t lo = s[g * 2], hi = s[g * 2 + 1];
+                        lo = vaddw_s8(lo, vget_low_s8(r0v));
+                        hi = vaddw_s8(hi, vget_high_s8(r0v));
+                        lo = vaddw_s8(lo, vget_low_s8(r1v));
+                        hi = vaddw_s8(hi, vget_high_s8(r1v));
+                        lo = vaddw_s8(lo, vget_low_s8(r2v));
+                        hi = vaddw_s8(hi, vget_high_s8(r2v));
+                        lo = vaddw_s8(lo, vget_low_s8(r3v));
+                        hi = vaddw_s8(hi, vget_high_s8(r3v));
+                        s[g * 2] = lo; s[g * 2 + 1] = hi;
+                    }
+                }
+                for (int i = 0; i < 8; i++) vst1q_s16(sum + i * 8, s[i]);
+            } else
+#endif
+            {
+                for (int v = v0; v < v1; v++) {
+                    const int8_t *T = a->lut8 + (size_t)v * 4 * en;
+                    const uint8_t *ix = a->idx +
+                        ((size_t)(r0 / VQ_TILE) * nv + v) * VQ_TILE * 3;
+                    for (int r = 0; r < nr; r++) {
+                        const unsigned b0 = ix[r * 3], b1 = ix[r * 3 + 1],
+                                       b2 = ix[r * 3 + 2];
+                        sum[r] = (int16_t)(sum[r] +
+                            T[P6_J0(b0, b1, b2)] +
+                            T[en + P6_J1(b0, b1, b2)] +
+                            T[2 * en + P6_J2(b0, b1, b2)] +
+                            T[3 * en + P6_J3(b0, b1, b2)]);
+                    }
+                }
+            }
+            const float ls = a->lscale[v0 / WASTE_VQ_LUT_BLK];
+            for (int r = 0; r < nr; r++) acc[r] += ls * (float)sum[r];
+        }
+        for (int r = 0; r < nr; r++)
+            a->y[r0 + r] = acc[r] * f16_to_f32(a->scale[r0 + r]);
+    }
+}
+
+/* The same two kernels, run on the calling thread.
+ *
+ * waste_parallel_for is not reentrant — one global descriptor guarded by
+ * g_pool_run_mu — so nothing a worker calls may dispatch. When moe_layer
+ * gives each expert its own thread, these are what that thread runs.
+ * Splitting is by row either way, so the result does not depend on which
+ * of the two was used. */
+static void vq_apply_serial(waste_model *m, float *y, const uint8_t *idx,
+                            const uint16_t *scale, int M, int N,
+                            const float *lut, const int8_t *q, const float *qs)
+{
+    const int nv = N / m->vec_dim;
+    if (m->index_bits == 6) {
+        vqp_arg a = { y, idx, scale, q, qs, nv };
+        vq_rows_p6(0, M, &a);
+    } else {
+        vq_arg a = { y, idx, scale, lut, nv, m->stages, m->cb_entries };
+        vq_rows(0, M, &a);
+    }
+}
+
+static void vq_matvec_serial(waste_model *m, float *y, const uint8_t *idx,
+                             const uint16_t *scale, const float *x, int M,
+                             int N, int cb_base, float *lut, int8_t *q,
+                             float *qs)
+{
+    lutb_arg a = { lut, m->codebooksT, x, cb_base, m->stages, m->cb_entries,
+                   m->vec_dim };
+    waste_k.lutb_range(0, N / m->vec_dim, &a);
+    if (q) vq_quant_lut(lut, N / m->vec_dim, m->stages, m->cb_entries, q, qs);
+    vq_apply_serial(m, y, idx, scale, M, N, lut, q, qs);
+}
+
 static void vq_apply(waste_model *m, float *y, const uint8_t *idx,
-                     const uint16_t *scale, int M, int N, const float *lut)
+                     const uint16_t *scale, int M, int N, const float *lut,
+                     const int8_t *q, const float *qs)
 {
     PROF_START(P_LUTA);
-    vq_arg a = { y, idx, scale, lut, N / m->vec_dim, m->stages, m->cb_entries };
-    /* min_chunk = VQ_TILE keeps every thread's range block-aligned, which
-     * the blocked index layout requires. */
-    waste_parallel_for(M, VQ_TILE * VQ_SUPER, vq_rows, &a);
+    const int nv = N / m->vec_dim;
+    if (m->index_bits == 6) {
+        vqp_arg a = { y, idx, scale, q, qs, nv };
+        waste_parallel_for(M, VQ_TILE * p6_chunk, vq_rows_p6, &a);
+    } else {
+        vq_arg a = { y, idx, scale, lut, nv, m->stages, m->cb_entries };
+        /* min_chunk = VQ_TILE keeps every thread's range block-aligned,
+         * which the blocked index layout requires. */
+        waste_parallel_for(M, VQ_TILE * VQ_SUPER, vq_rows, &a);
+    }
     PROF_END(P_LUTA);
 }
 
 static void vq_matvec(waste_model *m, float *y, const uint8_t *idx,
                       const uint16_t *scale, const float *x, int M, int N,
-                      int cb_base, float *lut)
+                      int cb_base, float *lut, int8_t *q, float *qs)
 {
     vq_build_lut(m, lut, cb_base, x, N, m->stages, m->cb_entries,
-                 m->vec_dim);
-    vq_apply(m, y, idx, scale, M, N, lut);
+                 m->vec_dim, q, qs);
+    vq_apply(m, y, idx, scale, M, N, lut, q, qs);
+}
+
+/* ---- expert-parallel MoE ------------------------------------------------
+ * One routed expert per task instead of one row range per task.
+ *
+ * The row-parallel form dispatches three times per expert — gate, up, down
+ * — and at Kimi-Linear's expert shapes each of those is a few microseconds
+ * of arithmetic against a fork-join that costs tens. Per token that is ~900
+ * dispatches; this is 26, one a layer, and every thread does a whole
+ * expert. Records have to be held for the length of the layer for it, which
+ * is what waste_ecache_hold exists for.
+ *
+ * Determinism is unaffected: each expert writes its own slice and the sum
+ * over experts is done afterwards in j order, so the result does not depend
+ * on which thread ran which expert or on how many there were. */
+typedef struct {
+    waste_model *m;
+    const waste_config *c;
+    const uint8_t **recs;
+    const float *w;
+    int j_off;                       /* first expert of this batch         */
+    int inter, lat;
+    const float *lut_gate, *lut_up;
+    const int8_t *q_gate, *q_up;
+    const float *qs_gate, *qs_up;
+} xpar_arg;
+
+static void moe_expert_range(int b, int e, void *p)
+{
+    const xpar_arg *a = (const xpar_arg *)p;
+    waste_model *m = a->m;
+    const waste_config *c = a->c;
+    const int inter = a->inter, lat = a->lat;
+
+    for (int t = b; t < e; t++) {
+        const int j = a->j_off + t;
+        const uint8_t *rec = a->recs[j];
+        const waste_expert_hdr *h = (const waste_expert_hdr *)rec;
+        const uint16_t *sc = (const uint16_t *)(rec + h->chan_corr_off);
+        float *ga = m->xga + (size_t)j * inter;
+        float *ub = m->xub + (size_t)j * inter;
+        float *acc = m->xacc + (size_t)j * lat;
+        float *ld = m->xlut + (size_t)j * m->xlut_sz;
+        int8_t *qd = m->xlut8 ? m->xlut8 + (size_t)j * m->xlut_sz : NULL;
+        float *qsd = m->xqs ? m->xqs + (size_t)j * m->xnsc : NULL;
+
+        vq_apply_serial(m, ga, rec + h->gate_off, sc, inter, lat,
+                        a->lut_gate, a->q_gate, a->qs_gate);
+        vq_apply_serial(m, ub, rec + h->up_off, sc + inter, inter, lat,
+                        a->lut_up, a->q_up, a->qs_up);
+        if (c->act_situ)
+            for (int i = 0; i < inter; i++)
+                ga[i] = waste_situ_pair(ga[i], ub[i], c->situ_beta,
+                                        c->situ_linear_beta);
+        else
+            for (int i = 0; i < inter; i++) ga[i] = silu(ga[i]) * ub[i];
+        vq_matvec_serial(m, acc, rec + h->down_off, sc + 2 * inter, ga, lat,
+                         inter, h->codebook_id + 2 * m->stages, ld, qd, qsd);
+        /* acc is left unweighted on purpose: the caller applies w[j] in the
+         * same `ysum[i] += w[j] * acc[i]` the serial loop uses, so the
+         * compiler contracts it to the same fma and the two paths agree
+         * bit for bit. Weighting it here instead rounded the product first,
+         * and a 1e-8 difference is not harmless downstream — vq_quant_lut
+         * takes its scale from max|lut|, so a perturbation that small
+         * changes the scale and moves every entry near a rounding boundary
+         * by one LSB. That measured as 0.68 on a logit. */
+    }
 }
 
 /* ---- layers ------------------------------------------------------------ */
@@ -2958,6 +3388,89 @@ static int moe_layer(waste_model *m, int L, const float *in, float *out, int *ro
     memset(ysum, 0, (size_t)lat * sizeof(float));
     const int lut_sz = ((hid > lat ? hid : lat) / m->vec_dim) * m->stages * m->cb_entries;
     float *lut_gate = m->lut, *lut_up = lut_gate + lut_sz, *lut_down = lut_up + lut_sz;
+    /* The int8 shadow mirrors m->lut region for region — same element
+     * count, one byte each — so the three offsets are the same lut_sz. */
+    int8_t *q_gate = NULL, *q_up = NULL, *q_down = NULL;
+    float *qs_gate = NULL, *qs_up = NULL, *qs_down = NULL;
+    if (m->lut8) {
+        const int nsc = lut_sz / (m->stages * m->cb_entries)
+                        / WASTE_VQ_LUT_BLK + 2;
+        q_gate = m->lut8; q_up = q_gate + lut_sz; q_down = q_up + lut_sz;
+        qs_gate = m->lut8_scale; qs_up = qs_gate + nsc; qs_down = qs_up + nsc;
+    }
+    /* Expert-parallel path. Needs the per-expert scratch, and needs the
+     * cache to be able to hold all K records at once — the held set is
+     * unevictable, so a cache that is not comfortably larger than K would
+     * be asked to find a victim among slots that are all pinned. */
+    if (xpar_on && m->xga && K > 1 && K <= WASTE_PF_MAX &&
+#if defined(WASTE_ENABLE_CUDA)
+        !m->cuda_vq_mode &&
+#endif
+        m->cache.n_slots >= 4 * K) {
+        /* In batches, not all K at once. Holding every record before doing
+         * any arithmetic is a barrier against the read-ahead: the hint has
+         * already queued all K reads, and waiting for the last one before
+         * starting the first expert stops the reads overlapping the
+         * multiplies they were issued to hide behind. On Kimi-Linear, where
+         * expert I/O is under 1% of a step, it cost nothing; on K3 it moved
+         * the I/O bucket from 3.11s to 14.54s and made the whole change a
+         * regression. A batch is a barrier only across itself. */
+        const uint8_t *recs[WASTE_PF_MAX];
+        waste_ecache_hold held[WASTE_PF_MAX];
+        for (int j = 0; j < K; j++)
+            held[j] = (waste_ecache_hold)WASTE_ECACHE_HOLD_INIT;
+        int lut_done = 0, ok = 1;
+        for (int j0 = 0; j0 < K; j0 += xpar_batch) {
+            int j1 = j0 + xpar_batch;
+            if (j1 > K) j1 = K;
+            PROF_START(P_EDEQ);
+            int n = j0;
+            for (; n < j1; n++) {
+                recs[n] = read_expert_hold(m, L, idx[n], &held[n]);
+                if (!recs[n]) break;
+            }
+            PROF_END(P_EDEQ);
+            if (n < j1) {
+                for (int j = j0; j < n; j++)
+                    waste_ecache_release_hold(&m->cache, &held[j]);
+                ok = 0;
+                break;
+            }
+            PROF_START(P_EMM);
+            if (!lut_done) {
+                const waste_expert_hdr *h0 = (const waste_expert_hdr *)recs[0];
+                vq_build_lut(m, lut_gate, h0->codebook_id + 0 * m->stages,
+                             xin, lat, m->stages, m->cb_entries, m->vec_dim,
+                             q_gate, qs_gate);
+                vq_build_lut(m, lut_up, h0->codebook_id + 1 * m->stages,
+                             xin, lat, m->stages, m->cb_entries, m->vec_dim,
+                             q_up, qs_up);
+                lut_done = 1;
+            }
+            xpar_arg pa = { m, c, recs, w, j0, inter, lat, lut_gate, lut_up,
+                            q_gate, q_up, qs_gate, qs_up };
+            waste_parallel_for(j1 - j0, 1, moe_expert_range, &pa);
+            PROF_END(P_EMM);
+            for (int j = j0; j < j1; j++)
+                waste_ecache_release_hold(&m->cache, &held[j]);
+        }
+        if (ok) {
+            PROF_START(P_EMM);
+            /* Summed here, in j order, so the total does not depend on the
+             * thread count or the batch size — the same guarantee the row
+             * split gives. */
+            for (int j = 0; j < K; j++) {
+                const float *accj = m->xacc + (size_t)j * lat;
+                const float wj = w[j];
+                for (int i = 0; i < lat; i++) ysum[i] += wj * accj[i];
+            }
+            PROF_END(P_EMM);
+            goto moe_done;
+        }
+        /* Something did not read. The partial batch was released above;
+         * fall through to the serial loop, which re-reads and reports why. */
+    }
+
     int lut_ready = 0;
     int routed_grouped = 0;
 #if defined(WASTE_ENABLE_CUDA)
@@ -2988,9 +3501,11 @@ static int moe_layer(waste_model *m, int L, const float *in, float *out, int *ro
         if (!lut_ready) {
             if (m->cuda_vq_mode != 2) {
                 vq_build_lut(m, lut_gate, h->codebook_id + 0 * m->stages,
-                             xin, lat, m->stages, m->cb_entries, m->vec_dim);
+                             xin, lat, m->stages, m->cb_entries, m->vec_dim,
+                             q_gate, qs_gate);
                 vq_build_lut(m, lut_up, h->codebook_id + 1 * m->stages,
-                             xin, lat, m->stages, m->cb_entries, m->vec_dim);
+                             xin, lat, m->stages, m->cb_entries, m->vec_dim,
+                             q_up, qs_up);
             }
 #if defined(WASTE_ENABLE_CUDA)
             if (m->cuda_vq_mode) {
@@ -3022,8 +3537,10 @@ static int moe_layer(waste_model *m, int L, const float *in, float *out, int *ro
         } else
 #endif
         {
-            vq_apply(m, ga, rec + h->gate_off, sc, inter, lat, lut_gate);
-            vq_apply(m, ub, rec + h->up_off, sc + inter, inter, lat, lut_up);
+            vq_apply(m, ga, rec + h->gate_off, sc, inter, lat, lut_gate,
+                     q_gate, qs_gate);
+            vq_apply(m, ub, rec + h->up_off, sc + inter, inter, lat, lut_up,
+                     q_up, qs_up);
         }
         if (c->act_situ)
             for (int i = 0; i < inter; i++)
@@ -3036,7 +3553,7 @@ static int moe_layer(waste_model *m, int L, const float *in, float *out, int *ro
                 vq_build_lut(m, lut_down,
                              h->codebook_id + 2 * m->stages,
                              ga, inter, m->stages, m->cb_entries,
-                             m->vec_dim);
+                             m->vec_dim, q_down, qs_down);
             {
                 PROF_START(P_LUTA);
                 const int failed = waste_cuda_vq_apply_down(
@@ -3060,7 +3577,8 @@ static int moe_layer(waste_model *m, int L, const float *in, float *out, int *ro
         {
             vq_matvec(m, acc, rec + h->down_off, sc + 2 * inter,
                       ga, lat, inter,
-                      h->codebook_id + 2 * m->stages, lut_down);
+                      h->codebook_id + 2 * m->stages, lut_down,
+                      q_down, qs_down);
         }
         const float wj = w[j];
         for (int i = 0; i < lat; i++) ysum[i] += wj * acc[i];
@@ -3073,6 +3591,7 @@ static int moe_layer(waste_model *m, int L, const float *in, float *out, int *ro
 #endif
         PROF_END(P_EMM);
     }
+moe_done:
     if (c->latent_dim) {
         if (c->latent_norm)
             waste_rmsnorm(ysum, ysum, waste_find(m, tname(
@@ -3952,6 +4471,11 @@ static int prefill_alloc(waste_model *m, int T)
     free(m->cx); free(m->cnorm); free(m->cresid); free(m->cq); free(m->ckv);
     free(m->clat); free(m->cff); free(m->cexp); free(m->cblockres);
     free(m->cprefix); free(m->croute); free(m->crw); free(m->cused);
+    /* Re-entered whenever a longer chunk is asked for, so these have to be
+     * cleared as well as freed: the VQ4P branch below only assigns them
+     * when it runs, and a stale pointer here is a double free. */
+    free(m->cq8); free(m->cq8_scale);
+    m->cq8 = NULL; m->cq8_scale = NULL;
 
     m->cx     = (float *)calloc((size_t)T * hid, sizeof(float));
     m->cnorm  = (float *)calloc((size_t)T * hid, sizeof(float));
@@ -3963,6 +4487,14 @@ static int prefill_alloc(waste_model *m, int T)
         const size_t lut_sz = (size_t)(nmax / m->vec_dim + 1) *
                               (size_t)m->stages * (size_t)m->cb_entries;
         m->cq = (float *)calloc((size_t)(2 * T + 1) * lut_sz + 64, sizeof(float));
+        if (m->index_bits == 6) {
+            const size_t nsc = lut_sz / ((size_t)m->stages * m->cb_entries)
+                               / WASTE_VQ_LUT_BLK + 2;
+            m->cq8 = (int8_t *)calloc((size_t)(2 * T + 1) * lut_sz + 64, 1);
+            m->cq8_scale = (float *)calloc((size_t)(2 * T + 1) * nsc + 64,
+                                           sizeof(float));
+            if (!m->cq8 || !m->cq8_scale) return -1;
+        }
     }
     {   /* ckv holds the shared-expert staging: gate, up, out */
         const int si = c->moe_inter * (c->n_shared ? c->n_shared : 1);
@@ -4076,6 +4608,13 @@ static void moe_chunk(waste_model *m, int L, const float *in, float *out, int nT
     const int lut_sz = ((hid > lat ? hid : lat) / m->vec_dim) * m->stages * m->cb_entries;
     float *lut_gu = m->cq;                    /* [nT][2][lut_sz] */
     float *lut_down = lut_gu + (size_t)nT * 2 * lut_sz;
+    /* Same mirroring as moe_layer, over m->cq's 2*nT+1 regions. */
+    int8_t *q_gu = m->cq8;
+    int8_t *q_down = q_gu ? q_gu + (size_t)nT * 2 * lut_sz : NULL;
+    const int nsc = lut_sz / (m->stages * m->cb_entries)
+                    / WASTE_VQ_LUT_BLK + 2;
+    float *qs_gu = m->cq8_scale;
+    float *qs_down = qs_gu ? qs_gu + (size_t)nT * 2 * nsc : NULL;
     int lut_ready = 0;
 
     float *ga = m->cff, *ub = ga + inter, *acc = m->cff + 2 * inter;
@@ -4111,11 +4650,15 @@ static void moe_chunk(waste_model *m, int L, const float *in, float *out, int nT
                 vq_build_lut(m, lut_gu + (size_t)(2 * t) * lut_sz,
                              h->codebook_id + 0 * m->stages,
                              xin + (size_t)t * lat, lat, m->stages,
-                             m->cb_entries, m->vec_dim);
+                             m->cb_entries, m->vec_dim,
+                             q_gu ? q_gu + (size_t)(2 * t) * lut_sz : NULL,
+                             qs_gu ? qs_gu + (size_t)(2 * t) * nsc : NULL);
                 vq_build_lut(m, lut_gu + (size_t)(2 * t + 1) * lut_sz,
                              h->codebook_id + 1 * m->stages,
                              xin + (size_t)t * lat, lat, m->stages,
-                             m->cb_entries, m->vec_dim);
+                             m->cb_entries, m->vec_dim,
+                             q_gu ? q_gu + (size_t)(2 * t + 1) * lut_sz : NULL,
+                             qs_gu ? qs_gu + (size_t)(2 * t + 1) * nsc : NULL);
             }
             lut_ready = 1;
         }
@@ -4126,16 +4669,21 @@ static void moe_chunk(waste_model *m, int L, const float *in, float *out, int nT
             if (wj == 0.0f) continue;
 
             vq_apply(m, ga, rec + h->gate_off, s16, inter, lat,
-                     lut_gu + (size_t)(2 * t) * lut_sz);
+                     lut_gu + (size_t)(2 * t) * lut_sz,
+                     q_gu ? q_gu + (size_t)(2 * t) * lut_sz : NULL,
+                     qs_gu ? qs_gu + (size_t)(2 * t) * nsc : NULL);
             vq_apply(m, ub, rec + h->up_off, s16 + inter, inter, lat,
-                     lut_gu + (size_t)(2 * t + 1) * lut_sz);
+                     lut_gu + (size_t)(2 * t + 1) * lut_sz,
+                     q_gu ? q_gu + (size_t)(2 * t + 1) * lut_sz : NULL,
+                     qs_gu ? qs_gu + (size_t)(2 * t + 1) * nsc : NULL);
             if (c->act_situ)
                 for (int i = 0; i < inter; i++)
                     ga[i] = waste_situ_pair(ga[i], ub[i], c->situ_beta, c->situ_linear_beta);
             else
                 for (int i = 0; i < inter; i++) ga[i] = silu(ga[i]) * ub[i];
             vq_matvec(m, acc, rec + h->down_off, s16 + 2 * inter, ga, lat, inter,
-                      h->codebook_id + 2 * m->stages, lut_down);
+                      h->codebook_id + 2 * m->stages, lut_down,
+                      q_down, qs_down);
             float *dst = ysum + (size_t)t * lat;
             for (int i = 0; i < lat; i++) dst[i] += wj * acc[i];
         }
