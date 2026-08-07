@@ -11,6 +11,11 @@
 > reached 0.728 tok/s at 132.13 W and 179.74 J/token without changing output;
 > it remains optional rather than the promoted default. A 4.52-hour promotion
 > soak also completed 50/50 exact trajectories on the development corpus.
+> These absolute results use the Spark's internal NVMe, an otherwise exclusive
+> host, and greedy decoding; they are not claims for shared-host, external-disk,
+> or sampled-generation operation. A matched cold-server power campaign measured
+> 0.111 full-request tok/s at 114.35 W for CPU-only and 0.212 tok/s at 130.49 W
+> for CUDA, with CUDA using 40.14% less total energy per generated token.
 > See the
 > [qualified profile](docs/GB10_QUALIFIED_PROFILE.md) and
 > [promotion record](docs/GN100.md#qualified-cuda-promotion-2026-08-07).
@@ -197,7 +202,7 @@ Every token answered by a cloud service is paid for twice: once on the invoice, 
 
 ## Project status
 
-The format and API are not frozen. K3 is the main target and the best-tested model. The CPU path remains the qualified default. An opt-in GB10 CUDA experiment is now the fastest measured path on that machine, but it has not been promoted from its experimental branch. CUDA beyond that narrow path, Metal, and other hardware-specific optimizations remain open. Current backend results are documented in [docs/BACKENDS.md](docs/BACKENDS.md), while open directions are tracked in [docs/RESEARCH.md](docs/RESEARCH.md). Read [docs/LEARNED.md](docs/LEARNED.md) before proposing an optimization: failed ideas and negative results are kept there deliberately.
+The format and API are not frozen. K3 is the main target and the best-tested model. The portable CPU path remains the upstream default; this fork's narrow, fail-closed GB10 CUDA profile is qualified on `spark/integration`. Other CUDA devices, Metal, and broader hardware-specific optimization remain open. Current backend results are documented in [docs/BACKENDS.md](docs/BACKENDS.md), while open directions are tracked in [docs/RESEARCH.md](docs/RESEARCH.md). Read [docs/LEARNED.md](docs/LEARNED.md) before proposing an optimization: failed ideas and negative results are kept there deliberately.
 
 Contributors are more than welcome. New experiments, support for additional hardware, and open discussion about how to improve performance are all encouraged—even when an idea produces a negative result.
 

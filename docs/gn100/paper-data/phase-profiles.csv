@@ -1,0 +1,4 @@
+stage,condition,kda_pct,mla_pct,moe_pct,expert_io_pct,expert_matmul_pct,vq_lut_pct,lm_head_pct,accounted_seconds,note,evidence_ref,evidence_archive,evidence_sha256
+baseline,x925_pinned_34_8_gib_cache,17.2,3.5,79.1,34.3,34.1,,0.2,66.33,subtotals overlap parents,private retained lab record,historical-lab-record,e8857a34e136c9681cf24c958921fef2e31d5c308c55f3109ef94ba3768b9b60
+sprint11,cpu_profile_before_kda_cuda,26.7,,,,,,,60.3,full KDA layer share before offload,https://github.com/mccoyspace/waste-spark/releases/tag/gn100-sprint12-results-2026-08-02,gn100-sprint12-evidence-2026-08-02.tar.gz,a38522b49866a3aa93b551560b69ade282bb960f6f26c1aea7050e4e5bfd65a0
+sprint12,accepted_dense_cuda_scope2,7.7,2.4,89.3,22.2,56.6,51.0,0.7,,subtotals overlap parents,https://github.com/mccoyspace/waste-spark/releases/tag/gn100-sprint12-results-2026-08-02,gn100-sprint12-evidence-2026-08-02.tar.gz,a38522b49866a3aa93b551560b69ade282bb960f6f26c1aea7050e4e5bfd65a0

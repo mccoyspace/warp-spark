@@ -1,0 +1,48 @@
+{
+  "schema": "waste.gn100.consolidation_task0.public_summary.v1",
+  "completed_date": "2026-08-06",
+  "machine": "Acer Veriton GN100 / NVIDIA GB10",
+  "status": "instrument_qualified",
+  "instrument": {
+    "model": "Shelly Plug Gen4 S4PL-00116US",
+    "firmware": "2.0.0",
+    "wall_sample_hz": 1,
+    "nvml_sample_hz": 4,
+    "energy_authority": "Shelly lifetime Wh with marker-time interpolation"
+  },
+  "measurements": {
+    "idle_no_model": {
+      "seconds": 600.0320789814,
+      "mean_wall_w": 51.8903333333,
+      "peak_wall_w": 56.3
+    },
+    "loaded_idle": {
+      "seconds": 600.0307509899,
+      "mean_wall_w": 56.9806666667,
+      "peak_wall_w": 66.4
+    },
+    "cpu_16": {
+      "seconds": 128.0345151424,
+      "mean_wall_w": 126.84296875,
+      "peak_wall_w": 131.3,
+      "total_j_per_generated_token": 991.575,
+      "marginal_j_per_generated_token": 559.0491233734
+    },
+    "cuda_16": {
+      "seconds": 92.9232928753,
+      "mean_wall_w": 132.0956989247,
+      "peak_wall_w": 141.3,
+      "total_j_per_generated_token": 777.15,
+      "marginal_j_per_generated_token": 436.2460088658
+    }
+  },
+  "alignment_sanity": {
+    "wall_delta_exceeds_nvml_delta": true,
+    "pass": true
+  },
+  "evidence": {
+    "archive": "consolidation-task0-power-evidence-20260806.tar.gz",
+    "archive_sha256": "94bcfbc0c37205a93a8436966579f44df8abd03f8908b07d03987d9a35bfe750"
+  },
+  "scope": "Instrument qualification; Task 2 is the definitive promoted-profile power campaign."
+}

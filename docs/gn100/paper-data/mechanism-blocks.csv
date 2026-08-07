@@ -1,0 +1,4 @@
+arm,description,median_total_ms,median_attention_ms,median_router_ms,median_expert_io_ms,median_routed_compute_ms,median_shared_compute_ms,median_moe_total_ms,diagnostic_tokens_per_second,evidence_ref,evidence_archive,evidence_sha256
+A,interleaved synchronous pread,20884,5560,203,3615,8601,1853,15096,0.1915,private retained Sprint 3 report,historical-lab-record,fbedd7795e7949fe469b09d78ea6435467b978a17b5fcaf882436d17116e8b28
+B,batched sequential pread,19821,5554,200,3510,7716,1815,14036,0.2018,private retained Sprint 3 report,historical-lab-record,fbedd7795e7949fe469b09d78ea6435467b978a17b5fcaf882436d17116e8b28
+C,io_uring QD4,18713,5564,201,2808,7238,1812,12904,0.2138,private retained Sprint 3 report,historical-lab-record,fbedd7795e7949fe469b09d78ea6435467b978a17b5fcaf882436d17116e8b28
