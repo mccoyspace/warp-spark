@@ -1,6 +1,6 @@
 # Prevent competing processes from opening one container
 
-Candidate commit: `4c32400c4516e38e7518c1f42d8fca6a787e4574`
+Candidate commit: `293d06e4db23b4674ce3431ccc47c67218253425`
 
 ## Problem
 

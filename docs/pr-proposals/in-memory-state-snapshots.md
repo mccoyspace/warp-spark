@@ -1,6 +1,6 @@
 # Add transactional in-memory state snapshots
 
-Candidate commit: `7cbb12def90922dc378768be711092c242e2eab3`
+Candidate commit: `6fba880cad7accce8d06828f88b423a6a62a72e4`
 
 ## Problem
 

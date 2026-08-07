@@ -1,7 +1,7 @@
 # Add an exact, budgeted server prefix cache
 
 Implementation commit:
-`39a23344d18cdb659d93b84c10902d0e5cdec9ab`
+`2d6c74daa946681d388c7d00bd03285047872619`
 
 Candidate status: implementation-complete, independently reviewed, and exercised
 with real K3 on this project's Acer GN100. The measurement below is one
@@ -25,7 +25,7 @@ arithmetic order.
 ## Dependency
 
 This candidate is intentionally stacked on `pr/in-memory-state-snapshots`,
-implementation commit `7cbb12def90922dc378768be711092c242e2eab3`. It uses:
+implementation commit `6fba880cad7accce8d06828f88b423a6a62a72e4`. It uses:
 
 - `waste_state_size`, `waste_state_export`, and transactional
   `waste_state_import`;

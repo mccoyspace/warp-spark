@@ -68,12 +68,18 @@ The three portable candidates were replayed on this base:
   checks on macOS;
 - `pr/in-memory-state-snapshots` (`6fba880`) applied without conflicts and
   passed `30 passed, 0 failed, 13 skipped` plus 173 server checks; and
-- `pr/server-prefix-cache` (`9cd478c`), stacked on snapshots, applied without
+- `pr/server-prefix-cache` (`0c53bc7`), stacked on snapshots, applied without
   conflicts and passed `30 passed, 0 failed, 13 skipped` plus 202 server
   checks.
 
-They are current-base candidates, not submitted PRs.  A focused Linux ARM64
-run remains before calling any one ready for upstream review.
+All three also passed their native Linux ARM64 model-free suites on the GN100:
+30/0/13 for the lock and 29/0/13 for each stacked snapshot branch, including
+the real CPU-binding check, with 168/173/202 server checks respectively.  The
+rebased snapshot candidate additionally passed `test_state` against the real
+K3 container: next logits, the complete recurrent state, and the legacy file
+continuation were bit-exact after restore.  These are current-base candidates,
+not submitted PRs.  Re-run the longer real-K3 server miss-hit-hit sequence only
+if the snapshot prerequisite lands and the prefix-cache PR is next to submit.
 
 ## Proposed pull-request stack
 
@@ -83,12 +89,12 @@ The order below follows dependencies, not the historical sprint order.
 | ---: | --- | --- | --- |
 | 0 | Linux 4 KiB `O_DIRECT` eligibility and transfer probing | Portable correctness | Already implemented upstream; no duplicate PR |
 | 1 | Auto-budget from Linux `MemAvailable` and cgroup-v2 headroom | Generic safety; preserve other platforms | Issue #14 is closed; upstream has stable cgroup capacity and the GN100 pressure row rejects the remaining hard ceiling |
-| 2 | POSIX model-container ownership lock with explicit opt-out | Generic safety/policy | Rebased on `d9b919a` at `pr/posix-model-lock`; Linux ARM64 recheck pending |
+| 2 | POSIX model-container ownership lock with explicit opt-out | Generic safety/policy | Rebased on `d9b919a`; macOS and GN100 suites pass at `pr/posix-model-lock` |
 | 3 | Explicit CPU-list affinity | Generic configuration | Implemented upstream in v0.6.6 as `--cpus`; no duplicate PR |
 | 4 | Final phase/layer trace and request-boundary flushing | Generic observability | Reconcile with upstream cache traces |
-| 5 | Transactional in-memory state export/import and caller-owned budget reservation | Generic engine API | Rebased cleanly on `d9b919a` at `pr/in-memory-state-snapshots`; Linux ARM64 recheck pending |
+| 5 | Transactional in-memory state export/import and caller-owned budget reservation | Generic engine API | Rebased cleanly on `d9b919a`; macOS/GN100 suites and real-K3 bit-exact round-trip pass |
 | 6 | Whole-expert scheduling through typed per-context configuration | Generic optimization | Complete experiment on `exp/whole-expert-scheduler`; no GN100 gain, excluded from integration |
-| 7 | Exact, renderer-delimited family-root server cache | Generic server feature | Rebased cleanly on `d9b919a` at `pr/server-prefix-cache`; depends on state snapshots; Linux ARM64 recheck pending |
+| 7 | Exact, renderer-delimited family-root server cache | Generic server feature | Rebased cleanly on `d9b919a`; macOS/GN100 suites pass; depends on state snapshots |
 | 8 | Mutable conversation-head reuse | Generic follow-on | Implemented on `spark/sprint7`; exact next-turn state/output, divergent-history, replacement, and shared-budget gates pass |
 
 Sprint 9 produced one additional discuss-first candidate: measurement
