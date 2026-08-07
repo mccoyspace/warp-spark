@@ -9,9 +9,10 @@ against the new base before opening the next PR.
 
 | Candidate | Fork branch | Draft | State |
 | --- | --- | --- | --- |
-| POSIX model-container ownership | [`pr/posix-model-lock`](https://github.com/mccoyspace/waste-spark/tree/pr/posix-model-lock) | [Description](posix-model-lock.md) | PR-ready; not yet submitted upstream |
-| In-memory state snapshots | [`pr/in-memory-state-snapshots`](https://github.com/mccoyspace/waste-spark/tree/pr/in-memory-state-snapshots) | [Description](in-memory-state-snapshots.md) | PR-ready; not yet submitted upstream |
-| Exact server prefix cache | [`pr/server-prefix-cache`](https://github.com/mccoyspace/waste-spark/tree/pr/server-prefix-cache) | [Description](server-prefix-cache.md) | PR-ready; real-K3 miss-hit-hit acceptance complete |
+| POSIX model-container ownership | [`pr/posix-model-lock`](https://github.com/mccoyspace/waste-spark/tree/pr/posix-model-lock) | [Description](posix-model-lock.md) | Rebased on upstream `d9b919a`; local suite passes; Linux ARM64 recheck pending |
+| In-memory state snapshots | [`pr/in-memory-state-snapshots`](https://github.com/mccoyspace/waste-spark/tree/pr/in-memory-state-snapshots) | [Description](in-memory-state-snapshots.md) | Rebased on upstream `d9b919a`; local suite passes; Linux ARM64 recheck pending |
+| Exact server prefix cache | [`pr/server-prefix-cache`](https://github.com/mccoyspace/waste-spark/tree/pr/server-prefix-cache) | [Description](server-prefix-cache.md) | Rebased on upstream `d9b919a`; local suite passes; Linux ARM64 recheck pending |
+| GCC AArch64 native-feature note | [`pr/gcc-aarch64-native-note`](https://github.com/mccoyspace/waste-spark/tree/pr/gcc-aarch64-native-note) | Branch diff | Documentation-only current-base candidate; not submitted upstream |
 
 The superseded Linux budgeting implementation is retained at
 [`archive/pre-063-linux-memory-budget`](https://github.com/mccoyspace/waste-spark/tree/archive/pre-063-linux-memory-budget);

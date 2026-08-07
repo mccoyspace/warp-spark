@@ -34,6 +34,47 @@ If upstream changes while a PR is under development, rebase the PR branch and
 repeat its full acceptance set.  Do not rebase a measured archive or copy its
 old benchmark number onto the rebased code.
 
+## Upstream refresh: 2026-08-07
+
+The fork's `main` now fast-forwards to upstream
+`d9b919a791148b571e643d0af666bf19b4d733ab` (v0.6.6 plus two README magnet
+corrections).  Since the previous shared base, upstream added optional VQ4P,
+converter reclaim, explicit `--cpus` placement, a corrected direct-I/O disk
+bench, and server/converter fixes.  VQ3R remains the default format, so the
+qualified GN100 container does not need conversion or another download.
+
+A no-commit merge into `spark/integration` found 14 textual conflicts.  Most
+are documentation or build-list combinations; the production work is
+concentrated in four interfaces:
+
+1. combine upstream's batch expert holds with the CUDA path's epoch-scoped
+   record pins;
+2. port the qualified VQ3R CUDA dispatch around upstream's generalized
+   VQ3R/VQ4P CPU API, failing closed for VQ4P until it has its own CUDA gate;
+3. compose upstream's compute-thread `--cpus` with the qualified launcher's
+   whole-process `taskset` without silently changing reader placement; and
+4. reconcile the fork's API-2 additions and version string with upstream's
+   new public CPU-list field.
+
+This is a focused integration and requalification project, not a container
+format migration.  Keep the consolidated-results tag immutable; perform the
+merge on a new candidate branch and promote it only after model-free suites,
+the retained K3 exactness check, and a short matched throughput run pass.
+
+The three portable candidates were replayed on this base:
+
+- `pr/posix-model-lock` (`293d06e`) needed three mechanical conflict
+  resolutions and passed `31 passed, 0 failed, 13 skipped` plus 168 server
+  checks on macOS;
+- `pr/in-memory-state-snapshots` (`6fba880`) applied without conflicts and
+  passed `30 passed, 0 failed, 13 skipped` plus 173 server checks; and
+- `pr/server-prefix-cache` (`9cd478c`), stacked on snapshots, applied without
+  conflicts and passed `30 passed, 0 failed, 13 skipped` plus 202 server
+  checks.
+
+They are current-base candidates, not submitted PRs.  A focused Linux ARM64
+run remains before calling any one ready for upstream review.
+
 ## Proposed pull-request stack
 
 The order below follows dependencies, not the historical sprint order.
@@ -41,13 +82,13 @@ The order below follows dependencies, not the historical sprint order.
 | Order | Proposed PR | Upstream boundary | Status on current base |
 | ---: | --- | --- | --- |
 | 0 | Linux 4 KiB `O_DIRECT` eligibility and transfer probing | Portable correctness | Already implemented upstream; no duplicate PR |
-| 1 | Auto-budget from Linux `MemAvailable` and cgroup-v2 headroom | Generic safety; preserve other platforms | Upstream 0.6.3 has stable cgroup capacity; GN100 pressure row does not support upstreaming the current hard ceiling |
-| 2 | POSIX model-container ownership lock with explicit opt-out | Generic safety/policy | PR-ready on `pr/posix-model-lock` |
-| 3 | Explicit Linux CPU-list affinity | Generic configuration | Keep the GN100 CPU choice outside core |
+| 1 | Auto-budget from Linux `MemAvailable` and cgroup-v2 headroom | Generic safety; preserve other platforms | Issue #14 is closed; upstream has stable cgroup capacity and the GN100 pressure row rejects the remaining hard ceiling |
+| 2 | POSIX model-container ownership lock with explicit opt-out | Generic safety/policy | Rebased on `d9b919a` at `pr/posix-model-lock`; Linux ARM64 recheck pending |
+| 3 | Explicit CPU-list affinity | Generic configuration | Implemented upstream in v0.6.6 as `--cpus`; no duplicate PR |
 | 4 | Final phase/layer trace and request-boundary flushing | Generic observability | Reconcile with upstream cache traces |
-| 5 | Transactional in-memory state export/import and caller-owned budget reservation | Generic engine API | PR-ready on `pr/in-memory-state-snapshots`; required before server prefix reuse |
+| 5 | Transactional in-memory state export/import and caller-owned budget reservation | Generic engine API | Rebased cleanly on `d9b919a` at `pr/in-memory-state-snapshots`; Linux ARM64 recheck pending |
 | 6 | Whole-expert scheduling through typed per-context configuration | Generic optimization | Complete experiment on `exp/whole-expert-scheduler`; no GN100 gain, excluded from integration |
-| 7 | Exact, renderer-delimited family-root server cache | Generic server feature | PR-ready on `pr/server-prefix-cache`; real-K3 miss-hit-hit acceptance complete; depends on state snapshots |
+| 7 | Exact, renderer-delimited family-root server cache | Generic server feature | Rebased cleanly on `d9b919a` at `pr/server-prefix-cache`; depends on state snapshots; Linux ARM64 recheck pending |
 | 8 | Mutable conversation-head reuse | Generic follow-on | Implemented on `spark/sprint7`; exact next-turn state/output, divergent-history, replacement, and shared-budget gates pass |
 
 Sprint 9 produced one additional discuss-first candidate: measurement
@@ -78,6 +119,20 @@ not, retain it only in the archive.
 PM QoS, fixed CPU sets, thermal/CPPC/NVML/PMU collection, `bpftrace` sidecars,
 cooldown gates, and fixed K3 prompts/budgets are Spark integration and evidence
 tools.  They do not belong in the portable engine PRs.
+
+The CUDA work is not a PR candidate on this pass.  Upstream issue
+[#11](https://github.com/sqliteai/waste/issues/11) is already the active CUDA
+design thread, and upstream VQ4P arrived after the qualified GB10 VQ3R path.
+The least noisy contribution is one concise results comment there: exactness,
+engine-level CPU/CUDA and held-out results, power and storage bounds, the
+consolidated release link, and an offer to discuss the source.  A CUDA PR
+should wait for maintainer interest and a decision about VQ4P coverage.
+
+`pr/gcc-aarch64-native-note` is a separate documentation-only candidate.  It
+records the observed GCC 13 failure mode where `-mcpu=native` accepts the GB10
+target but omits the dot-product and i8mm feature macros, compiling both
+kernels away.  It adds a macro probe and does not recommend enabling the
+numerically non-default paths.
 
 ### Current-pressure decision
 
