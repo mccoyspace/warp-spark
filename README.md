@@ -5,13 +5,12 @@
 > milestones and raw evidence stay immutable. The qualified K3 profile now
 > combines CUDA KDA, dense projections, and expert VQ gather with ten pinned
 > performance CPUs, child-scoped Q0, two direct-I/O readers at depth two, Q8,
-> and no router lookahead. A 4.52-hour promotion soak completed 50/50 exact
-> trajectories; its 24 CLI rows sustained **0.654 tok/s mean** (0.64–0.68)
-> on the development corpus. In a same-session, cold-cache full-request power
-> comparison, CUDA delivered **0.2125 vs 0.1112 tok/s** for CPU-only while
-> raising mean wall power by 16.14 W and **reducing total J/token by 40.14%**.
-> Exact family-root hits averaged 0.3842 tok/s and 338.31 total J/token. The
-> held-out absolute number is reserved for the consolidation Task 4 campaign.
+> and no router lookahead. **K3, held-out studio prompts, 64 tokens: 0.637
+> tok/s at 121.35 W wall power** (12 measurements across six newly frozen
+> families; 187.73 J/generated token). The recorded optional lookahead-6 arm
+> reached 0.728 tok/s at 132.13 W and 179.74 J/token without changing output;
+> it remains optional rather than the promoted default. A 4.52-hour promotion
+> soak also completed 50/50 exact trajectories on the development corpus.
 > See the
 > [qualified profile](docs/GB10_QUALIFIED_PROFILE.md) and
 > [promotion record](docs/GN100.md#qualified-cuda-promotion-2026-08-07).

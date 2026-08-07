@@ -1,0 +1,93 @@
+{
+  "schema": "waste.gn100.consolidation_task4.public_summary.v1",
+  "campaign": "consolidation-task4-h3-20260807-v1",
+  "completed_date": "2026-08-07",
+  "source_commit": "919749e0f2b52441ae5ed45f68d1967c1688cbdb",
+  "conditions": {
+    "host": "Acer Veriton GN100 / NVIDIA GB10",
+    "ambient_temperature_f": 79.0,
+    "workload": "six newly frozen H3 studio families, 64 greedy generated tokens, two interleaved repeats per family and arm",
+    "default_profile": "qualified CUDA profile, 59340 MiB expert cache, direct I/O, two readers at depth two, lookahead zero, child-scoped Q0",
+    "optional_arm": "same profile with lookahead six",
+    "power": "Shelly wall power at 1 Hz over engine-reported decode windows",
+    "measurement_not_gate": true
+  },
+  "overall": {
+    "lookahead_0": {
+      "n": 12,
+      "median_tokens_per_second": 0.6373165,
+      "aggregate_expert_hit_rate": 0.2848714193,
+      "median_mean_wall_w": 121.3509877,
+      "median_j_per_generated_token": 187.7283452,
+      "physical_expert_read_bytes": 10030264524800
+    },
+    "lookahead_6": {
+      "n": 12,
+      "median_tokens_per_second": 0.7281965,
+      "aggregate_expert_hit_rate": 0.4673223081,
+      "median_mean_wall_w": 132.1341698,
+      "median_j_per_generated_token": 179.7409402,
+      "physical_expert_read_bytes": 10571448442880
+    },
+    "lookahead_6_vs_0": {
+      "median_throughput_change": 0.1425979086,
+      "median_j_per_generated_token_change": -0.0425476771,
+      "median_mean_wall_w_change": 10.7831821
+    }
+  },
+  "families": {
+    "fabrication_engineering": {
+      "lookahead_0": {"median_tokens_per_second": 0.6458535, "aggregate_hit_rate": 0.3001974355, "median_j_per_generated_token": 184.21875},
+      "lookahead_6": {"median_tokens_per_second": 0.7380035, "aggregate_hit_rate": 0.4750074304, "median_j_per_generated_token": 177.525}
+    },
+    "budgeting_procurement": {
+      "lookahead_0": {"median_tokens_per_second": 0.637028, "aggregate_hit_rate": 0.2827573030, "median_j_per_generated_token": 187.2181442},
+      "lookahead_6": {"median_tokens_per_second": 0.727662, "aggregate_hit_rate": 0.4627579399, "median_j_per_generated_token": 177.525}
+    },
+    "collaboration_authorship": {
+      "lookahead_0": {"median_tokens_per_second": 0.626223, "aggregate_hit_rate": 0.2759213655, "median_j_per_generated_token": 190.940625},
+      "lookahead_6": {"median_tokens_per_second": 0.726466, "aggregate_hit_rate": 0.4647322945, "median_j_per_generated_token": 176.9798306}
+    },
+    "environmental_sustainability": {
+      "lookahead_0": {"median_tokens_per_second": 0.644903, "aggregate_hit_rate": 0.2952721637, "median_j_per_generated_token": 187.5758703},
+      "lookahead_6": {"median_tokens_per_second": 0.7358965, "aggregate_hit_rate": 0.4743174677, "median_j_per_generated_token": 177.525}
+    },
+    "audience_research": {
+      "lookahead_0": {"median_tokens_per_second": 0.630966, "aggregate_hit_rate": 0.2734693444, "median_j_per_generated_token": 190.6339363},
+      "lookahead_6": {"median_tokens_per_second": 0.7227515, "aggregate_hit_rate": 0.4599874745, "median_j_per_generated_token": 180.3168228}
+    },
+    "transport_logistics": {
+      "lookahead_0": {"median_tokens_per_second": 0.6348035, "aggregate_hit_rate": 0.2816109035, "median_j_per_generated_token": 189.2588281},
+      "lookahead_6": {"median_tokens_per_second": 0.728906, "aggregate_hit_rate": 0.4671312415, "median_j_per_generated_token": 176.9491174}
+    }
+  },
+  "correctness": {
+    "all_case_arm_repeat_hashes_exact": true,
+    "all_cuda_counters_exact": true,
+    "cuda_fallbacks": 0
+  },
+  "safety": {
+    "minimum_memavailable_gib": 28.8694611,
+    "maximum_process_swap_kib": 0,
+    "swap_in_delta_pages": 0,
+    "swap_out_delta_pages": 0,
+    "maximum_gpu_temperature_c": 70.0,
+    "maximum_nvme_temperature_c": 77.85
+  },
+  "disposition": {
+    "qualified_default_changed": false,
+    "lookahead_6_status": "optional_recorded_arm",
+    "headline": "K3, held-out studio prompts, 64 tokens, 0.637 tok/s at 121.35 W"
+  },
+  "evidence": {
+    "archive": "waste-gn100-consolidation-task4-h3-evidence-2026-08-07.tar.gz",
+    "archive_sha256": "aa98eaff496eff2b194a4632598c7a1ebe03b51a69dc0c8e0534554e6a928b9d",
+    "raw_manifest_sha256": "f4c4abbb0dd27303b7dbee6fb096f7546c2dd24ab1bdce89c920293c352da061",
+    "raw_contract_sha256": "d5671316842cbb577dc048d72e7baff8f53ebf4d8b0e5446efd79789e21487c9",
+    "raw_summary_sha256": "f63abd3a3e8b477d8a9bbe6f56aa0ba2778f7bf617635208fb6963154b1b21d1",
+    "h3_source_sha256": "15eb4e1d7c6f76c789d32cc2572291d194391c4bba36fc072df4ec8b4b4f9da3",
+    "h3_frozen_corpus_sha256": "1b95cafcf95841068217b68501179dbf486ec045a593e2966ec4503f08613f19"
+  },
+  "h2_status": "sealed_not_opened_not_used",
+  "upstream_submission": "none"
+}
