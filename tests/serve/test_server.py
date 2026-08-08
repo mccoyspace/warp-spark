@@ -128,6 +128,7 @@ class TestBasics(ServerTestCase):
         self.assertEqual(body["status"], "ok")
         self.assertEqual(body["model"], "test-model")
         self.assertFalse(body["prefix_cache"]["enabled"])
+        self.assertFalse(body["usage_learning"]["enabled"])
 
     def test_models(self):
         status, body = self.get("/v1/models")
@@ -166,6 +167,24 @@ class TestBasics(ServerTestCase):
                               if l.lower().startswith(b"content-length")][0])
                 while len(rest) < length:
                     rest += s.recv(4096)
+
+
+class TestUsageLearning(ServerTestCase):
+    server_kwargs = {"learn_usage": True}
+
+    def test_blocking_chat_saves_after_success(self):
+        status, _ = self.chat()
+        self.assertEqual(status, 200)
+        self.assertEqual(self.engine.usage_saves, 1)
+        _, health = self.get("/health")
+        self.assertEqual(health["usage_learning"]["saves"], 1)
+        self.assertEqual(health["usage_learning"]["failures"], 0)
+        self.assertIsNotNone(health["usage_learning"]["last_saved_at"])
+
+    def test_raw_completion_saves_after_success(self):
+        status, _ = self.post("/v1/completions", {"prompt": "hi"})
+        self.assertEqual(status, 200)
+        self.assertEqual(self.engine.usage_saves, 1)
 
 
 class TestChatCompletions(ServerTestCase):
