@@ -23,6 +23,12 @@
 > [the upstreaming map](docs/UPSTREAMING.md) and
 > [upstream issue #14](https://github.com/sqliteai/waste/issues/14).
 > `tools/spark_cuda_serve.sh` is the qualified single-user GN100 server path.
+>
+> **Latest quarantined experiment:** strict CUDA VQ4P coverage is complete on
+> Kimi-Linear. In the direct matched GB10 run, VQ3R remained slightly faster
+> (12.731 versus 12.326 tok/s with Q0), so this is compatibility coverage rather
+> than a K3-profile change. See the
+> [VQ4P report](https://github.com/mccoyspace/waste-spark/blob/exp/cuda-vq4p-gb10/docs/GPU_VQ4P_GB10.md).
 
 WASTE is an embeddable inference engine written in C, with no third-party runtime dependencies. It keeps the model trunk in memory, streams selected experts directly from disk, and uses the remaining RAM as a bounded expert cache.
 
