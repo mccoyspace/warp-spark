@@ -37,6 +37,21 @@ class _StoppedServer:
 
 
 class TestMain(unittest.TestCase):
+    def test_usage_learning_requires_separate_path_before_engine_open(self):
+        tmp = tempfile.mkdtemp(prefix="waste-main-test-")
+        model = Path(tmp) / "model.waste"
+        model.mkdir()
+        output = io.StringIO()
+        try:
+            with (patch.object(MAIN, "Engine") as open_,
+                  redirect_stdout(output), redirect_stderr(output)):
+                status = MAIN.main([str(model), "--learn-usage"])
+            self.assertEqual(status, 2, output.getvalue())
+            self.assertIn("requires an explicit --usage path", output.getvalue())
+            open_.assert_not_called()
+        finally:
+            shutil.rmtree(tmp, ignore_errors=True)
+
     def test_plan_labels_physical_capacity_and_current_ceiling(self):
         tmp = tempfile.mkdtemp(prefix="waste-main-test-")
         model = Path(tmp) / "model.waste"
