@@ -77,11 +77,11 @@ void waste_cuda_kda_free(waste_model *m);
 
 /* ---- lightweight phase profiling (WASTE_PROFILE=1) --------------------- */
 #include <time.h>
-double waste_prof[16];
-uint64_t waste_prof_n[16];
+double waste_prof[18];
+uint64_t waste_prof_n[18];
 enum { P_LUTB, P_KDA, P_MLA, P_ROUTE, P_EDEQ, P_EMM, P_HEAD, P_LUTA, P_MM,
        P_KDA_REC, P_KDA_QKV, P_KDA_CONV, P_KDA_AUX, P_KDA_GATE,
-       P_KDA_NORM, P_KDA_OUT };
+       P_KDA_NORM, P_KDA_OUT, P_LUTA_GU, P_LUTA_DOWN };
 static int prof_on = -1;
 static pthread_mutex_t prof_mu = PTHREAD_MUTEX_INITIALIZER;
 static double pnow(void)
@@ -2721,9 +2721,11 @@ static void vq_matvec_serial(waste_model *m, float *y, const uint8_t *idx,
 
 static void vq_apply(waste_model *m, float *y, const uint8_t *idx,
                      const uint16_t *scale, int M, int N, const float *lut,
-                     const int8_t *q, const float *qs)
+                     const int8_t *q, const float *qs, int down)
 {
     PROF_START(P_LUTA);
+    PROF_START(P_LUTA_GU);
+    PROF_START(P_LUTA_DOWN);
     const int nv = N / m->vec_dim;
     if (m->index_bits == 6) {
         vqp_arg a = { y, idx, scale, q, qs, nv };
@@ -2734,6 +2736,8 @@ static void vq_apply(waste_model *m, float *y, const uint8_t *idx,
          * which the blocked index layout requires. */
         waste_parallel_for(M, VQ_TILE * VQ_SUPER, vq_rows, &a);
     }
+    if (down) PROF_END(P_LUTA_DOWN);
+    else PROF_END(P_LUTA_GU);
     PROF_END(P_LUTA);
 }
 
@@ -2743,7 +2747,7 @@ static void vq_matvec(waste_model *m, float *y, const uint8_t *idx,
 {
     vq_build_lut(m, lut, cb_base, x, N, m->stages, m->cb_entries,
                  m->vec_dim, q, qs);
-    vq_apply(m, y, idx, scale, M, N, lut, q, qs);
+    vq_apply(m, y, idx, scale, M, N, lut, q, qs, 1);
 }
 
 /* ---- expert-parallel MoE ------------------------------------------------
@@ -3622,9 +3626,11 @@ static int moe_layer(waste_model *m, int L, const float *in, float *out, int *ro
         if (m->cuda_vq_mode) {
             {
                 PROF_START(P_LUTA);
+                PROF_START(P_LUTA_GU);
                 const int failed = waste_cuda_vq_apply_pair(
                     m, ga, ub, rec + h->gate_off, rec + h->up_off,
                     sc, inter, lat);
+                PROF_END(P_LUTA_GU);
                 PROF_END(P_LUTA);
                 if (failed)
                     return cuda_projection_failed(m, "VQ gate/up apply");
@@ -3635,9 +3641,9 @@ static int moe_layer(waste_model *m, int L, const float *in, float *out, int *ro
 #endif
         {
             vq_apply(m, ga, rec + h->gate_off, sc, inter, lat, lut_gate,
-                     q_gate, qs_gate);
+                     q_gate, qs_gate, 0);
             vq_apply(m, ub, rec + h->up_off, sc + inter, inter, lat, lut_up,
-                     q_up, qs_up);
+                     q_up, qs_up, 0);
         }
         if (c->act_situ)
             for (int i = 0; i < inter; i++)
@@ -3653,6 +3659,7 @@ static int moe_layer(waste_model *m, int L, const float *in, float *out, int *ro
                              m->vec_dim, q_down, qs_down);
             {
                 PROF_START(P_LUTA);
+                PROF_START(P_LUTA_DOWN);
                 const int failed = waste_cuda_vq_apply_down(
                     m, m->cuda_vq_mode, acc, rec + h->down_off,
                     sc + 2 * inter, ga, (waste_vq_lut_view){
@@ -3660,6 +3667,7 @@ static int moe_layer(waste_model *m, int L, const float *in, float *out, int *ro
                         m->cuda_vq_mode == 1 ? q_down : NULL,
                         m->cuda_vq_mode == 1 ? qs_down : NULL},
                     h->codebook_id + 2 * m->stages, lat, inter);
+                PROF_END(P_LUTA_DOWN);
                 PROF_END(P_LUTA);
                 if (failed)
                     return cuda_projection_failed(m, "VQ down apply");
@@ -4770,11 +4778,11 @@ static void moe_chunk(waste_model *m, int L, const float *in, float *out, int nT
             vq_apply(m, ga, rec + h->gate_off, s16, inter, lat,
                      lut_gu + (size_t)(2 * t) * lut_sz,
                      q_gu ? q_gu + (size_t)(2 * t) * lut_sz : NULL,
-                     qs_gu ? qs_gu + (size_t)(2 * t) * nsc : NULL);
+                     qs_gu ? qs_gu + (size_t)(2 * t) * nsc : NULL, 0);
             vq_apply(m, ub, rec + h->up_off, s16 + inter, inter, lat,
                      lut_gu + (size_t)(2 * t + 1) * lut_sz,
                      q_gu ? q_gu + (size_t)(2 * t + 1) * lut_sz : NULL,
-                     qs_gu ? qs_gu + (size_t)(2 * t + 1) * nsc : NULL);
+                     qs_gu ? qs_gu + (size_t)(2 * t + 1) * nsc : NULL, 0);
             if (c->act_situ)
                 for (int i = 0; i < inter; i++)
                     ga[i] = waste_situ_pair(ga[i], ub[i], c->situ_beta, c->situ_linear_beta);

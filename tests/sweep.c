@@ -57,8 +57,8 @@
 
 #include "../src/model.h"
 
-extern double waste_prof[16];
-extern uint64_t waste_prof_n[16];
+extern double waste_prof[18];
+extern uint64_t waste_prof_n[18];
 
 static double now(void)
 {
@@ -577,8 +577,8 @@ int main(int argc, char **argv)
             int routed[WASTE_MAX_LAYERS * 64];
             const int profile = getenv("WASTE_PROFILE") != NULL;
             if (profile) {
-                memset(waste_prof, 0, sizeof(double) * 16);
-                memset(waste_prof_n, 0, sizeof(uint64_t) * 16);
+                memset(waste_prof, 0, sizeof(double) * 18);
+                memset(waste_prof_n, 0, sizeof(uint64_t) * 18);
             }
             const double s = now();
             for (int i = 0; i < n_gen; i++) {
@@ -649,7 +649,7 @@ int main(int argc, char **argv)
                    vq_applies, vq_lut_builds, vq_launches, vq_syncs);
             if (profile) {
                 printf("profile %s=%d rep=%d", key, value, r + 1);
-                for (int p = 0; p < 16; p++)
+                for (int p = 0; p < 18; p++)
                     printf(" p%d=%.9f n%d=%" PRIu64,
                            p, waste_prof[p], p, waste_prof_n[p]);
                 putchar('\n');

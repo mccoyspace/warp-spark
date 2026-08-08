@@ -135,23 +135,25 @@ int main(int argc, char **argv)
            (unsigned long long)waste_model_cuda_vq_launches(&m),
            (unsigned long long)waste_model_cuda_vq_syncs(&m));
 
-    extern double waste_prof[16];
+    extern double waste_prof[18];
     if (getenv("WASTE_PROFILE")) {
         /* indented names are sub-totals of the line above and are excluded
          * from `tot`, so the percentages add to 100 */
-        const char *names[16] = {"  LUT build","kda","mla","moe(all)",
+        const char *names[18] = {"  LUT build","kda","mla","moe(all)",
                                  "  expert I/O","  expert mm","lm_head",
                                  "  LUT apply","  batched mm",
                                  "  kda recurrence","  kda qkv projections",
                                  "  kda short conv","  kda auxiliaries",
                                  "  kda output gate","  kda output norm",
-                                 "  kda output projection"};
+                                 "  kda output projection",
+                                 "    VQ gate/up apply",
+                                 "    VQ down apply"};
         double tot = 0;
-        for (int i = 0; i < 16; i++)
+        for (int i = 0; i < 18; i++)
             tot += (i == 0 || i == 4 || i == 5 || i == 7 || i >= 8)
                  ? 0 : waste_prof[i];
         printf("\n-- profile (s, %d steps) --\n", n + n_gen);
-        for (int i = 0; i < 16; i++)
+        for (int i = 0; i < 18; i++)
             if (waste_prof[i] > 0)
                 printf("  %-14s %7.2f  %5.1f%%\n", names[i], waste_prof[i],
                        100.0 * waste_prof[i] / tot);
