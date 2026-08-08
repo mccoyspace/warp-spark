@@ -42,6 +42,39 @@ In the CPU-LUT CUDA arm, LUT construction was 619.76% of apply time, far over
 the preregistered 10% trigger. GPU-side construction was therefore built and
 selected rather than added speculatively.
 
+## Direct VQ3R/VQ4P comparison
+
+The table above compares implementations of one VQ4P container; it does not
+say whether VQ4P is faster than VQ3R. A follow-on therefore ran the VQ3R and
+VQ4P containers with the same `1,2,3,4,5` prompt, 16 generated tokens, 8 GiB
+cache, two readers, depth two, CUDA dense scope 2, CUDA VQ mode 2/group 1, and
+three alternating repetitions per format.
+
+| Condition | VQ3R median | VQ4P median | VQ4P relative to VQ3R |
+| --- | ---: | ---: | ---: |
+| No PM QoS constraint | **7.191899 tok/s** | 7.080764 tok/s | **−1.55%** |
+| Explicit child-scoped Q0 | **12.730958 tok/s** | 12.326108 tok/s | **−3.18%** |
+
+VQ3R was slightly faster in both conditions. Under Q0, VQ4P followed a
+different quantized trajectory with 352 misses and 2,026,536,960 expert bytes,
+versus VQ3R's 335 misses and 1,874,546,688 bytes: 5.07% more misses and 8.11%
+more bytes. A one-run profile also measured VQ4P's GPU VQ apply phase at
+0.595693 seconds against VQ3R's 0.523384 seconds, 13.82% slower. The smaller
+64-entry table did not offset the fourth stage, packed-index work and block
+scaling on this shape, where the VQ3R table was already GPU-cache resident.
+
+The two formats are different quantizers, so cross-format byte equality is
+neither expected nor an exactness gate. They emitted the same first ten greedy
+tokens and diverged on the eleventh. Within each format, all three runs retained
+identical token, logit and route hashes, exact counters and zero fallback.
+
+Q0 raised the VQ3R and VQ4P medians by 77.02% and 74.08%, respectively. That
+brackets the earlier 9.138 tok/s VQ4P measurement and confirms that idle-state
+policy is load-bearing for this short CPU/GPU synchronization workload; it
+does not retroactively identify whether that earlier run had an active holder.
+No percentage acceptance threshold or K3 conversion decision was applied to
+this comparison.
+
 ## Exactness contract
 
 VQ4P is easier to parallelize exactly than VQ3R. The 4-stage int8 sum inside
@@ -76,3 +109,5 @@ The preregistration is
 [gn100/vq4p-cuda-preregistration.md](gn100/vq4p-cuda-preregistration.md), and
 the compact result is
 [gn100/vq4p-cuda-gb10-summary.json](gn100/vq4p-cuda-gb10-summary.json).
+The direct format comparison is
+[gn100/kimi-vq3r-vq4p-matched-summary.json](gn100/kimi-vq3r-vq4p-matched-summary.json).

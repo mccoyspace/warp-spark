@@ -91,5 +91,6 @@
     "selected_group": 1,
     "grouped_vq4p_mode": "fail_closed",
     "promotion": "remain_on_experimental_branch"
-  }
+  },
+  "matched_format_followup": "kimi-vq3r-vq4p-matched-summary.json"
 }

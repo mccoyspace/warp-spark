@@ -3246,3 +3246,16 @@ remove the CPU work. On this 26-layer Kimi-Linear VQ4P vehicle, construction
 was the bottleneck. On a different shape, the registered ratio should still
 decide whether the simpler coherent path ships. The K3 VQ3R qualified profile
 and its held-out numbers remain unchanged.
+
+The direct format comparison removes the ambiguity in the original crossover.
+With the same Kimi prompt and CUDA stack, VQ3R was 1.55% faster without Q0 and
+3.18% faster with Q0. VQ4P's differing route trajectory read 8.11% more expert
+bytes, but the kernel was not merely an I/O victim: its profiled VQ apply phase
+was also 13.82% slower. The 64-entry int8 table was already beyond the point
+where table residency paid for a fourth stage and block-scale folds. VQ4P is
+now supported and fast; on this vehicle it is not a speed upgrade over VQ3R.
+
+The same comparison also makes the short-workload idle regime impossible to
+ignore. Explicit Q0 raised medians 77.02% for VQ3R and 74.08% for VQ4P, with
+all six holders acquiring and releasing one descriptor cleanly. Format choice
+was a few percent; idle-state policy was a multiplier.

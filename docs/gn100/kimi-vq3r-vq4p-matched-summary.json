@@ -1,0 +1,102 @@
+{
+  "schema": "waste.gn100.kimi_vq_format_match.v1",
+  "date": "2026-08-07",
+  "status": "observation_complete_no_threshold_applied",
+  "branch": "exp/cuda-vq4p-gb10",
+  "hardware": {
+    "system": "Acer Veriton GN100",
+    "soc": "NVIDIA GB10",
+    "memory_gib": 128
+  },
+  "vehicle": {
+    "model": "Kimi-Linear-48B",
+    "vq3r_container_gib": 17.9,
+    "vq4p_container_gib": 17.9
+  },
+  "matched_configuration": {
+    "prompt_ids": [1, 2, 3, 4, 5],
+    "generated_tokens": 16,
+    "repetitions": 3,
+    "repetition_order": [
+      "vq3r-1", "vq4p-1", "vq4p-2",
+      "vq3r-2", "vq3r-3", "vq4p-3"
+    ],
+    "cache_mib": 8192,
+    "cache_slots": 3221,
+    "direct_io": true,
+    "reader_threads": 2,
+    "queue_depth": 2,
+    "cuda_kda": 1,
+    "cuda_dense": 2,
+    "cuda_vq": 2,
+    "cuda_vq_group": 1
+  },
+  "no_q0": {
+    "vq3r_tok_s": [7.191899, 7.240070, 7.181843],
+    "vq4p_tok_s": [7.132960, 7.061091, 7.080764],
+    "vq3r_median_tok_s": 7.191899,
+    "vq4p_median_tok_s": 7.080764,
+    "vq4p_relative_percent": -1.54528
+  },
+  "q0": {
+    "scope": "child",
+    "latency_us": 0,
+    "vq3r_tok_s": [12.730958, 12.771123, 12.454037],
+    "vq4p_tok_s": [12.211082, 12.326108, 12.477703],
+    "vq3r_median_tok_s": 12.730958,
+    "vq4p_median_tok_s": 12.326108,
+    "vq4p_relative_percent": -3.18004,
+    "vq3r_gain_over_no_q0_percent": 77.01803,
+    "vq4p_gain_over_no_q0_percent": 74.07879,
+    "holders": 6,
+    "holders_clean": 6,
+    "fd_active_after_exit": false,
+    "sysfs_modified": false
+  },
+  "trajectory": {
+    "vq3r_token_hash": "0xd0bd93812a6954ea",
+    "vq3r_logit_hash": "0x7580dbb3bf876c6d",
+    "vq3r_route_hash": "0x638b8b584449792a",
+    "vq4p_token_hash": "0xb553a16b6da4d4cc",
+    "vq4p_logit_hash": "0xd64812f1651c4037",
+    "vq4p_route_hash": "0x2693b3c6354e9838",
+    "shared_initial_generated_tokens": 10,
+    "first_generated_token_divergence": 11,
+    "causally_compared_logit_states": 11,
+    "causally_compared_route_rows": 260,
+    "route_rows_with_membership_change": 216,
+    "selected_slot_replacement_fraction": 0.17259615384615384,
+    "cross_format_max_abs_logit_difference": 7.510463237762451,
+    "note": "Cross-format differences are expected because VQ3R and VQ4P are different quantizers; exactness is enforced within each format."
+  },
+  "traffic": {
+    "vq3r_hits": 2993,
+    "vq3r_misses": 335,
+    "vq3r_bytes": 1874546688,
+    "vq4p_hits": 2976,
+    "vq4p_misses": 352,
+    "vq4p_bytes": 2026536960,
+    "vq4p_miss_delta_percent": 5.07463,
+    "vq4p_byte_delta_percent": 8.10811
+  },
+  "q0_profile_seconds": {
+    "vq3r_vq_apply": 0.523384177,
+    "vq4p_vq_apply": 0.595692627,
+    "vq4p_vq_apply_delta_percent": 13.81556,
+    "vq3r_gate_up": 0.401253354,
+    "vq4p_gate_up": 0.435642310,
+    "vq3r_down": 0.121665840,
+    "vq4p_down": 0.159592221
+  },
+  "observation": {
+    "faster_format_no_q0": "VQ3R",
+    "faster_format_q0": "VQ3R",
+    "vq4p_helped_throughput_on_this_vehicle": false,
+    "threshold_applied": false,
+    "k3_conversion_decision": "not_made"
+  },
+  "raw_evidence": [
+    "validation/vq4p-cuda-20260807/matched-vq3r-vq4p-sequence",
+    "validation/vq4p-cuda-20260807/matched-vq3r-vq4p-sequence-q0"
+  ]
+}
