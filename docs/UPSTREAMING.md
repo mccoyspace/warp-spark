@@ -135,11 +135,11 @@ wait for its review before creating another notification.
    favorable response, show the maintainer the exact miss-hit-hit behavior and
    measured 3.44–3.46x persistent-server request improvement, then ask whether
    they want that policy in-tree before opening it.
-3. **CUDA belongs in issue #11, not a surprise PR.** Post the prepared concise
-   result only after owner review. The generalized VQ realignment improves a
-   future landing shape: one pluggable CUDA implementation with a documented
-   VQ3R contract and an explicit VQ4P refusal, rather than a parallel format
-   parser.
+3. **CUDA belongs in issue #11, not a surprise PR.** Post any new result only
+   after owner review. The generalized dispatch now has strict VQ3R and VQ4P
+   implementations rather than a parallel format parser. The Kimi-Linear
+   VQ4P crossover is useful new evidence, but the branch remains experimental
+   until the maintainer signals interest in an architecture-level CUDA patch.
 4. **The GCC native-feature note is valid but low priority.** Keep its clean
    branch available; offer it as a small follow-up or fold it into a maintainer-
    requested build-doc pass instead of opening another unsolicited PR now.
@@ -178,15 +178,14 @@ PM QoS, fixed CPU sets, thermal/CPPC/NVML/PMU collection, `bpftrace` sidecars,
 cooldown gates, and fixed K3 prompts/budgets are Spark integration and evidence
 tools.  They do not belong in the portable engine PRs.
 
-The CUDA work is not a PR candidate on this pass. Upstream issue
+The CUDA work is not yet a PR candidate on this pass. Upstream issue
 [#11](https://github.com/sqliteai/waste/issues/11) is already the active CUDA
-design thread, and upstream VQ4P arrived after the qualified GB10 VQ3R path.
-The least noisy contribution is one concise results comment there: exactness,
-engine-level CPU/CUDA and held-out results, power and storage bounds, the
-consolidated release link, and an offer to discuss the source.  A CUDA PR
-should wait for maintainer interest and a decision about VQ4P coverage.
-The prepared, unposted text is in
-[`upstream-drafts/issue-11-gb10-cuda.md`](upstream-drafts/issue-11-gb10-cuda.md).
+design thread. The fork now has both the qualified K3 VQ3R result and a
+bounded, byte-exact Kimi-Linear VQ4P crossover, including scalar/NEON/CUDA
+measurements. That resolves the previous coverage question, but not the
+maintainer's preferred CUDA architecture. The least noisy next contribution
+is a short issue follow-up linking [GPU_VQ4P_GB10.md](GPU_VQ4P_GB10.md), only
+after owner review; a PR should still wait for maintainer interest.
 
 `pr/gcc-aarch64-native-note` is a separate documentation-only candidate.  It
 records the observed GCC 13 failure mode where `-mcpu=native` accepts the GB10

@@ -63,3 +63,17 @@ machine, both per apply shape and at engine level.  The success condition is
 not a large token-rate win: it is a completed strict VQ4P CUDA contract and a
 measured CPU/NEON/CUDA crossover.  Longer soaking and K3-scale conversion are
 out of scope until the bounded run passes.
+
+## Outcome
+
+The bounded run passed. The CPU-LUT CUDA arm spent 1.205485 seconds building
+LUTs against 0.194508 seconds applying them: **619.76%**, so the registered
+10% trigger fired. The GPU builder subsequently matched the reference fp32
+LUT, int8 bytes and scales exactly. Its 16-token median was 9.137839 tok/s,
+versus 3.771248 for CPU-LUT CUDA, 2.293125 for NEON and 1.470860 for scalar.
+
+All 17 compared causal states had byte-identical logits, routes and tokens,
+and the selected mode reported zero fallback. VQ4P mode 2/group 1 is therefore
+the selected configuration for this experiment; it remains on the `exp/*`
+branch and is not a K3-profile promotion. See
+[../GPU_VQ4P_GB10.md](../GPU_VQ4P_GB10.md) for the compact report.

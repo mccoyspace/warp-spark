@@ -53,7 +53,7 @@ of this section can stay about the mechanism:
 | AVX2 | `simd_avx2.c` | verified on Linux/x86_64 |
 | AVX-512 | `simd_avx512.c` | compiled and dispatched, never executed — CI runner is Zen 3, confirmed 2026-07-29 |
 | Metal | `metal.m` | correct, off by default, 22% slower |
-| CUDA | `cuda.cu` | qualified GB10 VQ3R path, off by default; VQ4P rejected explicitly |
+| CUDA | `cuda.cu` | qualified GB10 VQ3R path; experimental strict VQ4P path; off by default |
 | BLAS, ROCm | — | not implemented; the flag refuses to build |
 | SVE, RVV | — | not implemented |
 
@@ -470,7 +470,7 @@ survives. The reasoning under it — no headroom, plus a round-trip per call
 — does not transfer to a discrete card unchanged. The next section is what
 replaced it; read the two together.
 
-## CUDA: the gates, answered off-repo (2026-08-04)
+## CUDA: the discrete-card gates, answered off-repo (2026-08-04)
 
 Everything here is **third-party and not reproduced on this machine**,
 which is why issue #11 was written as a set of gates for someone else to
@@ -479,7 +479,8 @@ bare-metal node with K3; `fab2s` ran gates 1, 2 and 3 on a Ryzen 9 9900X
 (Zen 5, AVX-512) with an RTX 5060 Ti, on Kimi-Linear-48B. Method, sample
 spreads and the byte-accounting checks that make them trustworthy are in
 `docs/LEARNED.md` §48 and §50; what follows is only what it means for this
-document.
+document. This records the upstream/discrete-card baseline before the fork's
+coherent-GB10 implementation below.
 
 **The round-trip clause does not transfer.** On the RTX 5060 Ti (sm_120,
 15.5 GB usable, PCIe Gen5 x8), against that machine's own CPU time for the
@@ -533,8 +534,8 @@ independently reproduces `docs/GATES.md` Gate 3 on other hardware. The only
 shape that fits does not pass; the shape that passes misses VRAM by
 2.27 GiB.
 
-**So nothing changes here.** `src/cuda.cu` still does not exist,
-`WASTE_ENABLE_CUDA=1` still stops the build, and filling the
+**So nothing changed upstream at that checkpoint.** `src/cuda.cu` did not
+exist, `WASTE_ENABLE_CUDA=1` stopped the build, and filling the
 `waste_backend` slots with CUDA kernels would still reproduce the Metal
 result on different silicon. What has changed is that this is now a
 measured position rather than an argument by analogy from Apple silicon.
@@ -546,6 +547,26 @@ one-time load and deletes the deciding row. That is still one dispatch per
 layer with the residual never returning to the host, i.e. still a different
 engine and not a backend. The GPU VQ-decode throughput measured above
 applies to it unchanged.
+
+## CUDA on coherent GB10: VQ3R and VQ4P (2026-08-07)
+
+The Spark fork subsequently tested a different regime: CUDA and the CPU share
+the GB10's LPDDR5X address space, so expert records do not cross PCIe. The
+qualified K3 VQ3R path remains off by default. A bounded Kimi-Linear follow-on
+now also implements VQ4P and fails closed on any other manifest geometry.
+
+VQ4P's int8 sums inside a 32-vector scale block are exactly reorderable; only
+the fp32 LUT dots, ordered block folds and final channel scale constrain the
+CUDA arithmetic. The implementation exhaustively passed all 2^24 packed-index
+patterns and matched CPU-built fp32 LUTs, int8 LUTs, scales, logits, routes and
+tokens byte for byte.
+
+The matched Kimi-Linear VQ4P medians were 1.471 tok/s scalar, 2.293 NEON,
+3.771 CUDA with a coherent CPU-built LUT, and **9.138 CUDA with a GPU-built
+LUT**. The CPU LUT consumed 619.76% of apply time in the coherent arm, so the
+preregistered 10% trigger for GPU construction fired decisively. This is a
+Kimi-Linear crossover, not a K3 throughput claim, and remains quarantined on
+`exp/cuda-vq4p-gb10`. See [GPU_VQ4P_GB10.md](GPU_VQ4P_GB10.md).
 
 ## CI
 

@@ -1,0 +1,95 @@
+{
+  "schema": "waste.gn100.vq4p_cuda.v1",
+  "date": "2026-08-07",
+  "status": "experimental_vq4p_cuda_complete",
+  "branch": "exp/cuda-vq4p-gb10",
+  "code_commit": "af12de6",
+  "hardware": {
+    "system": "Acer Veriton GN100",
+    "soc": "NVIDIA GB10",
+    "memory_gib": 128
+  },
+  "vehicle": {
+    "model": "Kimi-Linear-48B",
+    "layers": 26,
+    "container_format": "VQ4P",
+    "container_size_gib": 17.9,
+    "conversion_seconds": 315.30
+  },
+  "contract": {
+    "packed_index_patterns_tested": 16777216,
+    "gpu_f32_lut_byte_exact": true,
+    "gpu_i8_lut_byte_exact": true,
+    "gpu_block_scales_byte_exact": true,
+    "causal_states": 17,
+    "changed_logit_steps": 0,
+    "max_abs_logit_error": 0.0,
+    "changed_route_rows": 0,
+    "changed_tokens": 0,
+    "cuda_fallbacks": 0,
+    "token_hash": "0xb553a16b6da4d4cc",
+    "logit_hash": "0xd64812f1651c4037",
+    "route_hash": "0x2693b3c6354e9838"
+  },
+  "matched_engine_crossover": {
+    "generated_tokens": 16,
+    "repeats": 3,
+    "cache_slots": 3221,
+    "readers": 2,
+    "queue_depth": 2,
+    "tok_s": {
+      "scalar": [1.478499, 1.470860, 1.467248],
+      "neon": [2.304586, 2.264450, 2.293125],
+      "cuda_cpu_lut": [3.733551, 3.771248, 3.809792],
+      "cuda_gpu_lut": [9.404292, 9.130235, 9.137839]
+    },
+    "median_tok_s": {
+      "scalar": 1.470860,
+      "neon": 2.293125,
+      "cuda_cpu_lut": 3.771248,
+      "cuda_gpu_lut": 9.137839
+    },
+    "speedup": {
+      "neon_over_scalar": 1.55904,
+      "cuda_cpu_lut_over_neon": 1.64459,
+      "cuda_gpu_lut_over_neon": 3.98488,
+      "cuda_gpu_lut_over_scalar": 6.21258,
+      "cuda_gpu_lut_over_cuda_cpu_lut": 2.42303
+    }
+  },
+  "profile_ms_per_routed_expert": {
+    "scalar": {
+      "cpu_lut": 1.046278,
+      "gate_up": 1.196925,
+      "down": 0.738855,
+      "accounted_total": 2.982057
+    },
+    "neon": {
+      "cpu_lut": 0.797244,
+      "gate_up": 0.216336,
+      "down": 0.605821,
+      "accounted_total": 1.619400
+    },
+    "cuda_cpu_lut": {
+      "cpu_lut": 0.724450,
+      "gate_up": 0.065248,
+      "down": 0.051401,
+      "accounted_total": 0.841100
+    },
+    "cuda_gpu_lut": {
+      "cpu_lut": 0.0,
+      "gate_up_including_gpu_build": 0.153224,
+      "down_including_gpu_build": 0.049600,
+      "accounted_total": 0.202824
+    }
+  },
+  "decision": {
+    "gpu_lut_trigger_percent": 10.0,
+    "observed_cpu_lut_over_apply_percent": 619.76,
+    "gpu_lut_build": "implemented_and_selected",
+    "selected_cuda_vq_mode": 2,
+    "selected_group": 1,
+    "grouped_vq4p_mode": "fail_closed",
+    "promotion": "remain_on_experimental_branch"
+  }
+}

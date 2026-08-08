@@ -3222,3 +3222,27 @@ to that case.
 Not measured: bandwidth against DRAM latency separately, GDS in GDS mode,
 KDA and MLA on a GPU, the VQ4P 64-entry crossover, VQ2R quality on a real
 eval, gate 4, contexts beyond 4096, prefill as distinct from decode.
+
+## 51. Integer exactness made VQ4P easier, but LUT placement decided speed (2026-08-07)
+
+The generalized VQ interface first failed closed on VQ4P, then earned its own
+bounded CUDA contract on Kimi-Linear. The classic hazard was structural, not
+floating point: the 4x6-bit little-endian index pack had to be correct for all
+16,777,216 three-byte patterns. Once that passed, VQ4P's inner apply was less
+constrained than VQ3R. Its four-stage int8 sums are bounded integer additions,
+so CUDA may parallel-reduce them exactly. Only the eight-FMA LUT dots, fp32
+block-fold order and final scale remain ordered.
+
+The obvious coherent-memory implementation was correct and incomplete as an
+optimization. Letting CUDA consume CPU-built int8 LUTs in place reached 3.771
+tok/s against NEON's 2.293, but the CPU spent 1.205 seconds building LUTs and
+only 0.195 seconds in CUDA apply. That was 619.76%, not the preregistered 10%
+threshold. A GPU builder that matched the reference fp32 tables, quantized
+bytes and scales exactly raised the same 16-token median to **9.138 tok/s**.
+
+The result is a regime finding, not a general model claim. Coherent memory
+made a CPU LUT possible without an H2D copy, but removing the copy did not
+remove the CPU work. On this 26-layer Kimi-Linear VQ4P vehicle, construction
+was the bottleneck. On a different shape, the registered ratio should still
+decide whether the simpler coherent path ships. The K3 VQ3R qualified profile
+and its held-out numbers remain unchanged.
