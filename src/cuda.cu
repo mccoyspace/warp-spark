@@ -48,9 +48,13 @@ typedef struct {
     size_t capacity;
     float *vq_books, *vq_x, *vq_y;
     float *vq_lut[3];
+    int8_t *vq_lut8[3];
+    float *vq_lut_scale[3];
     const int8_t *vq_lut8_host[3];
     const float *vq_lut_scale_host[3];
     size_t vq_lut_values[3];
+    size_t vq_lut_scale_values[3];
+    int vq_lut_mode[3];
     size_t vq_y_capacity;
     float *vq_group_pair_host_y, *vq_group_pair_device_y;
     float *vq_group_down_host_x, *vq_group_down_device_x;
@@ -188,6 +192,64 @@ __global__ static void vq_build_one(float *lut, const float *books,
         sum = fmaf(x[(size_t)vector * VQ3R_VEC_DIM + d],
                    book[(size_t)d * VQ3R_ENTRIES + code], sum);
     lut[p] = sum;
+}
+
+/* VQ4P mode 2: one CTA owns one 32-vector scale block.  It builds the
+ * fp32 table, reduces max(abs(table)), publishes the block scale and then
+ * quantizes every entry.  Max is order-independent for the finite tables
+ * admitted by preflight, while each dot retains the CPU's eight-FMA order.
+ * grid.y is one for down and two for the gate/up pair. */
+__global__ static void vq4p_build_quant(
+    float *lut0, float *lut1, int8_t *q0, int8_t *q1,
+    float *scale0, float *scale1, const float *books, const float *x,
+    int nv, int cb_base)
+{
+    const int kind = (int)blockIdx.y;
+    float *lut = kind ? lut1 : lut0;
+    int8_t *q = kind ? q1 : q0;
+    float *scale = kind ? scale1 : scale0;
+    const int v0 = (int)blockIdx.x * WASTE_VQ_LUT_BLK;
+    const int vn = min(WASTE_VQ_LUT_BLK, nv - v0);
+    const int n = vn * VQ4P_STAGES * VQ4P_ENTRIES;
+    const size_t base = (size_t)v0 * VQ4P_STAGES * VQ4P_ENTRIES;
+    float local_max = 0.0f;
+    for (int i = (int)threadIdx.x; i < n; i += (int)blockDim.x) {
+        const int code = i % VQ4P_ENTRIES;
+        const int vs = i / VQ4P_ENTRIES;
+        const int stage = vs % VQ4P_STAGES;
+        const int vector = v0 + vs / VQ4P_STAGES;
+        const float *book = books +
+            (size_t)(cb_base + kind * VQ4P_STAGES + stage) *
+            VQ4P_VEC_DIM * VQ4P_ENTRIES;
+        float sum = 0.0f;
+#pragma unroll
+        for (int d = 0; d < VQ4P_VEC_DIM; d++)
+            sum = __fmaf_rn(x[(size_t)vector * VQ4P_VEC_DIM + d],
+                            book[(size_t)d * VQ4P_ENTRIES + code], sum);
+        lut[base + i] = sum;
+        local_max = fmaxf(local_max, fabsf(sum));
+    }
+    __shared__ float maxima[VQ_BUILD_THREADS];
+    __shared__ float inverse;
+    maxima[threadIdx.x] = local_max;
+    __syncthreads();
+    for (int stride = VQ_BUILD_THREADS / 2; stride; stride >>= 1) {
+        if ((int)threadIdx.x < stride)
+            maxima[threadIdx.x] =
+                fmaxf(maxima[threadIdx.x], maxima[threadIdx.x + stride]);
+        __syncthreads();
+    }
+    if (threadIdx.x == 0) {
+        scale[blockIdx.x] = __fdiv_rn(maxima[0], 127.0f);
+        inverse = maxima[0] > 0.0f
+            ? __fdiv_rn(127.0f, maxima[0]) : 0.0f;
+    }
+    __syncthreads();
+    for (int i = (int)threadIdx.x; i < n; i += (int)blockDim.x) {
+        int value = __float2int_rn(__fmul_rn(lut[base + i], inverse));
+        value = max(-127, min(127, value));
+        q[base + i] = (int8_t)value;
+    }
 }
 
 /* A 128-thread CTA owns one 64-row blocked-index tile from each of gate and
@@ -507,8 +569,14 @@ static void cuda_vq_release(waste_cuda_kda *ctx)
     ctx->vq_group_failed = 0;
     for (int i = 0; i < 3; i++) {
         if (ctx->vq_lut[i]) cudaFree(ctx->vq_lut[i]);
+        if (ctx->vq_lut8[i]) cudaFree(ctx->vq_lut8[i]);
+        if (ctx->vq_lut_scale[i]) cudaFree(ctx->vq_lut_scale[i]);
         ctx->vq_lut[i] = NULL;
+        ctx->vq_lut8[i] = NULL;
+        ctx->vq_lut_scale[i] = NULL;
         ctx->vq_lut_values[i] = 0;
+        ctx->vq_lut_scale_values[i] = 0;
+        ctx->vq_lut_mode[i] = 0;
         ctx->vq_lut8_host[i] = NULL;
         ctx->vq_lut_scale_host[i] = NULL;
     }
@@ -546,6 +614,12 @@ extern "C" int waste_cuda_vq_init(waste_model *m)
     ctx->vq_lut_values[1] = ctx->vq_lut_values[0];
     ctx->vq_lut_values[2] =
         (size_t)(inter / m->vec_dim) * m->stages * m->cb_entries;
+    ctx->vq_lut_scale_values[0] = ctx->vq_lut_scale_values[1] =
+        (size_t)((lat / m->vec_dim + WASTE_VQ_LUT_BLK - 1) /
+                 WASTE_VQ_LUT_BLK);
+    ctx->vq_lut_scale_values[2] =
+        (size_t)((inter / m->vec_dim + WASTE_VQ_LUT_BLK - 1) /
+                 WASTE_VQ_LUT_BLK);
     ctx->vq_y_capacity = (size_t)inter * 2;
     if ((size_t)lat > ctx->vq_y_capacity) ctx->vq_y_capacity = (size_t)lat;
     if (ctx->vq_y_capacity > ctx->capacity) return -1;
@@ -570,20 +644,26 @@ extern "C" int waste_cuda_vq_init(waste_model *m)
         ctx->vq_group_down_x_slot_values * sizeof(float);
     const size_t group_down_y_bytes = VQ_GROUP_MAX *
         ctx->vq_group_down_y_slot_values * sizeof(float);
-    cudaError_t status = cudaSuccess;
-    if (m->vq_scheme == WASTE_VQ_SCHEME_VQ3R)
-        status = cudaMalloc((void **)&ctx->vq_books,
-                            book_values * sizeof(float));
+    cudaError_t status = cudaMalloc((void **)&ctx->vq_books,
+                                    book_values * sizeof(float));
     if (status == cudaSuccess)
         status = cudaMalloc((void **)&ctx->vq_x,
                             ctx->capacity * sizeof(float));
     if (status == cudaSuccess)
         status = cudaMalloc((void **)&ctx->vq_y,
                             ctx->vq_y_capacity * sizeof(float));
-    if (m->vq_scheme == WASTE_VQ_SCHEME_VQ3R)
-        for (int i = 0; status == cudaSuccess && i < 3; i++)
-            status = cudaMalloc((void **)&ctx->vq_lut[i],
-                                ctx->vq_lut_values[i] * sizeof(float));
+    for (int i = 0; status == cudaSuccess && i < 3; i++)
+        status = cudaMalloc((void **)&ctx->vq_lut[i],
+                            ctx->vq_lut_values[i] * sizeof(float));
+    if (m->vq_scheme == WASTE_VQ_SCHEME_VQ4P)
+        for (int i = 0; status == cudaSuccess && i < 3; i++) {
+            status = cudaMalloc((void **)&ctx->vq_lut8[i],
+                                ctx->vq_lut_values[i]);
+            if (status == cudaSuccess)
+                status = cudaMalloc((void **)&ctx->vq_lut_scale[i],
+                                    ctx->vq_lut_scale_values[i] *
+                                    sizeof(float));
+        }
     if (status == cudaSuccess)
         status = cudaHostAlloc((void **)&ctx->vq_group_pair_host_y,
                                group_pair_bytes, cudaHostAllocDefault);
@@ -602,7 +682,7 @@ extern "C" int waste_cuda_vq_init(waste_model *m)
     if (status == cudaSuccess)
         status = cudaMalloc((void **)&ctx->vq_group_down_device_y,
                             group_down_y_bytes);
-    if (status == cudaSuccess && m->vq_scheme == WASTE_VQ_SCHEME_VQ3R)
+    if (status == cudaSuccess)
         status = cudaMemcpyAsync(ctx->vq_books, m->codebooksT,
                                  book_values * sizeof(float),
                                  cudaMemcpyHostToDevice, ctx->stream);
@@ -634,17 +714,41 @@ extern "C" int waste_cuda_vq_prepare_pair(waste_model *m, int mode,
     if (values > ctx->vq_lut_values[0] || values > ctx->vq_lut_values[1])
         return -1;
     if (ctx->vq_scheme == WASTE_VQ_SCHEME_VQ4P) {
-        if (mode != 1 || !gate_lut.i8 || !up_lut.i8 ||
-            !gate_lut.block_scale || !up_lut.block_scale)
-            return -1;
-        /* GB10 HMM makes these ordinary CPU allocations directly visible
-         * to the GPU, just like the expert-record pointers.  Borrow rather
-         * than manufacture an H2D copy that coherent hardware does not
-         * need; apply synchronizes before the CPU may reuse either table. */
-        ctx->vq_lut8_host[0] = gate_lut.i8;
-        ctx->vq_lut8_host[1] = up_lut.i8;
-        ctx->vq_lut_scale_host[0] = gate_lut.block_scale;
-        ctx->vq_lut_scale_host[1] = up_lut.block_scale;
+        if (mode == 1) {
+            if (!gate_lut.i8 || !up_lut.i8 ||
+                !gate_lut.block_scale || !up_lut.block_scale)
+                return -1;
+            /* GB10 HMM makes these ordinary CPU allocations directly
+             * visible to the GPU, just like expert-record pointers. */
+            ctx->vq_lut8_host[0] = gate_lut.i8;
+            ctx->vq_lut8_host[1] = up_lut.i8;
+            ctx->vq_lut_scale_host[0] = gate_lut.block_scale;
+            ctx->vq_lut_scale_host[1] = up_lut.block_scale;
+        } else {
+            if (!x || cb_base < 0 ||
+                cb_base + 2 * VQ4P_STAGES > m->n_books)
+                return -1;
+            memcpy(ctx->host_x, x, (size_t)cols * sizeof(float));
+            cudaError_t status = cudaMemcpyAsync(
+                ctx->vq_x, ctx->host_x, (size_t)cols * sizeof(float),
+                cudaMemcpyHostToDevice, ctx->stream);
+            if (status == cudaSuccess) {
+                const dim3 grid(
+                    (unsigned)((cols / m->vec_dim + WASTE_VQ_LUT_BLK - 1) /
+                               WASTE_VQ_LUT_BLK), 2, 1);
+                vq4p_build_quant<<<grid, VQ_BUILD_THREADS, 0, ctx->stream>>>(
+                    ctx->vq_lut[0], ctx->vq_lut[1],
+                    ctx->vq_lut8[0], ctx->vq_lut8[1],
+                    ctx->vq_lut_scale[0], ctx->vq_lut_scale[1],
+                    ctx->vq_books, ctx->vq_x, cols / m->vec_dim, cb_base);
+                status = cudaGetLastError();
+            }
+            if (status != cudaSuccess) {
+                cuda_problem("VQ4P gate/up build", status);
+                return -1;
+            }
+        }
+        ctx->vq_lut_mode[0] = ctx->vq_lut_mode[1] = mode;
         ctx->vq_group_pair_prepared = 1;
         return 0;
     }
@@ -705,14 +809,22 @@ extern "C" int waste_cuda_vq_apply_pair(waste_model *m,
             ctx->vq_y, gate_idx, up_idx, scale,
             ctx->vq_lut[0], ctx->vq_lut[1], rows, cols / m->vec_dim);
     } else if (ctx->vq_scheme == WASTE_VQ_SCHEME_VQ4P &&
-               ctx->vq_group_pair_prepared && ctx->vq_lut8_host[0] &&
-               ctx->vq_lut8_host[1] && ctx->vq_lut_scale_host[0] &&
-               ctx->vq_lut_scale_host[1]) {
+               ctx->vq_group_pair_prepared && ctx->vq_lut_mode[0] &&
+               ctx->vq_lut_mode[0] == ctx->vq_lut_mode[1]) {
+        const int mode = ctx->vq_lut_mode[0];
+        const int8_t *gate_lut = mode == 1
+            ? ctx->vq_lut8_host[0] : ctx->vq_lut8[0];
+        const int8_t *up_lut = mode == 1
+            ? ctx->vq_lut8_host[1] : ctx->vq_lut8[1];
+        const float *gate_scale = mode == 1
+            ? ctx->vq_lut_scale_host[0] : ctx->vq_lut_scale[0];
+        const float *up_scale = mode == 1
+            ? ctx->vq_lut_scale_host[1] : ctx->vq_lut_scale[1];
+        if (!gate_lut || !up_lut || !gate_scale || !up_scale) return -1;
         vq4p_apply_pair<<<rows / VQ_INDEX_BLOCK, 2 * VQ_INDEX_BLOCK,
                           0, ctx->stream>>>(
             ctx->vq_y, gate_idx, up_idx, scale,
-            ctx->vq_lut8_host[0], ctx->vq_lut8_host[1],
-            ctx->vq_lut_scale_host[0], ctx->vq_lut_scale_host[1],
+            gate_lut, up_lut, gate_scale, up_scale,
             rows, cols / m->vec_dim);
     } else {
         return -1;
@@ -730,8 +842,66 @@ extern "C" int waste_cuda_vq_apply_pair(waste_model *m,
     }
     memcpy(gate_y, ctx->host_y, (size_t)rows * sizeof(float));
     memcpy(up_y, ctx->host_y + rows, (size_t)rows * sizeof(float));
-    ctx->vq_group_pair_prepared = 0;
+    /* VQ4P mode 1 borrows the CPU-built pair once per MoE layer and applies
+     * it to every routed expert.  The storage remains owned and unchanged
+     * until the next prepare call; clearing this after expert zero made the
+     * second expert fail despite a successful exactness preflight. */
+    if (ctx->vq_scheme != WASTE_VQ_SCHEME_VQ4P)
+        ctx->vq_group_pair_prepared = 0;
     return 0;
+}
+
+/* Preflight-only inspection of mode-2's three intermediate contracts.
+ * End-to-end equality would catch most errors, but comparing these directly
+ * makes a failure local: dot order, max/scale, or byte quantization. */
+extern "C" int waste_cuda_vq_check_lut(waste_model *m, int slot,
+                                         waste_vq_lut_view reference,
+                                         int cols)
+{
+    waste_cuda_kda *ctx = m ? (waste_cuda_kda *)m->cuda_kda_ctx : NULL;
+    if (!ctx || ctx->vq_scheme != WASTE_VQ_SCHEME_VQ4P ||
+        slot < 0 || slot > 2 || ctx->vq_lut_mode[slot] != 2 ||
+        !reference.f32 || !reference.i8 || !reference.block_scale ||
+        cols < 1 || cols % m->vec_dim)
+        return -1;
+    const size_t values =
+        (size_t)(cols / m->vec_dim) * m->stages * m->cb_entries;
+    const size_t scales =
+        (size_t)((cols / m->vec_dim + WASTE_VQ_LUT_BLK - 1) /
+                 WASTE_VQ_LUT_BLK);
+    if (values > ctx->vq_lut_values[slot] ||
+        scales > ctx->vq_lut_scale_values[slot])
+        return -1;
+    float *f32 = (float *)malloc(values * sizeof(float));
+    int8_t *i8 = (int8_t *)malloc(values);
+    float *block_scale = (float *)malloc(scales * sizeof(float));
+    if (!f32 || !i8 || !block_scale) {
+        free(f32); free(i8); free(block_scale);
+        return -1;
+    }
+    cudaError_t status = cudaStreamSynchronize(ctx->stream);
+    if (status == cudaSuccess)
+        status = cudaMemcpy(f32, ctx->vq_lut[slot], values * sizeof(float),
+                            cudaMemcpyDeviceToHost);
+    if (status == cudaSuccess)
+        status = cudaMemcpy(i8, ctx->vq_lut8[slot], values,
+                            cudaMemcpyDeviceToHost);
+    if (status == cudaSuccess)
+        status = cudaMemcpy(block_scale, ctx->vq_lut_scale[slot],
+                            scales * sizeof(float), cudaMemcpyDeviceToHost);
+    const int different = status != cudaSuccess ||
+        memcmp(f32, reference.f32, values * sizeof(float)) ||
+        memcmp(i8, reference.i8, values) ||
+        memcmp(block_scale, reference.block_scale,
+               scales * sizeof(float));
+    if (status != cudaSuccess)
+        cuda_problem("VQ4P LUT verification", status);
+    else if (different)
+        fprintf(stderr,
+                "waste: CUDA VQ4P mode-2 LUT contract failed at slot %d\n",
+                slot);
+    free(f32); free(i8); free(block_scale);
+    return different ? -1 : 0;
 }
 
 /* Grouped mode-2 handoff. The pair LUT is still prepared once with
@@ -938,12 +1108,44 @@ extern "C" int waste_cuda_vq_apply_down(waste_model *m, int mode,
         (size_t)(cols / m->vec_dim) * m->stages * m->cb_entries;
     if (values > ctx->vq_lut_values[2]) return -1;
     if (ctx->vq_scheme == WASTE_VQ_SCHEME_VQ4P) {
-        if (mode != 1 || !cpu_lut.i8 || !cpu_lut.block_scale) return -1;
+        const int8_t *lut8 = NULL;
+        const float *lscale = NULL;
+        cudaError_t status = cudaSuccess;
+        if (mode == 1) {
+            if (!cpu_lut.i8 || !cpu_lut.block_scale) return -1;
+            lut8 = cpu_lut.i8;
+            lscale = cpu_lut.block_scale;
+        } else {
+            if (!x || cb_base < 0 ||
+                cb_base + VQ4P_STAGES > m->n_books)
+                return -1;
+            memcpy(ctx->host_x, x, (size_t)cols * sizeof(float));
+            status = cudaMemcpyAsync(
+                ctx->vq_x, ctx->host_x, (size_t)cols * sizeof(float),
+                cudaMemcpyHostToDevice, ctx->stream);
+            if (status == cudaSuccess) {
+                const dim3 grid(
+                    (unsigned)((cols / m->vec_dim + WASTE_VQ_LUT_BLK - 1) /
+                               WASTE_VQ_LUT_BLK), 1, 1);
+                vq4p_build_quant<<<grid, VQ_BUILD_THREADS, 0, ctx->stream>>>(
+                    ctx->vq_lut[2], NULL, ctx->vq_lut8[2], NULL,
+                    ctx->vq_lut_scale[2], NULL, ctx->vq_books, ctx->vq_x,
+                    cols / m->vec_dim, cb_base);
+                status = cudaGetLastError();
+            }
+            if (status != cudaSuccess) {
+                cuda_problem("VQ4P down build", status);
+                return -1;
+            }
+            lut8 = ctx->vq_lut8[2];
+            lscale = ctx->vq_lut_scale[2];
+        }
+        ctx->vq_lut_mode[2] = mode;
         vq4p_apply_one<<<(rows + VQ_DOWN_THREADS - 1) / VQ_DOWN_THREADS,
                           VQ_DOWN_THREADS, 0, ctx->stream>>>(
-            ctx->vq_y, idx, scale, cpu_lut.i8, cpu_lut.block_scale,
+            ctx->vq_y, idx, scale, lut8, lscale,
             rows, cols / m->vec_dim);
-        cudaError_t status = cudaGetLastError();
+        status = cudaGetLastError();
         if (status == cudaSuccess)
             status = cudaMemcpyAsync(ctx->host_y, ctx->vq_y,
                                      (size_t)rows * sizeof(float),

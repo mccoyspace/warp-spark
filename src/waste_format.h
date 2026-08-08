@@ -99,7 +99,7 @@ typedef struct {
     uint32_t magic;          /* WASTE_MAGIC_EXPERT                          */
     uint16_t layer;
     uint16_t expert_id;      /* 0..895                                      */
-    uint8_t  fmt;            /* WQ_VQ3R | WQ_VQ2R                           */
+    uint8_t  fmt;            /* WQ_VQ3R | WQ_VQ2R | WQ_VQ4P                  */
     uint8_t  flags;          /* WF_*                                        */
     uint16_t codebook_id;    /* index into codebooks.bin                    */
     uint16_t lowrank_id;     /* MUST BE 0 in v0: the shared low-rank block

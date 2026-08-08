@@ -55,6 +55,8 @@ int  waste_cuda_vq_apply_pair(waste_model *m, float *gate_y, float *up_y,
                               const uint8_t *gate_idx,
                               const uint8_t *up_idx,
                               const uint16_t *scale, int rows, int cols);
+int  waste_cuda_vq_check_lut(waste_model *m, int slot,
+                             waste_vq_lut_view reference, int cols);
 int  waste_cuda_vq_apply_down(waste_model *m, int mode, float *y,
                               const uint8_t *idx, const uint16_t *scale,
                               const float *x, waste_vq_lut_view cpu_lut,
@@ -692,10 +694,11 @@ static int cuda_vq_preflight(waste_model *m, int mode)
                 "waste: CUDA VQ does not support this manifest VQ geometry\n");
         goto fail;
     }
-    if (m->vq_scheme == WASTE_VQ_SCHEME_VQ4P && mode != 1) {
+    if (m->vq_scheme == WASTE_VQ_SCHEME_VQ4P &&
+        mode == 2 && m->cuda_vq_group > 1) {
         fprintf(stderr,
-                "waste: CUDA VQ4P currently requires mode 1 "
-                "(CPU-built coherent LUT)\n");
+                "waste: CUDA VQ4P mode 2 is ungrouped; set "
+                "WASTE_CUDA_VQ_GROUP=1\n");
         goto fail;
     }
     const int lat = c->latent_dim ? c->latent_dim : c->hidden;
@@ -783,7 +786,7 @@ static int cuda_vq_preflight(waste_model *m, int mode)
             for (int i = 0; i < lat; i++)
                 m->x[i] = (float)((i * 37u) & 255u) * (1.0f / 128.0f) - 1.0f;
         }
-        if (mode == 1) {
+        if (mode == 1 || m->vq_scheme == WASTE_VQ_SCHEME_VQ4P) {
             vq_build_lut(m, gate_lut, h->codebook_id, m->x, lat,
                          m->stages, m->cb_entries, m->vec_dim,
                          gate_q, gate_qs);
@@ -802,6 +805,14 @@ static int cuda_vq_preflight(waste_model *m, int mode)
                 (waste_vq_lut_view){gate_lut, gate_q, gate_qs},
                 (waste_vq_lut_view){up_lut, up_q, up_qs},
                 h->codebook_id, lat)) {
+            free(cpu_gate); free(cpu_up); free(cpu_down);
+            goto fail;
+        }
+        if (m->vq_scheme == WASTE_VQ_SCHEME_VQ4P && mode == 2 &&
+            (waste_cuda_vq_check_lut(
+                 m, 0, (waste_vq_lut_view){gate_lut, gate_q, gate_qs}, lat) ||
+             waste_cuda_vq_check_lut(
+                 m, 1, (waste_vq_lut_view){up_lut, up_q, up_qs}, lat))) {
             free(cpu_gate); free(cpu_up); free(cpu_down);
             goto fail;
         }
@@ -839,7 +850,7 @@ static int cuda_vq_preflight(waste_model *m, int mode)
                     ? waste_situ_pair(cpu_gate[i], cpu_up[i], c->situ_beta,
                                       c->situ_linear_beta)
                     : (cpu_gate[i] / (1.0f + expf(-cpu_gate[i]))) * cpu_up[i];
-        if (mode == 1)
+        if (mode == 1 || m->vq_scheme == WASTE_VQ_SCHEME_VQ4P)
             vq_build_lut(m, down_lut, h->codebook_id + 2 * m->stages,
                          gate, inter, m->stages, m->cb_entries, m->vec_dim,
                          down_q, down_qs);
@@ -862,6 +873,12 @@ static int cuda_vq_preflight(waste_model *m, int mode)
                            mode == 1 ? down_q : NULL,
                            mode == 1 ? down_qs : NULL},
                        h->codebook_id + 2 * m->stages, lat, inter)) {
+            free(cpu_gate); free(cpu_up); free(cpu_down);
+            goto fail;
+        }
+        if (m->vq_scheme == WASTE_VQ_SCHEME_VQ4P && mode == 2 &&
+            waste_cuda_vq_check_lut(
+                m, 2, (waste_vq_lut_view){down_lut, down_q, down_qs}, inter)) {
             free(cpu_gate); free(cpu_up); free(cpu_down);
             goto fail;
         }

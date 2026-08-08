@@ -949,7 +949,9 @@ NAMES = {0: "F32", 1: "F16", 2: "Q8G", 3: "Q4G", 7: "Q3G"}
 pref = man.get("tensor_prefix", "")
 used = {t["fmt"] for t in man["trunk"]
         if not pref or t["name"].startswith(pref)}
-quant = (f"experts VQ{man['expert_quant']['stages']}R, trunk "
+eq = man["expert_quant"]
+expert = "VQ4P" if eq.get("index_bits", 8) == 6 else f"VQ{eq['stages']}R"
+quant = (f"experts {expert}, trunk "
          + "/".join(NAMES[f] for f in (7, 3, 2, 1, 0) if f in used))
 
 print(f"{info['arch']}, {info['quantization']}")

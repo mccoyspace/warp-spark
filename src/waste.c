@@ -209,8 +209,12 @@ static void quant_summary(waste_ctx *c)
     static const struct { int fmt; const char *name; } tbl[] = {
         { 7, "Q3G" }, { 3, "Q4G" }, { 2, "Q8G" }, { 1, "F16" }, { 0, "F32" },
     };
-    int n = snprintf(c->quant, sizeof c->quant, "experts VQ%dR, trunk",
-                     c->m.stages);
+    char expert[16];
+    if (c->m.vq_scheme == WASTE_VQ_SCHEME_VQ4P)
+        snprintf(expert, sizeof expert, "VQ4P");
+    else
+        snprintf(expert, sizeof expert, "VQ%dR", c->m.stages);
+    int n = snprintf(c->quant, sizeof c->quant, "experts %s, trunk", expert);
     size_t off = (n > 0 && (size_t)n < sizeof c->quant) ? (size_t)n : 0;
     const char *sep = " ";
     for (size_t i = 0; i < sizeof tbl / sizeof *tbl; i++) {
