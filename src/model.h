@@ -99,6 +99,16 @@ typedef struct {
     int   max_patches;
 } waste_vision_cfg;
 
+/* The container manifest carries the complete VQ geometry.  This enum is
+ * only the normalized name of a geometry a backend has actually qualified;
+ * it is not a second source of format parameters.  Unknown/VQ2R geometries
+ * remain valid for the CPU path and fail closed in CUDA. */
+typedef enum {
+    WASTE_VQ_SCHEME_OTHER = 0,
+    WASTE_VQ_SCHEME_VQ3R,
+    WASTE_VQ_SCHEME_VQ4P,
+} waste_vq_scheme;
+
 typedef struct {
     waste_config cfg;
     waste_vision_cfg vcfg;
@@ -112,6 +122,7 @@ typedef struct {
     float *codebooks;                /* [n_books][256][8]                   */
     float *codebooksT;               /* [n_books][8][256], for the LUT build*/
     int n_books, vec_dim, cb_entries, stages;
+    waste_vq_scheme vq_scheme;
     /* 8 = one whole byte of index per stage (VQ3R/VQ2R). 6 = WQ_VQ4P, four
      * indices packed into three bytes, which is what lets a stage table be
      * 64 bytes and so live in a NEON register. Sets the per-row stride of

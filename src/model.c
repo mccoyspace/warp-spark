@@ -1519,6 +1519,13 @@ int waste_model_load(waste_model *m, const char *dir, int kv_cap,
         js_free(&d); free(src);
         return -2;                        /* -> WASTE_E_FORMAT */
     }
+    m->vq_scheme = WASTE_VQ_SCHEME_OTHER;
+    if (m->stages == 3 && m->vec_dim == 8 && m->cb_entries == 256 &&
+        m->index_bits == 8)
+        m->vq_scheme = WASTE_VQ_SCHEME_VQ3R;
+    else if (m->stages == 4 && m->vec_dim == 8 && m->cb_entries == 64 &&
+             m->index_bits == 6)
+        m->vq_scheme = WASTE_VQ_SCHEME_VQ4P;
 
     if (load_trunk(m, dir, &d, js_get(&d, 0, "trunk")) < 0) { js_free(&d); free(src); return -1; }
 
