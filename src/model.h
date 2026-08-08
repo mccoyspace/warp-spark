@@ -58,6 +58,7 @@ typedef struct {
  * across a hidden state, and one global scale would flatten the small
  * positions to zero. */
 #define WASTE_VQ_LUT_BLK 32
+#define WASTE_VQ_INDEX_BLOCK 64
     int kda_layer[WASTE_MAX_LAYERS]; /* 1 if layer is KDA                   */
     float eps, routed_scale;
     int renorm;
@@ -109,6 +110,16 @@ typedef enum {
     WASTE_VQ_SCHEME_VQ4P,
 } waste_vq_scheme;
 
+/* A LUT has one semantic owner but two qualified execution views.  VQ3R
+ * consumes the fp32 table; VQ4P consumes its int8 shadow plus one scale per
+ * WASTE_VQ_LUT_BLK vector positions.  CUDA mode 1 borrows the applicable
+ * CPU-built view directly on coherent-memory systems. */
+typedef struct {
+    const float  *f32;
+    const int8_t *i8;
+    const float  *block_scale;
+} waste_vq_lut_view;
+
 typedef struct {
     waste_config cfg;
     waste_vision_cfg vcfg;
@@ -119,8 +130,8 @@ typedef struct {
     int      media_n, media_used, cfg_media_token;
     waste_tensor *t;
     int n_tensors;
-    float *codebooks;                /* [n_books][256][8]                   */
-    float *codebooksT;               /* [n_books][8][256], for the LUT build*/
+    float *codebooks;                /* [n_books][cb_entries][vec_dim]       */
+    float *codebooksT;               /* transposed for the LUT build         */
     int n_books, vec_dim, cb_entries, stages;
     waste_vq_scheme vq_scheme;
     /* 8 = one whole byte of index per stage (VQ3R/VQ2R). 6 = WQ_VQ4P, four

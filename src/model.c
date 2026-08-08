@@ -31,11 +31,16 @@
 #include "simd.h"
 #include "waste_backend.h"
 #include "waste_format.h"
+#include "vq_packed.h"
 
 static int bank_fetch(void *user, int layer, int expert, uint8_t *dst);
 static void vq_build_lut(waste_model *m, float *lut, int cb_base,
                          const float *x, int N, int stages, int entries,
                          int vec_dim, int8_t *q, float *qs);
+static void vq_apply_serial(waste_model *m, float *y, const uint8_t *idx,
+                            const uint16_t *scale, int M, int N,
+                            const float *lut, const int8_t *q,
+                            const float *qs);
 
 #if defined(WASTE_ENABLE_CUDA)
 int  waste_cuda_q4_matvec(waste_model *m, float *y,
@@ -43,7 +48,8 @@ int  waste_cuda_q4_matvec(waste_model *m, float *y,
                           int out, int in, int mode);
 int  waste_cuda_vq_init(waste_model *m);
 int  waste_cuda_vq_prepare_pair(waste_model *m, int mode, const float *x,
-                                const float *gate_lut, const float *up_lut,
+                                waste_vq_lut_view gate_lut,
+                                waste_vq_lut_view up_lut,
                                 int cb_base, int cols);
 int  waste_cuda_vq_apply_pair(waste_model *m, float *gate_y, float *up_y,
                               const uint8_t *gate_idx,
@@ -51,7 +57,7 @@ int  waste_cuda_vq_apply_pair(waste_model *m, float *gate_y, float *up_y,
                               const uint16_t *scale, int rows, int cols);
 int  waste_cuda_vq_apply_down(waste_model *m, int mode, float *y,
                               const uint8_t *idx, const uint16_t *scale,
-                              const float *x, const float *cpu_lut,
+                              const float *x, waste_vq_lut_view cpu_lut,
                               int cb_base, int rows, int cols);
 int  waste_cuda_vq_group_pair_enqueue(
         waste_model *m, int slot, const uint8_t *gate_idx,
@@ -669,8 +675,8 @@ fail:
 }
 
 /* The CUDA dispatch consumes the same manifest-described VQ scheme as the
- * CPU path, but only VQ3R has completed its numerical and performance gates.
- * Fail closed on every other pluggable scheme until it has its own contract. */
+ * CPU path.  Each accepted geometry has a separate kernel and numerical
+ * contract; everything else fails closed before recurrent state can move. */
 static int cuda_vq_preflight(waste_model *m, int mode)
 {
     if (!mode) return 0;
@@ -681,19 +687,25 @@ static int cuda_vq_preflight(waste_model *m, int mode)
                 "waste: CUDA VQ requires CUDA KDA mode 1 and dense scope 2\n");
         goto fail;
     }
-    if (m->index_bits != 8) {
+    if (m->vq_scheme == WASTE_VQ_SCHEME_OTHER) {
         fprintf(stderr,
-                "waste: CUDA VQ is VQ3R-complete; VQ4P is rejected "
-                "pending its own correctness contract\n");
+                "waste: CUDA VQ does not support this manifest VQ geometry\n");
         goto fail;
     }
-    if (m->stages != 3 || m->vec_dim != 8 || m->cb_entries != 256 ||
-        c->latent_dim != 3584 ||
-        c->moe_inter != 3072 || c->top_k != 16 || !m->codebooksT ||
-        m->n_books < 9) {
+    if (m->vq_scheme == WASTE_VQ_SCHEME_VQ4P && mode != 1) {
         fprintf(stderr,
-                "waste: CUDA VQ requires K3 VQ3R 3584/3072, top-16, "
-                "3-stage/256-entry geometry\n");
+                "waste: CUDA VQ4P currently requires mode 1 "
+                "(CPU-built coherent LUT)\n");
+        goto fail;
+    }
+    const int lat = c->latent_dim ? c->latent_dim : c->hidden;
+    if (lat < 1 || c->moe_inter < 1 || lat % m->vec_dim ||
+        c->moe_inter % m->vec_dim || lat % WASTE_VQ_INDEX_BLOCK ||
+        c->moe_inter % WASTE_VQ_INDEX_BLOCK || !m->codebooksT ||
+        m->n_books < 3 * m->stages) {
+        fprintf(stderr,
+                "waste: CUDA VQ requires block-64 rows and complete "
+                "manifest-described codebooks\n");
         goto fail;
     }
     if (waste_cuda_vq_init(m)) {
@@ -720,11 +732,12 @@ static int cuda_vq_preflight(waste_model *m, int mode)
         if (bank_fetch(m, L, 0, m->miss_buf)) goto fail;
         m->expert_reads = reads_before;
         const waste_expert_hdr *h = (const waste_expert_hdr *)m->miss_buf;
-        if (h->fmt != WQ_VQ3R) {
-            fprintf(stderr, "waste: CUDA VQ requires VQ3R expert records\n");
+        const int expected_fmt = m->vq_scheme == WASTE_VQ_SCHEME_VQ4P
+            ? WQ_VQ4P : WQ_VQ3R;
+        if (h->fmt != expected_fmt) {
+            fprintf(stderr, "waste: CUDA VQ expert record format mismatch\n");
             goto fail;
         }
-        const int lat = c->latent_dim;
         const int inter = c->moe_inter;
         const int lut_sz =
             ((c->hidden > lat ? c->hidden : lat) / m->vec_dim) *
@@ -735,22 +748,63 @@ static int cuda_vq_preflight(waste_model *m, int mode)
         float *gate_lut = m->lut;
         float *up_lut = gate_lut + lut_sz;
         float *down_lut = up_lut + lut_sz;
+        int8_t *gate_q = NULL, *up_q = NULL, *down_q = NULL;
+        float *gate_qs = NULL, *up_qs = NULL, *down_qs = NULL;
+        if (m->vq_scheme == WASTE_VQ_SCHEME_VQ4P) {
+            const int nsc = lut_sz / (m->stages * m->cb_entries) /
+                            WASTE_VQ_LUT_BLK + 2;
+            gate_q = m->lut8;
+            up_q = gate_q + lut_sz;
+            down_q = up_q + lut_sz;
+            gate_qs = m->lut8_scale;
+            up_qs = gate_qs + nsc;
+            down_qs = up_qs + nsc;
+        }
         const uint8_t *rec = m->miss_buf;
         const uint16_t *scale =
             (const uint16_t *)(rec + h->chan_corr_off);
         const int grouped = mode == 2 && m->cuda_vq_group > 1;
         const float *group_pair[1] = { NULL };
         const float *group_down[1] = { NULL };
+        float *cpu_gate = NULL, *cpu_up = NULL, *cpu_down = NULL;
+        if (m->vq_scheme == WASTE_VQ_SCHEME_VQ4P) {
+            cpu_gate = (float *)malloc((size_t)inter * sizeof(float));
+            cpu_up = (float *)malloc((size_t)inter * sizeof(float));
+            cpu_down = (float *)malloc((size_t)lat * sizeof(float));
+            if (!cpu_gate || !cpu_up || !cpu_down) {
+                free(cpu_gate); free(cpu_up); free(cpu_down);
+                goto fail;
+            }
+            /* A zero scratch vector would make every quantized LUT entry
+             * zero and turn the real-record exactness gate into a wiring
+             * test.  Use exactly representable, nonzero fp32 values so the
+             * preflight exercises packed indices, integer sums and every
+             * ordered fp32 fold before recurrent state can move. */
+            for (int i = 0; i < lat; i++)
+                m->x[i] = (float)((i * 37u) & 255u) * (1.0f / 128.0f) - 1.0f;
+        }
         if (mode == 1) {
             vq_build_lut(m, gate_lut, h->codebook_id, m->x, lat,
-                         m->stages, m->cb_entries, m->vec_dim, NULL, NULL);
+                         m->stages, m->cb_entries, m->vec_dim,
+                         gate_q, gate_qs);
             vq_build_lut(m, up_lut, h->codebook_id + m->stages,
                          m->x, lat, m->stages, m->cb_entries, m->vec_dim,
-                         NULL, NULL);
+                         up_q, up_qs);
+            if (cpu_gate) {
+                vq_apply_serial(m, cpu_gate, rec + h->gate_off, scale,
+                                inter, lat, gate_lut, gate_q, gate_qs);
+                vq_apply_serial(m, cpu_up, rec + h->up_off, scale + inter,
+                                inter, lat, up_lut, up_q, up_qs);
+            }
         }
         if (waste_cuda_vq_prepare_pair(
-                m, mode, m->x, gate_lut, up_lut, h->codebook_id, lat))
+                m, mode, m->x,
+                (waste_vq_lut_view){gate_lut, gate_q, gate_qs},
+                (waste_vq_lut_view){up_lut, up_q, up_qs},
+                h->codebook_id, lat)) {
+            free(cpu_gate); free(cpu_up); free(cpu_down);
             goto fail;
+        }
         if (grouped) {
             if (waste_cuda_vq_group_pair_enqueue(
                     m, 0, rec + h->gate_off, rec + h->up_off,
@@ -762,6 +816,16 @@ static int cuda_vq_preflight(waste_model *m, int mode)
         } else if (waste_cuda_vq_apply_pair(
                        m, gate, up, rec + h->gate_off, rec + h->up_off,
                        scale, inter, lat)) {
+            free(cpu_gate); free(cpu_up); free(cpu_down);
+            goto fail;
+        }
+        if (cpu_gate && (memcmp(cpu_gate, gate,
+                                (size_t)inter * sizeof(float)) ||
+                         memcmp(cpu_up, up,
+                                (size_t)inter * sizeof(float)))) {
+            fprintf(stderr,
+                    "waste: CUDA VQ4P gate/up real-record exactness failed\n");
+            free(cpu_gate); free(cpu_up); free(cpu_down);
             goto fail;
         }
         for (int i = 0; i < inter; i++)
@@ -769,10 +833,20 @@ static int cuda_vq_preflight(waste_model *m, int mode)
                 ? waste_situ_pair(gate[i], up[i], c->situ_beta,
                                   c->situ_linear_beta)
                 : (gate[i] / (1.0f + expf(-gate[i]))) * up[i];
+        if (cpu_gate)
+            for (int i = 0; i < inter; i++)
+                cpu_gate[i] = c->act_situ
+                    ? waste_situ_pair(cpu_gate[i], cpu_up[i], c->situ_beta,
+                                      c->situ_linear_beta)
+                    : (cpu_gate[i] / (1.0f + expf(-cpu_gate[i]))) * cpu_up[i];
         if (mode == 1)
             vq_build_lut(m, down_lut, h->codebook_id + 2 * m->stages,
                          gate, inter, m->stages, m->cb_entries, m->vec_dim,
-                         NULL, NULL);
+                         down_q, down_qs);
+        if (cpu_gate)
+            vq_apply_serial(m, cpu_down, rec + h->down_off,
+                            scale + 2 * inter, lat, inter, down_lut,
+                            down_q, down_qs);
         if (grouped) {
             if (waste_cuda_vq_group_down_enqueue(
                     m, 0, rec + h->down_off, scale + 2 * inter, gate,
@@ -783,14 +857,32 @@ static int cuda_vq_preflight(waste_model *m, int mode)
             if (waste_cuda_vq_group_drain(m)) goto fail;
         } else if (waste_cuda_vq_apply_down(
                        m, mode, down, rec + h->down_off, scale + 2 * inter,
-                       gate, mode == 1 ? down_lut : NULL,
+                       gate, (waste_vq_lut_view){
+                           mode == 1 ? down_lut : NULL,
+                           mode == 1 ? down_q : NULL,
+                           mode == 1 ? down_qs : NULL},
                        h->codebook_id + 2 * m->stages, lat, inter)) {
+            free(cpu_gate); free(cpu_up); free(cpu_down);
+            goto fail;
+        }
+        if (cpu_down && memcmp(cpu_down, down,
+                               (size_t)lat * sizeof(float))) {
+            fprintf(stderr,
+                    "waste: CUDA VQ4P down real-record exactness failed\n");
+            free(cpu_gate); free(cpu_up); free(cpu_down);
             goto fail;
         }
         for (int i = 0; i < inter; i++)
-            if (!isfinite(gate[i]) || !isfinite(up[i])) goto fail;
+            if (!isfinite(gate[i]) || !isfinite(up[i])) {
+                free(cpu_gate); free(cpu_up); free(cpu_down);
+                goto fail;
+            }
         for (int i = 0; i < lat; i++)
-            if (!isfinite(down[i])) goto fail;
+            if (!isfinite(down[i])) {
+                free(cpu_gate); free(cpu_up); free(cpu_down);
+                goto fail;
+            }
+        free(cpu_gate); free(cpu_up); free(cpu_down);
     }
     m->cuda_vq_preflight_modes |= 1 << mode;
     return 0;
@@ -2307,7 +2399,7 @@ typedef struct {
  * table is read M/64 times and the tile's indices (55 KB) stay in L1.
  * This is a cache-blocking win, not a SIMD one: the inner op is a gather,
  * which NEON cannot vectorize. */
-#define VQ_TILE 64          /* must equal the container's index_block */
+#define VQ_TILE WASTE_VQ_INDEX_BLOCK
 #ifndef VQ_SUPER
 #define VQ_SUPER 2          /* index blocks handled per pass (swept: 2 wins) */
 #endif
@@ -2499,13 +2591,6 @@ typedef struct {
     int nv;
 } vqp_arg;
 
-/* Unpack of the converter's little-endian 4x6 packing. Kept as one macro so
- * the scalar path and the NEON path cannot drift apart. */
-#define P6_J0(b0, b1, b2) ((b0) & 0x3f)
-#define P6_J1(b0, b1, b2) ((((b0) >> 6) | ((b1) << 2)) & 0x3f)
-#define P6_J2(b0, b1, b2) ((((b1) >> 4) | ((b2) << 4)) & 0x3f)
-#define P6_J3(b0, b1, b2) (((b2) >> 2) & 0x3f)
-
 static void vq_rows_p6(int b, int e, void *p)
 {
     vqp_arg *a = (vqp_arg *)p;
@@ -2586,10 +2671,10 @@ static void vq_rows_p6(int b, int e, void *p)
                         const unsigned b0 = ix[r * 3], b1 = ix[r * 3 + 1],
                                        b2 = ix[r * 3 + 2];
                         sum[r] = (int16_t)(sum[r] +
-                            T[P6_J0(b0, b1, b2)] +
-                            T[en + P6_J1(b0, b1, b2)] +
-                            T[2 * en + P6_J2(b0, b1, b2)] +
-                            T[3 * en + P6_J3(b0, b1, b2)]);
+                            T[WASTE_P6_J0(b0, b1, b2)] +
+                            T[en + WASTE_P6_J1(b0, b1, b2)] +
+                            T[2 * en + WASTE_P6_J2(b0, b1, b2)] +
+                            T[3 * en + WASTE_P6_J3(b0, b1, b2)]);
                     }
                 }
             }
@@ -3209,7 +3294,8 @@ static int moe_vq_grouped(waste_model *m, int L, const int *idx,
             }
             if (!pair_ready) {
                 if (waste_cuda_vq_prepare_pair(
-                        m, 2, xin, NULL, NULL, hdr[s]->codebook_id, lat)) {
+                        m, 2, xin, (waste_vq_lut_view){0},
+                        (waste_vq_lut_view){0}, hdr[s]->codebook_id, lat)) {
                     waste_cuda_vq_group_drain(m);
                     release_expert_holds(m, hold, count);
                     return cuda_projection_failed(m, "VQ group prepare");
@@ -3497,8 +3583,10 @@ static int moe_layer(waste_model *m, int L, const float *in, float *out, int *ro
         if (!rec) break;
         const waste_expert_hdr *h = (const waste_expert_hdr *)rec;
 #if defined(WASTE_ENABLE_CUDA)
-        if (m->cuda_vq_mode && h->fmt != WQ_VQ3R)
-            return cuda_projection_failed(m, "VQ3R record validation");
+        if (m->cuda_vq_mode && h->fmt !=
+                (m->vq_scheme == WASTE_VQ_SCHEME_VQ4P
+                    ? WQ_VQ4P : WQ_VQ3R))
+            return cuda_projection_failed(m, "CUDA VQ record validation");
 #endif
         const uint16_t *sc = (const uint16_t *)(rec + h->chan_corr_off);
 
@@ -3517,7 +3605,9 @@ static int moe_layer(waste_model *m, int L, const float *in, float *out, int *ro
 #if defined(WASTE_ENABLE_CUDA)
             if (m->cuda_vq_mode) {
                 if (waste_cuda_vq_prepare_pair(
-                        m, m->cuda_vq_mode, xin, lut_gate, lut_up,
+                        m, m->cuda_vq_mode, xin,
+                        (waste_vq_lut_view){lut_gate, q_gate, qs_gate},
+                        (waste_vq_lut_view){lut_up, q_up, qs_up},
                         h->codebook_id, lat))
                     return cuda_projection_failed(m, "VQ gate/up prepare");
                 if (m->cuda_vq_mode == 2) {
@@ -3565,8 +3655,10 @@ static int moe_layer(waste_model *m, int L, const float *in, float *out, int *ro
                 PROF_START(P_LUTA);
                 const int failed = waste_cuda_vq_apply_down(
                     m, m->cuda_vq_mode, acc, rec + h->down_off,
-                    sc + 2 * inter, ga,
-                    m->cuda_vq_mode == 1 ? lut_down : NULL,
+                    sc + 2 * inter, ga, (waste_vq_lut_view){
+                        m->cuda_vq_mode == 1 ? lut_down : NULL,
+                        m->cuda_vq_mode == 1 ? q_down : NULL,
+                        m->cuda_vq_mode == 1 ? qs_down : NULL},
                     h->codebook_id + 2 * m->stages, lat, inter);
                 PROF_END(P_LUTA);
                 if (failed)

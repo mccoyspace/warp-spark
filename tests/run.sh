@@ -67,6 +67,12 @@ fi
 # ---------------------------------------------------------------- unit ----
 head_ "kernels vs the reference implementations"
 
+if ./test_vq_packed 2>/dev/null | grep -q '^VQ4P PACK OK'; then
+    ok "VQ4P six-bit packing exhaustively round-trips"
+else
+    no "VQ4P six-bit packing"
+fi
+
 # Stable cgroup capacity and dynamic pressure are both policy, not kernels,
 # but they decide every automatic open and run in milliseconds against
 # synthetic files on every platform.
