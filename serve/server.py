@@ -88,6 +88,7 @@ class ChatServer(ThreadingHTTPServer):
                  prefix_cache_bytes: int = 0,
                  prefix_cache_entries: int = 8,
                  conversation_head: bool = False,
+                 learn_usage: bool = False,
                  request_qos=None,
                  performance_profile: Optional[dict] = None):
         if prefix_cache_bytes < 0 or prefix_cache_entries < 0:
@@ -119,6 +120,14 @@ class ChatServer(ThreadingHTTPServer):
         self.default_thinking = default_thinking
         self.allow_local_images = allow_local_images
         self.log_requests = log_requests
+        self.learn_usage = bool(learn_usage)
+        self.usage_learning = {
+            "enabled": self.learn_usage,
+            "saves": 0,
+            "failures": 0,
+            "last_saved_at": None,
+            "last_error": None,
+        }
         self.request_qos = request_qos or DisabledRequestQos()
         self.performance_profile = performance_profile or {"name": "default"}
         self.started = api.now()
@@ -182,6 +191,26 @@ class ChatServer(ThreadingHTTPServer):
             prefix_cache_bytes, prefix_cache_entries,
             self.prefix_cache_identity,
             conversation_head=conversation_head)
+
+    def save_usage_after_request(self) -> None:
+        """Best-effort snapshot of the live expert-cache ranking.
+
+        The caller holds the engine lock.  Learning must never turn an
+        otherwise successful generation into a failed HTTP request: the
+        separate usage file is an optimization artifact, not model state.
+        """
+        if not self.learn_usage:
+            return
+        try:
+            self.engine.save_usage()
+        except EngineError as exc:
+            self.usage_learning["failures"] += 1
+            self.usage_learning["last_error"] = str(exc)
+            sys.stderr.write(f"usage learning: {exc}\n")
+            return
+        self.usage_learning["saves"] += 1
+        self.usage_learning["last_saved_at"] = api.now()
+        self.usage_learning["last_error"] = None
 
     def server_close(self):
         try:
@@ -340,6 +369,7 @@ class Handler(BaseHTTPRequestHandler):
             "engine": engine_mod.build_info(),
             "uptime_s": api.now() - self.server.started,
             "prefix_cache": self.server.prefix_cache.stats(),
+            "usage_learning": dict(self.server.usage_learning),
             "performance_profile": self.server.performance_profile,
             "pm_qos": self.server.request_qos.stats(),
         })
@@ -491,6 +521,7 @@ class Handler(BaseHTTPRequestHandler):
                 max_tokens=opts["max_tokens"],
                 stop_tokens=self.server.stop_tokens or None)
         qos_report = qos_lease.report()
+        self.server.save_usage_after_request()
         tail = parser.finish()
         if not state["stopped"]:
             if deliver(tail, final=True):
@@ -693,6 +724,7 @@ class Handler(BaseHTTPRequestHandler):
                     max_tokens=opts["max_tokens"],
                     stop_tokens=srv.stop_tokens or None)
             qos_report = qos_lease.report()
+            srv.save_usage_after_request()
 
         text = "".join(pieces)
         for s in stops:
@@ -719,6 +751,7 @@ def serve(engine: Engine, *, host: str = "127.0.0.1", port: int = 8000,
           prefix_cache_bytes: int = 0,
           prefix_cache_entries: int = 8,
           conversation_head: bool = False,
+          learn_usage: bool = False,
           request_qos=None,
           performance_profile: Optional[dict] = None) -> ChatServer:
     """Build the server. The caller decides whether to serve_forever."""
@@ -734,6 +767,7 @@ def serve(engine: Engine, *, host: str = "127.0.0.1", port: int = 8000,
                      prefix_cache_bytes=prefix_cache_bytes,
                      prefix_cache_entries=prefix_cache_entries,
                      conversation_head=conversation_head,
+                     learn_usage=learn_usage,
                      request_qos=request_qos,
                      performance_profile=performance_profile)
     if ready is not None:

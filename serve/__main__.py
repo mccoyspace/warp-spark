@@ -128,6 +128,10 @@ examples:
                    help="learned hotlist (default <model>/usage.waste)")
     g.add_argument("--exclusive-open", action="store_true",
                    help="ask for single-process ownership of this container")
+    g.add_argument("--learn-usage", action="store_true",
+                   help="save the live expert-cache ranking after each "
+                        "successful request; requires an explicit --usage "
+                        "path so the model's default hotlist stays untouched")
     g.add_argument("--performance-profile", choices=PROFILE_NAMES,
                    default=None, metavar="NAME",
                    help="explicit opt-in operating profile; spark-q0 "
@@ -180,6 +184,10 @@ examples:
             not args.prefix_cache or args.prefix_cache_entries < 2):
         print("--conversation-head requires --prefix-cache and at least two "
               "prefix-cache entries", file=sys.stderr)
+        return 2
+    if args.learn_usage and not args.usage:
+        print("--learn-usage requires an explicit --usage path",
+              file=sys.stderr)
         return 2
 
     model = Path(args.model).expanduser()
@@ -312,6 +320,8 @@ examples:
         print(f"profile  {profile.name}{profile_note}")
         if args.vision:
             print("vision   on — requests may carry base64 images")
+        if args.learn_usage:
+            print(f"learning on — saving expert usage to {args.usage}")
         if not args.api_key and args.host not in ("127.0.0.1", "localhost",
                                                   "::1"):
             print(f"\nWARNING: listening on {args.host} with no --api-key: "
@@ -326,6 +336,7 @@ examples:
                     prefix_cache_bytes=args.prefix_cache,
                     prefix_cache_entries=args.prefix_cache_entries,
                     conversation_head=args.conversation_head,
+                    learn_usage=args.learn_usage,
                     request_qos=request_qos,
                     performance_profile=public_profile)
     except (EngineError, OSError, QosError, ValueError) as e:

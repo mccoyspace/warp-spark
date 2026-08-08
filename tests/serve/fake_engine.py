@@ -103,6 +103,7 @@ class FakeEngine:
     resets: int = 0
     imports: int = 0
     exports: int = 0
+    usage_saves: int = 0
     closed: bool = False
     _state_tokens: list[int] = field(default_factory=list)
     _lock: threading.RLock = field(default_factory=threading.RLock)
@@ -231,6 +232,9 @@ class FakeEngine:
 
     def close(self) -> None:
         self.closed = True
+
+    def save_usage(self) -> None:
+        self.usage_saves += 1
 
     # ---- generation ------------------------------------------------------
 
