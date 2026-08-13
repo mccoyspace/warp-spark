@@ -259,13 +259,15 @@ examples:
     # block-buffered and stderr is not, so without it this warning lands
     # above the banner it is qualifying — and reads as if the container
     # failed to load at all.
-    if srv.chat_error:
+    chat_error = getattr(srv, "chat_error", None)
+    chat_format = getattr(srv, "chat_format", xtml)
+    if chat_error:
         sys.stdout.flush()
         print(f"\nWARNING: /v1/chat/completions is unavailable for this "
-              f"container.\n  {srv.chat_error}.\n  /v1/completions is the "
+              f"container.\n  {chat_error}.\n  /v1/completions is the "
               f"one generating endpoint here. `waste chat` reads the\n"
               f"  container's chat.json and is unaffected.", file=sys.stderr)
-    elif srv.chat_format is xtml:
+    elif chat_format is xtml:
         print(f"thinking {'off by default' if args.no_thinking else 'on'}"
               f" — reasoning_effort per request")
     else:
@@ -277,7 +279,7 @@ examples:
 
     shown = args.host if ":" not in args.host else f"[{args.host}]"
     print(f"\nlistening on http://{shown}:{args.port}  "
-          f"(POST {'/v1/completions' if srv.chat_error else '/v1/chat/completions'})")
+          f"(POST {'/v1/completions' if chat_error else '/v1/chat/completions'})")
     # Flush before blocking forever. Redirected to a file, stdout is
     # block-buffered, so without this `python3 -m serve … > log &` shows an
     # empty log for as long as the server runs — which reads exactly like a
