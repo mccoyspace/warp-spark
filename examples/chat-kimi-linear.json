@@ -1,0 +1,6 @@
+{
+ "system": ["<|im_system|>system<|im_middle|>", "<|im_end|>"],
+ "user": ["<|im_user|>user<|im_middle|>", "<|im_end|>"],
+ "assistant": ["<|im_assistant|>assistant<|im_middle|>", "<|im_end|>"],
+ "open": "<|im_assistant|>assistant<|im_middle|>"
+}

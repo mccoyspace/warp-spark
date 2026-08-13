@@ -97,6 +97,7 @@ class MemPlan(C.Structure):
                 ("floor_bytes", C.c_uint64),
                 ("recommended_bytes", C.c_uint64),
                 ("vision_bytes", C.c_uint64),
+                ("working_set_bytes", C.c_uint64),
                 ("host_reserved_bytes", C.c_uint64)]
 
 
@@ -110,7 +111,7 @@ class Cfg(C.Structure):
                 ("vision", C.c_int),
                 ("verify_records", C.c_int),
                 ("usage_path", C.c_char_p),
-                ("allow_concurrent_open", C.c_int),
+                ("exclusive_open", C.c_int),
                 ("host_reserved_bytes", C.c_uint64)]
 
 
@@ -448,7 +449,7 @@ class Engine:
                  vision: bool = False,
                  verify_records: bool = False,
                  usage_path: Optional[str] = None,
-                 allow_concurrent_open: bool = False,
+                 exclusive_open: bool = False,
                  host_reserved_bytes: int = 0):
         ram_budget_bytes = _bounded_int(
             "ram_budget_bytes", ram_budget_bytes, 0, (1 << 64) - 1)
@@ -481,7 +482,7 @@ class Engine:
         # and a temporary would be freed before waste_open reads it.
         self._usage = usage_path.encode() if usage_path else None
         cfg.usage_path = self._usage
-        cfg.allow_concurrent_open = 1 if allow_concurrent_open else 0
+        cfg.exclusive_open = 1 if exclusive_open else 0
         cfg.host_reserved_bytes = host_reserved_bytes
 
         st = self.lib.waste_open_v2(self.model_path.encode(), C.byref(cfg),

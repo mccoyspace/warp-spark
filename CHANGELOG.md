@@ -8,6 +8,19 @@ measurement is the useful part.
 `docs/LEARNED.md` carries the full reasoning; this file carries what
 changed. Each entry names the section to read for the numbers behind it.
 
+## 0.7.0-spark.3 — 2026-08-12
+
+Spark integration is realigned with upstream WARP 0.6.8 development at
+`505e481`. It adopts the project rename, `chat.json` serving, DeepSeek-family
+conversion and attention corrections, the measured three-quarter-memory
+automatic budget, and upstream's opt-in exclusive container ownership. It
+retains the qualified GN100 CUDA paths, exact prefix snapshots, request-scoped
+Q0 profile, host-memory reservation, and measurement tooling.
+
+The public project name and repository links now say WARP. Compatibility names
+remain unchanged with upstream: the executable and C API are `waste`, containers
+use `.waste`, and environment variables use `WASTE_*`.
+
 ## 0.7.0-spark.2 — 2026-08-07
 
 Spark integration release realigned to upstream 0.6.6. It retains the
@@ -33,6 +46,287 @@ ordinary names through header macros, while an API-1 binary using those calls
 fails symbol resolution instead of crossing the boundary with smaller
 structures. Dynamic bindings can verify `waste_api_version()` and the two
 exported structure sizes before making any structure-bearing call.
+
+## 0.6.8 — unreleased
+
+Nothing changes for the two models this project ships numbers for: a
+Kimi-Linear forward is byte-identical to 0.6.7, and so is K3's. What changed
+is which *other* models the engine can read. The DeepSeek-V3 family — V3, R1
+and Kimi K2 — converts and now attends over an ordered sequence, which it did
+not before. Alongside that, a host can ask for exclusive ownership of a
+container, opt-in and off by default.
+
+**Callers must recompile against this header.** `exclusive_open` was appended
+to `waste_cfg`, and `WASTE_E_BUSY` was added to `waste_status`. The library is
+still pre-1.0 and does not promise a stable ABI; `serve/engine.py`'s ctypes
+mirror moved with the C header.
+
+### Added
+
+- **`convert.py` reads DeepSeek-V3 family checkpoints**
+  ([#26](https://github.com/sqliteai/warp/pull/26)). Three things stood between
+  a V3/R1/K2 checkpoint and a container, and each failed differently. fp8
+  block-scaled weights (`F8_E4M3` with a `_scale_inv` companion) are now
+  dequantized by both safetensors readers, with the tile size read from
+  `quantization_config.weight_block_size` rather than inferred from the two
+  shapes — inferring looks possible and is wrong whenever a dimension is not a
+  multiple of the tile, and a compatible-but-wrong size passes the shape check
+  while placing every scale on the wrong rows. DeepSeek's MoE tensor names
+  (`mlp.experts.E.{gate,up,down}_proj`) are detected from what is on disk and
+  normalised to the one spelling the engine knows; without it the expert probe
+  missed on every layer and reported `0 MB [missing]` after the download had
+  already finished. And the MoE *config* keys are normalised into the manifest
+  the same way — `src/model.c` reads `num_experts`, a DeepSeek config only
+  spells it `n_routed_experts`, so the finished container was refused at load
+  with no diagnostic. `moe_renormalize` is emitted only when true, because
+  `model.c` keys it on the field being present rather than on its value.
+  Verified end to end on `Kimi-K2-Instruct`: 61 layers, 384 experts top-8,
+  VQ3R, 354 GB expert set, 6.9 GB trunk.
+
+- **Opt-in single-process container ownership**
+  ([#29](https://github.com/sqliteai/warp/pull/29)). On POSIX hosts,
+  `waste_cfg.exclusive_open`, or `--exclusive-open` in the CLI and server,
+  takes a non-blocking advisory `flock` on the container directory. Multiple
+  contexts in one process share a device/inode-keyed reference; a cooperating
+  process that also requests exclusivity receives `WASTE_E_BUSY`. The last
+  close and every planning, budget, and partial-load failure release ownership;
+  descriptors are close-on-exec, and a forked child discards the copied
+  registry. Windows keeps its existing lifecycle behavior.
+
+  This is host policy, not RAM accounting. Container identity is a proxy for
+  memory oversubscription and a poor one — two processes on *different*
+  containers oversubscribe just as badly and are untouched by this, while two
+  small containers on a large machine are refused for nothing. That is why it
+  is off by default and why the budget question stayed open as
+  [#31](https://github.com/sqliteai/warp/issues/31).
+
+### Fixed
+
+- **MLA applied no rotary at all, so a non-NoPE container attended over an
+  unordered sequence** ([#27](https://github.com/sqliteai/warp/pull/27)).
+  Every occurrence of `rope` in `src/` was `qk_rope` used as a width;
+  `rope_theta`, `rope_scaling` and `mla_use_nope` were read nowhere. That is
+  correct for the Kimi models, which set `mla_use_nope` and pass those dims
+  through unrotated, and wrong for everything in the DeepSeek-V3 family, where
+  those dims are the only positional signal there is.
+
+  It is quiet rather than obvious: lexically determined answers still come out
+  right, which is why casual use does not catch it. On Kimi-K2 at VQ3R,
+  `"The capital of France is"` still answers `Paris.`; add a second turn
+  boundary and the top-1 next token is `<|im_end|>` at p=0.968 — an empty
+  assistant turn, because the model cannot tell which turn came first. With the
+  rotation it is `Hi` at 0.491. Not a degraded answer, an unordered one.
+
+  `rope_init` follows `DeepseekV3YarnRotaryEmbedding`: YaRN's ramp on
+  `inv_freq`, and `mscale_all_dim` squared onto the attention scale (1.8133 on
+  K2). The rotation is GPT-J interleaved, and k is rotated *before* it enters
+  the latent cache, because a cached entry is reused by every later query and
+  carries its own token's position. A rope shape this does not implement is
+  refused at load rather than run unrotated. Checked against an oracle whose
+  YaRN helpers are `exec`'d verbatim out of the DeepSeek release's
+  `modeling_deepseek.py`: 0.000023% relative L2 on this branch against 0.162%
+  on 0.6.7, and the mirror image the other way, so the comparison discriminates
+  rather than merely agreeing.
+
+  **Nothing moves for Kimi-Linear or K3.** `rope_init` returns before building
+  a table when `mla_use_nope` is set and leaves `att_mul` at exactly `1.0f`, so
+  those models take the previous path by construction rather than by a runtime
+  branch — verified byte-identical on a full forward.
+
+- **Advisory locking fails open when ownership cannot be established.** Only
+  actual `EWOULDBLOCK`/`EAGAIN` contention returns `WASTE_E_BUSY`. A directory
+  that is search-only, a filesystem without `flock`, or another non-contention
+  locking failure continues through the ordinary model-open path. This keeps
+  external FUSE, SMB, and NFS containers usable and leaves their real read
+  errors to the existing loader diagnostics.
+
+## 0.6.7 — 2026-08-10
+
+The engine decodes exactly as 0.6.6 did — same logits, same container
+format — and two things underneath it changed. The second model this project
+ships numbers for is now usable the way K3 is: converted with a chat format
+it can actually read, and served over HTTP rather than from the command line
+only. And the automatic memory budget stopped being able to choose a value
+ten times slower than a smaller one.
+
+**`waste_memplan` gained a field, so this is not a drop-in header.** A caller
+that only reads the struct is fine; one that allocates or copies it must
+recompile. `serve/engine.py` mirrors the new layout.
+
+The chat half came out of one support report — a Kimi-Linear container on a
+16 GB MacBook where `waste run` worked, `waste chat` answered oddly, and
+`python3 -m serve` printed its banner and exited. The budget half came out
+of an experiment that failed: collapsing K3's experts down to one, which
+does not work and is recorded below, is what made a small enough working set
+to expose the ceiling.
+
+### Added
+
+- **A second prompt format for the server** (`serve/chatfmt.py`,
+  `docs/SERVE.md`). At startup the richer format is asked for first: XTML
+  when the container's tokenizer carries `<|open|>`, `<|sep|>`, `<|close|>`
+  and `<|end_of_msg|>` as single tokens, and otherwise the container's own
+  `chat.json` — the same four prefix/suffix strings `waste chat` has always
+  read. A container is now addressed identically over HTTP and on the
+  command line, and a hand-edited `chat.json` is honoured by both.
+
+  Plain means plain: system / user / assistant turns, blocking and
+  streaming, with the stop token taken from the template's assistant suffix
+  rather than guessed. Everything four strings cannot express is refused
+  with a 400 naming the field — `tools`, `reasoning_effort`, an image part,
+  a tool-result turn. None of it is dropped silently, on the same reasoning
+  the effort mapping already followed: a server that ignores
+  `reasoning_effort` reports a different amount of reasoning than it did.
+
+  `chat.json` is validated harder here than by the CLI's reader, which has a
+  person watching and an interrupt key. Serving requires an `open`, a `user`
+  turn, and an assistant suffix carrying a control token — without the last
+  one every reply runs to `max_tokens` and reports `finish_reason: "length"`,
+  which reads as a broken model rather than a broken template. And every
+  `<|…|>` in the file is resolved against the real vocabulary before the
+  format is used at all, because markup the tokenizer does not have encodes
+  as ordinary text and the model then reads its own turn structure as prose
+  and answers anyway, plausibly and wrongly. The rendering keeps the split
+  that makes the XTML path safe: the template's strings go out as markup
+  segments, the caller's content never does.
+
+  Measured on a Kimi-Linear container: a multi-turn conversation
+  round-trips, streaming deltas arrive, and both refusals come back as 400s
+  naming `tools` and `reasoning_effort`. The serve suite is 211 checks, up
+  from 174.
+
+- **`tests/sweep.c` takes a `topk=` arm**, lowering only, since the scratch
+  is sized at load from the manifest's `top_k`. One load with the arms
+  interleaved, which is what made §56's curve trustworthy after two earlier
+  attempts were spoiled by comparing arms across process lifetimes — the
+  failure `sweep.c` exists to prevent and that §32 and §33 already record.
+
+- **`tools/convert.py` installs a `chat.json` per architecture**, with
+  `examples/chat-kimi-linear.json` alongside K3's. The architecture was
+  already recognised; it simply had nothing to install and said so, which
+  left every Kimi-Linear container to be finished by hand — and the obvious
+  hand fix, copying the ChatML `examples/chat.json`, is wrong in a way
+  nothing reports: `<|im_start|>` is not in Kimi's vocabulary and encodes as
+  six ordinary tokens.
+
+  So the converter also **refuses to install a template whose markup the
+  release's tokenizer does not carry**, naming the missing markers. Only
+  when there is a specials list to check against: a release without
+  `tokenizer_config.json` is no evidence, and refusing on none would be
+  worse than the unconditional copy it replaces.
+  `tests/test_convert_chat.py` covers both claims per architecture.
+
+### Fixed
+
+- **The automatic budget could choose a value 10x slower than a smaller one**
+  (`src/waste.c`, [LEARNED.md](docs/LEARNED.md) §57). It stepped down a whole
+  working set at a time until the total fit under **7/8** of usable RAM. 7/8
+  of 64 GB is 56, inside the 46-52 GB band §39 measured as an eightfold
+  collapse: the engine stays inside its budget, the machine does not, and a
+  cache hit becomes a page fault.
+
+  It had stayed harmless by luck. K3 at top-16 asks for 80.77 GB, cannot have
+  it, and the step-down lands on `floor + 1x` = 46.39 GB — the measured
+  optimum, reached for the wrong reason. Lower `num_experts_per_token` to 8
+  and a token's working set halves, three multiples fit under the old
+  ceiling, and the default took 54.77 GB and ran at **0.08 tok/s against 0.77
+  at 46 GB**, with a *higher* hit rate and a *lower* RSS — which is what
+  paging looks like from inside the process.
+
+  The ceiling is now **3/4**, measured rather than assumed: 46 GB is the
+  largest budget on this machine known to be on the good side and 52 the
+  smallest known to be on the bad one. K3 at top-16 still resolves to
+  46.39 GB, Kimi-Linear is untouched, a 128 GB machine still gets the full
+  `floor + 3x`, and K3 at top-8 now resolves to 46.18 GB and **0.88 tok/s**
+  on the path a user gets by typing nothing.
+
+- **The server refused to start on any container without XTML markers**
+  ([#34](https://github.com/sqliteai/waste/issues/34)). `ChatServer.__init__`
+  resolved the four control tokens and let the `EngineError` out, so the
+  process died before binding a port — taking `/health`, `/v1/models` and
+  `/v1/completions` with it, none of which need a chat format at all, and
+  reporting only that `<|open|>` had come out as five tokens. The reason is
+  now held rather than raised, and a container with neither format serves
+  everything except `/v1/chat/completions`, which returns 400 with
+  `code: "unsupported_chat_format"` and both reasons — no XTML markers, and
+  what was wrong with the `chat.json`.
+
+### Changed
+
+- **`waste_memplan` reports `working_set_bytes`** — one token's expert
+  traffic, `top_k` records per MoE layer. Callers recovered it as
+  `(recommended_bytes - floor_bytes) / 3`, which stopped being true here:
+  `recommended_bytes` is now capped at the container's whole expert set,
+  because a cache holding every expert cannot be improved by growing. On an
+  ordinary container nothing moves — K3's bank is 952 GB against a 3x working
+  set of 52 GB — but the two are no longer three times apart in general, so
+  the quantity the rule is built on is reported instead of re-derived.
+  `waste plan --json` carries it.
+
+- **`README.md` figures re-measured on this commit**: K3's floor 29.06 →
+  29.19 GB, its default budget 46.25 → 46.39 GB, Kimi-Linear's floor 1.28 →
+  1.32 GB and its decode 10.65 → 10.62 tok/s. Drift from earlier commits,
+  not from any change here; the K3 decode range is left as it was, because
+  its low end was measured under conditions this pass did not reproduce.
+
+### Measured and not adopted
+
+- **Merging a layer's experts into one, or into sixteen, is not a
+  compression of a MoE — it is a deletion of it** (§53-§55). Built because it
+  was asked for: 982 GB becomes 30 GB, decode goes 0.60 to 1.58 tok/s, and
+  the model emits `<|close|>` forever. No weighting helps, and the reason is
+  geometric — distinct experts are mutually **orthogonal** (cos 0.0006), so
+  their average has `1/sqrt(E)` of their norm and is 99.8% orthogonal to
+  every one of them. A gain sweep confirms it from the other side: scaling
+  the merged expert to *zero* is better than using it. Clustering into 16
+  does not rescue it, and pruning to the 16 busiest — which beats every
+  merge — still answers that the capital of Italy is Paris. The tooling
+  stays on the `k3-mini` branch rather than main.
+
+- **Fewer experts per token is worth taking; the default still does not
+  take it** (§56). `num_experts_per_token` 8 instead of 16 is **1.49x** at
+  KL 0.037, with top-16's greedy continuation reproduced; top-4 is 1.78x,
+  keeps the right argmax, and stops following the prompt within a few
+  tokens. It is a quality trade, so it is documented in `README.md` and left
+  to the caller rather than changed under anyone.
+
+- **§4D re-priced: batching is worth less in this regime, not more** (§58).
+  `docs/EFFICIENCY.md` §1's 1.62x reproduces exactly at top-16 (**1.60x**)
+  and falls to **1.28x** at top-8 — batching takes its gain from the I/O and
+  truncating `top_k` has already taken half of it, so the two overlap rather
+  than compose. The ceiling holds for batching across independent streams
+  too, which §4D never separated from grouping within one: `vq_apply` costs
+  one pass per (token, expert) pair however they are grouped, and that is
+  64.2% of a step, so no scheme beats **1.56x**.
+
+- **The trunk's contextual sparsity is real and unusable** (§59, §60). A
+  quarter of the shared expert's intermediate channels carry 99% of the
+  layer's output — but the trunk is **49.9% attention** against 16.5% FFN,
+  so perfect sparsity where the technique fits is worth **1.14x**. And the
+  channel identity is near-random across tokens: Jaccard 0.196-0.271 against
+  a 0.143 chance baseline, 2-4% of the set common to eight consecutive
+  tokens, 70-83% of all channels appearing in at least one of them. No
+  static core to prune, no cheap prediction to make. Taken together these
+  put the honest ceiling from 0.88 tok/s at about **2x**, and name what the
+  rest would cost: 6.1x of bandwidth efficiency, which is a rewrite of the
+  forward pass, and 11.2x of bytes per token, for which no mechanism was
+  found.
+
+- **Tool calls over `chat.json` are not built**, and the reason is not
+  effort. Four prefix/suffix strings cannot carry a tool declaration, an
+  argument list, or a result turn — K3's encoder needs 647 lines for it.
+  Kimi-Linear's tokenizer does carry `<|tool_call_begin|>` and friends, so
+  it is reachable in principle, but the markup is not transcribed anywhere
+  in this repo and cannot be derived from the release on disk: that copy
+  ships no `chat_template` and no reference encoder. #34 holds this half.
+
+- **The `chat.json` renderer is transcribed and tested, not differentially
+  verified.** `serve/xtml.py` earns its confidence from a segment-for-segment
+  differential against the release's own `encoding_k3.py` under `K3_DIR`,
+  and there is no equivalent program for Kimi-Linear to check against. If an
+  Instruct release ships a `chat_template`, HF's Jinja renderer would be a
+  real oracle and a `tools/`-side check like the existing ones; until then
+  the weaker claim is the honest one.
 
 ## 0.6.6 — 2026-08-05
 
@@ -301,13 +595,13 @@ wrong on the other.
   form and no cache policy softens it. The ceiling is now
   `min(physical, cgroup limit)` — the smallest finite `memory.max` or
   `memory.high` across the cgroup and its ancestors, since the limit is
-  hierarchical. This stable capacity feeds the integration's existing
-  current-pressure resolver. See §43.
+  hierarchical — and the rest of the resolver is unchanged. See §40.
 
-  Current pressure (`MemAvailable`, `memory.current`) remains deliberately
-  outside `waste_usable_ram()`. In this Spark integration it is applied by the
-  separate `waste_memory_ceiling()` safety snapshot, along with caller-owned
-  `host_reserved_bytes`, after stable capacity has been established.
+  Current pressure (`MemAvailable`, `memory.current`) was considered and
+  deliberately left out: a budget is resolved once and held for a whole run,
+  so bounding it by an instantaneous sample would make the same command on
+  the same machine two different runs. Whether it should trim the working-set
+  multiplier instead is #14, still open.
 
 - **`tools/convert.py` spawned `--jobs` × cores threads**
   ([#13](https://github.com/sqliteai/waste/pull/13), contributed by
@@ -338,9 +632,8 @@ wrong on the other.
 
 - `waste_usable_ram()`: physical RAM, or a smaller cgroup-v2 limit when one
   applies — what a budget of 0 sizes against, and what an embedding host
-  should use as stable capacity. `waste plan --json` reports it beside
-  `physical_ram_bytes` and the integration's dynamic
-  `memory_ceiling_bytes`.
+  should size its own ceiling from. `waste plan --json` reports it beside
+  `physical_ram_bytes`, which stays what it always was.
 
 - **`tests/sweep.c`, a one-process measurement harness.** It loads a
   container once and runs the arms back to back, interleaved, resetting the
@@ -424,10 +717,9 @@ wrong on the other.
   its reads are consumed and the disk is about to idle through the next
   layer's attention, layer L+1's router runs on layer L's hidden state and
   issues speculative reads for its top 6. Demand hit rate 14–19% → 38–40%
-  in the initial paired runs, with a median 1.17x. A later one-load control
-  corrected the byte conclusion at the default cache: 204–205 → 191 GB
-  (6.6% less), while a much smaller cache amplified bytes by about 8%.
-  `WASTE_LOOKAHEAD=0` disables. §34–36, §41.
+  with total bytes read unchanged (254.2 → 254.5 GB): the records were
+  going to be read anyway, and only *when* changes. Nine paired runs,
+  median 1.17x. `WASTE_LOOKAHEAD=0` disables. §34, §35.
 - **`WASTE_MLOCK`** wires the trunk and the expert cache; `WASTE_MLOCK=cache`
   wires the cache alone. Off by default — Linux's `RLIMIT_MEMLOCK` is
   commonly 8 MB. Wiring the trunk is worth 3x in the transition zone around

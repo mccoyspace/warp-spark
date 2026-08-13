@@ -23,14 +23,14 @@ state save/load, model introspection and aggregate stats.
 Deliberately *not* in the API: logging to stdout, signal handlers, config
 files, argument parsing. Those belong to the host — the CLI included.
 
-### Container ownership
+### Optional container ownership
 
-On POSIX hosts, the first `waste_open` takes a non-blocking advisory lock on
-the container directory before memory planning or model-sized allocation. A
-different process opening the same container receives `WASTE_E_BUSY`; it does
-not wait while both processes allocate the model and discover the collision
-through memory pressure. Paths are matched by device and inode, so aliases of
-one directory do not evade the check.
+On POSIX hosts, `waste_cfg.exclusive_open` asks `waste_open` to take a
+non-blocking advisory lock on the container directory before memory planning or
+model-sized allocation. A cooperating process that also requests exclusivity
+for the same container receives `WASTE_E_BUSY`; it does not wait. Paths are
+matched by device and inode, so aliases of one directory do not evade the
+check.
 
 Contexts in one process remain independent as documented: they share a
 reference-counted ownership entry, and the last `waste_close` releases it.
@@ -38,11 +38,14 @@ Failures during planning, budget validation, or partial model loading release
 it as well. Lock descriptors are close-on-exec, and a forked child is treated
 as a different process rather than inheriting the parent's registry.
 
-An embedding host that deliberately accepts competing model loads can set
-`waste_cfg.allow_concurrent_open`. The CLI and server expose the same opt-out
-as `--allow-concurrent-open`. This is an advisory lock between cooperating
-WASTE processes and depends on the filesystem's `flock` support; Windows keeps
-its existing lifecycle behavior and ignores the setting.
+Concurrent opens remain the default. Containers are read-only, and process
+ownership is host policy rather than a data-safety requirement; a workstation
+daemon can opt in through `waste_cfg.exclusive_open`, or `--exclusive-open` on
+the CLI and server. This is an advisory lock between cooperating WASTE
+processes, not RAM accounting or a security boundary. If the directory cannot
+be opened for locking or the filesystem does not support `flock`, the model
+continues without ownership. Windows keeps its existing lifecycle behavior and
+ignores the setting.
 
 ## 2. CLI as a first-class client
 
@@ -149,38 +152,43 @@ because it then *spends* everything up to the cap. Expert cache is only
 worth anything in whole multiples of one token's working set — below one
 multiple it keeps nothing alive between tokens, and the fraction above a
 multiple buys a few points of hit rate while walking the machine into
-paging, where a hit costs a page fault. Filling a 7/8 cap gave K3 a
-27.32 GB cache on this laptop, sitting between two budgets measured at
-0.11 and 0.04 tok/s, when 17.5 GB runs at 0.33. (Those three are the
+paging, where a hit costs a page fault. Filling the cap — 7/8 of RAM, as it
+then was — gave K3 a 27.32 GB cache on this laptop, sitting between two
+budgets measured at 0.11 and 0.04 tok/s, when 17.5 GB runs at 0.33. (Those three are the
 pre-read-ahead sweep; the ratios between them are the point and read-ahead
 does not change them — see [EFFICIENCY.md](EFFICIENCY.md).)
 
-The default has two memory layers. Stable capacity is
-`waste_usable_ram()`: physical RAM or, when smaller, the least finite cgroup-v2
-`memory.max` or `memory.high` over the process and every ancestor. This fixes
-the container failure in upstream 0.6.3. Linux `sysconf(_SC_PHYS_PAGES)` reads
-host RAM from inside a cgroup, so without this layer a 32 GiB group on a large
-host could resolve K3 at roughly 80 GB and be killed rather than merely slowed.
+So the default steps down a whole working set at a time and takes the
+largest that fits under **3/4** of the RAM this process may use:
+`floor + 3x`, else `2x`, else `1x`, else the floor.
 
-The Spark integration then takes one current-pressure snapshot at open.
-`waste_memory_ceiling()` is the smallest of 7/8 stable usable capacity,
-`MemAvailable` minus the same proportional reserve, and finite cgroup
-headroom (`limit - memory.current`) minus that limit's reserve. Stable capacity
-still binds when a current file is missing or malformed. These are deliberately
-separate APIs: capacity describes the process's machine; the ceiling describes
-what one automatic open can safely add now.
+The quarter left to the OS is a measurement, not a margin of taste. It was
+an eighth until 2026-08-09, which put the ceiling at 56 GB on a 64 GB
+machine — inside the 46-52 GB cliff. That stayed harmless only because K3
+at top-16 asks for 80.77 GB and could never reach it. Lower `top_k` to 8
+and the working set halves, three multiples fit under the old ceiling, and
+the default picked 54.77 GB and ran at **0.08 tok/s against 0.77 at
+46 GB** — same container, ten times slower, higher hit rate, lower RSS.
+[LEARNED.md](LEARNED.md) §56.
+K3 lands on `floor + 1x` here — a 46.25 GB budget, 17.56 GB of cache, and
+the top of the measured curve with no flag given. A 128 GB machine still
+gets the full `3x`, and a model whose recommendation already fits, like
+Kimi-Linear, is unaffected. When even the floor is above the cap the
+engine runs at the floor and says so on stderr, because the alternative
+is refusing to open a model that does technically fit.
 
-Within that ceiling the resolver steps down a whole working set at a time and
-takes the largest of `floor + 3x`, `2x`, `1x`, or the floor. A host reservation
-displaces expert cache inside the selected total. If it is larger than all
-optional cache, the total rises only to the combined floor and only when that
-floor still fits the known Linux current ceiling. K3 lands on `floor + 1x` on
-the measured 64 GB Mac; an idle 128 GB GN100 still gets the full `3x`.
+Only *capacity* enters that reading. `MemAvailable` and `memory.current`
+are pressure, they move between the read and the allocation, and a budget
+resolved once at open cannot track them — bounding a run that lasts hours
+by an instantaneous reading makes the same command on the same machine
+two different runs. Whether current pressure should trim the multiplier
+is [issue #14](https://github.com/sqliteai/warp/issues/14), open.
 
-When the engine floor plus caller reservation is above a known Linux ceiling,
-automatic sizing returns `WASTE_E_MEMORY` before a model-sized allocation. An
-explicit nonzero budget remains the caller's contract and is honored, with a
-warning when it exceeds current safe headroom.
+The Spark API-2 extension retains `waste_cfg.host_reserved_bytes` for state
+snapshots and other host-owned caches. The reservation is inside the same
+budget: it displaces expert cache, and open fails with `WASTE_E_RAM_BUDGET` if
+the selected or explicit total cannot hold the engine floor plus the host
+reservation. It does not alter upstream's capacity-based tier selection.
 
 ### What the floor is made of
 
@@ -381,7 +389,7 @@ is not worth an option. On one whose cores are not, it is worth more than
 the thread count. Third-party measurement on a Ryzen 9 9900X — Zen 5, two
 6-core CCDs with separate 32 MB L3 — running Kimi-Linear-48B, thread count
 and CPU count held constant so only locality differs
-([issue #23](https://github.com/sqliteai/waste/issues/23)):
+([issue #23](https://github.com/sqliteai/warp/issues/23)):
 
 | 6 threads on | median tok/s |
 |---|---|

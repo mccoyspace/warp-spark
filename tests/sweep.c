@@ -314,9 +314,8 @@ int main(int argc, char **argv)
     if (argc < 5) {
         fprintf(stderr,
                 "usage: %s CONTAINER ids,.. n_gen KEY=v1,v2,.. [repeat]\n"
-                "  KEY is lookahead, iodepth, cache (MB), cuda, cuda_dense, "
-                "or cuda_vq\n",
-                argv[0]);
+                "  KEY is lookahead, iodepth, cache (MB), topk, cuda, "
+                "cuda_dense, or cuda_vq\n", argv[0]);
         return 2;
     }
     int ids[MAX_IDS], n = 0;
@@ -344,11 +343,14 @@ int main(int argc, char **argv)
     const int is_look = !strcmp(key, "lookahead");
     const int is_depth = !strcmp(key, "iodepth");
     const int is_cache = !strcmp(key, "cache");
+    /* topk may only be lowered from what the container declares: scratch is
+     * allocated for the manifest's value. */
+    const int is_topk = !strcmp(key, "topk");
     const int is_cuda = !strcmp(key, "cuda");
     const int is_dense = !strcmp(key, "cuda_dense");
     const int is_vq = !strcmp(key, "cuda_vq");
-    if (!is_look && !is_depth && !is_cache && !is_cuda && !is_dense &&
-        !is_vq) {
+    if (!is_look && !is_depth && !is_cache && !is_topk && !is_cuda &&
+        !is_dense && !is_vq) {
         fprintf(stderr, "unknown key %s\n", key);
         return 2;
     }
@@ -374,6 +376,7 @@ int main(int argc, char **argv)
         fprintf(stderr, "load failed\n");
         return 1;
     }
+    const int top_k0 = m.cfg.top_k;
     if (!m.direct_io) {
         fprintf(stderr, "direct I/O fell back on at least one expert bank\n");
         waste_model_free(&m);
@@ -459,7 +462,15 @@ int main(int argc, char **argv)
         for (int a = 0; a < n_arms; a++) {
             const int ai = (r & 1) ? n_arms - 1 - a : a;
             int value = arm[ai];
-            if (is_look) {
+            if (is_topk) {
+                if (value < 1 || value > top_k0) {
+                    fprintf(stderr, "topk %d outside 1..%d (the container's)\n",
+                            value, top_k0);
+                    waste_model_free(&m);
+                    return 2;
+                }
+                m.cfg.top_k = value;
+            } else if (is_look) {
                 waste_model_set_lookahead(value);
                 value = waste_model_get_lookahead();
             } else if (is_depth) {

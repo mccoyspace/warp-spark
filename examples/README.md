@@ -217,7 +217,43 @@ the model:
 put in these strings has to exist in the tokenizer as a *single* token, or
 it will be split into ordinary text and the model will not recognize it —
 `waste tokenize MODEL "<|im_start|>"` is the check, and the container's
-`specials.json` is the list of what is available.
+`specials.json` is the list of what is available. Neither Kimi release
+uses ChatML's markers, so this file is a starting point for other models
+and the two below are the ones to copy for those.
+
+## chat-kimi-linear.json — Kimi-Linear
+
+[chat-kimi-linear.json](chat-kimi-linear.json) is Kimi-Linear's format.
+`tools/convert.py` installs it when it recognises the architecture; copy
+it by hand into a container converted before that:
+
+```bash
+cp examples/chat-kimi-linear.json ~/models/kimi-linear.waste/chat.json
+```
+
+The markup is Moonshot's own, not ChatML — five control tokens, one per
+role plus a separator and a terminator:
+
+| token | id | role |
+|---|---|---|
+| `<\|im_system\|>` | 163594 | opens a system turn |
+| `<\|im_user\|>` | 163587 | opens a user turn |
+| `<\|im_assistant\|>` | 163588 | opens an assistant turn |
+| `<\|im_middle\|>` | 163601 | ends the turn header |
+| `<\|im_end\|>` | 163586 | ends a turn |
+
+A turn is the opener, the role name as ordinary text, `<|im_middle|>`, the
+content, and `<|im_end|>`; the model is handed the floor with an assistant
+opener and no terminator. Note that `<|im_start|>` — ChatML's, and what
+[chat.json](chat.json) carries — is **not** in this vocabulary: it encodes
+as six ordinary tokens, so a container given the generic template answers
+as if it were continuing prose. `waste tokenize` is the check.
+
+`serve/` serves this format too, from this same file: a container whose
+tokenizer has no XTML markers is chatted with through its `chat.json`.
+Plain conversation only — no tools, no reasoning channel, no images, each
+refused with a 400 naming the field rather than dropped. See
+[SERVE.md](../docs/SERVE.md), "serve/chatfmt.py".
 
 ## chat-k3.json — Kimi K3
 

@@ -40,7 +40,8 @@ import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Optional
 
-from . import api
+from . import api, xtml
+from .chatfmt import ChatFormat, ChatFormatError, PlainParser
 from .engine import Cancelled, Engine, EngineError
 from .prefix_cache import CONTROLLER_OVERHEAD_BYTES, PrefixCache
 from .qos import DisabledRequestQos, QosError
@@ -129,9 +130,52 @@ class ChatServer(ThreadingHTTPServer):
             self.model_info = {}
         # Markers by token id: the parser decides structure from ids, not
         # from what the text happens to spell. See regions.py.
-        self.markers = engine.marker_ids()
-        self.stop_tokens = [tid for tid, text in self.markers.items()
-                            if text == "<|end_of_msg|>"]
+        #
+        # Two formats, asked for in order of what they can express. XTML is
+        # the whole protocol — channels, tools, images — so it is tried
+        # first. A container without it may still describe a plain
+        # conversation in its own chat.json, the file `waste chat` has
+        # always read; serving from the same file means one definition per
+        # container rather than one per client.
+        #
+        # Neither resolving may raise out of here. It used to, which took
+        # the whole process down — including /health, /v1/models and
+        # /v1/completions, none of which need a chat format at all — and
+        # told the operator only that a token had come out as five tokens.
+        # Hold the reason instead and refuse the one endpoint that cannot be
+        # served. What does not change is that the refusal happens: markup
+        # the tokenizer does not have encodes as ordinary text, and the
+        # model would read its own turn structure as prose and answer
+        # anyway. See #34.
+        try:
+            self.markers = engine.marker_ids()
+            self.chat_format = xtml
+            self.chat_error = None
+            self.stop_tokens = [tid for tid, text in self.markers.items()
+                                if text == "<|end_of_msg|>"]
+        except EngineError as e:
+            self.markers = {}
+            self.chat_format = None
+            self.chat_error = str(e)
+            self.stop_tokens = []
+            try:
+                fmt = ChatFormat.load(engine)
+            except ChatFormatError as e2:
+                # Both reasons, because either one alone misleads: "no XTML"
+                # reads as "wrong model" when the chat.json is simply
+                # missing, and the chat.json reason alone hides that the
+                # richer format was tried first.
+                self.chat_error = f"{e}; and {e2}"
+            else:
+                self.markers = fmt.markers
+                self.chat_format = fmt
+                self.chat_error = None
+                self.stop_tokens = [fmt.stop_id]
+                # No think markup in such a container, so the channel does
+                # not exist to default on. A request that asks for it is
+                # refused by the renderer rather than answered without it.
+                self.default_thinking = False
+
         self.prefix_cache_identity = _prefix_identity(
             engine, model_id, self.model_info, self.markers)
         self.prefix_cache = PrefixCache(
@@ -144,6 +188,17 @@ class ChatServer(ThreadingHTTPServer):
             self.request_qos.close()
         finally:
             super().server_close()
+
+    def new_parser(self, thinking: bool):
+        """The reply reader for whichever format this container speaks.
+
+        `thinking` says which channel the generation prompt left open, and
+        only XTML has channels to leave open.
+        """
+        if self.chat_format is xtml:
+            return RegionParser(in_think=thinking, in_response=not thinking,
+                                markers=self.markers)
+        return PlainParser(markers=self.markers)
 
     def handle_error(self, request, client_address):
         """A client hanging up is not an error worth a traceback.
@@ -312,6 +367,20 @@ class Handler(BaseHTTPRequestHandler):
         srv = self.server
         engine = srv.engine
 
+        # Before anything else, and before the engine lock: this container
+        # has no chat format we can render, and no request can change that.
+        # 400 rather than 501 because for an OpenAI client the unsupported
+        # thing is the model, which is a request parameter — and a 501 is
+        # the one status those clients tend to retry.
+        if srv.chat_error:
+            raise api.APIError(
+                f"this model cannot be used for chat completions: "
+                f"{srv.chat_error}. serve/ renders Kimi K3's XTML prompt "
+                f"format and no other. POST /v1/completions for raw "
+                f"continuation, or use `waste chat`, which reads the "
+                f"container's own chat.json",
+                status=400, param="model", code="unsupported_chat_format")
+
         stream = body.get("stream", False)
         if not isinstance(stream, bool):
             raise api.APIError("'stream' must be a boolean", param="stream")
@@ -335,7 +404,7 @@ class Handler(BaseHTTPRequestHandler):
                 engine, body,
                 default_thinking=srv.default_thinking,
                 allow_local_images=srv.allow_local_images,
-                tmpdir=srv.tmpdir)
+                tmpdir=srv.tmpdir, fmt=srv.chat_format)
 
             opts = api.generation_options(
                 body, default_max_tokens=srv.default_max_tokens,
@@ -345,9 +414,7 @@ class Handler(BaseHTTPRequestHandler):
 
             request_id = api.new_id("chatcmpl")
             created = api.now()
-            parser = RegionParser(in_think=prompt.thinking,
-                                  in_response=not prompt.thinking,
-                                  markers=srv.markers)
+            parser = srv.new_parser(prompt.thinking)
 
             if stream:
                 self._chat_stream(body, prompt, opts, stops, parser,

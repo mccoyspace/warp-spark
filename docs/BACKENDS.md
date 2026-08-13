@@ -24,7 +24,7 @@ selected backend's name exposed for introspection (`vector_backend()`).
 Detection is careful: `cpu_supports_avx512()` checks CPUID *and* XGETBV, so
 a CPU whose OS has not enabled ZMM state is correctly rejected.
 
-WASTE adopts all of it:
+WARP adopts all of it:
 
 - one dispatch table, filled with a baseline that is **always compiled in**;
 - backends **partially override** — an unimplemented kernel keeps the CPU
@@ -36,7 +36,7 @@ WASTE adopts all of it:
 - **name introspection** (`waste_backend_name()`), surfaced by the CLI.
 
 One difference: sqlite-vector's distance functions all share a signature,
-so a 2-D array works. WASTE's kernels do not, so the table is a **struct of
+so a 2-D array works. WARP's kernels do not, so the table is a **struct of
 function pointers** (`waste_kernels` in
 [src/waste_backend.h](../src/waste_backend.h)). Same idea, C-idiomatic for
 heterogeneous ops.
@@ -533,11 +533,21 @@ independently reproduces `docs/GATES.md` Gate 3 on other hardware. The only
 shape that fits does not pass; the shape that passes misses VRAM by
 2.27 GiB.
 
-**So nothing changes here.** `src/cuda.cu` still does not exist,
-`WASTE_ENABLE_CUDA=1` still stops the build, and filling the
-`waste_backend` slots with CUDA kernels would still reproduce the Metal
-result on different silicon. What has changed is that this is now a
-measured position rather than an argument by analogy from Apple silicon.
+**That conclusion is upstream-specific, not universal.** The GB10 Spark fork
+subsequently qualified incremental coherent-memory CUDA offload: its VQ3R
+gather preserved router-ordered accumulation, produced zero changes across
+10,649,600 logits and 5,888 routed rows, and improved matched full-request
+throughput by 91% while reducing energy per generated token by 40%. VQ4P CUDA
+also met its strict numerical contract on Kimi-Linear, though it was slightly
+slower than VQ3R on this hardware. The maintained evidence is in
+[GN100.md](GN100.md); upstream discussion remains
+[issue #11](https://github.com/sqliteai/warp/issues/11).
+
+For upstream itself, `src/cuda.cu` still does not exist and
+`WASTE_ENABLE_CUDA=1` still stops the build. The maintainer has no NVIDIA
+hardware or CUDA CI, so the Spark source is useful for architecture review but
+is not yet a merge request. The open design choice is a stable out-of-tree
+backend seam versus an in-tree guarded backend with a named hardware owner.
 
 **What would move it**, stated so it can be tested rather than argued: a
 card with enough VRAM to hold the experts resident — VQ3R's 17.77 GiB total

@@ -49,8 +49,8 @@ extern "C" {
 #define WASTE_VERSION_MAJOR  0
 #define WASTE_VERSION_MINOR  7
 #define WASTE_VERSION_PATCH  0
-#define WASTE_VERSION_STRING "0.7.0-spark.2"
-#define WASTE_UPSTREAM_VERSION_STRING "0.6.6"
+#define WASTE_VERSION_STRING "0.7.0-spark.3"
+#define WASTE_UPSTREAM_VERSION_STRING "0.6.8"
 #define WASTE_VERSION_NUMBER (WASTE_VERSION_MAJOR * 10000 + \
                               WASTE_VERSION_MINOR * 100 + \
                               WASTE_VERSION_PATCH)
@@ -101,6 +101,13 @@ typedef struct {
      * the queued image embeddings. waste_open folds it into the figures
      * above when vision is on, so the resolved budget accounts for it. */
     uint64_t vision_bytes;
+    /* One token's expert traffic: top_k records per MoE layer. The unit the
+     * cache is only useful in whole multiples of (Gate 5), and the step the
+     * automatic budget walks down in — which is why it is reported rather
+     * than left to be re-derived from `recommended_bytes`. It cannot be:
+     * recommended is capped at the container's whole expert set, so on a
+     * merged container the two stop being three times apart. */
+    uint64_t working_set_bytes;
     /* Caller-owned bytes reserved inside ram_budget_bytes. This is zero
      * from waste_plan_memory (which has no configuration); after open,
      * waste_memory_used reports the value that reduced the expert cache. */
@@ -130,17 +137,17 @@ typedef struct {
      * 0 = the engine picks, and it picks conservatively: expert cache is
      * only useful in whole multiples of one token's working set, so it
      * starts from waste_memplan.recommended_bytes (floor + 3x that set)
-     * and steps down a whole multiple at a time until the total fits under
-     * the current safe ceiling. Stable capacity is 7/8 of
-     * waste_usable_ram(), which is physical RAM or a smaller finite cgroup
-     * max/high. Linux further bounds that by MemAvailable and cgroup
-     * headroom, each with a proportional reserve.
-     * It does not spend the remainder up to that ceiling: the last fraction
-     * buys a little hit rate and risks the OS paging the cache out. When a
-     * known current ceiling cannot hold floor_bytes plus caller-owned
-     * host_reserved_bytes, loading fails with WASTE_E_MEMORY before a
-     * model-sized allocation. The reservation otherwise displaces expert
-     * cache inside the same automatically selected total.
+     * and steps down a whole multiple at a time until the total fits
+     * under 3/4 of waste_usable_ram(). It does not spend the remainder up to
+     * that ceiling: the last fraction buys a little hit rate and risks
+     * the OS paging the cache out, which costs far more than it gains.
+     * The quarter left to the OS is measured, not assumed: an eighth put
+     * the ceiling inside a cliff where the same container ran 10x slower
+     * with a higher hit rate (docs/LEARNED.md §39, §56).
+     * When not even floor + 1x fits, it runs at floor_bytes.
+     * A host_reserved_bytes value displaces expert cache inside that selected
+     * total; if necessary the total grows only to the combined engine and
+     * host floor.
      *
      * An explicit nonzero value remains the caller's contract. Loading
      * fails with WASTE_E_RAM_BUDGET if it is below floor_bytes plus
@@ -245,12 +252,13 @@ typedef struct {
      * of the few files the engine reads that nobody asked it to. */
     const char *usage_path;
 
-    /* On POSIX hosts, one process owns a container at a time by default.
-     * Multiple contexts in that process share the ownership; a competing
-     * process receives WASTE_E_BUSY before model-sized allocations begin.
-     * Set this only when the host deliberately accepts competing loads.
-     * It is ignored on platforms without the ownership lock. */
-    int allow_concurrent_open;
+    /* Ask for single-process ownership of this container on POSIX hosts.
+     * Multiple contexts in that process share the ownership; a cooperating
+     * competing process that also requests exclusivity receives WASTE_E_BUSY
+     * before model-sized allocations begin. Off by default: containers are
+     * read-only, and whether concurrent loads are acceptable is host policy.
+     * Unsupported locks fail open, and non-POSIX hosts ignore this setting. */
+    int exclusive_open;
 
     /* Memory retained by the host for this context, such as exported state
      * snapshots. It is part of ram_budget_bytes, not additional to it: the

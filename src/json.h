@@ -188,6 +188,14 @@ static inline int js_at(const js_doc *d, int arr, int i)
     return p;
 }
 
+/* The token's type, or -1 for no such token. The accessors below fold
+ * "absent" and "present but not that type" into the same default; a caller
+ * that has to tell those apart needs this. */
+static inline int js_typeof(const js_doc *d, int t)
+{
+    return (t < 0 || t >= d->n) ? -1 : (int)d->tok[t].type;
+}
+
 static inline double js_num(const js_doc *d, int t, double dflt)
 {
     if (t < 0 || t >= d->n || d->tok[t].type != JS_NUM) return dflt;
@@ -206,6 +214,14 @@ static inline int64_t js_int(const js_doc *d, int t, int64_t dflt)
 {
     double v = js_num(d, t, (double)dflt);
     return (int64_t)v;
+}
+
+/* Reads a value, not a presence: `false` is false, and anything that is not
+ * a JSON boolean — including a missing key — is dflt. */
+static inline int js_bool(const js_doc *d, int t, int dflt)
+{
+    if (t < 0 || t >= d->n || d->tok[t].type != JS_BOOL) return dflt;
+    return d->src[d->tok[t].start] == 't';
 }
 
 /* Copies at most cap-1 bytes; always NUL-terminates. */

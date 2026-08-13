@@ -6,7 +6,12 @@ turned out wrong, the wrong version is kept — the refutations were worth
 more than the confirmations.
 
 Sections are dated and appended, never rewritten, so a number appears more
-than once as the engine changed under it. **Later wins.** The decode
+than once as the engine changed under it. **Later wins.** That rule also
+covers the project's name: it was WASTE until 2026-08-10 and is WARP now,
+and entries written before then say WASTE. They were not edited, for the
+same reason the wrong numbers were not. The binary, the header, the
+`WASTE_*` environment variables and the `.waste` container extension keep
+the old name in either case. The decode
 profile in particular is measured three times — §10 before the MLA
 absorption, §12 with a cold cache, and the README with the cache at the
 knee — and the shares move because the cache moves, not because one of
@@ -3222,3 +3227,915 @@ to that case.
 Not measured: bandwidth against DRAM latency separately, GDS in GDS mode,
 KDA and MLA on a GPU, the VQ4P 64-entry crossover, VQ2R quality on a real
 eval, gate 4, contexts beyond 4096, prefill as distinct from decode.
+
+## 51. Four numbers that describe one prompt, and only one is the disk (2026-08-09)
+
+Written down because the confusion is easy to have and expensive to act on:
+"how many experts does a prompt read" has four different answers, and the
+one that sets tok/s is the smallest of them.
+
+On `kimi-linear.waste` (26 MoE layers, 256 experts, top-8), a 23-token
+Italian prompt, `WASTE_DUMP_ROUTE` for the trace and `test_forward … 0` so
+prefill is the whole run:
+
+| | |
+|---|---|
+| routing decisions (tokens x MoE layers) | 598 |
+| expert **activations** (x top-8) | 4784 |
+| **distinct** `(layer, expert)` records | 1803 |
+| records read on the best measured run | 1803 |
+
+The gap between 4784 and 1803 is intra-prompt reuse, and it is not evenly
+spread: 898 of the 1803 are touched exactly once, while 8 of them are
+touched on 22 of the 23 tokens.
+
+Same prompt, four configurations, changing only cache size and lookahead:
+
+| config | hit | misses | evictions | GB read |
+|---|---|---|---|---|
+| 8 GB cache, lookahead off | 62.3% | **1803** | 0 | 4.48 |
+| 4 GB cache, lookahead off | 62.1% | 1812 | 202 | 4.50 |
+| 4 GB cache, lookahead 6 (default) | **83.0%** | **814** | 404 | **5.00** |
+| 64 MB cache, lookahead off | **0.0%** | 4784 | 4759 | 11.88 |
+
+Two rows are worth keeping for what they confirm. The first: with the cache
+above the working set and no speculation, misses land on **1803 exactly**,
+the distinct count computed from the trace — the counter is not
+approximating anything. The last: 64 MB holds 25 records against the 208 one
+token needs, every reuse has been evicted before it is reused, and the hit
+rate is **0.0%**, which is §4's zero reproduced on a second model and a
+second architecture.
+
+**The row that matters is the third, and it reads more bytes than the
+minimum while stalling half as often.** 5.00 GB against 4.48 — +11.6% of I/O
+— for 814 blocking reads against 1812, **-55%**. That is not a contradiction
+between two counters, it is the reason they are two counters: `misses`
+counts accesses that waited on the disk, `bytes_read` counts I/O including
+the lookahead's speculation, and `src/ecache.c` keeps
+`spec_issued` out of `misses` on purpose so a wrong guess cannot be read as
+a cache that performed badly. On a design where the disk is the budget, the
+stall is the currency and the byte is the price.
+
+This is a third point on the curve §39 drew, and the sign is the other way
+round: there, on K3 decode, the lookahead read 6.6% *fewer* bytes at 1498
+slots and 8% more at 287. Here, at 1610 slots — 89% of the prompt's distinct
+records — it reads 11.6% *more*. Consistent with the mechanism §39 named
+rather than against it: speculation costs bytes whenever the demand stream
+would have hit anyway, and a short prefill with heavy intra-prompt reuse is
+the regime where it would have. It buys stalls, not bytes, and here that is
+all it buys.
+
+**Pool size, not model size, is what governs the reuse.** The same counters
+on `k3.waste` (92 MoE layers, 896 experts, top-16), 4 prefill tokens, 8 GB
+cache, lookahead at its default:
+
+| | Kimi-Linear, 23 tok | K3, 4 tok |
+|---|---|---|
+| activations | 4784 | 5888 |
+| distinct records | 1803 (**37.7%**) | 4492 (**76.3%**) |
+| misses | 814 | 3919 |
+| GB read | 5.00 | 66.56 |
+
+Three quarters of K3's activations touch a record never seen before in the
+prompt, against a bit over a third on Kimi-Linear. That is the whole reason
+the budget resolver reasons in whole working sets on K3 and nobody has
+needed it to on Kimi-Linear — and note the K3 run is deep in the thrashing
+regime it describes, 692 slots against 4492 distinct records and 5068
+evictions.
+
+Not measured: the same counters on decode rather than prefill, prompts long
+enough for the hot set to saturate, and whether the 37.7 / 76.3% split
+tracks `n_experts` or `n_experts / top_k`.
+
+## 52. There is no expert for history (2026-08-09)
+
+The intuition that a MoE routes a question to a topical specialist — "this
+one is maths, that one is history" — is worth refuting with numbers, because
+it licenses an optimization that does not exist: pinning or prefetching a
+per-domain expert subset.
+
+Two Italian prompts on `kimi-linear.waste`, one historical and one
+mathematical, 23 and 22 tokens, deliberately sharing their first token
+(`13724`, "La"). The control comes free from that: at position 0 there is no
+context, so the hidden state is a function of the token id alone.
+
+```
+token 13724, position 0
+  L1  history  8 117 155  13 233 164 248 236
+      maths    8 117 155  13 233 164 248 236
+  ...
+  -> all 26 layers, 8/8 identical
+```
+
+**The two prompts route the first token to the same 208 experts, all of
+them.** The router is a matvec on the hidden state; it has no channel
+through which "the question is about history" could reach it except the
+hidden state, and at position 0 there is nothing in the hidden state but the
+token. Mechanically obvious, which is the point of using it as the control:
+it isolates the input.
+
+Context does move it, and by a lot. Token `2694` ("di"), four occurrences
+across the two prompts, experts in common over the 26 layers:
+
+| | hist@4 | hist@20 | math@3 | math@19 |
+|---|---|---|---|---|
+| **hist@4** | 100% | 45% | 40% | 19% |
+| **hist@20** | 45% | 100% | 32% | 13% |
+| **math@3** | 40% | 32% | 100% | 27% |
+| **math@19** | 19% | 13% | 27% | 100% |
+
+Identical token, 13% to 45%. So the topical signal is real but second order,
+and the ordering says how much:
+
+| overlap of top-8 sets | |
+|---|---|
+| two tokens within the history prompt | 26% |
+| two tokens within the maths prompt | 32% |
+| a history token against a maths token | **16%** |
+
+16% against 26-32% is a domain effect that exists and does not dominate: two
+tokens of the *same* sentence already share only a quarter of their experts.
+Over the whole prompts the pools are 69.3 and 56.2 distinct experts per
+layer out of 256, overlapping at **29.8% Jaccard**.
+
+There is also a trained force pushing the other way. The
+`e_score_correction_bias` reorders the selection against the raw scores on
+90% of Kimi-Linear's routing lines and on **368 of 368** of K3's — the
+weights logged next to the ids are not monotone decreasing, and that is the
+load-balancing term at work. A model with a maths expert would be a model
+whose balancing had failed.
+
+**What this rules out and what it leaves open.** Ruled out: any prefetch or
+residency policy keyed on the topic of the request, and any offline
+partition of the bank by domain. The exploitable locality is sequential —
+the same experts recurring across nearby tokens, §51's 4784-to-1803 — which
+is exactly what `waste_ecache_hint` and the lookahead already take.
+
+Left open, and weaker than it needs to be: `usage.waste` warm assumes a
+*global* hot set. Measured across these two prompts, records used by >=80%
+of a prompt's tokens number 25 (history) and 34 (maths), sharing 17 — **40%
+of the union**, falling to 27% at a >=50% threshold. So a global hot set
+exists on this evidence and is the *minority* of either prompt's: between a
+quarter and two fifths shared, the rest prompt-specific. That is neither the
+warm list's premise nor its refutation, and 23 tokens is far too short to
+settle it.
+
+Not measured: whether longer or more homogeneous corpora separate the pools
+further, whether the effect grows with `n_experts` (K3's 896 were not run
+this way), and any of it on decode rather than prefill.
+
+## 53. k3-mini: the experts do not average, because they are orthogonal (2026-08-09)
+
+Asked directly: collapse every MoE layer's experts into one, find the best
+weighting to do it with, and measure what the result costs and what it can
+still say.
+
+**The tooling for this and the next two sections lives on the `k3-mini`
+branch, not on main** — `tools/merge_experts.py` picks the weights,
+`tools/merge_layer.c` does the terabyte, `tests/check_mini.sh` reports both
+halves of the trade, and `src/model.c` there carries a no-router path that a
+merged container needs. None of it was merged, because what it measured is
+that the direction is dead; the numbers are here so nobody builds it twice.
+What did come to main is the resolver fix §57 describes, which this
+experiment is what uncovered.
+
+    Wbar = sum_e alpha_e * W_e            sum_e alpha_e = 1
+
+The systems half is exactly what arithmetic says it must be. The model half
+is a total loss, and the reason is one measured number.
+
+### What a merged container costs and buys
+
+Same machine, same prompt, `waste run --temp 0 -n 16`, default budget:
+
+| | K3 | k3-mini |
+|---|---|---|
+| container on disk | 982 GB | **30 GB** |
+| expert bank | 952.48 GB | 1.06 GB |
+| parameters | 2.78 T total, 104.19 B active | 59.78 B total, 58.61 B active |
+| `waste plan` floor | 29.19 GB | 28.80 GB |
+| recommended budget | 80.77 GB (capped to 46.39) | **32.02 GB** |
+| peak RSS | 45.43 GB | 28.91 GB |
+| decode | 0.60 tok/s | **1.58 tok/s** |
+| expert reads / token | ~17-19k | 92 |
+| cache | 9023 hit / 14529 miss = 38% | 1472 hit / 0 miss = **100%** |
+| what it says | "The capital of Italy is **Rome**." | `<\|close\|><\|close\|><\|close\|>…` |
+
+Building it: 92 layers, 1.02 TB read and 2.7e12 weights decoded, **301 s**.
+
+**The RAM floor barely moves — 29.19 to 28.80 GB — and that is the point
+most likely to be misread.** The floor is the resident trunk, 27.28 GB, and
+merging the experts does not touch it. What merging removes is the
+*pressure*: K3 wants 80.77 GB and cannot have it, k3-mini is finished at
+32.02 GB and more RAM buys it nothing. Same floor, no ceiling.
+
+**The speedup is mostly arithmetic, not I/O**, which was not the
+expectation. `WASTE_PROFILE=1`, 16 steps, K3 at a full working set of cache:
+
+| bucket | K3 | k3-mini |
+|---|---|---|
+| expert mm | 14.49 s (35.2%) | 0.98 s (10.3%) |
+| LUT apply | 12.48 s (30.3%) | 0.67 s (7.0%) |
+| expert I/O | 2.96 s (7.2%) | 0.11 s (1.1%) |
+| accounted | 41.15 s | 9.58 s |
+
+Expert mm falls 14.8x and the LUT apply 18.6x, both close to the 16x that
+top-16 to top-1 predicts, while expert I/O — the bucket this whole engine is
+built around — was only 7.2% to begin with at that cache size. (`kda` also
+falls, 12.29 to 4.58 s, for work that is nominally identical in both. Not
+explained; most likely pool contention with the MoE phase, and it is not
+what the table is about.)
+
+### The weighting does not matter, and that is a property of the model
+
+Four schemes, Kimi-Linear, against the unmerged model's next-token
+distribution on the same 128-token prompt:
+
+| alphas | KL (nats) | logit rel L2 | pearson | top-10 |
+|---|---|---|---|---|
+| `trace` — routed weight over 248 tokens | **2.668** | 0.328 | 0.751 | 2/10 |
+| `uniform` — 1/E | 2.687 | 0.330 | 0.749 | 2/10 |
+| `bias` — softmax(e_score_correction_bias) | 2.687 | 0.330 | 0.749 | 2/10 |
+| `top1` — the single busiest expert | 3.710 | 0.493 | 0.512 | 1/10 |
+
+The three averaging schemes agree to 0.7%, because **the alphas are nearly
+the same vector under every principled rule**. The trained bias prior is
+flat to three digits — perplexity 895.8 of 896 on K3, 255.9 of 256 on
+Kimi-Linear, no expert above 1.08x uniform — which is what a load-balancing
+term is trained to produce. There is no informative weighting to find,
+because the model was trained not to have one. And `top1` is the control
+that matters: concentrating the mass is *worse*, so the damage is not "the
+average is too blurry".
+
+### The gain sweep, which settles it
+
+If the merged expert were a weak but correctly-aimed version of the layer,
+scaling it up would help. `routed_scaling_factor` is one number in the
+manifest, so the sweep costs only the runs (Kimi-Linear):
+
+| gain | 0x | 1x | 2x | 4x | 8x | 16x | 24x |
+|---|---|---|---|---|---|---|---|
+| KL | **2.684** | 2.687 | 2.690 | 2.696 | 2.708 | 2.737 | 2.769 |
+
+**Gain 0 is the best row**, and every increase is monotonically worse.
+Reproduced on K3: gain 1 is KL 4.241, gain 0 is KL **4.065**. Deleting the
+merged expert outright beats using it, on both models. The merged routed
+path is not weak signal, it is noise, and what k3-mini actually runs is
+"trunk + shared experts + attention" with a small harmful perturbation.
+
+### Why: the experts are mutually orthogonal
+
+Decoded straight out of the container, Kimi-Linear layer 1, 16 experts
+sampled:
+
+| | gate | down |
+|---|---|---|
+| cos(expert_i, expert_j), i != j | **0.0006** | **-0.0001** |
+| \|merged\| / mean \|expert\| | 0.0646 | 0.0606 |
+| 1/sqrt(E), E = 256 | 0.0625 | 0.0625 |
+| cos(merged, expert), mean | 0.0653 | 0.0613 |
+
+Distinct experts are orthogonal to measurement precision, and everything
+else follows from that one line. The average of E orthogonal matrices has
+1/sqrt(E) of their norm — measured 0.0646 against a predicted 0.0625 — and
+cosine ~1/sqrt(E) with each of them. **The merged expert is 99.8%
+orthogonal to every expert it was built from.** It is not a compromise
+between specialists; it is a direction none of them points in, at a
+sixteenth of the magnitude.
+
+This also kills the repair that looks obvious. An FFN's intermediate
+dimension is permutation-symmetric, so averaging unaligned neurons is
+normally the bug, and the model-merging literature (git re-basin, OT
+fusion) exists to fix exactly that. It does not apply: alignment presupposes
+that two networks compute something similar up to a permutation, and
+cos = 0.0006 says these compute nothing similar under any permutation.
+There is no correspondence to recover, which is why no alignment mode was
+built rather than built and found wanting.
+
+§52 measured the same structure from the routing side. Orthogonality is what
+"there is no expert for history" looks like in the weights.
+
+### What it settles
+
+- **Collapsing a MoE to one expert is not a compression of it, it is a
+  deletion of it.** The honest description of k3-mini is "K3 with the routed
+  path removed", and the gain sweep is proof rather than interpretation.
+- **The speedup is real and belongs to the deletion**: a 59.78 B model
+  instead of a 2.78 T one, at 2.63x the tokens per second and 16.5 GB less
+  peak RSS.
+- **No convex combination does better** — not a measured one, not the
+  trained prior, not the busiest expert, not any gain. The failure is
+  geometric, so it cannot be fixed by choosing alphas.
+
+Two method notes. The merge tool refuses a job with no `alpha=`; it used to
+default to uniform, which silently produced three byte-identical containers
+from three different policies because the driver built the alpha files and
+forgot to name them. And `merge_layer --check` reports the re-quantization
+error separately from the merge, so a bad result has one suspect instead of
+two: it lands at 0.195 rel L2, the same VQ3R figure §50 records, which is
+how the decode path was shown to agree with `verify_container.py` (cosine
+0.992 on a one-hot merge) before any of the above was believed.
+
+Not measured: k > 1 clustering (merging 896 experts into 16 groups is one
+token's working set held resident, and is a different geometry), merging
+only the head of the usage distribution, distillation or fine-tuning of a
+merged model back toward usefulness, and whether any trained MoE has experts
+that are *not* orthogonal.
+
+## 54. k = 16 clusters: routing was the exclusion, and residency is not free (2026-08-09)
+
+§53 left one door open — "merging into more than one expert is a different
+operation with a different geometry, and at k = 16 it would be exactly one
+token's working set held resident. Not run." Run now, with `--clusters k`
+and three partitionings. It closes the door twice: once on quality, and
+once, unexpectedly, on speed.
+
+### A correction to §53 first
+
+§53 explained the merge schemes' agreement by saying "the alphas are nearly
+the same vector under every principled rule". **That is wrong.** The trained
+bias prior is flat, as §53 says, but the *measured* usage is not:
+
+| Kimi-Linear L1 | busiest expert | top-16 share | perplexity |
+|---|---|---|---|
+| `trace`, 248 tokens | **15.1x uniform** | **34.5%** | 124.1 / 256 |
+| `bias` | 1.05x uniform | 6.5% | 255.9 / 256 |
+
+`trace` and `uniform` are genuinely different vectors — one substantially
+concentrated, one flat by construction — and they still land at KL 2.668
+and 2.687. The result is *stronger* than the explanation §53 gave it: a
+correctly measured, concentrated weighting buys nothing over 1/E, which
+rules out "you used the wrong alphas" instead of sidestepping it. Every
+number in §53 stands; that one sentence of reasoning does not.
+
+### The sweep
+
+Kimi-Linear, KL from the unmerged model on the same 128-token prompt:
+
+| k | merge, roundrobin | merge, random | prune (keep k busiest) |
+|---|---|---|---|
+| 1 | 2.668 | — | 3.710 |
+| 4 | 2.663 | — | — |
+| 8 | 2.662 | — | — |
+| 16 | 2.721 | 2.545 | **2.200** |
+| 32 | — | — | 2.292 |
+| 64 | — | — | 2.396 |
+
+Merging is flat from k=1 to k=8 and then gets *worse*. **Pruning — which is
+not a merge at all, just "keep the k busiest experts and run all of them on
+every token" — beats every merge at every k tried.** Both curves are
+U-shaped, both minima are catastrophic, and every one of these containers
+answers "The capital of Italy is" with **Paris**.
+
+The norm law from §53 holds at the second point once the right n is used —
+not the member count but the effective one, `1 / sum(alpha^2)`:
+
+| | members | effective | measured ratio | 1/sqrt(effective) |
+|---|---|---|---|---|
+| k=1, uniform | 256 | 256 | 0.065 | 0.063 |
+| k=16 roundrobin, cluster 0 | 14 | 2.99 | 0.561 | 0.578 |
+
+and cos(member_i, member_j) is **0.0005 inside a cluster** — the same
+orthogonality §53 found across the whole layer. Clustering does not find
+similar experts to merge, because a layer does not contain any.
+
+### What the shape says: the value of routing is the exclusion
+
+The two curves cross in a way that names what is lost. Merging destroys the
+experts, by the norm law. Pruning keeps k of them intact and still fails —
+and gets *worse* as k grows past 16, while its logit rel L2 and pearson
+improve monotonically over the same range (0.326 / 0.766 at k=16, 0.308 /
+0.779 at k=64).
+
+That combination is the result. The aggregate output moves closer to the
+original as experts are added back; the next-token distribution moves away.
+What a prune-k layer cannot do is **leave an expert out**. Adding the
+17th-busiest expert to a permanently-on set adds its contribution to every
+token, including all the tokens the real router would have excluded it
+from, and past k=16 the wrongly-included mass grows faster than the
+correctly-included mass.
+
+So what routing buys is not which experts exist, nor how they are weighted
+on average — §53 ruled out both — it is the per-token exclusion. That is
+§52 seen from the weights: a token's top-8 shares 26% of its members with
+its neighbour in the same sentence, and most of what a layer decides is
+what *not* to run.
+
+### K3 at k = 16, which is slower than K3
+
+The systems half was supposed to be the easy win: 16 experts x 92 layers is
+exactly one token's working set, so the bank is 18.26 GB instead of 952 GB
+and never misses. Built in 635 s; 105.36 B parameters, 104.19 B active,
+which is the same active count as K3 — k = top_k means the arithmetic is
+unchanged and only the I/O should differ.
+
+Same prompt, same 46.39 GB budget, `waste run -n 12`:
+
+| | K3 | k3-k16 |
+|---|---|---|
+| decode | **0.52 tok/s** | **0.27 tok/s** |
+| cache | 39% hit, 10731 misses | **100% hit, 0 misses** |
+| bytes read (16 steps) | 218.83 GB | 17.01 GB |
+| peak RSS | 48.52 GB | 47.76 GB |
+| KL from K3 | — | 4.705 (k=1 was 4.241) |
+
+**Zero expert I/O, identical arithmetic, less RAM, and it takes twice as
+long.** `WASTE_PROFILE=1` at a matched 17.6 GB cache says the slowdown is
+not in the MoE:
+
+| bucket | K3 | k3-k16 | ratio |
+|---|---|---|---|
+| kda | 12.34 | 19.70 | **1.60x** |
+| mla | 2.42 | 4.06 | 1.68x |
+| expert mm | 15.01 | 25.99 | 1.73x |
+| LUT apply | 12.99 | 23.97 | 1.85x |
+| expert I/O | 3.51 | **1.50** | 0.43x |
+| accounted | 42.31 | 63.36 | 1.50x |
+
+**`kda` never touches an expert, and it is 1.6x slower.** So is `mla`. Every
+bucket that does byte-identical work in both containers slows by the same
+factor as the buckets that do not. That is a machine-wide slowdown, not an
+algorithmic one, and it is the only reading the numbers allow.
+
+The mechanism this is consistent with — and it is consistent rather than
+isolated, since nothing here instrumented the OS — is the one §24, §32 and
+§39 keep arriving at from other directions. k=16 touches **all** of its
+18.26 GB of cache every single token and evicts nothing (0 evictions), on
+top of a 27 GB trunk it also touches every token: ~45 GB permanently hot on
+a 64 GB machine. The streaming container has the same RSS and the same
+budget, but 17418 evictions — its slots are constantly rewritten, so at any
+instant its genuinely hot set is the trunk plus the few GB it is cycling,
+and the rest can go cold.
+
+**That refines §39's cliff in a way worth keeping: the cliff is not a
+property of the budget number, it is a property of how much of the budget is
+touched per token.** Two runs at 46.39 GB and within 1 GB of the same peak
+RSS differ 2x, and the one that is *resident* is the slow one. "A paged
+cache hit is slower than the disk read it replaced" is in CLAUDE.md already;
+what is new is that a container can be built whose hit rate is 100% by
+construction and which loses to streaming anyway.
+
+### What it settles
+
+- **k > 1 does not rescue the merge.** Quality is flat to k=8 and worse at
+  k=16, on both models; on K3, k=16 (KL 4.705) is worse than k=1 (4.241).
+- **Pruning beats merging everywhere**, and still does not work. The best
+  static approximation of a top-8-of-256 layer found here is a fixed 16
+  experts, at KL 2.200, which still says the capital of Italy is Paris.
+- **Holding one working set resident is not automatically a win.** The
+  configuration §53 named as the interesting unrun case turns out to be
+  slower than the streaming engine it was meant to replace.
+
+A method note. The k=16 container also exposed a budget bug: the resolver
+recommended `floor + 3x a token's working set` without noticing that for a
+merged container the working set *is* the whole bank, so it asked for
+80.77 GB where 46.39 GB holds every expert byte. Now capped at the
+container's total expert size; unmerged containers are unaffected (K3's
+952 GB bank against a 3x working set of 52 GB, Kimi-Linear's 16.5 against
+1.6).
+
+Not measured: whether the slowdown is macOS's compressor specifically (no
+OS instrumentation was taken), the same comparison on Linux or on a machine
+where 45 GB is not 70% of RAM, k=16 with top_k < k and a rebuilt 16-row
+router, and whether any of these containers fine-tunes back to usefulness.
+
+## 55. §54's speed claim was measured wrong, and k=16 is faster (2026-08-09)
+
+§54 reported that K3 at k=16 runs at 0.27 tok/s against unmerged K3's 0.52,
+called it "slower rather than faster", and built an explanation on top of it
+about resident memory. **The measurement was taken with one process per arm,
+at the end of a session that had just written 80 GB of containers and read
+several terabytes. Re-run with `tests/sweep.c` — one load, arms interleaved,
+two repeats — it inverts.**
+
+| container | cache | slots | tok/s (rep 1, rep 2) | hit | GB read |
+|---|---|---|---|---|---|
+| K3 | 4096 | 346 | 0.579, 0.600 | 29.9% | 291.7 |
+| K3 | 9000 | 760 | 0.597, 0.623 | 34.3% | 260.7 |
+| K3 | 17736 | 1498 | 0.595, 0.612 | 41.2% | 219.9 |
+| k3-k16 | 4096 | 346 | 0.506, 0.508 | **0.0%** | 272.1 |
+| k3-k16 | 9000 | 760 | 0.455, 0.503 | **0.0%** | 272.1 |
+| k3-k16 | 18000 | 1521 | **0.718, 0.689** | 93.8% | 17.0 |
+
+**k = 16 with its whole bank resident is ~1.15x faster than streaming K3,
+not 2x slower.** Both repeats agree, and the two containers were measured in
+the same process state as each other.
+
+The error is the one this repo has now made three times. `tests/sweep.c`
+exists because of §32 and §33; its header says two arms in two processes are
+two computers; §50's method notes record ~30% unexplained low outliers on
+byte-identical work over long campaigns on this machine class. All of that
+was read during the session that then produced the bad number anyway. The
+rule that would have caught it is not "be careful", it is **never compare
+two arms across two process lifetimes, and never at the end of a campaign** —
+which is exactly what `sweep` is for and what it was not used for.
+
+**What §54 got wrong, precisely**: the throughput table, the profile table
+built from the same paired runs, and every sentence explaining why a
+resident cache would be slow — including "the cliff is a property of how
+much of the budget is touched per token", which was an inference from
+`kda` being 1.6x slower in one process than in another. The K3 arms above
+are flat from 346 to 1498 slots (0.579-0.623, spread 7%, repeats differing
+2-4% at the same setting), so cache residency does not cost what §54 said
+it costs. `WASTE_PURGEABLE` is off by default, so the volatile/nonvolatile
+syscalls that were the other candidate never ran either.
+
+**What §54 got right, and why it survives**: everything about quality. The
+k-sweep, prune beating merge at every k, the U-shape, the orthogonality and
+the norm law are all logit and weight measurements — deterministic
+functions of the container, independent of machine state. Those tables
+stand unchanged, and so does the conclusion that no static combination of
+experts reproduces the routing.
+
+### What the corrected number actually says
+
+Removing **93% of the expert I/O buys 15%.** That is the useful figure, and
+it independently confirms from the outside what `WASTE_PROFILE` says from
+the inside: at a full working set of cache, expert I/O is 7-8% of a K3
+decode step, and the step is bound by the VQ apply. A container engineered
+so that expert reads are impossible gains about what the I/O bucket was
+worth, and no more.
+
+Which is also the answer to "would an accelerator help here". The bytes are
+not the budget once the cache is full — the dependent gather chains are, and
+`docs/BACKENDS.md` measured Metal losing on this engine (22% slower overall,
+53 GB/s against the CPU's 195 GB/s on the one matvec it implements) and CUDA
+finding ~84% of the step tracking core clock rather than DRAM.
+
+One detail worth keeping from the small-cache arms. **k3-k16 hits 0.0% at
+346 and 760 slots where K3 hits 29.9% and 34.3% at the same sizes.** A
+merged container accesses its 1472 records in the same deterministic cycle
+every token, which is LRU's worst case exactly; a routed container's access
+order varies, so LFRU catches some reuse. Making the working set fixed makes
+it degrade *harder* when it does not fit.
+
+Not measured: whether the 1.15x holds at longer generations, on a machine
+where 46 GB is not 72% of RAM, or against a k=16 container whose quality was
+not already destroyed — which is the only reason none of this is a
+recommendation.
+
+## 56. Truncating top_k: 1.49x, and the knee is not where the KL says (2026-08-09)
+
+§53-§55 established what cannot be done: no static combination of experts
+survives, because what routing buys is the per-token exclusion. The
+complement is the lever nobody had priced — **keep the selection, take fewer
+of it.** `num_experts_per_token` is a manifest field; nothing is
+re-converted, and every consumer adapts (`cfg_sane` bounds it,
+`waste_plan_memory` sizes floor and recommendation from it, the scratch
+shrinks, `moe_layer` renormalizes the survivors to one).
+
+**`docs/EFFICIENCY.md` lever C does not already answer this.** C was refused
+because ranks 9-16 carry 33.3% of the routed mass where it needed under a
+tenth — but C *demoted* the tail to a cheaper precision, worth 16.7%, while
+this drops it and takes the compute with it. And C was priced against a
+profile where expert I/O was 54.8% of a step; it is now 8.3%, and §55
+measured that removing 93% of it buys 15%. The bottleneck moved, so every
+I/O-shaped lever needs repricing. Nobody had measured the **KL** of
+truncation end to end — only §20's reconstruction error on the weights.
+
+`tests/sweep.c` gained a `topk=` arm (lowering only: the scratch is sized at
+load from the manifest's top_k). One load, arms interleaved, two repeats,
+cache fixed at 17736 MB, K3:
+
+| top_k | tok/s | speedup | KL vs top-16 | hit | GB/token | working set |
+|---|---|---|---|---|---|---|
+| 16 | 0.594 | 1.00x | — | 41.2% | 13.7 | 17.01 GiB |
+| 12 | 0.696 | **1.17x** | **0.007** | 50.1% | 10.1 | 12.76 |
+| 8 | 0.885 | **1.49x** | 0.037 | 62.8% | 6.9 | 8.50 |
+| 6 | 0.931 | 1.57x | 0.046 | 71.0% | 5.6 | 6.38 |
+| 4 | 1.055 | 1.78x | 0.118 | 78.5% | 4.8 | 4.25 |
+
+Against the bar this repo applies to containers — §50 records VQ2R at KL
+**0.0179** as damage real enough for `verify_container.py` to FAIL —
+top-12 does *less* damage than a quantization the repo rejects, and top-8
+twice as much while halving the working set.
+
+**The knee is 16 to 8 and it is a regime change.** A token's working set
+falls 17.01 to 8.50 GiB, and the 26.8 GiB this machine has above the floor
+goes from holding 1.6 of them to 3.2 — the `floor + 3x` window §39 called
+good and which K3 at top-16 could never reach on 64 GB. Below top-8 the
+cache is already ample and only the linear compute saving is left, which is
+why 8 to 6 buys almost nothing.
+
+### The KL at one position does not certify an operating point
+
+top-4 has KL 0.118 and the correct argmax, and it is **broken**. Greedy
+continuation, 60 tokens, same prompt:
+
+| top_k | what it writes |
+|---|---|
+| 16 | "1. **The 'Red Planet'**: … iron oxide … 2. … largest volcano: Olympus Mons …" |
+| 8 | "1. **The 'Red Planet'** … iron oxide (rust) on its surface. 2. It has the largest volcano …" |
+| 4 | "It looks like your message got cut off after '1.' …" then `<\|close\|>` forever |
+
+top-8 reproduces top-16's content, facts and order with different
+formatting. top-4 does not follow the prompt at all. **A single-position KL
+measures the head of the distribution; the top-10 overlap falling 7, 6, 5, 5
+was the signal that the tail was reordering, and the tail is what a
+continuation walks into.** §50 used exactly this test to reject VQ2R; it is
+the gate, and KL is only the screen.
+
+### The lever moves the budget into the cliff
+
+Reducing top_k lowers the recommendation from 80.77 GB to 54.77 GB, which
+for the first time **fits** under the resolver's 7/8-of-RAM ceiling — so the
+resolver takes it, and walks into the 46-52 GB cliff §39 measured:
+
+| top-8 | tok/s | peak RSS | hit |
+|---|---|---|---|
+| default budget (54.77 GB) | **0.08** | 40.71 GB | 67% |
+| `--budget 46G` | **0.77** | 47.29 GB | 62% |
+
+**10x slower at the larger budget**, with lower RSS and a higher hit rate —
+§39's signature exactly. The hazard was previously masked: K3 at top-16 asked
+for 80.77 GB, never got it, and was forced down to a good value. Making the
+recommendation reachable made it dangerous. The resolver's ceiling is too
+generous on this machine and nothing in it knows about the cliff.
+
+### The ceiling on this whole direction
+
+MoE is 64.2% of a decode step; kda is 29.2% and mla 5.7%. So **2.8x is the
+absolute limit of anything that only touches experts**, even if they were
+free. top-4 at 1.78x has already removed 68% of the MoE time, and the rest
+of the way down (top-2, top-1) is where the model breaks — Kimi-Linear
+measures KL 1.327 and 2.568 there. Going past 2.8x means attacking kda and
+mla, which is `docs/BACKENDS.md`'s "a different engine, not a backend".
+
+Recommended operating point on this machine: **top-8 with an explicit
+`--budget 46G`** — 1.49x, KL 0.037, continuation intact.
+
+Not measured: longer generations (§50's note that hit rate rises with
+length applies to both arms and may move the ratio), other prompts and
+languages for the continuation gate, top-8 on Kimi-Linear as a deployment
+rather than a control, and the natural composition — **fewer experts stored
+more precisely**, where a 4-stage container at top-4 reads a quarter of the
+records at +33% each and could buy back truncation error with per-expert
+accuracy (§20's `err² = err3² + mass(S)·delta` prices the trade). That one
+costs a re-conversion.
+
+## 57. The resolver's headroom was an eighth because nobody had measured it (2026-08-09)
+
+§56 found the default budget walking into §39's cliff the moment `top_k`
+came down. The cause is one constant: the automatic budget stepped down
+until it fit under **7/8** of usable RAM, and 7/8 of 64 GB is 56 GB — inside
+the 46-52 GB band §39 had already measured as an eightfold collapse.
+
+**The eighth was never measured.** It was a plausible margin, and it stayed
+harmless for one reason: K3 at top-16 asks for 80.77 GB, cannot have it, and
+the step-down lands on `floor + 1x` = 46.39 GB — the measured optimum,
+reached for the wrong reason. Lower `top_k` to 8 and a token's working set
+halves to 8.50 GiB, three multiples now fit under 56, and the default takes
+54.77 GB.
+
+| K3 at top-8, default budget | budget | tok/s | peak RSS | hit |
+|---|---|---|---|---|
+| before (7/8 ceiling) | 54.77 GB | **0.08** | 40.71 GB | 67% |
+| after (3/4 ceiling) | 46.18 GB | **0.88** | 48.57 GB | 62% |
+
+**11x, on the path a user gets by typing nothing.** Note which way the other
+columns move: the slow one has the *higher* hit rate and the *lower* RSS,
+which is what paging looks like from inside the process — the OS took the
+cache, the engine re-read less because it was waiting more, and every
+counter the engine keeps says it was doing better.
+
+K3 at top-16 still resolves to 46.39 GB, unchanged. Kimi-Linear, whose
+recommendation fits many times over, is untouched. A 128 GB machine still
+gets the full `floor + 3x`.
+
+Two smaller things came out of the same edit.
+
+**`waste_memplan` now reports `working_set_bytes`.** The resolver used to
+recover it as `(recommended - floor) / 3`, which stopped being true when §55
+capped `recommended` at the container's whole expert set — on a merged
+container the two are no longer three times apart. A quantity the rule is
+built on should be reported, not re-derived from something that has since
+grown a special case. `tests/run.sh` mirrors the rule and now reads the
+field instead of recomputing it; `serve/engine.py`'s struct follows.
+
+**The rule is now stated the same way in four places** — `waste.h`'s doc
+comment, `docs/ENGINE.md`, `tests/run.sh`'s comment and the resolver itself.
+All four said 7/8. Three of them were prose that had been true.
+
+Not measured: where the cliff actually is on this machine (46 works, 52
+does not, and nothing between them has been run), whether it is a fraction
+of RAM at all or an absolute headroom the OS needs — 3/4 is the safe side of
+the only two points there are, not a fitted value — and any of this on
+Linux, where the page-cache behaviour under `O_DIRECT` is not the same.
+
+## 58. §4D re-priced: batching is worth less now, not more (2026-08-09)
+
+§56 and §57 both turned on the same thing — a measurement priced when
+expert I/O was half a step, still being quoted after the cache made it 8%.
+So §4D was re-run rather than assumed, and it comes out the other way from
+the guess that prompted the re-run.
+
+`EFFICIENCY.md` §1 measured chunked prefill at **1.62x** over sequential and
+derived a 1.63x ceiling for any batching scheme, on the model that grouping
+removes I/O and none of the compute. Same measurement today, 56-token
+prompt, cache at a full working set:
+
+| top_k | mode | tok/s | | GB read |
+|---|---|---|---|---|
+| 16 | sequential | 0.43 | | 860.8 |
+| 16 | chunked | 0.69 | **1.60x** | 307.7 |
+| 8 | sequential | 0.67 | | 449.0 |
+| 8 | chunked | 0.86 | **1.28x** | 179.3 |
+
+**§1 reproduces exactly at top-16 — 1.60x against its 1.62x — and collapses
+to 1.28x at top-8.** Both levers take their gain from the same place, so
+they overlap instead of composing: 0.43 to 0.86 is 2.0x end to end where the
+product of the two would be 2.38x.
+
+**And the ceiling holds for batching across independent streams too, which
+§4D never separated from grouping within one.** The reason §1 gave is
+structural and does not care where the tokens come from: `vq_apply` costs
+one pass per (token, expert) pair, and the pair count is `T * K * 92`
+however they are grouped. That work is 64.2% of a step, so as B grows the
+per-token cost tends to it and no batching scheme beats **1/0.642 = 1.56x**.
+Aggregate throughput on this engine tops out near 1.4 tok/s, not the tens
+that a bytes-only argument suggests.
+
+The bytes-only argument is worth naming because it is the one that misleads.
+Per token this engine touches ~36.4 GB — 27.3 of resident trunk, 9.1 of
+experts at top-8 — and at the 195 GB/s this machine reaches on a streaming
+quantized matvec that would be 187 ms, i.e. 5.4 tok/s. It measures 0.88.
+**The engine runs at 16.4% of its own memory bandwidth**, because the step
+is dependent gather chains rather than streaming, which is the same thing
+`docs/BACKENDS.md` found on CUDA (84% of the step tracks core clock, 23%
+DRAM). Batching does not fix that; it amortizes bytes, and bytes are not
+what the clock is going into.
+
+### What that leaves, arithmetically
+
+60 tok/s is 68x from 0.88. The factor splits cleanly and neither half is
+optional:
+
+| | factor | built? |
+|---|---|---|
+| bytes per token, 36.4 GB to 3.25 | **11.2x** | no |
+| bandwidth efficiency, 16.4% to 100% | **6.1x** | no |
+| top_k truncation | 1.49x | yes, §56 |
+| batching | ≤1.56x, and it overlaps top_k | yes, and already default for prefill |
+
+11.2 x 6.1 = 68. The two levers that exist are, between them, worth about
+2x and are nearly spent; the whole remaining factor is in the two that do
+not. And the byte half cannot come from the experts: they are 9.1 GB of the
+36.4, so deleting them outright is 1.33x. **It has to come from the trunk,
+which is 75% of the bytes and 100% unconditional.**
+
+Which names the next measurement precisely, and it is a geometry question of
+exactly the kind that killed the merge in §53 before anything was built:
+**does K3's trunk have contextual sparsity at all** — is there a per-token
+prediction that keeps most of a layer's output while reading a tenth of its
+weights? If the answer is as flat as the merge alphas turned out to be, 60
+tok/s on this machine is closed and the honest ceiling is about 2x from
+here. Not run.
+
+Method note, and it is the third time today: the guess that prompted this
+re-run was that the new regime would make batching *more* valuable. It makes
+it less. A regime change invalidates a measurement's conclusion in whichever
+direction the arithmetic says, and the arithmetic has to be redone rather
+than re-argued.
+
+## 59. The trunk is not FFN, so contextual sparsity is aimed at 16% of it (2026-08-09)
+
+§58 left one question standing: 60 tok/s needs 11.2x fewer bytes per token,
+the experts are only a quarter of them, so it has to come from the trunk —
+**does K3's trunk have contextual sparsity?** The literature that makes this
+work (Deja Vu and its descendants) targets FFN blocks, where a ReLU-family
+activation produces true zeros and a small predictor can say in advance
+which neurons will fire.
+
+The first thing to measure was not the activations. It was where the bytes
+are:
+
+| per token, top-8 | GB | share | if it vanished entirely |
+|---|---|---|---|
+| attention (MLA + KDA) | 18.92 | **49.9%** | 2.00x |
+| routed experts | 9.10 | 24.0% | 1.32x |
+| shared experts (FFN) | 6.27 | **16.5%** | 1.20x |
+| routed latent projections | 2.44 | 6.4% | 1.07x |
+| lm_head | 1.19 | 3.1% | 1.03x |
+
+**Half of K3's per-token bytes are attention, and the FFN the technique
+addresses is a sixth.** Nothing here, deleted outright, reaches 2x. A
+generous compound — half the attention heads skippable *and* the FFN 90%
+sparse — is **1.66x** against the 11.2x required.
+
+### The sparsity is real, and it is worth 1.14x
+
+Measured anyway, because "is it harvestable at all" is worth knowing. Real
+hidden states from a K3 run (`WASTE_DUMP_HIDDEN`), shared-expert weights
+decoded from `trunk.bin`, SiTU applied as the container declares it
+(beta 4.0, linear_beta 25.0). Keeping only the largest intermediate channels
+for that token and zeroing the rest, relative L2 of the layer's output:
+
+| keep | L5 | L20 | L45 | L88 |
+|---|---|---|---|---|
+| 50% | 0.034 | 0.036 | 0.055 | 0.016 |
+| 25% | 0.094 | 0.103 | 0.148 | 0.041 |
+| 12.5% | 0.163 | 0.194 | 0.238 | 0.069 |
+| 6.25% | 0.230 | 0.267 | 0.317 | 0.092 |
+
+**A quarter of the channels carry 99% of the output energy** (rel L2 0.094 →
+1 − 0.094² = 0.991), consistently across depth, and the last layers are
+sparser than the middle ones. Against a flat activation, keeping a quarter
+would leave error 0.87; this is 0.09. The concentration is not marginal.
+
+And it is worth **1.14x**, because it applies to 16.5% of the bytes. Keeping
+half rather than a quarter — which is what a 93-layer error budget would
+more likely allow, since 9% per layer compounds — is **1.09x**.
+
+### What it settles
+
+**60 tok/s on this machine is closed.** Not for want of a trick: the bytes
+are too evenly spread for any single-component saving to matter, the one
+component the technique fits is a sixth of them, and the half that is
+attention has no "read a tenth of the weights" formulation at all — every
+output dimension of a projection depends on every input.
+
+The honest ceiling from 0.88 tok/s, adding everything measured today:
+top_k truncation 1.49x (taken), batching ≤1.56x and overlapping it (§58),
+FFN sparsity 1.09-1.14x if built. **About 2x, total.** Past that needs
+different hardware or a different model — the 6.1x of bandwidth efficiency
+is real but it is a kernel rewrite of the whole forward pass, which is
+`docs/BACKENDS.md`'s "a different engine, not a backend".
+
+Two caveats on the sparsity numbers, both in the direction of making them
+weaker rather than stronger. One token, four layers — the dump truncates per
+token, so this is a single position measured at four depths. And existence
+is not exploitability: skipping a column of `down_proj` requires knowing
+which channels matter *before* computing the activation that reveals them,
+which is the predictor half of Deja Vu and is not measured here at all.
+
+Not measured: attention-head-level sparsity (the 49.9%), whether the
+channel set is stable enough across tokens for a cheap predictor, and any
+of this on a model whose activation is ReLU-family rather than SiTU.
+
+## 60. The sparse channels are not the same channels (2026-08-09)
+
+§59 measured that K3's shared-expert FFN is genuinely sparse per token — a
+quarter of the intermediate channels carry 99% of the layer's output — and
+left the half that decides whether it is usable: **is it the same quarter
+next token?** Skipping a column of `down_proj` requires knowing which
+channels matter *before* computing the activation that reveals them.
+
+Eight tokens, each the last position of a growing prefix of one sentence
+(the dump truncates per token, so this is eight runs), top 25% by magnitude:
+
+| layer | Jaccard between tokens | random baseline | in all 8 | in at least one | a static set covers |
+|---|---|---|---|---|---|
+| 20 | **0.271** | 0.143 | 56 (4%) | 4289 (70%) | 57% |
+| 45 | **0.206** | 0.143 | 25 (2%) | 4934 (80%) | 49% |
+| 88 | **0.196** | 0.143 | 31 (2%) | 5083 (83%) | 48% |
+
+For sets of size p drawn at random the expected Jaccard is `p/(2-p)` =
+0.143. Measured is 0.20-0.27 — **1.4x to 1.9x chance, not 5x or 10x.**
+There is no stable core: 2-4% of the set is common to all eight. A fixed set
+chosen on the mean activation captures about half of any single token's.
+
+And the number that kills the batched form of the idea too: **70-83% of all
+channels appear in the top quarter of at least one of eight tokens.** A
+group of eight would have to read four fifths of the matrix regardless.
+
+The eight tokens are prefixes of the same sentence, which is the most
+favourable case for stability that could have been chosen. It still comes
+out close to noise.
+
+### Which closes it
+
+The shape is exactly §53's, from a different direction. There, the experts
+were individually meaningful and mutually orthogonal, so no static
+combination of them existed. Here the channels are individually meaningful
+per token and their identity is nearly unstructured across tokens, so no
+static selection of them exists either. **Both times the structure is real
+and local, and has no regularity to exploit above it.**
+
+So the ranking, complete, from 0.88 tok/s on this machine:
+
+| | worth | state |
+|---|---|---|
+| top_k truncation to 8 | 1.49x | measured, taken |
+| batching | ≤1.56x, overlaps the above | already default for prefill |
+| FFN contextual sparsity | 1.09-1.14x if it worked | **and it does not: §60** |
+| bandwidth efficiency 16.4% → 100% | 6.1x | a rewrite of the forward pass |
+| bytes per token, 36.4 GB → 3.25 | 11.2x | no mechanism found |
+
+**About 2x is the honest ceiling from here**, and 60 tok/s needs different
+hardware or a different model. That is the answer to the question §58 posed,
+arrived at without building anything.
+
+Two caveats, both real. This is magnitude ranking of the output, and Deja
+Vu's predictors are trained on the input rather than thresholded on the
+output — a learned predictor could in principle find structure that
+magnitude does not expose, since the activation is a deterministic function
+of x. What the 2-4% common core and the 83% union say is that it would have
+to find nearly all of it, which is the regime where the predictor costs what
+it saves. And the input used is the post-layer residual from
+`WASTE_DUMP_HIDDEN`, not the normalized state the engine hands the shared
+expert — a proxy, chosen because the byte arithmetic in §59 caps the whole
+direction at 1.14x regardless of how exactly it is measured.
+
+Not measured: a trained predictor, attention-head-level sparsity (the 49.9%
+of bytes §59 found there), and stability across genuinely unrelated prompts
+rather than prefixes of one.

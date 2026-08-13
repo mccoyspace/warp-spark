@@ -98,6 +98,9 @@ static void model_lock_atfork_child(void)
 
 static void model_lock_init(void)
 {
+    /* pthread_atfork handlers cannot be unregistered. A host that loads this
+     * shared library dynamically must not dlclose it before a later fork, or
+     * the process would call these handlers after their code was unmapped. */
     (void)pthread_atfork(model_lock_atfork_prepare, model_lock_atfork_parent,
                          model_lock_atfork_child);
 }
@@ -105,12 +108,16 @@ static void model_lock_init(void)
 /* One OS lock per container and process. Device/inode identity means aliases
  * of the same directory share an entry. The registry supplies the reference
  * semantics flock does not: closing one context must not release ownership
- * while another context in this process still uses the container. */
-static waste_model_lock *model_lock_acquire(const char *path, int allow,
+ * while another context in this process still uses the container.
+ *
+ * Replacing the directory underneath an open context can change that identity
+ * and let the process contend with itself. The registry covers the normal,
+ * stable-container case; hosts that replace containers must close them first. */
+static waste_model_lock *model_lock_acquire(const char *path, int exclusive,
                                             waste_status *status)
 {
     *status = WASTE_OK;
-    if (allow) return NULL;
+    if (!exclusive) return NULL;
 
     pthread_once(&model_lock_once, model_lock_init);
     int flags = O_RDONLY;
@@ -118,17 +125,16 @@ static waste_model_lock *model_lock_acquire(const char *path, int allow,
     flags |= O_CLOEXEC;
 #endif
     const int fd = open(path, flags);
-    if (fd < 0) { *status = WASTE_E_IO; return NULL; }
+    if (fd < 0) return NULL;
 #ifndef O_CLOEXEC
     const int fdflags = fcntl(fd, F_GETFD);
     if (fdflags < 0 || fcntl(fd, F_SETFD, fdflags | FD_CLOEXEC)) {
         close(fd);
-        *status = WASTE_E_IO;
         return NULL;
     }
 #endif
     struct stat st;
-    if (fstat(fd, &st)) { close(fd); *status = WASTE_E_IO; return NULL; }
+    if (fstat(fd, &st)) { close(fd); return NULL; }
 
     pthread_mutex_lock(&model_lock_mu);
     for (waste_model_lock *p = model_locks; p; p = p->next) {
@@ -146,7 +152,7 @@ static waste_model_lock *model_lock_acquire(const char *path, int allow,
         const int busy = errno == EWOULDBLOCK || errno == EAGAIN;
         pthread_mutex_unlock(&model_lock_mu);
         close(fd);
-        *status = busy ? WASTE_E_BUSY : WASTE_E_IO;
+        if (busy) *status = WASTE_E_BUSY;
         return NULL;
     }
 
@@ -155,7 +161,6 @@ static waste_model_lock *model_lock_acquire(const char *path, int allow,
         (void)flock(fd, LOCK_UN);
         pthread_mutex_unlock(&model_lock_mu);
         close(fd);
-        *status = WASTE_E_OOM;
         return NULL;
     }
     p->dev = st.st_dev;
@@ -184,14 +189,14 @@ static void model_lock_release(waste_model_lock *entry)
     pthread_mutex_unlock(&model_lock_mu);
 }
 #else
-/* Keep non-POSIX lifecycle behavior unchanged. The public opt-out is ignored
+/* Keep non-POSIX lifecycle behavior unchanged. The public opt-in is ignored
  * on hosts where this advisory ownership lock is not implemented. */
 struct waste_model_lock { int unused; };
-static waste_model_lock *model_lock_acquire(const char *path, int allow,
+static waste_model_lock *model_lock_acquire(const char *path, int exclusive,
                                             waste_status *status)
 {
     (void)path;
-    (void)allow;
+    (void)exclusive;
     *status = WASTE_OK;
     return NULL;
 }
@@ -524,20 +529,42 @@ waste_status waste_plan_memory_v2(const char *model_path, uint32_t ctx_tokens,
     /* one layer's top-k experts, double buffered */
     const int top_k = (int)js_int(&d, js_get(&d, cfg, "num_experts_per_token"), 8);
     const int lyr = js_get(&d, 0, "layers");
-    uint64_t rec = 0;
+    uint64_t rec = 0, bank_total = 0;
     if (js_size(&d, lyr) > 0) {
         const int first = lyr + 2;   /* first member's value */
         const uint64_t bytes = (uint64_t)js_int(&d, js_get(&d, first, "bytes"), 0);
         const uint64_t n = (uint64_t)js_int(&d, js_get(&d, first, "experts"), 1);
         rec = n ? bytes / n : 0;
+        /* Every expert byte the container holds. cfg_sane refuses a bank
+         * whose expert count differs from the config's, so one layer's
+         * `bytes` times the layer count is the whole set — counted with the
+         * same `layers` as the working set below, which includes the dense
+         * layers that have no bank. That makes both about 1% loose on K3,
+         * in the direction that recommends slightly more rather than less,
+         * and changing it would move a figure tests/run.sh asserts. */
+        bank_total = bytes * (uint64_t)layers;
     }
     out->min_expert_cache = rec * (uint64_t)top_k * 2;
     out->floor_bytes = out->trunk_bytes + out->state_bytes +
                        out->scratch_bytes + out->min_expert_cache;
     /* A cache below one token's working set keeps nothing alive to the
-     * next token (Gate 5), so "recommended" starts at 3x that. */
-    out->recommended_bytes = out->floor_bytes +
-                             rec * (uint64_t)top_k * (uint64_t)layers * 3;
+     * next token (Gate 5), so "recommended" starts at 3x that — but never
+     * above the size of every expert in the container, because a cache that
+     * holds the whole bank cannot be improved by making it larger.
+     *
+     * Without the cap a merged container — one whose top_k equals its
+     * num_experts, which is what the k3-mini experiment on the branch of
+     * that name produces — asks for three times its entire bank: k3-mini at
+     * k=16 was recommending 80.77 GB when 47.45 GB holds every expert byte
+     * that exists. Unmerged containers are untouched — K3's bank is 952 GB
+     * against a 3x working set of 52 GB, and Kimi-Linear's 16.5 GB against
+     * 1.6 GB. */
+    out->working_set_bytes = rec * (uint64_t)top_k * (uint64_t)layers;
+    {
+        uint64_t want = out->working_set_bytes * 3;
+        if (bank_total && want > bank_total) want = bank_total;
+        out->recommended_bytes = out->floor_bytes + want;
+    }
 
     js_free(&d);
     free(src);
@@ -577,7 +604,7 @@ waste_status waste_open_v2(const char *model_path, const waste_cfg *cfg_in,
     snprintf(c->path, sizeof c->path, "%s", model_path);
 
     waste_status lock_status = WASTE_OK;
-    c->model_lock = model_lock_acquire(model_path, cfg.allow_concurrent_open,
+    c->model_lock = model_lock_acquire(model_path, cfg.exclusive_open,
                                        &lock_status);
     if (lock_status != WASTE_OK) { free(c); return lock_status; }
 
@@ -614,16 +641,30 @@ waste_status waste_open_v2(const char *model_path, const waste_cfg *cfg_in,
      *
      * So step down a whole working set at a time and take the largest
      * that fits. On 64 GB K3 gets floor + 1x = 46 GB, the measured
-     * optimum; on an otherwise idle 128 GB host it still gets the full
-     * floor + 3x; a model whose recommendation already fits, like
-     * Kimi-Linear, is unaffected. "The machine" first means stable usable
-     * capacity, not host physical RAM: a finite cgroup max/high can be much
-     * smaller. Linux then applies current MemAvailable and cgroup headroom.
-     * If that dynamic ceiling cannot hold the floor plus a caller's host
-     * reservation, fail before making the model-sized allocation. */
-    const uint64_t physical = waste_physical_ram();
-    const uint64_t usable = usable_ram_from_physical(physical);
-    const uint64_t cap = current_memory_ceiling(physical, usable);
+     * optimum; on 128 GB it still gets the full floor + 3x; a model whose
+     * recommendation already fits, like Kimi-Linear, is unaffected. When
+     * not even one multiple fits, run at the floor and say so below.
+     *
+     * What "the machine" means is waste_usable_ram, not physical RAM: in a
+     * cgroup those differ by the ratio between the host and the limit, and
+     * sizing against the host there is not a slow run but a killed one. */
+    const uint64_t phys = waste_usable_ram();
+    /* A quarter left to the OS, not an eighth. The eighth was never measured
+     * — it was a plausible-looking margin — and on this 64 GB machine it
+     * puts the ceiling at 56 GB, inside the cliff §39 measured between 46
+     * and 52. It stayed harmless only because K3 at top-16 asks for 80.77 GB
+     * and could never reach it: the step-down landed on floor + 1x = 46 GB,
+     * the measured optimum, for the wrong reason. Lowering top_k shrinks the
+     * working set until three multiples fit under the old ceiling, and then
+     * the default picks 54.77 GB and runs at **0.08 tok/s against 0.77 at
+     * 46 GB** — same container, ten times slower, with a *higher* hit rate
+     * and a *lower* RSS, which is what paging looks like from in here
+     * (docs/LEARNED.md §56).
+     *
+     * A quarter puts the ceiling at 48 GB here: K3 at top-16 still resolves
+     * to 46.39 GB, top-8 to 45.98 instead of 54.77, and Kimi-Linear — whose
+     * recommendation fits many times over — is untouched. */
+    const uint64_t cap = phys ? phys - phys / 4 : 0;   /* 25% left to the OS */
     uint64_t budget = cfg.ram_budget_bytes;
     if (cfg.host_reserved_bytes > UINT64_MAX - c->plan.floor_bytes) {
         model_lock_release(c->model_lock);
@@ -638,34 +679,13 @@ waste_status waste_open_v2(const char *model_path, const waste_cfg *cfg_in,
                                  cfg.host_reserved_bytes;
 
     if (!budget) {
-        budget = waste_memory_auto_budget(c->plan.floor_bytes,
-                                          c->plan.recommended_bytes, cap);
-        if (!budget) {
-#if defined(__linux__)
-            model_lock_release(c->model_lock);
-            free(c);
-            return WASTE_E_MEMORY;
-#else
-            /* Before current-pressure accounting, a floor above the 7/8
-             * physical ceiling still opened with a warning. Preserve that
-             * behavior on platforms that supplied no new current signal. */
-            budget = c->plan.floor_bytes;
-#endif
+        const uint64_t ws = c->plan.working_set_bytes;
+        budget = c->plan.floor_bytes;
+        for (int k = 3; k >= 1; k--) {
+            const uint64_t b = c->plan.floor_bytes + ws * (uint64_t)k;
+            if (!cap || b <= cap) { budget = b; break; }
         }
-        /* Keep the same automatically selected total so ordinary host
-         * reservations displace expert cache. If the reservation itself is
-         * larger than all optional cache, grow only to the combined floor.
-         * Linux has a current-pressure ceiling: do not grow through it. */
-        if (budget < engine_base) {
-#if defined(__linux__)
-            if (cap && engine_base > cap) {
-                model_lock_release(c->model_lock);
-                free(c);
-                return WASTE_E_MEMORY;
-            }
-#endif
-            budget = engine_base;
-        }
+        if (budget < engine_base) budget = engine_base;
     }
     if (budget < engine_base) {
         model_lock_release(c->model_lock);
@@ -673,8 +693,7 @@ waste_status waste_open_v2(const char *model_path, const waste_cfg *cfg_in,
         return WASTE_E_RAM_BUDGET;
     }
 
-    /* A budget close to the memory currently available to this process
-     * backfires: the OS starts paging out
+    /* A budget close to usable RAM backfires: the OS starts paging out
      * the engine's own expert cache, and a "hit" then costs a page fault
      * instead of the disk read the engine was managing. Measured on K3:
      * 29.1 GB of cache on a 64 GB machine ran at 0.04 tok/s against 0.32
@@ -683,21 +702,12 @@ waste_status waste_open_v2(const char *model_path, const waste_cfg *cfg_in,
      * the check entirely by being zero here, which is exactly the case that
      * needed it. Explicit budgets remain the caller's contract, so warn
      * rather than silently changing one. */
-    if (cap && budget > cap) {
-#if defined(__linux__)
+    if (cap && budget > cap)
         fprintf(stderr,
-                "waste: budget %.1f GB exceeds the current safe memory "
-                "ceiling %.1f GB\n       available or cgroup memory may be "
-                "paged; automatic budgeting would choose less\n",
-                budget / 1073741824.0, cap / 1073741824.0);
-#else
-        fprintf(stderr,
-                "waste: budget %.1f GB leaves under 12%% of the %.1f GB this "
+                "waste: budget %.1f GB leaves under 25%% of the %.1f GB this "
                 "process may use\n       the OS will page out the expert cache "
                 "and throughput collapses\n",
-                budget / 1073741824.0, usable / 1073741824.0);
-#endif
-    }
+                budget / 1073741824.0, phys / 1073741824.0);
 
     c->cfg.ram_budget_bytes = budget;   /* what we actually run under */
     c->plan.host_reserved_bytes = cfg.host_reserved_bytes;

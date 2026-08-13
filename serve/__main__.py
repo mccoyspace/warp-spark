@@ -21,9 +21,9 @@ if __package__ in (None, ""):                    # python3 serve/__main__.py
     sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
     __package__ = "serve"
 
-from . import api                                            # noqa: E402
+from . import api, xtml                                      # noqa: E402
 from .engine import (CACHE_LFRU, CACHE_LRU,                  # noqa: E402
-                     WASTE_E_ARG, WASTE_E_UNSUPPORTED,
+                     WASTE_E_ARG, WASTE_E_BUSY, WASTE_E_UNSUPPORTED,
                      Engine, EngineError, build_info, physical_ram,
                      usable_ram, memory_ceiling, plan_memory)
 from .prefix_cache import CONTROLLER_OVERHEAD_BYTES          # noqa: E402
@@ -77,7 +77,7 @@ def bounded_int(lo: int, hi: int):
 def main(argv=None) -> int:
     ap = argparse.ArgumentParser(
         prog="python3 -m serve",
-        description="OpenAI-compatible server for a WASTE container.",
+        description="OpenAI-compatible server for a WARP container.",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 examples:
@@ -126,8 +126,8 @@ examples:
                         "since. Costs ~5%% on Kimi-Linear, ~1%% on K3")
     g.add_argument("--usage", default=None, metavar="PATH",
                    help="learned hotlist (default <model>/usage.waste)")
-    g.add_argument("--allow-concurrent-open", action="store_true",
-                   help="permit another process to load the same container")
+    g.add_argument("--exclusive-open", action="store_true",
+                   help="ask for single-process ownership of this container")
     g.add_argument("--performance-profile", choices=PROFILE_NAMES,
                    default=None, metavar="NAME",
                    help="explicit opt-in operating profile; spark-q0 "
@@ -246,7 +246,7 @@ examples:
             vision=args.vision,
             verify_records=profile.verify_records,
             usage_path=args.usage,
-            allow_concurrent_open=args.allow_concurrent_open,
+            exclusive_open=args.exclusive_open,
             host_reserved_bytes=args.prefix_cache)
         effective_direct_io = bool(engine.stats()["direct_io"])
         if profile.strict and not effective_direct_io:
@@ -283,6 +283,9 @@ examples:
         elif args.cpus and status == WASTE_E_UNSUPPORTED:
             print("--cpus: this platform does not bind threads to CPUs "
                   "(Linux and Windows only)", file=sys.stderr)
+        elif args.exclusive_open and status == WASTE_E_BUSY:
+            print("--exclusive-open: another process owns this container; "
+                  "stop it or retry without --exclusive-open", file=sys.stderr)
         return 1
 
     try:
@@ -331,9 +334,34 @@ examples:
         print(f"{e}", file=sys.stderr)
         return 1
 
+    # Said at startup, not on the first 400: an operator who learns this
+    # from a client's error message has already written the client.
+    #
+    # The flush is not decoration. Redirected to a file, stdout is
+    # block-buffered and stderr is not, so without it this warning lands
+    # above the banner it is qualifying — and reads as if the container
+    # failed to load at all.
+    chat_error = getattr(srv, "chat_error", None)
+    chat_format = getattr(srv, "chat_format", xtml)
+    if chat_error:
+        sys.stdout.flush()
+        print(f"\nWARNING: /v1/chat/completions is unavailable for this "
+              f"container.\n  {chat_error}.\n  /v1/completions is the "
+              f"one generating endpoint here. `waste chat` reads the\n"
+              f"  container's chat.json and is unaffected.", file=sys.stderr)
+    elif chat_format is xtml:
+        print(f"thinking {'off by default' if args.no_thinking else 'on'}"
+              f" — reasoning_effort per request")
+    else:
+        # Serving from chat.json rather than XTML. Say what is missing, in
+        # the same breath as saying it works — a client that sends `tools`
+        # and gets a 400 should not be the first time this is mentioned.
+        print(f"chat     from {model}/chat.json — plain conversation only, "
+              f"no tools,\n         no reasoning channel, no images")
+
     shown = args.host if ":" not in args.host else f"[{args.host}]"
     print(f"\nlistening on http://{shown}:{args.port}  "
-          f"(POST /v1/chat/completions)")
+          f"(POST {'/v1/completions' if chat_error else '/v1/chat/completions'})")
     # Flush before blocking forever. Redirected to a file, stdout is
     # block-buffered, so without this `python3 -m serve … > log &` shows an
     # empty log for as long as the server runs — which reads exactly like a

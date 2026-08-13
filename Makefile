@@ -237,7 +237,7 @@ waste$(EXE): cli/main.o libwaste.a
 # the two failures tests/run.sh was written to catch, so a binary that
 # `test` builds and `clean` forgets defeats the check meant to notice it.
 TESTNAMES := test_kda test_container test_forward test_tokenizer test_k3parts \
-             test_state test_vision test_image test_lock test_memory test_cpus \
+             test_state test_vision test_image test_memory test_cpus test_lock \
              test_abi test_ecache sweep
 TESTBINS  := $(addsuffix $(EXE),$(TESTNAMES))
 

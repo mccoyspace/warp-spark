@@ -10,7 +10,7 @@ changes at once.
 
 The public fork uses these rules:
 
-- `main` tracks `sqliteai/waste:main` without local commits.
+- `main` tracks `sqliteai/warp:main` without local commits.
 - `pr/<topic>` starts from the current upstream commit, or an explicitly named
   prerequisite branch, and contains one reviewable concern.
 - `exp/<topic>` contains work that is still being measured or that produced a
@@ -34,7 +34,33 @@ If upstream changes while a PR is under development, rebase the PR branch and
 repeat its full acceptance set.  Do not rebase a measured archive or copy its
 old benchmark number onto the rebased code.
 
-## Upstream refresh: 2026-08-07
+## Upstream refresh: 2026-08-12
+
+Upstream has renamed the project to **WARP — Weight-Aware Runtime and Paging**.
+The repository is now [`sqliteai/warp`](https://github.com/sqliteai/warp), while
+the executable, C symbols, `WASTE_*` variables, and `.waste` container extension
+remain intentionally unchanged. The Spark fork follows the public WARP name
+without creating an incompatible symbol rename.
+
+`spark/integration` now merges upstream `505e481` (0.6.8 development, following
+the 0.6.7 release). The merge adopts `chat.json` serving, DeepSeek-family
+conversion and attention corrections, the measured three-quarter-memory
+automatic budget, and the opt-in exclusive-open implementation accepted from
+[PR #29](https://github.com/sqliteai/warp/pull/29). It retains the qualified
+Spark CUDA paths, request-scoped Q0 profile, exact prefix snapshots, and
+host-owned snapshot reservation. Model-free build and server suites pass on
+macOS; native CUDA/K3 qualification remains required before deploying this
+source to the running Spark service.
+
+Issue [#11](https://github.com/sqliteai/warp/issues/11) now has a direct
+maintainer decision: the GB10 CUDA results are useful counterevidence to a
+blanket “whole forward pass or nothing” rule, but upstream will not merge a
+CUDA backend it cannot run or test. A source-separated backend is useful for
+architecture review, not yet a merge request. The next design question is a
+stable out-of-tree backend seam versus an in-tree guarded backend with a named
+hardware owner.
+
+## Previous upstream refresh: 2026-08-07
 
 The fork's `main` now fast-forwards to upstream
 `d9b919a791148b571e643d0af666bf19b4d733ab` (v0.6.6 plus two README magnet
@@ -110,7 +136,7 @@ The order below follows dependencies, not the historical sprint order.
 | ---: | --- | --- | --- |
 | 0 | Linux 4 KiB `O_DIRECT` eligibility and transfer probing | Portable correctness | Already implemented upstream; no duplicate PR |
 | 1 | Auto-budget from Linux `MemAvailable` and cgroup-v2 headroom | Generic safety; preserve other platforms | Issue #14 is closed; upstream has stable cgroup capacity and the GN100 pressure row rejects the remaining hard ceiling |
-| 2 | POSIX model-container ownership lock with explicit opt-out | Generic safety/policy | Open upstream as [PR #29](https://github.com/sqliteai/waste/pull/29); mergeable and awaiting review |
+| 2 | Opt-in POSIX model-container ownership lock | Generic safety/policy | Merged upstream as [PR #29](https://github.com/sqliteai/warp/pull/29); Spark integration now uses upstream's `exclusive_open` contract |
 | 3 | Explicit CPU-list affinity | Generic configuration | Implemented upstream in v0.6.6 as `--cpus`; no duplicate PR |
 | 4 | Final phase/layer trace and request-boundary flushing | Generic observability | Reconcile with upstream cache traces |
 | 5 | Transactional in-memory state export/import and caller-owned budget reservation | Generic engine API | Rebased cleanly on `d9b919a`; macOS/GN100 suites and real-K3 bit-exact round-trip pass |
@@ -120,8 +146,8 @@ The order below follows dependencies, not the historical sprint order.
 
 ### Submission recommendation after realignment
 
-Do not open the stack as a batch. PR #29 is the only active upstream request;
-wait for its review before creating another notification.
+Do not open the stack as a batch. PR #29 has landed; prepare and review the
+state-snapshot candidate next, but do not submit it without owner approval.
 
 1. **State snapshots remain the best next PR.** They are one commit and one
    engine primitive, passed real-K3 bit-exact restore, and enable more than the
@@ -179,13 +205,13 @@ cooldown gates, and fixed K3 prompts/budgets are Spark integration and evidence
 tools.  They do not belong in the portable engine PRs.
 
 The CUDA work is not a PR candidate on this pass. Upstream issue
-[#11](https://github.com/sqliteai/waste/issues/11) is already the active CUDA
+[#11](https://github.com/sqliteai/warp/issues/11) is already the active CUDA
 design thread, and upstream VQ4P arrived after the qualified GB10 VQ3R path.
 The least noisy contribution is one concise results comment there: exactness,
 engine-level CPU/CUDA and held-out results, power and storage bounds, the
 consolidated release link, and an offer to discuss the source.  A CUDA PR
 should wait for maintainer interest and a decision about VQ4P coverage.
-The prepared, unposted text is in
+The posted text and follow-ups are retained in
 [`upstream-drafts/issue-11-gb10-cuda.md`](upstream-drafts/issue-11-gb10-cuda.md).
 
 `pr/gcc-aarch64-native-note` is a separate documentation-only candidate.  It

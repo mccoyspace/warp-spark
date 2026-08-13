@@ -32,7 +32,7 @@ Attention + Gated MLA, 1M context, open weights July 27, 2026.
   residuals vector-quantized. Near-lossless at 3 bit; usable at 2 bit where
   GPTQ collapses (PPL 11.87 vs 438 on Qwen3-30B-A3B).
   [arXiv:2602.11184](https://arxiv.org/pdf/2602.11184)
-  **Half of it survived.** The residual VQ is the WASTE expert format and
+  **Half of it survived.** The residual VQ is the WARP expert format and
   earns its place — VQ beats round-to-nearest decisively below 4 bits. The
   *shared low-rank* half was the original centrepiece and does not pay for
   itself on Kimi's experts: 0.12 bits for 0.3 pp, and a loss at equal

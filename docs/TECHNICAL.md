@@ -117,7 +117,7 @@ so even the 3.32 GB cache records a 29.1% demand hit rate.
 
 ## Router lookahead
 
-At the end of layer L, WASTE runs layer L+1's resident router on layer L's
+At the end of layer L, WARP runs layer L+1's resident router on layer L's
 hidden state and starts fetching the six highest-ranked experts. The real
 router still selects the experts after the next hidden state exists; the
 prediction changes only when bytes move, so logits remain bit-identical.

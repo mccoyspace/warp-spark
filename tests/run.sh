@@ -57,11 +57,15 @@ head_ "model-container ownership"
 # This intentionally opens two contexts at once. Always give it a tiny
 # dedicated container rather than duplicating a caller-supplied K3 load.
 LOCK_MODEL="$TMP/lock-test.waste"
-if python3 tools/make_test_container.py "$LOCK_MODEL" >/dev/null 2>&1 &&
-   ./test_lock "$LOCK_MODEL" "$TMP" 2>/dev/null | grep -q '^PASS'; then
-    ok "same-process references, process exclusion, opt-out and cleanup"
+if ! python3 tools/make_test_container.py "$LOCK_MODEL" \
+        >"$TMP/lock-container.log" 2>&1; then
+    sk "model-container ownership lock" \
+       "could not build its synthetic container"
+elif ./test_lock "$LOCK_MODEL" "$TMP" >"$TMP/lock.log" 2>&1; then
+    ok "opt-in process exclusion, references, fail-open and cleanup"
 else
     no "model-container ownership lock"
+    head -20 "$TMP/lock.log"
 fi
 
 # ---------------------------------------------------------------- unit ----
@@ -708,6 +712,175 @@ else
     sk "engine checks" "no container at $MODEL"
 fi
 
+# --------------------------------------------------------------- rotary ----
+head_ "rotary (MLA on a model that is not NoPE)"
+
+# Everything above this point runs on a Kimi, and every Kimi sets
+# mla_use_nope — so none of it reaches rope_init or rope_apply in
+# src/model.c. The rotation was absent from the engine for that reason and
+# the suite stayed green throughout, which is the failure this section
+# exists to stop repeating.
+#
+# It builds its own DeepSeek-V3-shaped container rather than using $MODEL,
+# so it runs on every host and does not depend on which weights happen to be
+# on disk. Nobody ships a V3 container yet — that needs the fp8 reader —
+# but the shape is what the engine branches on, and the shape is free.
+ROPE="$TMP/rope.waste"
+RIDS=3,7,11,5,9,13,2,17,4,8,19,23,6,29,12,31
+if ! python3 tools/make_test_container.py --rope --seed 0 "$ROPE" >/dev/null 2>&1; then
+    sk "rotary checks" "make_test_container.py --rope did not build a container"
+else
+    ./test_forward "$ROPE" "$RIDS" "$TMP/rope_seq.bin" 0 >/dev/null 2>&1
+    if [ ! -s "$TMP/rope_seq.bin" ]; then
+        no "the engine did not run a container without mla_use_nope"
+    else
+        # Same two-source shape as the Kimi oracle above: generate from the
+        # reference where torch is available, fall back to the fixture where
+        # it is not. This container is *generated* rather than converted, so
+        # unlike that one it is byte-reproducible at seed 0 and the fixture
+        # is portable — the digest below is what says so.
+        RGEN=""
+        if command -v uv >/dev/null 2>&1; then
+            uv run --no-project --with torch \
+                python tools/deepseek_ref.py --container "$ROPE" --ids "$RIDS" \
+                --dump "$TMP/rope_ref.bin" >/dev/null 2>&1 || true
+            [ -s "$TMP/rope_ref.bin" ] && RGEN="$TMP/rope_ref.bin"
+        fi
+        RFIX=tests/fixtures/oracle_ropesynth_16tok.bin
+        rope_why=""
+        if [ -z "$RGEN" ] && [ -f "${RFIX%.bin}.json" ]; then
+            rope_why=$(python3 - "$ROPE" "${RFIX%.bin}.json" <<'PY'
+import hashlib, json, os, sys
+h = hashlib.sha256()
+for n in sorted(os.listdir(sys.argv[1])):
+    h.update(n.encode())
+    h.update(open(os.path.join(sys.argv[1], n), "rb").read())
+want = json.load(open(sys.argv[2])).get("container_sha256")
+if want and h.hexdigest() != want:
+    print("no uv to generate one, and make_test_container.py --rope no "
+          "longer builds the container this fixture was made from — "
+          "regenerate it, see " + os.path.basename(sys.argv[2]))
+PY
+)
+        fi
+        if [ -n "$rope_why" ]; then
+            sk "engine vs the rotary oracle" "$rope_why"
+        elif [ -n "$RGEN" ] || [ -f "$RFIX" ]; then
+            if python3 - "$TMP/rope_seq.bin" "${RGEN:-$RFIX}" <<'PY'
+import struct, sys
+def L(p):
+    b = open(p, "rb").read()
+    return struct.unpack(f"<{len(b)//4}f", b)
+a, b = L(sys.argv[1]), L(sys.argv[2])
+sys.exit(0 if max(abs(x - y) for x, y in zip(a, b)) < 1e-3 else 1)
+PY
+            then
+                if [ -n "$RGEN" ]
+                then ok "rotated MLA matches a PyTorch oracle built from this container"
+                else ok "rotated MLA matches the shipped rotary fixture"
+                fi
+            # An engine that skips the rotation still produces finite,
+            # weight-shaped logits — that is why this went unnoticed — so the
+            # diff is the only thing that separates the two.
+            else no "rotated MLA diverges from the oracle"
+            fi
+        else
+            sk "engine vs the rotary oracle" \
+               "no fixture; regenerate with tools/deepseek_ref.py --dump"
+        fi
+
+        # The chunked check above runs on $MODEL, which is NoPE. mla_layer is
+        # per-token on both paths, so this should hold by construction — and
+        # it is exactly the kind of "by construction" that a later batched
+        # MLA would break silently.
+        WASTE_CHUNK=1 ./test_forward "$ROPE" "$RIDS" "$TMP/rope_chunk.bin" 0 >/dev/null 2>&1
+        if python3 - "$TMP/rope_seq.bin" "$TMP/rope_chunk.bin" <<'PY'
+import struct, sys
+def L(p):
+    b = open(p, "rb").read()
+    return struct.unpack(f"<{len(b)//4}f", b)
+a, b = L(sys.argv[1]), L(sys.argv[2])
+d = max(abs(x - y) for x, y in zip(a, b))
+sys.exit(0 if d < 1e-3 and a.index(max(a)) == b.index(max(b)) else 1)
+PY
+        then ok "chunked prefill == token-at-a-time with rotation"
+        else no "chunked prefill diverges on a rotated model"
+        fi
+
+        # Same model, same seed, one line of config: mla_use_nope written out
+        # as false instead of omitted. A loader that tests the key for
+        # presence reads that as NoPE and skips the rotation, which is the
+        # pre-fix engine — so these logits have to match the ones above.
+        FALSE="$TMP/rope_nopefalse.waste"
+        if ! python3 tools/make_test_container.py --rope --nope false --seed 0 \
+             "$FALSE" >/dev/null 2>&1; then
+            sk "mla_use_nope: false rotates" "container not built"
+        else
+            ./test_forward "$FALSE" "$RIDS" "$TMP/rope_false.bin" 0 >/dev/null 2>&1
+            if [ -s "$TMP/rope_false.bin" ] && cmp -s "$TMP/rope_seq.bin" "$TMP/rope_false.bin"
+            then ok "mla_use_nope: false rotates, like the same model without the key"
+            else no "mla_use_nope: false was read as NoPE and skipped the rotation"
+            fi
+        fi
+
+        # null is how an HF config says "no scaling" and convert.py copies it
+        # verbatim, so it is the shape most containers on disk carry. It has
+        # to load as plain RoPE — the same as {} and the same as no key at
+        # all — rather than being read as a scaling with an unknown type.
+        none_ok=1
+        for shape in drop null empty; do
+            dir="$TMP/rope_$shape.waste"
+            rm -rf "$dir"
+            python3 tools/make_test_container.py --rope --rope-scaling "$shape" \
+                --seed 0 "$dir" >/dev/null 2>&1 || { none_ok=0; break; }
+            ./test_forward "$dir" "$RIDS" "$TMP/rs_$shape.bin" 0 >/dev/null 2>&1
+            [ -s "$TMP/rs_$shape.bin" ] || { none_ok=0; break; }
+            cmp -s "$TMP/rs_drop.bin" "$TMP/rs_$shape.bin" || { none_ok=0; break; }
+        done
+        if [ "$none_ok" = 1 ]
+        then ok "rope_scaling null and {} load as plain RoPE, like no key at all"
+        else no "rope_scaling null or {} did not load as plain RoPE"
+        fi
+    fi
+
+    # Shapes rope_init does not implement. Each has to be refused at load:
+    # running one would apply no rotation or the wrong one, and that is not a
+    # degraded answer but an unordered one.
+    rope_refused() {              # <what> <expected message> <container args...>
+        local what=$1 want=$2; shift 2
+        local dir="$TMP/rope_bad.waste"
+        rm -rf "$dir"
+        if ! python3 tools/make_test_container.py --rope "$@" "$dir" >/dev/null 2>&1; then
+            sk "$what is refused at load" "container not built"
+        # Read into a variable rather than piping: a refused load is a
+        # non-zero exit, which is the point, and under `set -o pipefail` that
+        # would sink the pipeline no matter what grep found.
+        elif printf '%s' "$(./test_forward "$dir" 3,7,11 "$TMP/bad.bin" 0 2>&1 || true)" \
+             | grep -q "$want"; then
+            ok "$what is refused at load"
+        else
+            no "$what loaded instead of being refused"
+        fi
+    }
+
+    # The rope table is a fixed WASTE_MAX_ROPE_HALF pairs.
+    rope_refused "a rope slice wider than the build holds" \
+                 "needs rotation" --qk-rope 132
+    # Anything but yarn — linear, dynamic — reaches none of the ramp below it.
+    rope_refused "an unimplemented rope_scaling type" \
+                 "not implemented, only yarn" --rope-type linear
+    # Unequal mscales put a ratio on cos/sin that rope_tables does not apply.
+    rope_refused "rope_scaling with mscale != mscale_all_dim" \
+                 "not implemented" --mscale 0.707
+    # A scaling object that carries no type is not the same as no scaling.
+    rope_refused "rope_scaling that carries no type" \
+                 "carries no type" --rope-scaling notype
+    # Present but not a boolean names no sequence order, so neither does a
+    # default picked for it.
+    rope_refused "mla_use_nope that is not true or false" \
+                 "not true or false" --nope 1
+fi
+
 # --------------------------------------------------------------- budget ----
 head_ "RAM budget"
 
@@ -715,10 +888,11 @@ head_ "RAM budget"
 # it always passes --budget. With no flag the engine chooses, and that
 # choice is all that stands between a model whose recommendation exceeds
 # the machine — K3 asks for 80.63 GB — and a swap storm. So assert the
-# shape, not a live number sampled by another process: the engine steps down
-# to one of floor + 3x, 2x, 1x, or the floor, less at most one expert record
-# of slot rounding. tests/test_memory.c separately proves largest-fitting
-# selection against fixed ceilings. Filling the cap instead is what put a 27 GB
+# rule, not a number, and it holds on any host: the engine steps down a
+# whole token working set at a time and takes the largest of
+# floor + 3x, 2x, 1x that fits under 3/4 of the RAM this process may use,
+# or the floor when not even one multiple does, less at most one expert
+# record of slot rounding. Filling the cap instead is what put a 27 GB
 # cache on a 64 GB machine and cost 8x throughput — docs/LEARNED.md §16.
 default_budget() {
     python3 - "$1" <<'PY'
@@ -733,34 +907,35 @@ def j(*a):
     return json.loads(r.stdout)
 
 plan, info = j("plan", sys.argv[1]), j("info", sys.argv[1])
-# Read all three engine-owned figures. Stable usable capacity prevents a
-# container from sizing against host RAM; the dynamic ceiling is the snapshot
-# an automatic open uses after current pressure. It is diagnostic here: the
-# later `info` process takes its own snapshot, so comparing the two exactly
-# would make a working-set boundary crossing look like an engine failure.
-physical = plan["physical_ram_bytes"]
-usable = plan["usable_ram_bytes"]
-cap = plan["memory_ceiling_bytes"]
-if physical and usable and usable > physical:
-    raise SystemExit("usable RAM exceeds physical RAM")
-if usable and cap and cap > usable:
-    raise SystemExit("current ceiling exceeds usable RAM")
+# From the engine rather than os.sysconf, which does not exist in Windows
+# CPython at all and would read the host's RAM inside a container anyway.
+# This is the same number the engine sized itself against, so what the
+# check still tests is the rule — floor + the largest whole working set
+# under 3/4 of it — and not the RAM reading, which has its own platform
+# code and no business being written twice. It is a capacity and not a
+# pressure reading, so it is the same in this process and in the `info`
+# one below; a ceiling that moved between the two would make this check
+# fail as an engine bug on any busy machine.
+phys = plan["usable_ram_bytes"]
+if not phys:
+    print("usable RAM unknown on this host")
+    sys.exit(0)
+cap = phys - phys // 4
 # what the engine actually holds: the plan's mandatory parts plus the
 # cache it really allocated, which is what `info` reports
 held = plan["floor_bytes"] - plan["min_expert_cache"] + info["expert_cache_bytes"]
-# recommended_bytes is floor + 3 * one token's working set, by construction.
-ws = (plan["recommended_bytes"] - plan["floor_bytes"]) // 3
+# the engine reports it: recommended_bytes is capped at the container's whole
+# expert set, so on a merged container it is no longer floor + 3 * this
+ws = plan["working_set_bytes"]
+want = plan["floor_bytes"]
+for k in (3, 2, 1):
+    if plan["floor_bytes"] + ws * k <= cap:
+        want = plan["floor_bytes"] + ws * k
+        break
 rec = plan["min_expert_cache"] // (2 * info["top_k"]) if info["top_k"] else 0
-targets = {plan["floor_bytes"] + ws * k for k in (0, 1, 2, 3)}
-matches = [target for target in targets
-           if target - rec - 1 <= held <= target]
-if len(matches) != 1:
-    raise SystemExit(f"resolved budget {held} is not one whole-working-set tier")
-want = matches[0]
 G = 1 << 30
-print(f"{held/G:.2f} GB held, legal tier {want/G:.2f} GB, "
-      f"plan-time ceiling snapshot {cap/G:.2f} GB, usable {usable/G:.2f} GB, "
-      f"physical {physical/G:.2f} GB")
+print(f"{held/G:.2f} GB held, ceiling {want/G:.2f} GB, usable {phys/G:.2f} GB")
+sys.exit(0 if want - rec - 1 <= held <= want else 1)
 PY
 }
 
@@ -1102,6 +1277,19 @@ elif out=$(python3 tests/test_convert_resume.py 2>&1); then
     ok "resume keeps finished layers, never renumbers them, and publishes"
 else
     no "convert.py resume"
+    printf '%s\n' "$out" | grep -E "FAIL|Error|Traceback" | head -5
+fi
+
+# The chat.json the converter installs has to be the one whose markup the
+# release's tokenizer carries. Installing the wrong one is silent: absent
+# markers encode as ordinary text, so the model reads its own turn structure
+# as prose and still answers, plausibly and wrongly. Same stubs, no weights.
+if ! command -v python3 >/dev/null 2>&1; then
+    sk "convert.py chat.json" "python3 not installed"
+elif out=$(python3 tests/test_convert_chat.py 2>&1); then
+    ok "each architecture gets its own chat.json, and no one else's"
+else
+    no "convert.py chat.json"
     printf '%s\n' "$out" | grep -E "FAIL|Error|Traceback" | head -5
 fi
 

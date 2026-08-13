@@ -18,7 +18,7 @@ counts, KDA:MLA ratio) still get confirmed at Gate 1.
 > questions at the end are all settled in [K3.md](K3.md); the numbers in
 > this file that were predictions are annotated where they appear.
 
-## Why this matters for WASTE
+## Why this matters for WARP
 
 KDA state is O(1) in sequence length: one matrix state per head plus a
 tiny conv window. At 1M context the attention side costs megabytes, not
@@ -74,7 +74,7 @@ Structural facts that shape the C kernel:
    also produced via a rank-128 bottleneck (`g_a_proj`/`g_b_proj`). This
    is the "gated" in Gated MLA/KDA — it is on the *output*, elementwise.
 6. Reference switches to a fused-recurrent path when `q_len <= 64` and a
-   chunked path otherwise — the same split WASTE should use
+   chunked path otherwise — the same split WARP should use
    (decode = recurrent, prefill = chunked).
 
 ## Recurrence
@@ -181,7 +181,7 @@ here. One rental, two gates.
 
 > **No rental was needed (2026-07-27, noted here 2026-08-02).** Step 3
 > passed the same day against `tools/kimi_ref.py` — a pure-PyTorch oracle
-> reading the WASTE container directly, which sidesteps `fla-core` and
+> reading the WARP container directly, which sidesteps `fla-core` and
 > Triton entirely because it never loads the HF modeling code. Kimi-Linear
 > end to end at rel 1.58e-06, and K3's 93 layers at ≤1.14e-05 with final
 > logits at 3.56e-06 once the weights landed. The routing trace came from

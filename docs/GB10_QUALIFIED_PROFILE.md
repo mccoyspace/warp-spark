@@ -9,7 +9,7 @@ own branches.
 
 | Setting | Frozen value |
 |---|---|
-| Model | Kimi K3 converted WASTE container |
+| Model | Kimi K3 converted WARP `.waste` container |
 | CUDA KDA | `WASTE_CUDA_KDA=1` |
 | CUDA dense | `WASTE_CUDA_DENSE=2` |
 | CUDA VQ | `WASTE_CUDA_VQ=2`, group 1 |

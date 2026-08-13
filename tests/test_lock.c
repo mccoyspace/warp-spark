@@ -73,12 +73,12 @@ static int raw_lock_available(const char *model)
     return rc == 0;
 }
 
-static int probe(const char *model, int allow, uint64_t budget,
+static int probe(const char *model, int exclusive, uint64_t budget,
                  waste_status expected)
 {
     waste_cfg cfg;
     waste_cfg_init(&cfg);
-    cfg.allow_concurrent_open = allow;
+    cfg.exclusive_open = exclusive;
     cfg.ram_budget_bytes = budget;
     waste_ctx *ctx = NULL;
     const waste_status got = waste_open(model, &cfg, &ctx);
@@ -94,17 +94,17 @@ static int probe(const char *model, int allow, uint64_t budget,
 /* Exec makes this a genuinely separate library instance rather than relying
  * on fork's copied registry. It also verifies the lock descriptor is closed
  * across exec while the parent's descriptor continues to own the lock. */
-static int child_probe(const char *self, const char *model, int allow,
+static int child_probe(const char *self, const char *model, int exclusive,
                        uint64_t budget, waste_status expected)
 {
     const pid_t pid = fork();
     if (pid < 0) return 1;
     if (pid == 0) {
         char a[2], b[32], e[16];
-        snprintf(a, sizeof a, "%d", allow);
+        snprintf(a, sizeof a, "%d", exclusive);
         snprintf(b, sizeof b, "%llu", (unsigned long long)budget);
         snprintf(e, sizeof e, "%d", expected);
-        execl(self, self, "--probe", model, a, b, e, (char *)NULL);
+        execlp(self, self, "--probe", model, a, b, e, (char *)NULL);
         _exit(127);
     }
     int ws;
@@ -128,10 +128,10 @@ static void remove_variant(const char *dir, int trunk)
 int main(int argc, char **argv)
 {
     if (argc == 6 && !strcmp(argv[1], "--probe")) {
-        const int allow = atoi(argv[3]);
+        const int exclusive = atoi(argv[3]);
         const uint64_t budget = (uint64_t)strtoull(argv[4], NULL, 10);
         const waste_status expected = (waste_status)strtol(argv[5], NULL, 10);
-        return probe(argv[2], allow, budget, expected);
+        return probe(argv[2], exclusive, budget, expected);
     }
     if (argc != 3) {
         fprintf(stderr, "usage: %s MODEL SCRATCH-DIR\n", argv[0]);
@@ -142,7 +142,7 @@ int main(int argc, char **argv)
 
     waste_cfg cfg;
     waste_cfg_init(&cfg);
-    CHECK(cfg.allow_concurrent_open == 0, "ownership must default on");
+    CHECK(cfg.exclusive_open == 0, "ownership must default off");
     CHECK(strstr(waste_strerror(WASTE_E_BUSY), "another process") != NULL,
           "WASTE_E_BUSY must explain the contention");
     waste_memplan plan;
@@ -151,6 +151,35 @@ int main(int argc, char **argv)
         return 1;
     }
     cfg.ram_budget_bytes = plan.floor_bytes;
+
+    /* Ordinary opens do not take ownership. A second process therefore
+     * reaches budget validation instead of being rejected by container
+     * identity. */
+    waste_ctx *ordinary = NULL;
+    CHECK(waste_open(model, &cfg, &ordinary) == WASTE_OK, "default open");
+    CHECK(ordinary != NULL, "default context");
+    CHECK(raw_lock_available(model), "ownership must be opt-in");
+    if (ordinary) waste_close(ordinary);
+
+    /* A search-only directory is still a readable container: known files can
+     * be opened through it, but opening the directory itself for flock fails.
+     * Exclusive ownership is advisory, so that lock failure must not turn a
+     * model the engine can read into an open failure. */
+    struct stat model_mode;
+    const int have_mode = stat(model, &model_mode) == 0;
+    CHECK(have_mode, "read container permissions");
+    if (have_mode) {
+        const int search_only = chmod(model, 0111) == 0;
+        CHECK(search_only, "make container search-only");
+        if (search_only) {
+            CHECK(probe(model, 1, plan.floor_bytes, WASTE_OK) == 0,
+                  "locking failure must proceed without ownership");
+        }
+        CHECK(chmod(model, model_mode.st_mode & 0777) == 0,
+              "restore container permissions");
+    }
+
+    cfg.exclusive_open = 1;
 
     waste_ctx *a = NULL, *b = NULL;
     CHECK(waste_open(model, &cfg, &a) == WASTE_OK, "first open");
@@ -162,26 +191,26 @@ int main(int argc, char **argv)
      * its own flock. Keeping it open exercises reference-counted release. */
     CHECK(waste_open(model, &cfg, &b) == WASTE_OK, "same-process second open");
     CHECK(b != NULL, "second context");
-    CHECK(child_probe(argv[0], model, 0, 1, WASTE_E_BUSY) == 0,
+    CHECK(child_probe(argv[0], model, 1, 1, WASTE_E_BUSY) == 0,
           "competing process must receive WASTE_E_BUSY before budgeting");
-    CHECK(child_probe(argv[0], model, 1, 1, WASTE_E_RAM_BUDGET) == 0,
-          "explicit opt-out must bypass ownership");
+    CHECK(child_probe(argv[0], model, 0, 1, WASTE_E_RAM_BUDGET) == 0,
+          "default open must bypass optional ownership");
 
     waste_close(a);
     a = NULL;
     CHECK(!raw_lock_available(model),
           "closing one context must retain the other context's ownership");
-    CHECK(child_probe(argv[0], model, 0, 1, WASTE_E_BUSY) == 0,
+    CHECK(child_probe(argv[0], model, 1, 1, WASTE_E_BUSY) == 0,
           "remaining same-process reference must exclude competitors");
 
     waste_close(b);
     b = NULL;
     CHECK(raw_lock_available(model), "last close must release ownership");
-    CHECK(child_probe(argv[0], model, 0, 1, WASTE_E_RAM_BUDGET) == 0,
+    CHECK(child_probe(argv[0], model, 1, 1, WASTE_E_RAM_BUDGET) == 0,
           "a new process must pass ownership after normal close");
 
     /* Every return after acquisition must release the OS lock. */
-    CHECK(probe(model, 0, 1, WASTE_E_RAM_BUDGET) == 0,
+    CHECK(probe(model, 1, 1, WASTE_E_RAM_BUDGET) == 0,
           "budget failure status");
     CHECK(raw_lock_available(model), "budget failure must release ownership");
 
@@ -226,7 +255,7 @@ int main(void)
 {
     waste_cfg cfg;
     waste_cfg_init(&cfg);
-    if (cfg.allow_concurrent_open != 0) return 1;
+    if (cfg.exclusive_open != 0) return 1;
     puts("PASS model-container ownership lock (not used on this platform)");
     return 0;
 }

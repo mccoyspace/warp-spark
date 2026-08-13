@@ -9,9 +9,9 @@ account of "what is left", started after
 an outside article
 ([AirLLM](https://github.com/lyogavin/airllm) running K3 at ~5 minutes per
 token) prompted a review of the streaming path. The article itself has
-nothing this engine wants — WASTE is ~100x faster and never expands an
+nothing this engine wants — WARP is ~100x faster and never expands an
 expert at all — but one line of it does: **AirLLM overlaps loading with
-compute and WASTE does not.**
+compute and WARP does not.**
 
 Everything below was measured on the 64 GB M5 Pro with the container on the
 internal SSD, unless marked as an estimate. Estimates are labelled and their

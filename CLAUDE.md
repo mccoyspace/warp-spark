@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## What this is
 
-WASTE is an embeddable MoE inference engine in C11 (no third-party runtime
+WARP is an embeddable MoE inference engine in C11 (no third-party runtime
 deps) that keeps a model's dense trunk resident and streams routed experts
 from disk, using the remaining RAM as a bounded expert cache. Its proof
 point is Kimi K3 (2.78T params, 982 GiB container) on a 64 GB laptop.
@@ -219,6 +219,9 @@ Stdlib-only OpenAI-compatible HTTP. `xtml.py` is a **port** of the release's
 `encoding_k3.py` (K3 ships no Jinja template), checked segment-for-segment
 against that file whenever `K3_DIR` is set; `regions.py` is the streaming
 parser that reads replies back into reasoning / content / `tool_calls`;
+`chatfmt.py` is the fallback for a container with no XTML markers, serving
+it from the same `chat.json` the CLI reads — plain conversation only, with
+tools, thinking and images refused by name rather than dropped;
 `engine.py` is the ctypes binding plus one lock held for a whole generation
 (a `waste_ctx` is not thread-safe). Struct layouts in `engine.py` mirror
 `waste.h` field for field — change one, change the other.

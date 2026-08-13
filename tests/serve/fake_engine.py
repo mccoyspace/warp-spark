@@ -30,24 +30,34 @@ MARKERS = {1: xtml.OPEN_TOKEN, 2: xtml.CLOSE_TOKEN,
            3: xtml.SEP_TOKEN, 4: xtml.END_OF_MSG_TOKEN}
 _BY_TEXT = {v: k for k, v in MARKERS.items()}
 
+# What a chat.json container carries instead: Kimi-Linear's markup, which
+# shares no marker with XTML. Same ids-are-structure discipline, different
+# vocabulary — which is the whole point of testing against it.
+LINEAR_MARKERS = {11: "<|im_system|>", 12: "<|im_user|>",
+                  13: "<|im_assistant|>", 14: "<|im_middle|>",
+                  15: "<|im_end|>"}
+
 # Ordinary text starts here, so no piece of content can collide with a
 # marker id — the same separation the real container gets from its
 # reserved block.
 _TEXT_BASE = 1000
 
 
-def split_markers(text: str) -> list[tuple[int, str]]:
+def split_markers(
+        text: str,
+        by_text: Optional[dict[str, int]] = None) -> list[tuple[int, str]]:
     """Cut a reply into (token_id, piece), markers as their own tokens.
 
     Everything else becomes one token per character, which is not how BPE
     works but is the most demanding shape for a streaming parser: every
     boundary is a chunk boundary.
     """
+    by_text = _BY_TEXT if by_text is None else by_text
     out: list[tuple[int, str]] = []
     rest = text
     while rest:
         best, marker = -1, ""
-        for m in _BY_TEXT:
+        for m in by_text:
             p = rest.find(m)
             if p >= 0 and (best < 0 or p < best):
                 best, marker = p, m
@@ -55,7 +65,7 @@ def split_markers(text: str) -> list[tuple[int, str]]:
             out.extend((_TEXT_BASE + ord(c), c) for c in rest)
             break
         out.extend((_TEXT_BASE + ord(c), c) for c in rest[:best])
-        out.append((_BY_TEXT[marker], ""))
+        out.append((by_text[marker], ""))
         rest = rest[best + len(marker):]
     return out
 
@@ -67,6 +77,13 @@ class FakeEngine:
     reply: str = "Hello!"
     vision: bool = False
     ctx_max: int = 4096
+    # A container whose tokenizer has no XTML markers — any non-K3 one.
+    # marker_ids() is what discovers that, and it raises.
+    no_markers: bool = False
+    # The control tokens this container's tokenizer does have, and where
+    # ChatFormat.load looks for a chat.json.
+    markers: dict[int, str] = field(default_factory=lambda: dict(MARKERS))
+    model_path: str = ""
     # Raised by generate(), to exercise the error paths.
     fail_with: Optional[Exception] = None
     # Sleep this long before each token, to test client disconnects.
@@ -96,8 +113,17 @@ class FakeEngine:
     def lock(self) -> threading.RLock:
         return self._lock
 
+    @property
+    def _by_text(self) -> dict[str, int]:
+        return {v: k for k, v in self.markers.items()}
+
     def marker_ids(self) -> dict[int, str]:
-        return dict(MARKERS)
+        if self.no_markers:
+            raise EngineError(
+                f"{xtml.OPEN_TOKEN} is not a single token in this container "
+                f"(got 5): its specials.json does not carry K3's XTML "
+                f"markers", WASTE_E_UNSUPPORTED)
+        return dict(self.markers)
 
     def model_info(self) -> dict:
         return {"n_layers": 4, "n_experts": 8, "top_k": 2, "hidden": 128,
@@ -120,7 +146,7 @@ class FakeEngine:
     def tokenize(self, text: str, *, markup: bool = False,
                  add_bos: bool = False) -> list[int]:
         if markup:
-            return [tid for tid, _ in split_markers(text)]
+            return [tid for tid, _ in split_markers(text, self._by_text)]
         # Text mode: markers are ordinary characters, never control ids.
         return [_TEXT_BASE + ord(c) for c in text]
 
@@ -134,8 +160,8 @@ class FakeEngine:
     def detokenize(self, tokens: list[int]) -> str:
         out = []
         for t in tokens:
-            if t in MARKERS:
-                out.append(MARKERS[t])
+            if t in self.markers:
+                out.append(self.markers[t])
             elif t >= _TEXT_BASE:
                 out.append(chr(t - _TEXT_BASE))
         return "".join(out)
@@ -226,7 +252,7 @@ class FakeEngine:
                                "max_tokens": max_tokens,
                                "stop_tokens": list(stop_tokens or [])})
 
-            tokens = split_markers(self.reply)[:max_tokens]
+            tokens = split_markers(self.reply, self._by_text)[:max_tokens]
             for i, (tid, piece) in enumerate(tokens):
                 if self.delay:
                     time.sleep(self.delay)

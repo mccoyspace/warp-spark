@@ -27,7 +27,7 @@ import uuid
 from pathlib import Path
 from typing import Any, Optional
 
-from . import xtml
+from . import chatfmt, xtml
 from .engine import Engine
 from .regions import RegionParser
 
@@ -295,8 +295,14 @@ class Prompt:
 
 
 def build_prompt(engine: Engine, body: dict, *, default_thinking: bool,
-                 allow_local_images: bool, tmpdir: str) -> Prompt:
+                 allow_local_images: bool, tmpdir: str,
+                 fmt: Any = xtml) -> Prompt:
     """Messages in, token ids out.
+
+    `fmt` is the chat format: the xtml module for a K3 container, or a
+    chatfmt.ChatFormat built from the container's own chat.json. Both
+    expose build_chat_segments and image_prompt with the same signatures,
+    so nothing below here knows which one it has.
 
     The order here is not arbitrary. Images are encoded *first*, because
     each one contributes a media block to the text and the engine's queue
@@ -355,7 +361,7 @@ def build_prompt(engine: Engine, body: dict, *, default_thinking: bool,
             # half-queued.
             w, h = engine.image_dimensions(path)
             engine.image_add(path)
-            image_prompts.append(xtml.image_prompt(w, h))
+            image_prompts.append(fmt.image_prompt(w, h))
             n_images += 1
     finally:
         # waste_image_add encodes on the spot rather than holding the path
@@ -376,12 +382,14 @@ def build_prompt(engine: Engine, body: dict, *, default_thinking: bool,
     if response_format is not None:
         kwargs["response_format"] = response_format
 
+    family_root_end: list[int] = []
     try:
-        family_root_end: list[int] = []
-        segments = xtml.build_chat_segments(
+        segments = fmt.build_chat_segments(
             messages, tools, thinking=thinking, add_generation_prompt=True,
             image_prompts=image_prompts or None,
             family_root_end=family_root_end, **kwargs)
+    except chatfmt.ChatFormatError as e:
+        raise APIError(str(e), param=e.param or "messages")
     except xtml.XTMLError as e:
         raise APIError(str(e), param="messages")
 

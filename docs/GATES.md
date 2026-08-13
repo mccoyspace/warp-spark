@@ -88,7 +88,7 @@ top of the range every earlier projection assumed, and it has 1.7 TB free.
 - **`/Volumes/WasteDisk/k3/` = download + staging** for the ~1.5 TB of raw
   MXFP4 shards (sequential writes at 0.9 GB/s are perfectly adequate, and
   it keeps the raw download off the internal disk permanently).
-- **internal SSD = the converted WASTE container** (~700-900 GB, fits in
+- **internal SSD = the converted WARP container** (~700-900 GB, fits in
   1.7 TB free). This is what the engine streams experts from at runtime.
 - Conversion reads shards sequentially from external → writes container to
   internal. Neither step is bottlenecked by the USB bridge.
@@ -254,7 +254,7 @@ criterion is written into [FORMAT.md](FORMAT.md).
 on both the CPU baseline and the NEON path.
 
 **Step 3** (full forward pass vs oracle, real weights). `src/model.c`
-loads a WASTE container and runs Kimi-Linear end to end in C — trunk
+loads a WARP container and runs Kimi-Linear end to end in C — trunk
 dequantized at load, experts read one 4 KiB record at a time and
 dequantized on demand, KDA through the dispatch table, MLA with a KV
 cache, sigmoid + top-k routing. Diffed against `tools/kimi_ref.py` on the

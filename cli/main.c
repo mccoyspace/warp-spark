@@ -112,7 +112,7 @@ typedef struct {
     uint64_t budget;
     uint32_t ctx, max_tokens;
     float temperature, top_p;
-    int top_k, threads, quiet, learn, json, no_echo, allow_concurrent;
+    int top_k, threads, quiet, learn, json, no_echo, exclusive_open;
     int media_inlined;              /* the media block is already in the
                                        prompt string, inside the user turn */
     uint64_t seed;
@@ -190,7 +190,7 @@ static int parse_opts(int argc, char **argv, int from, opts *o)
         else if (!strcmp(a, "--json")) o->json = 1;
         else if (!strcmp(a, "--raw")) o->raw = 1;
         else if (!strcmp(a, "--verify")) o->verify = 1;
-        else if (!strcmp(a, "--allow-concurrent-open")) o->allow_concurrent = 1;
+        else if (!strcmp(a, "--exclusive-open")) o->exclusive_open = 1;
         else if (!strcmp(a, "-")) {                /* explicit stdin */
             if (o->n_pos >= MAX_POS) { fprintf(stderr, "too many arguments\n"); return -1; }
             o->pos[o->n_pos++] = "-";
@@ -274,7 +274,7 @@ static waste_status open_model(const char *path, const opts *o, waste_ctx **ctx)
      * Kimi-Linear. Worth it for a container that was copied or downloaded
      * and has not been read since. */
     cfg.verify_records = o->verify;
-    cfg.allow_concurrent_open = o->allow_concurrent;
+    cfg.exclusive_open = o->exclusive_open;
     const waste_status st = waste_open(path, &cfg, ctx);
     /* Two statuses that say nothing useful on their own when --cpus is
      * what produced them, and it usually is: nothing else here can be
@@ -285,6 +285,10 @@ static waste_status open_model(const char *path, const opts *o, waste_ctx **ctx)
     else if (o->cpus && st == WASTE_E_UNSUPPORTED)
         fprintf(stderr, "--cpus: this platform does not bind threads to "
                         "CPUs (Linux and Windows only)\n");
+    else if (o->exclusive_open && st == WASTE_E_BUSY)
+        fprintf(stderr, "--exclusive-open: another process owns this "
+                        "container; stop it or retry without "
+                        "--exclusive-open\n");
     return st;
 }
 
@@ -491,16 +495,25 @@ static int cmd_plan(int argc, char **argv)
     if (o.json) {
         printf("{\"ctx\":%u,\"trunk_bytes\":%llu,\"state_bytes\":%llu,"
                "\"scratch_bytes\":%llu,\"min_expert_cache\":%llu,"
-               "\"floor_bytes\":%llu,\"recommended_bytes\":%llu",
+               "\"floor_bytes\":%llu,\"recommended_bytes\":%llu,"
+               "\"working_set_bytes\":%llu",
                o.ctx, (unsigned long long)p.trunk_bytes,
                (unsigned long long)p.state_bytes,
                (unsigned long long)p.scratch_bytes,
                (unsigned long long)p.min_expert_cache,
                (unsigned long long)p.floor_bytes,
-               (unsigned long long)p.recommended_bytes);
-        /* Stable capacity and current safety are different questions. Report
-         * both beside physical RAM so clients do not duplicate platform and
-         * cgroup parsing or mistake host RAM for container capacity. */
+               (unsigned long long)p.recommended_bytes,
+               (unsigned long long)p.working_set_bytes);
+        /* The human form already says "machine N GB" and the JSON did not,
+         * so anything reading this had to work out physical RAM for itself
+         * — which on Windows means neither sysconf nor /proc exists and the
+         * caller reimplements GlobalMemoryStatusEx. The engine already
+         * knows; 0 when it cannot tell.
+         *
+         * Both figures, because in a container they differ and only the
+         * second is the one the budget was sized against. A reader given
+         * only physical_ram_bytes there would compute a ceiling the engine
+         * never used, and conclude the engine had ignored its own rule. */
         printf(",\"physical_ram_bytes\":%llu,\"usable_ram_bytes\":%llu,"
                "\"memory_ceiling_bytes\":%llu",
                (unsigned long long)waste_physical_ram(),
@@ -529,8 +542,14 @@ static int cmd_plan(int argc, char **argv)
     printf("  ---------------------------------\n");
     printf("  FLOOR                 %12s\n", b[4]);
     human(p.recommended_bytes, b[0], 32);
-    printf("  recommended           %12s   (floor + 3x a token's working set;\n"
-           "                                      below that the cache keeps\n"
+    /* Not "floor + 3x a working set" any more: waste_plan_memory caps the
+     * cache term at the container's whole expert set, which fires on merged
+     * containers (top_k == num_experts) and would make that phrase describe
+     * a number the engine did not pick. */
+    printf("  recommended           %12s   (floor + 3x a token's working set,\n"
+           "                                      capped at every expert the\n"
+           "                                      container holds; below one\n"
+           "                                      working set the cache keeps\n"
            "                                      nothing alive between tokens)\n", b[0]);
     if (p.vision_bytes) {
         char vb[32];
@@ -1239,8 +1258,8 @@ int main(int argc, char **argv)
                "given as - or simply piped in.\n\n"
                "options: --budget 8G  --ctx N  -n N  --temp F  --top-p F\n"
                "         --top-k N  --seed N  --threads N  --cpus LIST\n"
-               "         --file F  --stop STR  --json  -q  --learn  --verify\n"
-               "         --allow-concurrent-open\n"
+               "         --stop STR  --file F  --json  -q  --learn  --verify\n"
+               "         --exclusive-open\n"
          "  --stop  ends generation when the text appears\n"
          "  --json  machine-readable output for eval, tokenize, plan,\n"
          "          info and bench\n"
@@ -1252,7 +1271,7 @@ int main(int argc, char **argv)
          "  the cores differ: on a two-die Ryzen, six threads on one die\n"
          "  measured 16-25%% faster than six split across both. Linux and\n"
          "  Windows; the default is to leave placement to the OS\n"
-         "  --allow-concurrent-open opts out of the POSIX container lock\n"
+         "  --exclusive-open asks for single-process container ownership\n"
          "  --verify checks each expert record's checksum as it is read,\n"
          "  for a container you have not read since copying it. Costs ~5%%\n"
          "  on Kimi-Linear, ~1%% on K3; off otherwise\n",
