@@ -49,8 +49,9 @@ automatic budget, and the opt-in exclusive-open implementation accepted from
 [PR #29](https://github.com/sqliteai/warp/pull/29). It retains the qualified
 Spark CUDA paths, request-scoped Q0 profile, exact prefix snapshots, and
 host-owned snapshot reservation. Model-free build and server suites pass on
-macOS; native CUDA/K3 qualification remains required before deploying this
-source to the running Spark service.
+macOS: 46 passed, 0 failed and 13 expected skips, plus 314 server checks with
+two release-dependent skips. Native CUDA/K3 qualification remains required
+before deploying this source to the running Spark service.
 
 Issue [#11](https://github.com/sqliteai/warp/issues/11) now has a direct
 maintainer decision: the GB10 CUDA results are useful counterevidence to a
@@ -59,6 +60,22 @@ CUDA backend it cannot run or test. A source-separated backend is useful for
 architecture review, not yet a merge request. The next design question is a
 stable out-of-tree backend seam versus an in-tree guarded backend with a named
 hardware owner.
+
+The review branches were then rebuilt on this WARP base, with their old heads
+preserved under `archive/pre-warp-*`:
+
+- `pr/in-memory-state-snapshots` at `35c0506`: 41/0/13 plus 216 server checks;
+- `pr/server-prefix-cache` at `10a239c`, stacked on snapshots: its model-free
+  suite and all 245 server checks pass, including the new `chat.json` path;
+- `pr/gcc-aarch64-native-note` at `5fe7fcf`: documentation/build probe only;
+- `exp/studio-usage-learning` at `33674b6`, rebuilt on `spark/integration`:
+  47/0/13 plus 317 server checks.
+
+The measured `exp/cuda-vq4p-gb10` branch was not rewritten: its published
+numbers must continue to name the exact source that produced them. Current
+qualified VQ3R CUDA source is present in `spark/integration`; a source-separated
+review branch should be prepared only for the issue #11 architecture discussion,
+not presented as a merge request.
 
 ## Previous upstream refresh: 2026-08-07
 
