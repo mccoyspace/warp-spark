@@ -78,8 +78,8 @@ preserved under `archive/pre-warp-*`:
   245 server checks pass, including the `chat.json` path;
 - `pr/gcc-aarch64-native-note` at `11301f4`: 44/0/13; documentation/build probe
   only;
-- `exp/studio-usage-learning` at `33674b6`, rebuilt on `spark/integration`:
-  47/0/13 plus 317 server checks.
+- `exp/studio-usage-learning` at `de70c6b`, rebuilt on `spark/integration`:
+  50/0/13 plus all 317 server checks.
 
 The measured `exp/cuda-vq4p-gb10` branch was not rewritten: its published
 numbers must continue to name the exact source that produced them. Current
