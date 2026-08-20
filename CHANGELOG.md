@@ -8,6 +8,22 @@ measurement is the useful part.
 `docs/LEARNED.md` carries the full reasoning; this file carries what
 changed. Each entry names the section to read for the numbers behind it.
 
+## 0.7.0-spark.4 — 2026-08-19
+
+Spark integration now merges upstream WARP `7f1fbba`: the 0.6.8 release plus
+its post-release downloader, FP8-reader, test-race, Windows-portability, and
+documentation corrections. K3's Linux inference path is unchanged. The merge
+retains the qualified GN100 CUDA paths and incorporates upstream's official
+record of the coherent-memory and VQ4P results.
+
+The refreshed tree passes 50 model-free checks with 13 expected skips and all
+314 server checks on macOS. The active GCC-note, state-snapshot, and stacked
+prefix-cache candidates were rebuilt on the same upstream base without
+conflicts and pass their applicable suites. The native GB10 CUDA build passes
+48 model-free checks with 14 expected skips and all 314 server checks. A short
+real-K3 CUDA compatibility smoke produced identical token, logit, route, I/O,
+and CUDA counters across both repeats with no swap.
+
 ## 0.7.0-spark.3 — 2026-08-12
 
 Spark integration is realigned with upstream WARP 0.6.8 development at

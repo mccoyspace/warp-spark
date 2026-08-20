@@ -42,16 +42,25 @@ the executable, C symbols, `WASTE_*` variables, and `.waste` container extension
 remain intentionally unchanged. The Spark fork follows the public WARP name
 without creating an incompatible symbol rename.
 
-`spark/integration` now merges upstream `505e481` (0.6.8 development, following
-the 0.6.7 release). The merge adopts `chat.json` serving, DeepSeek-family
-conversion and attention corrections, the measured three-quarter-memory
-automatic budget, and the opt-in exclusive-open implementation accepted from
-[PR #29](https://github.com/sqliteai/warp/pull/29). It retains the qualified
-Spark CUDA paths, request-scoped Q0 profile, exact prefix snapshots, and
-host-owned snapshot reservation. Model-free build and server suites pass on
-macOS: 46 passed, 0 failed and 13 expected skips, plus 314 server checks with
-two release-dependent skips. Native CUDA/K3 qualification remains required
-before deploying this source to the running Spark service.
+`spark/integration` now merges upstream `7f1fbba`: the 0.6.8 release and its
+post-release correctness, portability, test, and documentation fixes. The
+merge adopts the FP8-reader coverage, downloader correction, and upstream's
+official record of the coherent-memory and VQ4P results. It retains the
+qualified Spark CUDA paths, request-scoped Q0 profile, exact prefix snapshots,
+and host-owned snapshot reservation. Model-free build and server suites pass
+on macOS: 50 passed, 0 failed and 13 expected skips, plus all 314 server checks
+with two release-dependent skips. On the GN100, the native ARM/CUDA suite
+passes 48/0/14 and all 314 server checks pass with the same two reference
+skips. The extra model-free skip is the unavailable `uv`-based kernel fixture.
+
+A short real-K3 compatibility smoke used the qualified 59,340-MiB cache,
+ten-core placement, Q0, CUDA KDA/dense/VQ stack, and frozen usage hotlist. Its
+two one-token repeats produced identical token, logit, route, I/O, and CUDA
+counters at 0.627740 and 0.628984 tok/s. The token hash
+`0x3bb98078eda15e96` matches the retained pre-refresh smoke; the current CUDA
+logit hash was identical across repeats at `0x204d300cd0ba02a9`. Swap stayed at
+zero and the Q0 holder closed cleanly. This is a compatibility smoke, not a new
+throughput estimate.
 
 Issue [#11](https://github.com/sqliteai/warp/issues/11) now has a direct
 maintainer decision: the GB10 CUDA results are useful counterevidence to a
@@ -64,10 +73,11 @@ hardware owner.
 The review branches were then rebuilt on this WARP base, with their old heads
 preserved under `archive/pre-warp-*`:
 
-- `pr/in-memory-state-snapshots` at `35c0506`: 41/0/13 plus 216 server checks;
-- `pr/server-prefix-cache` at `10a239c`, stacked on snapshots: its model-free
-  suite and all 245 server checks pass, including the new `chat.json` path;
-- `pr/gcc-aarch64-native-note` at `5fe7fcf`: documentation/build probe only;
+- `pr/in-memory-state-snapshots` at `d3b31c0`: 44/0/13 plus all 216 server checks;
+- `pr/server-prefix-cache` at `a70b444`, stacked on snapshots: 44/0/13 and all
+  245 server checks pass, including the `chat.json` path;
+- `pr/gcc-aarch64-native-note` at `11301f4`: 44/0/13; documentation/build probe
+  only;
 - `exp/studio-usage-learning` at `33674b6`, rebuilt on `spark/integration`:
   47/0/13 plus 317 server checks.
 
