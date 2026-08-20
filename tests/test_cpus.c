@@ -31,7 +31,9 @@
 #include <string.h>
 
 #if defined(__linux__)
+#include <errno.h>
 #include <sys/syscall.h>
+#include <time.h>
 #include <unistd.h>
 #define HAVE_READBACK 1
 #else
@@ -110,16 +112,38 @@ static int read_affinity(waste_cpumask *m)
 }
 
 /* Every range records the thread that ran it and what that thread was
- * allowed to run on, then burns enough time that the next chunk is taken
- * by a different thread rather than by this one coming back for it. */
+ * allowed to run on, then waits for the other chunks at a rendezvous.
+ *
+ * The wait used to be a fixed 2M-iteration spin per element, on the
+ * reasoning that the caller would still be burning time when the worker
+ * woke and would therefore not come back for the next chunk itself. That is
+ * a wall-clock assumption, and it stopped holding under load: 6 failures in
+ * 12 full suite runs on a 24-thread box, 1 in 40 standalone with the
+ * machine busy, 0 in 8 idle — the suite is its own load, which is why it
+ * failed there most (#30). When it lost the race the caller drained every
+ * chunk and `distinct` came back 1, which reads as "the pool did not
+ * participate" when the pool only did not need to.
+ *
+ * A rendezvous does not race, because a thread holding a chunk cannot come
+ * back for another one while it is waiting inside it. The caller blocking
+ * here is precisely what gives a worker the chance to take the next chunk,
+ * so the property is established rather than hoped for.
+ *
+ * Timed rather than a bare wait: a pool that genuinely does not participate
+ * has to fail this check, not hang the suite on it. */
 #define MAXREC 256
+#define RENDEZVOUS_S 10
 static struct { pthread_t th; waste_cpumask mask; } rec[MAXREC];
 static int nrec;
 static pthread_mutex_t rec_mu = PTHREAD_MUTEX_INITIALIZER;
 
+static pthread_mutex_t rv_mu = PTHREAD_MUTEX_INITIALIZER;
+static pthread_cond_t rv_cv = PTHREAD_COND_INITIALIZER;
+static int rv_arrived, rv_want, rv_timedout;
+
 static void note_range(int b, int e, void *arg)
 {
-    (void)arg;
+    (void)arg; (void)b; (void)e;
     waste_cpumask mine;
     const int ok = read_affinity(&mine) == 0;
 
@@ -131,10 +155,23 @@ static void note_range(int b, int e, void *arg)
     }
     pthread_mutex_unlock(&rec_mu);
 
-    volatile long sink = 0;
-    for (int i = b; i < e; i++)
-        for (long k = 0; k < 2000000L; k++) sink += k;
-    (void)sink;
+    struct timespec ts;
+    clock_gettime(CLOCK_REALTIME, &ts);
+    ts.tv_sec += RENDEZVOUS_S;
+
+    pthread_mutex_lock(&rv_mu);
+    rv_arrived++;
+    pthread_cond_broadcast(&rv_cv);
+    while (rv_arrived < rv_want && !rv_timedout) {
+        if (pthread_cond_timedwait(&rv_cv, &rv_mu, &ts) == ETIMEDOUT) {
+            /* Release the others too. One timeout is the whole answer, and
+             * waiting for each of them to reach it in turn would multiply
+             * the suite's worst case by the thread count. */
+            rv_timedout = 1;
+            pthread_cond_broadcast(&rv_cv);
+        }
+    }
+    pthread_mutex_unlock(&rv_mu);
 }
 
 static int check_bind(void)
@@ -163,8 +200,21 @@ static int check_bind(void)
     const int nthreads = waste_pool_threads();
     CHECK(nthreads == picked);
 
+    /* waste_parallel_for hands out ceil(n / nthreads) per chunk, not
+     * min_chunk, so n = nthreads * 4 is exactly `nthreads` chunks of 4 —
+     * one per thread. That is what makes a barrier of nthreads the precise
+     * assertion rather than an approximation of one. */
     nrec = 0;
+    rv_arrived = 0;
+    rv_timedout = 0;
+    rv_want = nthreads;
     waste_parallel_for(nthreads * 4, 1, note_range, NULL);
+    if (rv_timedout) {
+        fprintf(stderr, "only %d of %d chunks reached the rendezvous in %d s: "
+                        "the pool did not take the chunks left for it\n",
+                rv_arrived, rv_want, RENDEZVOUS_S);
+        return 1;
+    }
 
     /* Every range, on whichever thread ran it. */
     CHECK(nrec > 0);
@@ -186,7 +236,11 @@ static int check_bind(void)
 
     /* With more than one CPU, more than the caller should have taken a
      * chunk — otherwise the check above proves only that the caller was
-     * bound and says nothing about the pool. */
+     * bound and says nothing about the pool. Guaranteed rather than raced
+     * for once the rendezvous above completed: every chunk was held by a
+     * thread blocked in it, so distinct == nthreads. Kept as its own check
+     * because it is the statement of intent, and it is what someone reading
+     * a failure will look at first. */
     if (picked > 1) {
         int distinct = 0;
         for (int i = 0; i < nrec; i++) {

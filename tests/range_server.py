@@ -10,7 +10,13 @@ not silently accept. This serves a directory with real 206 responses, or
 with Range support switched off, so both branches of the worker's resume
 logic can be exercised without touching the network.
 
-  python3 tests/range_server.py DIR PORT [--no-range] [--port-file F]
+  python3 tests/range_server.py DIR PORT [--no-range] [--flaky N] [--port-file F]
+
+--flaky N answers the first N GETs for each path with 503 and serves it
+normally afterwards, which is what a transient CDN failure looks like from
+curl's side. get_small used to lose a file to exactly this and report the
+run as successful (#35), so the retry that replaced it needs something that
+fails and then stops failing.
 
 PORT 0 asks the kernel for a free one, which is what the caller should
 use: a hardcoded port is a check that fails on any machine already running
@@ -44,10 +50,24 @@ class Server(http.server.HTTPServer):
         self.server_name, self.server_port = self.server_address[:2]
 
 
-def make_handler(root, ranges):
+def make_handler(root, ranges, flaky):
+    # Per-path GET counter. Single-threaded server, so no lock is needed.
+    seen = {}
+
     class H(http.server.BaseHTTPRequestHandler):
         def log_message(self, *a):
             pass
+
+        def _flaked(self):
+            """True if this GET is one of the first `flaky` for its path."""
+            if not flaky:
+                return False
+            n = seen.get(self.path, 0) + 1
+            seen[self.path] = n
+            if n <= flaky:
+                self.send_error(503)
+                return True
+            return False
 
         def _path(self):
             # No traversal guard: this serves one temp dir to one test on
@@ -66,6 +86,8 @@ def make_handler(root, ranges):
             self.end_headers()
 
         def do_GET(self):
+            if self._flaked():
+                return
             try:
                 n = os.path.getsize(self._path())
             except OSError:
@@ -93,9 +115,14 @@ def main():
         i = argv.index("--port-file")
         port_file = argv[i + 1]
         del argv[i:i + 2]
+    flaky = 0
+    if "--flaky" in argv:
+        i = argv.index("--flaky")
+        flaky = int(argv[i + 1])
+        del argv[i:i + 2]
     ranges = "--no-range" not in argv
     root, port = [a for a in argv if not a.startswith("--")][:2]
-    srv = Server(("127.0.0.1", int(port)), make_handler(root, ranges))
+    srv = Server(("127.0.0.1", int(port)), make_handler(root, ranges, flaky))
 
     # Hand the real port back only after the constructor has bound and
     # listened, so a caller that sees this file can connect immediately —

@@ -4139,3 +4139,119 @@ direction at 1.14x regardless of how exactly it is measured.
 Not measured: a trained predictor, attention-head-level sparsity (the 49.9%
 of bytes §59 found there), and stability across genuinely unrelated prompts
 rather than prefixes of one.
+
+## 61. §50's flip condition was met from the other side (2026-08-13)
+
+**Third-party, third contributor, and again not reproduced here.**
+`mccoyspace` ran an incremental CUDA offload on an NVIDIA **GB10** — a
+coherent unified-memory part, not a discrete card — on K3 and on
+Kimi-Linear. Reported in issue #11; the raw archives and the operating
+profile are linked from there. Nothing below was executed on this machine,
+and the same caution applies as to §48 and §50.
+
+§50 ended by naming the condition under which the discrete-card answer
+flips: *"VQ3R's 17.77 GiB fits a 24 GB part comfortably — and then the H2D
+term becomes a one-time load rather than 19.8 ms every token, which is the
+whole deciding row."* That condition has now been met, by a route §50 did
+not consider. Coherent unified memory does not make the H2D term a one-time
+load; it means **there is no H2D term**. The deciding row is not reduced,
+it is absent.
+
+### What paid, and by how much
+
+K3, against that machine's own CPU baseline:
+
+| stage | K3 decode | contract |
+|---|---:|---|
+| CPU baseline before GPU work | 0.34-0.35 tok/s | deterministic CPU reference |
+| KDA CUDA pilot | 0.476 tok/s | bounded logit tolerance, routes and tokens unchanged |
+| accepted dense Q4 projections | 0.673 tok/s | same route/token contract |
+| VQ3R gather, strict 64-token capture | **0.902 tok/s** | byte-identical logits, routes, tokens |
+| qualified held-out default | **0.637 tok/s at 121.35 W** | 12 unseen 64-token prompts |
+
+**Read the held-out row, not the strict one.** 0.637 tok/s is the figure
+with an out-of-sample contract behind it, and this machine does 0.45-0.62
+tok/s on the same model — so it clears the top of that band by about 3%,
+which is the same order as the band's own width. The honest summary of the
+K3 result is therefore not "2.6x" but "a coherent-memory GPU part reaches
+roughly what an M5 Pro laptop reaches, having had to write CUDA to get
+there." The 2.6x is real and it is measured against that host's own CPU,
+which is the correct denominator for asking whether the GPU paid, and the
+wrong one for asking whether the hardware buys anything.
+
+### What it refutes
+
+`docs/BACKENDS.md` said, as of 2026-08-04, that filling the `waste_backend`
+slots with CUDA kernels *"would still reproduce the Metal result on
+different silicon."* On this class of vehicle that is now false. The offload
+was incremental and kernel-class — KDA, then dense projections, then the VQ
+gather — with **attention state, routing and final expert accumulation left
+on the CPU**. It is much closer to filling slots than to the whole-forward-
+pass rewrite Metal's conclusion demanded, and it paid anyway.
+
+The reason the Metal conclusion over-generalised is now visible: it
+observed a *mechanism* — synchronous launch and round-trip per call on
+several hundred small dependent matvecs — and stated a *shape*. Coherent
+memory removes the round trip without removing the dependency. §50 had
+already found the same seam from the discrete side (6.25x on the round trip,
+killed instead by transfer bandwidth and VRAM capacity); this closes it.
+
+### What it does not touch
+
+**The discrete-card answer of §50 stands unchanged.** PCIe is still slower
+than the host's own RAM, and a 16 GB card still does not hold a 16.5 GiB
+expert bank. GB10 is not evidence about a 5060 Ti, and nothing here should
+be read as reopening that case.
+
+The **VRAM floor** in issue #11 also stands: 27.28 GB resident trunk and a
+17.19 GiB working set is a hard 32 GB minimum for K3, realistically 48. GB10
+clears it. Most parts people mean when they ask for CUDA do not.
+
+### The design detail worth keeping regardless
+
+CUDA produces a separate partial per selected expert; the **CPU applies the
+router weights and reduces those partials in original router order.** That
+is what made byte-identical logits reachable at all — zero changes across
+10,649,600 logits and 5,888 routed rows — and keeping the router itself on
+the CPU is what makes route invariance an *interpretable* gate rather than a
+tolerance. §43's bar (an int8 table makes the engine discontinuous, so an
+approximate match is not a match) was cleared rather than negotiated.
+
+### VQ4P, including the negative half
+
+§50 listed "the VQ4P 64-entry crossover" as not measured. It has been, on
+the same vehicle, one container and identical runtime settings, 16-token
+medians:
+
+| path | tok/s |
+|---|---:|
+| scalar CPU | 1.471 |
+| NEON CPU | 2.293 |
+| CUDA, CPU-built LUT read coherently | 3.771 |
+| CUDA, GPU-built and quantized LUT | **9.138** |
+
+3.98x NEON — and **the mechanism is not a saved copy**. In the coherent
+CPU-LUT arm, building the LUT on the CPU cost 1.205 s against 0.195 s of
+CUDA apply, 619.76%, which fired a preregistered 10% trigger for a GPU LUT
+builder. Moving construction on-device is the whole difference between
+3.771 and 9.138. That is the same lesson as §42 from the other end: the
+table is not free, and where it is built decides more than how it is
+applied.
+
+The negative result inside it is worth as much. **VQ4P is not a throughput
+upgrade over VQ3R on that vehicle**, despite complete and exact coverage:
+7.192 against 7.081 tok/s without Q0, 12.731 against 12.326 with it. VQ4P
+followed a differing quantized trajectory that read 8.11% more expert bytes,
+and its profiled CUDA VQ phase was 13.82% slower. Complete, exact, and not a
+win — reported rather than buried, which is why it is here.
+
+This is a Kimi-Linear result, not a K3 throughput claim, and no K3
+conversion decision follows from it.
+
+### What is still not measured
+
+Whether any of it is maintainable. This project cannot execute a line of it:
+no NVIDIA hardware, no way to regress-check a numerical contract, and — per
+issue #36, filed the same week — a suite whose non-synthetic path does not
+run in CI on any platform either. That is the open question about CUDA now,
+and it is not a question about kernels.

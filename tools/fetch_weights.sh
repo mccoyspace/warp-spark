@@ -10,7 +10,9 @@
 # A 1.4 TB pull over hours will hit dropped connections, 5xx from the CDN,
 # and at least one interrupted run. So:
 #   - every shard is resumed with `curl -C -`, never restarted;
-#   - each shard is retried with exponential backoff and jitter;
+#   - each shard is retried with exponential backoff and jitter, and so is
+#     every small file the repo's own listing names — a file that exists and
+#     was not fetched is a failure, not a 404;
 #   - a shard counts as done only when its size matches Content-Length,
 #     and completed shards are recorded in a state file so re-runs skip
 #     them without even a HEAD request;
@@ -32,6 +34,8 @@ REPO="${REPO:-moonshotai/Kimi-K3}"
 DEST="${DEST:-/Volumes/WasteDisk/k3}"
 JOBS="${JOBS:-3}"
 MAX_RETRY="${MAX_RETRY:-8}"
+SMALL_RETRY="${SMALL_RETRY:-5}"
+SMALL_BACKOFF="${SMALL_BACKOFF:-3}"
 MIN_FREE_GB="${MIN_FREE_GB:-40}"
 DRY=0
 CHECK_ONLY=0
@@ -105,19 +109,74 @@ log() { printf '%s  %s\n' "$(date '+%Y-%m-%d %H:%M:%S')" "$*" | tee -a "$LOG"; }
 # download and by convert.py afterwards, so --check and --dry-run stay
 # inspection modes: they fetch nothing but the index, and nothing at all
 # once it is on disk.
+# get_small MODE FILE...  — MODE is `req` or `opt`, and the difference is
+# whether "a 404 here is normal" is true.
+#
+# For `opt`, the guessed fallback list further down, it is: a whitelist names
+# files a given repo may not ship. For `req` — the repo's own API listing, and
+# the index every mode needs — it is not. Those files demonstrably exist, so
+# anything short of fetching one is a file that was there and was not taken.
+#
+# This used to be one attempt with the error discarded into `rm -f`, which
+# cost a real download (#35): ten of eleven small files lost to transient
+# failures, on a run that then reported ALL SHARDS COMPLETE and rc=0. All ten
+# returned 200 when probed by hand minutes later. The gap between cause and
+# symptom is the expensive part — a missing config.json fails convert.py
+# hours later, and a missing tiktoken.model does not fail it at all: the
+# conversion completes and produces a container that cannot tokenize.
+#
+# The listing block below already makes this argument about whitelists —
+# "a whitelist cannot report what it never knew to ask for" — and then the
+# fetch dropped the answer without saying so.
+SMALL_MISSING=""
 get_small() {
+    mode="$1"; shift
     for f in "$@"; do
         [ -s "$DEST/$f" ] && continue
-        if hcurl -sfL --max-time 300 -o "$DEST/$f.part" "$RAW/$f" 2>/dev/null; then
-            mv "$DEST/$f.part" "$DEST/$f"
-            log "got $f"
-        else
-            rm -f "$DEST/$f.part"          # a 404 here is normal: not every
-        fi                                  # repo ships every one of these
+        ok=0
+        for try in $(seq 1 "$SMALL_RETRY"); do
+            # No -f, deliberately: with it, every HTTP status collapses into
+            # exit 22 and a 404 is indistinguishable from a 503. Letting curl
+            # succeed on an HTTP error keeps rc for "did not reach the server"
+            # and %{http_code} for "the server answered, and this is what it
+            # said" — which is the whole distinction this function needs.
+            code=$(hcurl -sL --max-time 300 -w '%{http_code}' \
+                         -o "$DEST/$f.part" "$RAW/$f" 2>/dev/null)
+            rc=$?
+            if [ "$rc" = 0 ] && [ "$code" = 200 ]; then
+                mv "$DEST/$f.part" "$DEST/$f"
+                log "got $f"
+                ok=1
+                break
+            fi
+            rm -f "$DEST/$f.part"
+            if [ "$rc" = 0 ] && [ "$code" = 404 ]; then
+                # Retrying cannot help either way. Silent for `opt`, which is
+                # the case the old comment was written about; for `req` the
+                # repo changed under the run, and that is worth a line.
+                [ "$mode" = req ] &&
+                    log "MISSING $f: the repo listed it and now answers 404"
+                break
+            fi
+            [ "$try" = "$SMALL_RETRY" ] && break
+            # Short backoff: these are kilobytes to a few MB, not the shard
+            # path's tens of GB, so the worker's 1<<try schedule would spend
+            # more time waiting than the file takes to fetch. Overridable
+            # for the same reason MAX_RETRY is — tests/run.sh drives this
+            # against a local server and must not sleep through it.
+            wait=$(( try * SMALL_BACKOFF + RANDOM % (SMALL_BACKOFF + 2) ))
+            log "fail $f (rc=$rc http=$code), retry in ${wait}s"
+            sleep "$wait"
+        done
+        if [ "$ok" = 0 ] && [ "$mode" = req ]; then
+            SMALL_MISSING="${SMALL_MISSING:+$SMALL_MISSING }$f"
+        fi
     done
 }
 
-get_small model.safetensors.index.json
+# `req`: a transient failure here used to reach the FATAL below, which then
+# blamed the repo layout for a network error.
+get_small req model.safetensors.index.json
 if [ "$DRY" = 0 ] && [ "$CHECK_ONLY" = 0 ]; then
     # Ask the repo what it contains instead of guessing filenames. The
     # hardcoded list this replaces cost real money: it did not know about
@@ -138,18 +197,32 @@ for s in d.get("siblings", []):
     if f.endswith(".safetensors") or "/" in f or f == "model.safetensors.index.json":
         continue
     print(f)
-' 2>/dev/null)
+' 2>/dev/null | tr -d '\r')       # see the .shards comment below: CRLF here
+                                  # would put a %0D on every URL get_small
+                                  # asks for, and now record every one of
+                                  # them as missing
     if [ -n "$SMALL" ]; then
         log "repo lists $(printf '%s\n' "$SMALL" | wc -l | tr -d ' ') small files"
         # shellcheck disable=SC2086
-        get_small $SMALL
+        get_small req $SMALL
     else
         log "WARNING: could not list the repo; falling back to known names."
         log "         Check $API by hand for files this misses."
-        get_small config.json generation_config.json tokenizer.json \
+        # `opt`: this list is guessed, so a 404 is the whitelist being wrong
+        # about one repo rather than a file going astray.
+        get_small opt config.json generation_config.json tokenizer.json \
                   tokenizer_config.json tiktoken.model preprocessor_config.json \
                   chat_template.jinja configuration_kimi_k3.py \
                   modeling_kimi_k3.py modeling_kimi_linear.py
+    fi
+    # Said here as well as at the end, because the shard download that
+    # follows can run for hours and this is the moment it is still cheap
+    # to fix.
+    if [ -n "$SMALL_MISSING" ]; then
+        log "WARNING: the repo listed these and they are not on disk:"
+        for f in $SMALL_MISSING; do log "         $f"; done
+        log "         re-running fetches them; already-downloaded files are"
+        log "         skipped, so it costs only what is missing."
     fi
 fi
 
@@ -159,14 +232,29 @@ fi
     exit 1; }
 
 # --- plan ------------------------------------------------------------------
-python3 - "$DEST/model.safetensors.index.json" > "$DEST/.shards" <<'PY'
+# Every python3 below is piped through `tr -d '\r'`, and that is load-bearing
+# rather than tidy (#36, gap 2). MSYS2 ships a *Windows* python3, whose stdout
+# does text-mode \n -> \r\n; .download-state is appended by bash and does not.
+# So `grep -qxF "$f" "$STATE"` compared "model-00001-of-00020.safetensors\r"
+# against the same name without it and never matched: on Windows every shard
+# looked absent, a finished 91.5 GB download reported "0 / 20 complete", and
+# the free-space check then refused to start on a total it had already
+# fetched. Everything the header above promises about surviving a long haul
+# was inert there, and the first run looks perfect, which is what makes it
+# easy to miss.
+#
+# `tr` rather than sys.stdout.reconfigure(): this has to be right on a Python
+# build that cannot be tested from here, and deleting a byte that must never
+# appear in a safetensors filename is checkable by reading. It is a no-op
+# everywhere else.
+python3 - "$DEST/model.safetensors.index.json" <<'PY' | tr -d '\r' > "$DEST/.shards"
 import json, sys
 idx = json.load(open(sys.argv[1]))
 for s in sorted(set(idx["weight_map"].values())):
     print(s)
 PY
 TOTAL=$(wc -l < "$DEST/.shards" | tr -d ' ')
-TOTAL_BYTES=$(python3 - "$DEST/model.safetensors.index.json" <<'PY'
+TOTAL_BYTES=$(python3 - "$DEST/model.safetensors.index.json" <<'PY' | tr -d '\r'
 import json, sys
 print(json.load(open(sys.argv[1])).get("metadata", {}).get("total_size", 0))
 PY
@@ -314,6 +402,17 @@ done_now=$(wc -l < "$STATE" | tr -d ' ')
 log "pass finished (rc=$rc): $done_now / $TOTAL shards complete, $(free_gb) GB free"
 if [ "$done_now" -lt "$TOTAL" ]; then
     log "re-run to continue; nothing already downloaded is refetched"
+    exit 1
+fi
+# The shards are what takes the hours, but they are not the whole checkpoint,
+# and reporting completion on them alone is what #35 was about: the run said
+# ALL SHARDS COMPLETE and rc=0 over a directory convert.py could not use.
+if [ -n "$SMALL_MISSING" ]; then
+    log "shards complete, but these files the repo listed are not on disk:"
+    for f in $SMALL_MISSING; do log "    $f"; done
+    log "NOT COMPLETE: re-run to fetch them. convert.py needs config.json,"
+    log "              and without tiktoken.model it still succeeds and"
+    log "              writes a container that cannot tokenize."
     exit 1
 fi
 log "ALL SHARDS COMPLETE"

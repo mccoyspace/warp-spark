@@ -47,7 +47,7 @@ fails symbol resolution instead of crossing the boundary with smaller
 structures. Dynamic bindings can verify `waste_api_version()` and the two
 exported structure sizes before making any structure-bearing call.
 
-## 0.6.8 — unreleased
+## 0.6.8 — 2026-08-13
 
 Nothing changes for the two models this project ships numbers for: a
 Kimi-Linear forward is byte-identical to 0.6.7, and so is K3's. What changed

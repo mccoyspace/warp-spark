@@ -101,7 +101,53 @@ static void  ec_volatile(waste_ecache *c, int si) { (void)c; (void)si; }
 #include <sys/mman.h>
 int waste_wire(void *p, size_t n) { return mlock(p, n) == 0; }
 #else
-int waste_wire(void *p, size_t n) { return VirtualLock(p, n) != 0; }
+/* VirtualLock is bounded by the process *maximum working set*, not by
+ * available memory, and the default maximum is far below any cache worth
+ * wiring. So this wired nothing at all on Windows: 5928 of 5928 slots
+ * refused with ERROR_WORKING_SET_QUOTA on a machine with 54 GB free and
+ * nothing paging (#36, gap 5). mlock has no equivalent requirement, which
+ * is why the port worked everywhere else and this went unnoticed.
+ *
+ * Raise the ceiling on demand rather than up front: waste_wire is handed one
+ * slot at a time and never learns the total, so the first refusal is the
+ * only place the size actually needed is known. SetProcessWorkingSetSize
+ * takes both bounds, so the current minimum is read back and preserved —
+ * passing a minimum above the maximum fails the call outright.
+ *
+ * If the raise is refused — it can need SE_INC_WORKING_SET_NAME, which a
+ * service account may not hold — latch and stop asking. The caller's
+ * accounting is unchanged, since a latched call still reports failure; what
+ * goes away is thousands of syscalls that cannot succeed. Reporting the
+ * failure honestly is the existing behaviour and stays: an engine that
+ * refused to open because it could not wire its cache would be worse than
+ * one running with a pageable cache.
+ *
+ * Unverified on a real Windows host: no machine here has one. It builds
+ * under both toolchains and the failure path is the previous behaviour. */
+static int wire_quota_exhausted;      /* raise refused; stop trying */
+
+int waste_wire(void *p, size_t n)
+{
+    if (VirtualLock(p, n)) return 1;
+    if (GetLastError() != ERROR_WORKING_SET_QUOTA || wire_quota_exhausted)
+        return 0;
+
+    SIZE_T lo = 0, hi = 0;
+    if (!GetProcessWorkingSetSize(GetCurrentProcess(), &lo, &hi)) {
+        wire_quota_exhausted = 1;
+        return 0;
+    }
+    /* Room for this slot and the ones behind it, so the raise is not paid
+     * once per slot. Overshooting costs nothing: the maximum is a ceiling
+     * the process may reach, not a reservation. */
+    const SIZE_T grow = n + (n < (64u << 20) ? (64u << 20) : n);
+    if (hi > (SIZE_T)-1 - grow || !SetProcessWorkingSetSize(GetCurrentProcess(),
+                                                            lo, hi + grow)) {
+        wire_quota_exhausted = 1;
+        return 0;
+    }
+    return VirtualLock(p, n) != 0;
+}
 #endif
 
 int waste_mlock_mode(void)

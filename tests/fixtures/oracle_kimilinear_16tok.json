@@ -3,6 +3,8 @@
   "source": "moonshotai/Kimi-Linear-48B-A3B-Instruct",
   "convert_flags": [],
   "trunk": "Q4G/Q8G/F32",
+  "codebooks_sha256": "4f9b70c897f3c9150a85dbb388c7407250b35335eaba07f9b1db116b92c4ef43",
+  "_codebooks_sha256": "sha256 of the container's codebooks.bin. `trunk` above is not enough on its own: --device changes the k-means books and nothing else the width can see, so a cpu-converted container reports the same Q4G/Q8G/F32 and the diff then fails by 2.77 with no way to tell engine from fixture (issue #36, gap 3 — the same shape as #7). This pins the artefact rather than a property of it.",
   "expert_quant": "VQ3R, 3 stages, 256 entries, vec_dim 8",
   "converted_on": "macOS arm64, --device mps (the default where MPS is available)",
   "generated": "2026-07-31",

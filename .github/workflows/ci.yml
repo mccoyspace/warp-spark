@@ -288,6 +288,33 @@ jobs:
             echo "FAIL: CUDA source is not wired into the build"; exit 1
           fi
 
+      # diskbench.c has no Makefile rule and was compiled by no job on any
+      # platform, so nothing noticed that it did not build for Windows at
+      # all — posix_memalign, pread and fsync all implicit (#36, gap 4).
+      # It is a standalone tool built with one cc line, which is exactly
+      # why it went unwatched; one cc line is also all it takes to watch it.
+      # LEARNED §46's standing rule sends people to this tool before they
+      # are allowed to call anything disk-bound, so it does not get to rot.
+      #
+      # The -posix driver, and -lpthread, for the reason the Makefile gives
+      # at "threading models as separate compilers": mingw ships win32 and
+      # posix threads as different compilers and only -posix has pthread.h.
+      # The plain `gcc-mingw-w64-x86-64` package resolves the unsuffixed
+      # driver to the win32 variant, where this compiles and then fails to
+      # link on pthread_create — which is how this step failed the first
+      # time it ran, so it is doing its job already.
+      - name: diskbench builds, natively and for Windows
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq --no-install-recommends \
+              gcc-mingw-w64-x86-64-posix
+          cc -O2 -Wall -Wextra -Werror -o /tmp/diskbench \
+              tools/diskbench.c -lpthread
+          echo "ok: native"
+          x86_64-w64-mingw32-gcc-posix -O2 -Wall -Wextra -Werror \
+              -o /tmp/diskbench.exe tools/diskbench.c -lpthread
+          echo "ok: windows cross-build"
+
       # Every source file carries the licence header.
       - name: SPDX headers
         run: |

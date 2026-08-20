@@ -116,6 +116,34 @@ In interactive mode, `/image FILE` attaches an image to the next message. An ima
 
 See [docs/K3.md](docs/K3.md) for the vision architecture and measurements, and [examples/README.md](examples/README.md) for CLI, C, and HTTP multimodal examples.
 
+## Other models
+
+K3 is the target and the best-tested model, and Kimi-Linear is the small one to
+start with. Since 0.6.8 the converter and the engine also handle the
+**DeepSeek-V3 family — V3, R1 and Kimi K2**, which needed two changes rather
+than one.
+
+`convert.py` now reads fp8 block-scaled weights, applying the per-tile scales
+these checkpoints ship in a companion tensor, and normalises DeepSeek's MoE
+tensor and config names to the single spelling the engine reads. And MLA now
+applies rotary to its rope dims. The engine had implemented none: the Kimi
+models set `mla_use_nope` and pass those dims through unrotated, which is
+correct for them and wrong for everything in the V3 family, where in MLA those
+dims are the only positional signal there is. A container built before this was
+not degraded, it was unordered — it could not tell which turn of a conversation
+came first.
+
+No throughput figures here, because nobody on this project has a K2 container.
+What has been measured, by [@fab2s](https://github.com/fab2s) who contributed
+both changes: a `Kimi-K2-Instruct` conversion — 61 layers, 384 experts top-8,
+VQ3R, a 354 GB expert set and a 6.9 GB trunk — opens and reports 1.03 T
+parameters total, 31.69 B active per token; and the rotary arithmetic agrees to
+0.000023% relative L2 with an oracle whose YaRN helpers are taken verbatim from
+the DeepSeek release's own `modeling_deepseek.py`.
+
+Kimi K3 and Kimi-Linear are unaffected: their forward pass is byte-identical to
+0.6.7, by construction rather than by a runtime branch.
+
 ## What you need
 
 To build and test WARP:

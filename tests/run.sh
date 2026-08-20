@@ -44,6 +44,32 @@ no()   { printf "  \033[31mFAIL\033[0m  %s\n" "$1"; fail=$((fail+1)); }
 sk()   { printf "  \033[33mSKIP\033[0m  %s — %s\n" "$1" "$2"; skip=$((skip+1)); }
 head_() { printf "\n\033[1m%s\033[0m\n" "$1"; }
 
+# uv, with a deadline. A uv that is absent skips cleanly; a uv that is
+# present and cannot work does not fail, it *hangs*, and takes the suite
+# with it — MSYS2's mingw-w64-ucrt-x86_64-uv 0.12.1 opened no TCP sockets
+# at all, five processes and zero connections (#36). The packaging is not
+# this project's problem; a suite with no deadline on a subprocess is.
+#
+# Done by hand rather than with `timeout`, which is GNU coreutils and is not
+# on a stock macOS. Exit 124 matches what timeout would have returned, so a
+# caller that only checks for success sees a failure either way.
+UV_TIMEOUT="${UV_TIMEOUT:-600}"
+run_uv() {
+    uv "$@" &
+    uvpid=$!
+    uvwaited=0
+    while kill -0 "$uvpid" 2>/dev/null; do
+        if [ "$uvwaited" -ge "$UV_TIMEOUT" ]; then
+            kill -9 "$uvpid" 2>/dev/null
+            wait "$uvpid" 2>/dev/null
+            return 124
+        fi
+        sleep 1
+        uvwaited=$((uvwaited + 1))
+    done
+    wait "$uvpid"
+}
+
 head_ "build"
 if make -s test >/dev/null 2>&1 && make -s >/dev/null 2>&1; then
     ok "make && make test"
@@ -144,14 +170,14 @@ esac
 
 if command -v uv >/dev/null 2>&1; then
     ./test_k3parts "$TMP/k3parts.bin" >/dev/null 2>&1
-    if uv run --quiet --with torch --no-project python tools/k3parts_ref.py \
+    if run_uv run --quiet --with torch --no-project python tools/k3parts_ref.py \
            "$TMP/k3parts.bin" 2>/dev/null | grep -q "^PASS"; then
         ok "K3 components (SiTU, both decay gates, AttnRes)"
     else
         no "K3 components"
     fi
 
-    if KDA_T=24 KDA_H=4 KDA_K=32 KDA_V=32 uv run --quiet --with torch \
+    if KDA_T=24 KDA_H=4 KDA_K=32 KDA_V=32 run_uv run --quiet --with torch \
            --with fla-core --with einops --no-project python tools/kda_ref.py \
            2>/dev/null | grep -q "^PASS"; then
         ok "KDA kernel vs fla's naive_recurrent_kda"
@@ -245,6 +271,69 @@ else
     kill $RSRV 2>/dev/null; wait $RSRV 2>/dev/null
 fi
 
+# get_small, the other half of the script, and the half that had no checks.
+# Its contract is that a file the repo's own listing names and the server
+# does not deliver is a failure and not a 404 (#35): one attempt with the
+# error discarded lost ten of eleven small files on a real download, and the
+# run still printed ALL SHARDS COMPLETE and rc=0.
+fetch_small() {                        # $1 = port, then MODE and file names
+    local port="$1"; shift
+    rm -rf "$FT/sm"; mkdir -p "$FT/sm"
+    { echo "DEST=$FT/sm; RAW=http://127.0.0.1:$port; LOG=\$DEST/log"
+      echo 'SMALL_RETRY=3; SMALL_BACKOFF=0'   # do not sleep through the suite
+      echo 'log() { printf "%s\n" "$*" >> "$LOG"; }'
+      echo 'hcurl() { curl "$@"; }'
+      sed -n '/^SMALL_MISSING=""$/,/^}$/p' tools/fetch_weights.sh
+      echo 'get_small "$@"'
+      echo 'printf "MISSING:[%s]\n" "$SMALL_MISSING"'
+    } > "$FT/gensm.sh"
+    bash "$FT/gensm.sh" "$@" 2>/dev/null
+}
+
+echo hello > "$FT/srv/small.txt"
+
+if [ -n "${NO_CURL:-}" ]; then
+    sk "a listed small file survives a transient failure" "curl not installed"
+elif ! start_server --flaky 2; then
+    no "range server did not start (small-file retry not run)"
+else
+    # Two 503s and then the file. The single attempt this replaces lost it
+    # here, silently, and the run went on to report success.
+    out=$(fetch_small $PORT req small.txt)
+    if [ "$(cat "$FT/sm/small.txt" 2>/dev/null)" = hello ] &&
+       echo "$out" | grep -q 'MISSING:\[\]' &&
+       grep -q "retry in" "$FT/sm/log"; then
+        ok "a listed small file survives a transient failure"
+    else
+        no "small-file retry ($out)"
+    fi
+    kill $RSRV 2>/dev/null; wait $RSRV 2>/dev/null
+fi
+
+# On a clean server, not the flaky one: --flaky counts per path, so a 404
+# there arrives behind two 503s and the check would be measuring both at
+# once.
+if [ -n "${NO_CURL:-}" ]; then
+    sk "a file the repo listed and did not serve is reported, not passed over" "curl not installed"
+elif ! start_server; then
+    no "range server did not start (small-file accounting not run)"
+else
+    # `req` records it; `opt` — the guessed fallback list — is the case the
+    # old "a 404 here is normal" comment was actually right about, and has
+    # to stay silent.
+    req_out=$(fetch_small $PORT req absent.txt); req_log=$(cat "$FT/sm/log" 2>/dev/null)
+    opt_out=$(fetch_small $PORT opt absent.txt); opt_log=$(cat "$FT/sm/log" 2>/dev/null)
+    if echo "$req_out" | grep -q 'MISSING:\[absent.txt\]' &&
+       echo "$req_log" | grep -q "MISSING absent.txt" &&
+       echo "$opt_out" | grep -q 'MISSING:\[\]' &&
+       ! echo "$opt_log" | grep -q "MISSING"; then
+        ok "a file the repo listed and did not serve is reported, not passed over"
+    else
+        no "small-file accounting (req=$req_out opt=$opt_out)"
+    fi
+    kill $RSRV 2>/dev/null; wait $RSRV 2>/dev/null
+fi
+
 if [ -n "${NO_CURL:-}" ]; then
     sk "a server without Range support restarts the shard instead of giving up" "curl not installed"
 elif ! start_server --no-range; then
@@ -305,15 +394,21 @@ if [ -d "$MODEL" ]; then
     if [ "$SYNTHETIC" = 1 ]; then
         sk "container round-trip" "synthetic container has no source weights"
     elif [ -d "$SRC" ] && command -v uv >/dev/null 2>&1; then
-        if uv run --quiet --with torch --no-project python tools/verify_container.py \
+        if run_uv run --quiet --with torch --no-project python tools/verify_container.py \
                --container "$MODEL" --src "$SRC" --experts 1 2>/dev/null \
                | grep -q "^PASS"; then
             ok "dequantized weights match the source"
         else
             no "container round-trip"
         fi
-    else
+    elif [ ! -d "$SRC" ]; then
         sk "container round-trip" "source weights not at $SRC"
+    else
+        # The weights are here and uv is not, which the single message this
+        # replaces reported as absent weights (#36). Someone then goes
+        # looking for a download that is already on the disk.
+        sk "container round-trip" \
+           "uv not installed (the weights at $SRC are here; verify_container.py runs under a plain torch interpreter too)"
     fi
 else
     sk "container checks" "no container at $MODEL"
@@ -624,7 +719,7 @@ import sys; sys.exit(0 if abs($eng - $sim) <= 5 else 1)" 2>/dev/null; then
     else
         GEN=""
         if [ -z "${WASTE_ORACLE:-}" ] && command -v uv >/dev/null 2>&1; then
-            uv run --no-project --with torch --with fla-core --with einops \
+            run_uv run --no-project --with torch --with fla-core --with einops \
                 python tools/kimi_ref.py --container "$MODEL" --prompt-ids "$IDS" \
                 --tokens 0 --dump "$TMP/oracle.bin" >/dev/null 2>&1 || true
             [ -s "$TMP/oracle.bin" ] && GEN="$TMP/oracle.bin"
@@ -632,9 +727,37 @@ import sys; sys.exit(0 if abs($eng - $sim) <= 5 else 1)" 2>/dev/null; then
         oracle_why=""
         if [ -z "$GEN" ] && [ -z "${WASTE_ORACLE:-}" ] && [ -f "${ORACLE%.bin}.json" ]; then
             oracle_why=$(python3 - "$MODEL" "${ORACLE%.bin}.json" <<'PY'
-import json, os, subprocess, sys
+import hashlib, json, os, subprocess, sys
 WASTE = os.path.join(os.curdir, "waste" + (".exe" if os.name == "nt" else ""))
 meta = json.load(open(sys.argv[2]))
+name = os.path.basename(sys.argv[2])
+
+# The codebooks, not just the trunk width. `trunk` alone let a container
+# through whose books were trained on a different --device, and the sidecar
+# records that axis ("converted_on") while the check ignored it: a default
+# conversion on a CPU-only machine also reports Q4G/Q8G/F32, so the gate
+# passed and the diff then failed by 2.77 (#36, gap 3). The comment above
+# already says why that is not an engine error — the same seed on a
+# different device trains different k-means books — so the gate has to see
+# the books themselves. Hashing codebooks.bin covers --device and every
+# other conversion knob at once, and it is under a megabyte to read.
+#
+# This is #7 recurring on a second axis, so the fix is the one the rotary
+# fixture already uses: pin the artefact, not a property of it.
+want_cb = meta.get("codebooks_sha256")
+if want_cb:
+    cb = os.path.join(sys.argv[1], "codebooks.bin")
+    try:
+        with open(cb, "rb") as f:
+            got_cb = hashlib.sha256(f.read()).hexdigest()
+    except OSError:
+        got_cb = None
+    if got_cb and got_cb != want_cb:
+        print(f"no uv to generate one, and the fixture's codebooks are not "
+              f"this container's ({want_cb[:12]} vs {got_cb[:12]}) — a "
+              f"cross-conversion diff is not an engine error, see {name}")
+        sys.exit(0)
+
 want = meta.get("trunk")
 r = subprocess.run([WASTE, "info", sys.argv[1], "--json"],
                    capture_output=True, text=True)
@@ -644,7 +767,7 @@ except Exception:
     sys.exit(0)                       # let the diff speak if info cannot
 if want and got != want:
     print(f"no uv to generate one, and the fixture is from a {want} trunk "
-          f"against this container's {got} — see {os.path.basename(sys.argv[2])}")
+          f"against this container's {got} — see {name}")
 PY
 )
         fi
@@ -741,7 +864,7 @@ else
         # is portable — the digest below is what says so.
         RGEN=""
         if command -v uv >/dev/null 2>&1; then
-            uv run --no-project --with torch \
+            run_uv run --no-project --with torch \
                 python tools/deepseek_ref.py --container "$ROPE" --ids "$RIDS" \
                 --dump "$TMP/rope_ref.bin" >/dev/null 2>&1 || true
             [ -s "$TMP/rope_ref.bin" ] && RGEN="$TMP/rope_ref.bin"
@@ -1045,10 +1168,19 @@ PYFV
         sk "peak RSS inside the budget" "sanitizer shadow memory makes RSS meaningless"
     elif [ "$SYNTHETIC" = 1 ]; then
         sk "peak RSS inside the budget" "needs a tokenizer to drive the CLI"
-    elif tests/check_budget.sh "$MODEL" 2>/dev/null | grep -q "^BUDGET OK"; then
-        ok "peak RSS stays inside the configured budget"
     else
-        no "peak RSS exceeded the budget"
+        # Not piped straight into grep: that discards the exit status, and
+        # 77 (could not measure) has to be told from a real overrun. On
+        # Windows the unmeasurable case was reported as an overrun (#36).
+        bud=$(tests/check_budget.sh "$MODEL" 2>/dev/null); brc=$?
+        if printf '%s' "$bud" | grep -q "^BUDGET OK"; then
+            ok "peak RSS stays inside the configured budget"
+        elif [ "$brc" = 77 ]; then
+            sk "peak RSS inside the budget" \
+               "$(printf '%s' "$bud" | sed -n 's/^BUDGET UNMEASURABLE: //p')"
+        else
+            no "peak RSS exceeded the budget"
+        fi
     fi
 else
     sk "budget checks" "no container at $MODEL"
@@ -1070,8 +1202,12 @@ if [ -n "${WASTE_SANITIZED:-}" ] && [ -f "$BIG/manifest.json" ]; then
     BIG=/nonexistent-under-sanitizer
 fi
 if [ -f "$BIG/manifest.json" ]; then
-    if tests/check_budget.sh "$BIG" 32 long 2>/dev/null | grep -q "^BUDGET OK"; then
+    bud=$(tests/check_budget.sh "$BIG" 32 long 2>/dev/null); brc=$?
+    if printf '%s' "$bud" | grep -q "^BUDGET OK"; then
         ok "peak RSS stays inside the budget on K3 too"
+    elif [ "$brc" = 77 ]; then
+        sk "peak RSS inside the budget on K3" \
+           "$(printf '%s' "$bud" | sed -n 's/^BUDGET UNMEASURABLE: //p')"
     else
         no "peak RSS exceeded the budget on K3"
     fi
@@ -1255,7 +1391,7 @@ fi
 if [ "$SYNTHETIC" = 1 ]; then
     sk "tokenizer diff" "synthetic container carries no tokenizer"
 elif [ -d "$MODEL" ] && command -v uv >/dev/null 2>&1 && [ -d "$SRC" ]; then
-    if uv run --quiet --with tiktoken --no-project python tools/tokdiff.py \
+    if run_uv run --quiet --with tiktoken --no-project python tools/tokdiff.py \
            "$MODEL" "$SRC" 2>/dev/null | tail -1 | grep -q "identical"; then
         ok "C tokenizer matches Python tiktoken"
     else
@@ -1267,6 +1403,30 @@ fi
 
 # ------------------------------------------------------------ converter ----
 head_ "converter"
+
+# The fp8 converter path has two readers and a silent shape-preserving failure
+# mode, so keep its tile mapping under a small synthetic test instead of
+# relying on a multi-hour model conversion. Exit 77 is an explicit skip when
+# torch is unavailable, never a pass.
+#
+# Through uv, like every other torch checker here: torch is not a dependency
+# of this repo and is not a system package on the machines that run this. As
+# bare `python3` the whole check reported "torch not installed" and skipped
+# everywhere, CI included — where the Linux job is the one that installs uv,
+# so this is exactly where it does get to run.
+if ! command -v uv >/dev/null 2>&1; then
+    # The guard is on uv rather than python3 for the same reason: without uv
+    # run_uv exits 127 and the catch-all below would call that a failure.
+    sk "fp8 block-scale mapping" "uv not installed"
+else
+    out=$(run_uv run --quiet --with torch --no-project \
+              python tests/test_fp8_blocks.py 2>&1); rc=$?
+    case "$rc" in
+        0)  ok "fp8 block scales, partial tiles, missing companions, and reader agreement" ;;
+        77) sk "fp8 block-scale mapping" "torch not installed" ;;
+        *)  no "fp8 block-scale mapping"; printf '%s\n' "$out" | grep -E "FAIL|Error|Traceback" | head -5 ;;
+    esac
+fi
 
 # Resume is the one converter behaviour that cannot be checked by looking at
 # a finished container: it is about the partial states a crash leaves. The

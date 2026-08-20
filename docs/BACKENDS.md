@@ -53,7 +53,7 @@ of this section can stay about the mechanism:
 | AVX2 | `simd_avx2.c` | verified on Linux/x86_64 |
 | AVX-512 | `simd_avx512.c` | compiled and dispatched, never executed — CI runner is Zen 3, confirmed 2026-07-29 |
 | Metal | `metal.m` | correct, off by default, 22% slower |
-| CUDA | `cuda.cu` | qualified GB10 VQ3R path, off by default; VQ4P rejected explicitly |
+| CUDA | `cuda.cu` | qualified GB10 VQ3R path, off by default; VQ4P rejected explicitly. Upstream records the coherent-memory result as third-party evidence; see below |
 | BLAS, ROCm | — | not implemented; the flag refuses to build |
 | SVE, RVV | — | not implemented |
 
@@ -325,6 +325,11 @@ CUDA cannot execute in this container because it has no NVIDIA GPU or toolkit.
 CI dry-runs the CUDA build wiring; the real CUDA 13 build and numerical/
 performance campaign run on the GB10 Spark and are recorded in
 [GPU_GB10.md](GPU_GB10.md).
+The corresponding upstream tree still has no CUDA source and intentionally
+refuses `WASTE_ENABLE_CUDA=1`. Its documentation now records the discrete-card
+and coherent-memory measurements as third-party evidence and treats accepting a
+CUDA implementation as a maintenance question rather than a performance one;
+see "Coherent memory: the shape claim does not hold" below.
 
 ## AVX2 and AVX-512 (2026-07-28)
 
@@ -339,6 +344,63 @@ Those moved behind the dispatch table for this, with their argument
 structs and the two shared inlines in a new `src/simd.h`. The third hot
 path, the VQ gather, gets nothing — no x86 SIMD helps it either, for the
 same reason NEON does not.
+
+> **Qualified on 2026-08-13; the last sentence is about VQ3R only.** It was
+> written when 3x256 was the only expert format, and for that shape it is
+> exactly right: §41 measured why, and the arithmetic is not close. A
+> 256-entry stage table is 256 bytes — sixteen vector registers of the
+> thirty-two that exist — so it fits no byte-permute primitive on any ISA,
+> and blocking cannot make it fit.
+>
+> **VQ4P broke the premise, not the conclusion's wording.** 4x64 spends the
+> same 24 bits per 8-weight vector, and a 64-entry stage table is 64 bytes,
+> four registers — which is precisely what `vqtbl4q_s8` addresses. So the
+> apply *did* get a NEON kernel (`src/model.c`: four `vqtbl4q_s8` per 16
+> rows over a `vld3q_u8` deinterleave, inside a 64-row `VQ_TILE`), and an
+> x86 build takes the `else` branch — one row at a time, four scalar table
+> loads per row. That is not a narrower kernel, it is the absence of one, on
+> the same build where VQ3R's table gets `simd_avx512.c`.
+>
+> **How much this costs depends on who meets it, and that is narrower than
+> issue #32 states.** #32 says VQ4P is what `convert.py` produces by
+> default; it is not. `--index-bits` defaults to 8 and `--stages` to 3, so a
+> default conversion is VQ3R, and VQ4P has to be asked for explicitly with
+> `--index-bits 6 --stages 4 --entries 64`. An x86 build therefore meets the
+> scalar apply only when someone requests that shape. The catch is who that
+> is: the shape is exactly the one §50 left open as the 64-entry crossover,
+> so the people most likely to hit it are the people trying to answer the
+> open question — and they would get an ISA difference reported as a
+> table-size result.
+>
+> The candidate is AVX-512 **VBMI's `vpermi2b`**, which indexes 128 bytes
+> across two zmm registers — the same primitive with room to spare for 64
+> entries. Zen 4 and later, Ice Lake and later. `src/simd_avx512.c` already
+> exists and dispatch resolves once at init, so it is a slot to fill and not
+> an `#ifdef` in `model.c`.
+>
+> **Unmeasured in both directions, and worth saying before anyone spends a
+> weekend on it:** the path may be bound by the deinterleave rather than by
+> the lookup, in which case the table primitive buys much less than it looks
+> like it should; and cross-lane byte permutes are not uniformly cheap
+> across x86 microarchitectures. This is a hypothesis with an obvious first
+> experiment, not a plan — issue #32 tracks it.
+>
+> One consequence beyond the kernel: **`docs/LEARNED.md` §47's tuning table
+> is an ARM result.** `WASTE_XPAR`, `WASTE_XPAR_BATCH`, `WASTE_P6_CHUNK` and
+> the thread counts were all measured against the vectorized apply, and on
+> x86 the kernel underneath them is a different kernel, so the inversion
+> between Kimi-Linear and K3 has never been retested there. `CLAUDE.md`
+> carries those settings as engine-wide guidance; read them as ARM guidance
+> until someone re-runs them.
+>
+> If someone writes it, the bar is bit-identity against the portable path
+> and not "close" — `-DWASTE_P6_SCALAR` already makes the ARM path
+> self-checking, and §43 says why an int8 table raises the bar that far. The
+> check that decides it is *SIMD backend matches the CPU baseline*, and it
+> has to run on an `--index-bits 6` container: the suite's default
+> `WASTE_REF_MODEL` is a VQ3R conversion, and running the suite on the wrong
+> container shape is exactly how a load path once stayed broken through
+> green runs.
 
 **AVX2 is verified.** On Linux/x86_64 the engine reports `backend AVX2`,
 the suite is 12 passed / 0 failed, and *SIMD backend matches the CPU
@@ -464,11 +526,13 @@ different engine, not a backend. The code stays, off by default, because
 it is correct and because that argument should be re-run if the CPU path
 ever stops being bandwidth-bound.
 
-**That re-run has since happened, on NVIDIA hardware, and it splits this
-paragraph in two.** The "different engine, not a backend" conclusion
-survives. The reasoning under it — no headroom, plus a round-trip per call
-— does not transfer to a discrete card unchanged. The next section is what
-replaced it; read the two together.
+**That re-run has since happened, twice, on NVIDIA hardware, and what is
+left of this paragraph is smaller than it looks.** The reasoning under it —
+no headroom, plus a round-trip per call — does not transfer to a discrete
+card unchanged (next section). And the conclusion itself, "a different
+engine, not a backend", was a *shape* stated from a *mechanism*, and does
+not survive a vehicle where the mechanism is absent (2026-08-13 section
+below). Read all three together; the last one is the current position.
 
 ## CUDA: the gates, answered off-repo (2026-08-04)
 
@@ -556,6 +620,66 @@ one-time load and deletes the deciding row. That is still one dispatch per
 layer with the residual never returning to the host, i.e. still a different
 engine and not a backend. The GPU VQ-decode throughput measured above
 applies to it unchanged.
+
+> **Superseded in part on 2026-08-13.** The condition this paragraph names
+> was met from the other side, and the sentence about filling the
+> `waste_backend` slots is false on that class of vehicle. The discrete-card
+> answer above is unaffected. See the next section.
+
+## Coherent memory: the shape claim does not hold (2026-08-13)
+
+**Third-party, third contributor, not reproduced here** — the same standing
+caution as the two sections above. `mccoyspace` ran an incremental CUDA
+offload on an NVIDIA **GB10**, a coherent unified-memory part rather than a
+discrete card, on K3 and Kimi-Linear. Numbers, contracts and the negative
+results are in `docs/LEARNED.md` §61; what follows is only what it means for
+this document.
+
+**Two sentences in this file were wrong, and they were wrong in the same
+way.** Metal concluded that making a GPU pay "would mean moving the whole
+forward pass on-device ... a different engine, not a backend", and the
+section above concluded that filling the `waste_backend` slots "would still
+reproduce the Metal result on different silicon." Both took a *mechanism*
+that had been measured — synchronous launch and a round-trip per call, over
+several hundred small dependent matvecs — and restated it as a *shape*.
+Coherent memory removes the round trip without removing the dependency, so
+the mechanism is absent and the shape claim does not follow.
+
+What was actually done there was incremental and kernel-class — KDA, then
+the dense projections, then the VQ gather — with **attention state, routing
+and final expert accumulation left on the CPU**. That is much closer to
+filling slots than to a rewritten engine, and it paid: 0.34-0.35 → 0.902
+tok/s on K3 under a byte-identical-logits capture, 0.637 tok/s at 121.35 W
+on a held-out set.
+
+**Read the held-out figure against this machine, not against that host's
+CPU.** The README publishes 0.45-0.62 tok/s for K3 on an M5 Pro laptop, so
+0.637 clears the top of that band by about 3% — the same order as the band's
+own width. The 2.6x is real and it is the right ratio for asking whether the
+GPU paid *on that host*; it is the wrong one for asking whether the hardware
+buys anything over a laptop. Both readings belong here.
+
+**What does not change:**
+
+- **The discrete-card answer** of the previous section. PCIe is still
+  slower than host RAM and a 16 GB card still does not hold a 16.5 GiB
+  expert bank. GB10 is not evidence about a 5060 Ti.
+- **The build guard.** `src/cuda.cu` still does not exist and
+  `WASTE_ENABLE_CUDA=1` still stops the build. Nothing here is a decision
+  to accept a CUDA backend.
+- **The reason it is not one.** This project cannot execute a line of that
+  code — no NVIDIA hardware, no way to regress-check a numerical contract
+  per release. Adding a surface no machine here can reach is a maintenance
+  question, not a kernel question, and it is sharpened rather than softened
+  by issue #36: the suite's non-synthetic path does not run in CI on any
+  platform either. That is what has to be answered before code, and
+  answering it afterwards is how a project acquires a backend nobody can
+  fix.
+
+The design detail worth carrying into any such discussion: CUDA emitted one
+partial per selected expert and the **CPU reduced them in original router
+order**, which is what made byte-identical logits reachable and route
+invariance an interpretable gate rather than a tolerance.
 
 ## CI
 
