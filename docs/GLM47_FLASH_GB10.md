@@ -53,6 +53,7 @@ WASTE_CUDA_KDA=1
 WASTE_CUDA_DENSE=3
 WASTE_CUDA_VQ=2
 WASTE_CUDA_VQ_GROUP=1
+WASTE_CUDA_PREFILL_VQ=1
 WASTE_XPAR=0
 ```
 
@@ -89,6 +90,36 @@ The dense fast path is not bit-identical at every logit. Its contract is
 unchanged greedy output and routing, bounded numerical error, exact semantic
 work counters, and no fallback.
 
+## Chunk-prefill CUDA result
+
+The vLLM comparison exposed prompt prefill, rather than decode, as the largest
+remaining engine gap. A default-off pilot therefore reused the already
+qualified CUDA VQ3R kernel inside WARP's existing chunk-prefill path. Routing,
+shared-expert work, MLA attention, and residual accumulation remain on the CPU.
+
+On the same 461-token prompt, fresh-process control/candidate/control timing was:
+
+| Measure | Control 1 | CUDA VQ prefill | Control 2 |
+| --- | ---: | ---: | ---: |
+| Prefill seconds | 115.22 | **66.75** | 116.37 |
+| Prefill throughput | 4.00 tok/s | **6.91 tok/s** | 3.96 tok/s |
+
+The CUDA arm was **42.4% faster** than the 115.80-second bracket mean. Final
+logits were byte-identical, all 21,206 ordered route rows matched, and each arm
+performed the same 2,647 misses and 9,400,111,104 physical expert bytes. CUDA
+work counters matched the precomputed totals: 84,824 experts, 254,472 applies,
+127,236 LUT builds, 275,678 launches, and 169,648 synchronizations.
+
+Grouping all four routed experts reduced synchronization count by 4x but did
+not improve wall time (66.88 seconds), so group 1 remains selected. A separate
+38-token prompt plus 16-token decode check reduced process wall time from 13.11
+to 9.62 seconds (26.6%) with byte-identical prefill logits, identical generated
+tokens and routes, unchanged physical reads, and no fallback.
+
+This result applies a specific lesson from the vLLM comparison without changing
+WARP's architecture: move the measured prefill bottleneck onto a proven GPU
+kernel while retaining the compact VQ3R container and streaming expert cache.
+
 ## Functional scope
 
 A simple factual continuation produced the expected answer and stopped on a
@@ -96,8 +127,10 @@ secondary model turn marker after 10 tokens at 11.05 decode tok/s. A separate
 studio-planning smoke test completed 109 tokens at 12.25 decode tok/s and
 about 7.56 completion tok/s end to end.
 
-The converted container retains the vendor Jinja template, but WARP does not
-interpret arbitrary Jinja and no qualified `chat.json` exists yet. The tests
-therefore used explicitly framed raw prompts. `/v1/chat/completions`, native
-tool calling, and a promoted service profile remain future work; this branch
-does not change the existing qualified K2 or K3 profiles.
+The branch now includes a small extended `chat.json` schema that reproduces the
+official plain, no-thinking GLM format, including its one-time preamble,
+assistant-history trimming, and three stop tokens. Official-template token IDs
+matched exactly on the retained fixtures. A real multi-turn HTTP check returned
+the requested value and stopped correctly; unsupported thinking and tool calls
+fail closed. Native tool calling and a promoted service profile remain future
+work, and this branch does not change the existing qualified K2 or K3 profiles.
