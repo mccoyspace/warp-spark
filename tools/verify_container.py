@@ -32,7 +32,9 @@ KINDS = (("gate", "w1"), ("up", "w3"), ("down", "w2"))
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from mxfp4 import ST                                              # noqa: E402
-from convert import moe_layout                                    # noqa: E402
+from convert import (ShardReader, is_source_only_layer, moe_layout,
+                     source_layer_index, unsupported_source_features,
+                     validate_glm47_full_source)                  # noqa: E402
 
 
 def load_codebooks(path):
@@ -97,6 +99,30 @@ def main():
     args = ap.parse_args()
 
     man = json.load(open(os.path.join(args.container, "manifest.json")))
+    source_index = ShardReader(args.src)
+    cfg = man["config"]
+    validate_glm47_full_source(cfg, source_index,
+                               man.get("tensor_prefix", ""))
+    n_layers = cfg["num_hidden_layers"]
+    source_only = sorted({
+        layer for name in source_index.names()
+        if (layer := source_layer_index(name)) is not None and
+        layer >= n_layers
+    })
+    assert man.get("source_ignored_layers", []) == source_only, (
+        "manifest/source ignored-layer mismatch: "
+        f"{man.get('source_ignored_layers', [])} != {source_only}")
+    expected_unsupported = unsupported_source_features(cfg)
+    if expected_unsupported:
+        assert man.get("unsupported_features", []) == expected_unsupported, (
+            "manifest does not record the source features conversion omitted")
+    bad_layers = [int(layer) for layer in man["layers"]
+                  if int(layer) >= n_layers]
+    assert not bad_layers, f"source-only layers published as expert banks: {bad_layers}"
+    bad_trunk = [entry["name"] for entry in man["trunk"]
+                 if is_source_only_layer(entry["name"], n_layers)]
+    assert not bad_trunk, f"source-only tensors published in trunk: {bad_trunk[:3]}"
+
     stages = man["expert_quant"]["stages"]
     books = load_codebooks(os.path.join(args.container, "codebooks.bin"))
     print(f"container: {man['expert_quant']['fmt']}, {len(books)} codebooks, "

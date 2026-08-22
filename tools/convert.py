@@ -336,6 +336,30 @@ CONFIG_ALIASES = (
 # renormalisation on for a checkpoint that sets it false. Emit only when true.
 CONFIG_FLAG_ALIASES = (("moe_renormalize", "norm_topk_prob"),)
 
+GLM47_FULL_ARCH = "Glm4MoeForCausalLM"
+
+
+def hf_architecture(cfg):
+    """The release architecture, including K3's outer text wrapper."""
+    arches = (cfg.get("_outer", {}).get("architectures") or
+              cfg.get("architectures") or [])
+    return arches[0] if arches else ""
+
+
+def is_glm47_full(cfg):
+    """True only for the official full GLM-4.7 causal-LM architecture."""
+    return (hf_architecture(cfg) == GLM47_FULL_ARCH and
+            cfg.get("model_type") == "glm4_moe")
+
+
+def chat_profile(cfg):
+    """Qualified declarative-chat profile for a release architecture."""
+    arch = hf_architecture(cfg)
+    return ("kimi-k3" if "KimiK3" in arch else
+            "kimi-linear" if "KimiLinear" in arch else
+            "glm47-flash" if (arch == GLM47_FULL_ARCH or
+                               "Glm4MoeLite" in arch) else "")
+
 
 def normalise_cfg(cfg):
     """A copy of the HF config with MoE keys under the names the engine reads."""
@@ -367,7 +391,38 @@ def normalise_cfg(cfg):
         # the release config omits the key. WARP's MLA rotation uses that
         # layout; a future explicit false is preserved for a fail-closed load.
         out.setdefault("rope_interleave", True)
+    elif is_glm47_full(out):
+        # The released config omits these because its reference class
+        # hardcodes the sigmoid/no-auxiliary-loss router. WARP names the
+        # selection method explicitly at load time, so make the inherited
+        # semantics visible rather than relying on another implementation's
+        # class default.
+        out.setdefault("topk_method", "noaux_tc")
+        out.setdefault("moe_router_activation_func", "sigmoid")
     return out
+
+
+def unsupported_source_features(cfg):
+    """Source features deliberately omitted from this v0 container.
+
+    The released full GLM-4.7 checkpoint may append one MTP decoder layer
+    after the 92 base layers. It is not part of ordinary next-token logits,
+    and WARP has no MTP-head contract yet, so conversion omits it rather than
+    accidentally treating it as a 93rd base layer. Keep that decision in the
+    manifest: an ignored layer number alone does not explain why it vanished.
+    """
+    if not is_glm47_full(cfg):
+        return []
+    count = cfg.get("num_nextn_predict_layers", 0) or 0
+    if not isinstance(count, int) or count < 0:
+        raise ValueError("num_nextn_predict_layers must be a non-negative integer")
+    if not count:
+        return []
+    base = cfg["num_hidden_layers"]
+    return [{"name": "multi_token_prediction",
+             "source_layers": list(range(base, base + count)),
+             "action": "omitted",
+             "reason": "unsupported"}]
 
 
 def source_layer_index(name):
@@ -420,6 +475,12 @@ class ShardReader:
         idx = json.load(open(os.path.join(model_dir, "model.safetensors.index.json")))
         self.wm = idx["weight_map"]
         self._hdr = {}
+        try:
+            with io.open(os.path.join(model_dir, ".reclaimed"),
+                         encoding="utf-8") as inp:
+                self.reclaimed = set(inp.read().split())
+        except OSError:
+            self.reclaimed = set()
         # fp8 block size is a property of the checkpoint and is stated in its
         # config; it must not be inferred from the weight/scale shape ratio,
         # which is ambiguous whenever a dimension is not a multiple of the tile.
@@ -439,6 +500,18 @@ class ShardReader:
 
     def names(self):
         return self.wm.keys()
+
+    def tensor_meta(self, name):
+        """Safetensors dtype and shape without reading the tensor payload."""
+        fn = self.wm[name]
+        if (fn in self.reclaimed and
+                not os.path.exists(os.path.join(self.dir, fn))):
+            # A reclaim resume has already proved and consumed this shard.
+            # The index still proves the separate-expert naming; the bank and
+            # ledger are the evidence used by the existing resume contract.
+            return {"reclaimed": True}
+        hdr, _base = self._header(fn)
+        return hdr[name]
 
     def get(self, name):
         fn = self.wm[name]
@@ -465,6 +538,175 @@ class ShardReader:
                                "refusing to read fp8 without its block scales")
             return unblock_scale(t.float(), self.get(sname), self.fp8_block)
         return t.float()
+
+
+def validate_glm47_full_source(cfg, source, prefix=""):
+    """Fail closed at the official full GLM-4.7 source boundary.
+
+    This validates the *published checkpoint representation*, not the current
+    Transformers module implementation. The latter packs all experts into two
+    3-D parameters in memory; the official BF16 safetensors instead publish
+    one gate/up/down tensor per expert, which is the representation this
+    converter consumes. Header-only shape checks keep this cheap even for the
+    full checkpoint.
+
+    Other architectures are left to their existing conversion paths. A source
+    claiming either half of the full GLM identity must claim both halves,
+    however, so a renamed or future GLM variant is not silently interpreted as
+    this exact release.
+    """
+    arch = hf_architecture(cfg)
+    model_type = cfg.get("model_type")
+    claims_full = arch == GLM47_FULL_ARCH or model_type == "glm4_moe"
+    if not claims_full:
+        return
+
+    errors = []
+    if arch != GLM47_FULL_ARCH:
+        errors.append(f"architectures[0]={arch!r}, expected {GLM47_FULL_ARCH!r}")
+    if model_type != "glm4_moe":
+        errors.append(f"model_type={model_type!r}, expected 'glm4_moe'")
+
+    def config_value(canon, hf=None):
+        value = cfg.get(canon)
+        return cfg.get(hf) if value is None and hf else value
+
+    expected = (
+        ("num_hidden_layers", None, 92),
+        ("hidden_size", None, 5120),
+        ("vocab_size", None, 151552),
+        ("num_experts", "n_routed_experts", 160),
+        ("num_experts_per_token", "num_experts_per_tok", 8),
+        ("num_shared_experts", "n_shared_experts", 1),
+        ("first_k_dense_replace", None, 3),
+        ("intermediate_size", None, 12288),
+        ("moe_intermediate_size", None, 1536),
+        ("num_attention_heads", None, 96),
+        ("num_key_value_heads", None, 8),
+        ("head_dim", None, 128),
+        ("partial_rotary_factor", None, 0.5),
+        ("rope_theta", None, 1000000.0),
+        ("rms_norm_eps", None, 1e-5),
+        ("max_position_embeddings", None, 202752),
+        ("hidden_act", None, "silu"),
+        ("routed_scaling_factor", None, 2.5),
+        ("tie_word_embeddings", None, False),
+        ("attention_bias", None, True),
+        ("use_qk_norm", None, True),
+        ("n_group", None, 1),
+        ("topk_group", None, 1),
+        ("norm_topk_prob", None, True),
+    )
+    for canon, hf, want in expected:
+        got = config_value(canon, hf)
+        if isinstance(want, float):
+            matches = (isinstance(got, (int, float)) and
+                       abs(float(got) - want) <= max(1e-12, abs(want) * 1e-9))
+        elif isinstance(want, bool):
+            matches = got is want
+        else:
+            matches = got == want
+        if not matches:
+            label = f"{canon}/{hf}" if hf else canon
+            errors.append(f"{label}={got!r}, expected {want!r}")
+    if cfg.get("rope_scaling") is not None:
+        errors.append("rope_scaling must be null for the qualified release")
+    if cfg.get("topk_method", "noaux_tc") != "noaux_tc":
+        errors.append("topk_method must be noaux_tc when present")
+    for router_key in ("moe_router_activation_func", "scoring_func"):
+        if router_key in cfg and cfg[router_key] != "sigmoid":
+            errors.append(f"{router_key} must be sigmoid when present")
+
+    n_mtp = cfg.get("num_nextn_predict_layers", 0) or 0
+    if not isinstance(n_mtp, int) or n_mtp not in (0, 1):
+        errors.append("num_nextn_predict_layers must be 0 or 1")
+        n_mtp = 0
+
+    names = set(source.names())
+    packed = sorted(n for n in names if re.search(
+        r"\.model\.layers\.\d+\.mlp\.experts\."
+        r"(?:gate_up_proj|down_proj)(?:\.weight)?$", "." + n))
+    if packed:
+        errors.append("packed 3-D expert storage is unsupported "
+                      f"(first {packed[0]})")
+
+    source_only = sorted({
+        layer for name in names
+        if (layer := source_layer_index(name)) is not None and layer >= 92
+    })
+    expected_source_only = list(range(92, 92 + n_mtp))
+    if source_only != expected_source_only:
+        errors.append("appended source layers are "
+                      f"{source_only}, expected {expected_source_only} for MTP")
+
+    def require(name, shape, dtype="BF16"):
+        if name not in names:
+            errors.append(f"missing {name}")
+            return
+        try:
+            meta = source.tensor_meta(name)
+        except (KeyError, OSError, ValueError) as exc:
+            errors.append(f"cannot read header for {name}: {exc}")
+            return
+        if meta.get("reclaimed"):
+            return
+        got_shape = tuple(meta.get("shape", ()))
+        got_dtype = meta.get("dtype")
+        if got_shape != tuple(shape):
+            errors.append(f"{name} shape {got_shape}, expected {tuple(shape)}")
+        if got_dtype != dtype:
+            errors.append(f"{name} dtype {got_dtype!r}, expected {dtype}")
+
+    p = prefix + "model."
+    H, heads, kv_heads, hd = 5120, 96, 8, 128
+    q_rows, kv_rows = heads * hd, kv_heads * hd
+    require(p + "embed_tokens.weight", (151552, H))
+    require(p + "norm.weight", (H,))
+    require(prefix + "lm_head.weight", (151552, H))
+
+    # Both ends catch a release that changes representation partway through
+    # while keeping the check to a handful of safetensors headers.
+    for layer in (0, 91):
+        base = f"{p}layers.{layer}."
+        require(base + "input_layernorm.weight", (H,))
+        require(base + "post_attention_layernorm.weight", (H,))
+        attn = base + "self_attn."
+        require(attn + "q_proj.weight", (q_rows, H))
+        require(attn + "q_proj.bias", (q_rows,))
+        require(attn + "k_proj.weight", (kv_rows, H))
+        require(attn + "k_proj.bias", (kv_rows,))
+        require(attn + "v_proj.weight", (kv_rows, H))
+        require(attn + "v_proj.bias", (kv_rows,))
+        require(attn + "o_proj.weight", (H, q_rows))
+        require(attn + "q_norm.weight", (hd,))
+        require(attn + "k_norm.weight", (hd,))
+
+    dense = 12288
+    for layer in (0, 2):
+        mlp = f"{p}layers.{layer}.mlp."
+        require(mlp + "gate_proj.weight", (dense, H))
+        require(mlp + "up_proj.weight", (dense, H))
+        require(mlp + "down_proj.weight", (H, dense))
+
+    moe = 1536
+    for layer in range(3, 92):
+        mlp = f"{p}layers.{layer}.mlp."
+        if layer in (3, 91):
+            require(mlp + "gate.weight", (160, H))
+            require(mlp + "gate.e_score_correction_bias", (160,), dtype="F32")
+            require(mlp + "shared_experts.gate_proj.weight", (moe, H))
+            require(mlp + "shared_experts.up_proj.weight", (moe, H))
+            require(mlp + "shared_experts.down_proj.weight", (H, moe))
+        for expert in range(160):
+            ep = mlp + f"experts.{expert}."
+            require(ep + "gate_proj.weight", (moe, H))
+            require(ep + "up_proj.weight", (moe, H))
+            require(ep + "down_proj.weight", (H, moe))
+
+    if errors:
+        shown = "; ".join(errors[:12])
+        more = f"; ... {len(errors) - 12} more" if len(errors) > 12 else ""
+        raise ValueError("GLM-4.7 full source contract failed: " + shown + more)
 
 
 # ------------------------------------------------------------ quantizers --
@@ -1137,6 +1379,17 @@ def main():
     sr = ShardReader(args.src)
     dev = torch.device(args.device)
 
+    # Full GLM-4.7 is qualified against the official BF16 checkpoint layout,
+    # not against whichever packed parameter representation a Transformers
+    # release happens to use internally. Refuse before conversion has done
+    # expensive work or published any container files.
+    try:
+        validate_glm47_full_source(cfg, sr, prefix)
+        source_unsupported = unsupported_source_features(cfg)
+    except ValueError as exc:
+        print(str(exc), file=sys.stderr)
+        return 1
+
     # ---- staging reclaim: refuse before anything is deleted, not during --
     debt = None
     if args.reclaim != "off":
@@ -1451,11 +1704,7 @@ def main():
     _tmpl_for = {"kimi-k3": "chat-k3.json",
                  "kimi-linear": "chat-kimi-linear.json",
                  "glm47-flash": "chat-glm47-flash.json"}
-    _hf0 = ((cfg.get("_outer", {}).get("architectures")
-             or cfg.get("architectures") or [""]))[0]
-    _arch0 = ("kimi-k3" if "KimiK3" in _hf0 else
-              "kimi-linear" if "KimiLinear" in _hf0 else
-              "glm47-flash" if "Glm4MoeLite" in _hf0 else "")
+    _arch0 = chat_profile(cfg)
     _dst = os.path.join(args.out, "chat.json")
     _name = _tmpl_for.get(_arch0)
     if _name and not os.path.exists(_dst):
@@ -1562,8 +1811,7 @@ def main():
     # model_type, which for K3 is the text model's and reads "kimi_linear"
     # in a K3 container. Write what `waste info` reports, so a container
     # inspected by hand and a container opened by the engine agree.
-    _hf = ((cfg.get("_outer", {}).get("architectures")
-            or cfg.get("architectures") or [""]))[0]
+    _hf = hf_architecture(cfg)
     arch = ("kimi-k3" if "KimiK3" in _hf else
             "kimi-linear" if "KimiLinear" in _hf else
             _hf or cfg.get("model_type", "unknown"))
@@ -1598,6 +1846,10 @@ def main():
         manifest["source_ignored_layers"] = source_only_layers
         print("source: omitted appended non-base layer(s) " +
               ", ".join(map(str, source_only_layers)))
+    if source_unsupported:
+        manifest["unsupported_features"] = source_unsupported
+        print("source: multi-token prediction is unsupported; appended "
+              "MTP layer omitted")
     # A manifest that lists fewer expert layers than the one it replaces
     # publishes a container the engine will refuse to open, and the banks it
     # drops are still on disk taking up room. Never intended; say so.

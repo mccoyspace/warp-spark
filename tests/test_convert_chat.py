@@ -119,6 +119,9 @@ def main():
         ck(build(tmp, "glm", "Glm4MoeLiteForCausalLM", GLM_MARKERS)
            == shipped("chat-glm47-flash.json"),
            "Glm4MoeLite installs chat-glm47-flash.json verbatim")
+        ck(H.CONV.chat_profile({
+               "architectures": ["Glm4MoeForCausalLM"]}) == "glm47-flash",
+           "full Glm4Moe selects the same qualified GLM chat metadata")
 
         print("and never one the tokenizer cannot spell")
         ck(build(tmp, "cross", "KimiLinearForCausalLM", K3_MARKERS) is None,

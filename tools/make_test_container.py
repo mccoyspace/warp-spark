@@ -99,6 +99,54 @@ V3_ROPE = {
                      "type": "yarn"},
 }
 
+# A shape-scaled full GLM-4.7 source contract. Unlike --rope's latent MLA,
+# this is ordinary grouped-query attention with Q/K normalization, QKV bias,
+# and half-split RoPE on only the first half of each head. Twenty-four query
+# heads to two KV heads preserves the release's 96:8 grouping ratio while
+# crossing a KV-group boundary. Eight-wide heads leave four half-split rotary
+# dimensions (distinguishable from adjacent-pair RoPE) and four pass-through
+# dimensions. Four layers keep all three dense layers plus one MoE layer, and
+# the optional fifth MTP layer is recorded as deliberately omitted.
+GLM47_CFG = {
+    "model_type": "glm4_moe",
+    "architectures": ["Glm4MoeForCausalLM"],
+    "hidden_size": 128,
+    "num_hidden_layers": 4,
+    "first_k_dense_replace": 3,
+    "intermediate_size": 256,
+    "moe_intermediate_size": 64,
+    "n_routed_experts": 8,
+    "num_experts": 8,
+    "num_experts_per_tok": 2,
+    "num_experts_per_token": 2,
+    "n_shared_experts": 1,
+    "num_shared_experts": 1,
+    "norm_topk_prob": True,
+    "moe_renormalize": True,
+    "topk_method": "noaux_tc",
+    "moe_router_activation_func": "sigmoid",
+    "routed_scaling_factor": 2.5,
+    "n_group": 1,
+    "topk_group": 1,
+    "hidden_act": "silu",
+    "num_attention_heads": 24,
+    "num_key_value_heads": 2,
+    "head_dim": 8,
+    "partial_rotary_factor": 0.5,
+    "attention_bias": True,
+    "use_qk_norm": True,
+    "rope_theta": 1000000.0,
+    "rope_scaling": None,
+    "max_position_embeddings": 202752,
+    "rms_norm_eps": 1e-5,
+    "vocab_size": 256,
+    "tie_word_embeddings": False,
+    "bos_token_id": 1,
+    "eos_token_id": 2,
+    "eos_token_ids": [2, 3, 4],
+    "num_nextn_predict_layers": 1,
+}
+
 
 def f32(vals):
     return struct.pack("<%df" % len(vals), *vals)
@@ -283,6 +331,10 @@ def main():
                     help="a DeepSeek-V3 instead of a Kimi-Linear: every layer "
                          "MLA, no mla_use_nope, and rope_theta with YaRN — the "
                          "only shape that reaches the engine's rotary")
+    ap.add_argument("--glm47-full", action="store_true",
+                    help="a tiny full GLM-4.7: standard GQA with QKV bias, "
+                         "Q/K norm, partial half-split RoPE, three dense "
+                         "layers and one separate-expert MoE layer")
     ap.add_argument("--qk-rope", type=int, metavar="N",
                     help="override qk_rope_head_dim. With --rope, a slice "
                          "wider than the build's WASTE_MAX_ROPE_HALF pair "
@@ -308,10 +360,12 @@ def main():
                          "at 1.0. Unequal mscales put a ratio on cos/sin that "
                          "the engine does not apply, so it refuses instead")
     args = ap.parse_args()
+    if args.rope and args.glm47_full:
+        ap.error("--rope and --glm47-full are mutually exclusive")
     rng = random.Random(args.seed)
     os.makedirs(args.out, exist_ok=True)
 
-    cfg = dict(CFG)
+    cfg = dict(GLM47_CFG if args.glm47_full else CFG)
     if args.rope:
         # Dropping linear_attn_config is what makes every layer MLA, so the
         # rotation is exercised at depth rather than in the one full-attention
@@ -347,9 +401,14 @@ def main():
         cfg["bos_token_id"] = vocab - len(SPECIALS)
         cfg["eos_token_id"] = vocab - len(SPECIALS) + 2   # <|end_of_msg|>
     hid = cfg["hidden_size"]
-    nh, vh = cfg["num_attention_heads"], cfg["v_head_dim"]
-    qd = cfg["qk_nope_head_dim"] + cfg["qk_rope_head_dim"]
-    kvl, rope = cfg["kv_lora_rank"], cfg["qk_rope_head_dim"]
+    nh = cfg["num_attention_heads"]
+    if args.glm47_full:
+        vh = qd = cfg["head_dim"]
+        kvl = rope = 0
+    else:
+        vh = cfg["v_head_dim"]
+        qd = cfg["qk_nope_head_dim"] + cfg["qk_rope_head_dim"]
+        kvl, rope = cfg["kv_lora_rank"], cfg["qk_rope_head_dim"]
     moe, dense = cfg["moe_intermediate_size"], cfg["intermediate_size"]
     kda = {l - 1 for l in cfg.get("linear_attn_config", {}).get("kda_layers", [])}
 
@@ -359,7 +418,20 @@ def main():
         p = f"model.layers.{L}."
         t.f32(p + "input_layernorm.weight", [hid])
         t.f32(p + "post_attention_layernorm.weight", [hid])
-        if L in kda:
+        if args.glm47_full:
+            a = p + "self_attn."
+            qrows = cfg["num_attention_heads"] * cfg["head_dim"]
+            kvrows = cfg["num_key_value_heads"] * cfg["head_dim"]
+            t.quant(a + "q_proj.weight", [qrows, hid])
+            t.f32(a + "q_proj.bias", [qrows])
+            t.quant(a + "k_proj.weight", [kvrows, hid])
+            t.f32(a + "k_proj.bias", [kvrows])
+            t.quant(a + "v_proj.weight", [kvrows, hid])
+            t.f32(a + "v_proj.bias", [kvrows])
+            t.quant(a + "o_proj.weight", [hid, qrows])
+            t.f32(a + "q_norm.weight", [cfg["head_dim"]])
+            t.f32(a + "k_norm.weight", [cfg["head_dim"]])
+        elif L in kda:
             a = p + "self_attn."
             for w in ("q_proj", "k_proj", "v_proj"):
                 t.quant(a + w + ".weight", [C_KDA, hid])
@@ -434,7 +506,8 @@ def main():
 
     manifest = {
         "format_version": 0,
-        "arch": cfg["model_type"],
+        "arch": (cfg["architectures"][0] if args.glm47_full
+                 else cfg["model_type"]),
         "tensor_prefix": args.prefix,
         "config": cfg,
         "expert_quant": {"fmt": "VQ3R", "stages": STAGES, "vec_dim": VEC_DIM,
@@ -443,6 +516,14 @@ def main():
         "layers": layers,
         "trunk": t.index,
     }
+    if args.glm47_full:
+        manifest["source_ignored_layers"] = [cfg["num_hidden_layers"]]
+        manifest["unsupported_features"] = [{
+            "name": "multi_token_prediction",
+            "source_layers": [cfg["num_hidden_layers"]],
+            "action": "omitted",
+            "reason": "unsupported",
+        }]
     with open(os.path.join(args.out, "manifest.json"), "w") as f:
         json.dump(manifest, f, indent=1)
 
