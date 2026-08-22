@@ -4208,7 +4208,8 @@ int waste_model_set_cuda_dense(waste_model *m, int scope)
     const char *backend = getenv("WASTE_BACKEND");
     if (scope && backend && !strcmp(backend, "cpu")) return -1;
     if (scope && (!m->cuda_kda_mode || m->cuda_kda_failed)) return -1;
-    if (m->cuda_vq_mode && scope != 2) return -1;
+    if (m->cuda_vq_mode && scope != 2 &&
+        !(scope == 3 && waste_model_cuda_k2_vq3r_compatible(m))) return -1;
     m->cuda_dense_scope = scope;
     m->cuda_dense_effective = 0;
     m->cuda_dense_calls = 0;
