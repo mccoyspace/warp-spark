@@ -123,12 +123,58 @@ class TestMain(unittest.TestCase):
             self.assertEqual(serve_.call_args.kwargs["prefix_cache_entries"],
                              3)
             self.assertFalse(serve_.call_args.kwargs["conversation_head"])
+            self.assertFalse(serve_.call_args.kwargs["semantic_anchors"])
             self.assertTrue(engine.closed)
             self.assertTrue(stopped.shutdown_called)
             self.assertTrue(stopped.close_called)
         finally:
             shutil.rmtree(tmp, ignore_errors=True)
             shutil.rmtree(server_tmp, ignore_errors=True)
+
+    def test_semantic_anchors_are_validated_and_wired_before_open(self):
+        tmp = tempfile.mkdtemp(prefix="waste-main-test-")
+        model = Path(tmp) / "model.waste"
+        model.mkdir()
+        server_tmp = tempfile.mkdtemp(prefix="waste-main-server-test-")
+        engine = FakeEngine(host_reserved_bytes=1 << 20)
+        stopped = _StoppedServer(server_tmp)
+        output = io.StringIO()
+        try:
+            with (patch.object(MAIN, "Engine", return_value=engine),
+                  patch.object(MAIN, "serve", return_value=stopped) as serve_,
+                  patch.object(MAIN, "build_info", return_value="WASTE test"),
+                  redirect_stdout(output), redirect_stderr(output)):
+                status = MAIN.main([
+                    str(model), "--port", "0", "--prefix-cache", "1M",
+                    "--prefix-cache-entries", "4", "--semantic-anchors",
+                ])
+            self.assertEqual(status, 0, output.getvalue())
+            self.assertTrue(serve_.call_args.kwargs["semantic_anchors"])
+            self.assertFalse(serve_.call_args.kwargs["conversation_head"])
+            self.assertIn("exact completed-message checkpoints", output.getvalue())
+        finally:
+            shutil.rmtree(tmp, ignore_errors=True)
+            shutil.rmtree(server_tmp, ignore_errors=True)
+
+    def test_semantic_anchors_reject_missing_cache_and_head_combination(self):
+        tmp = tempfile.mkdtemp(prefix="waste-main-test-")
+        model = Path(tmp) / "model.waste"
+        model.mkdir()
+        output = io.StringIO()
+        try:
+            with (patch.object(MAIN, "Engine") as open_,
+                  redirect_stdout(output), redirect_stderr(output)):
+                missing = MAIN.main([str(model), "--semantic-anchors"])
+                combined = MAIN.main([
+                    str(model), "--prefix-cache", "1M",
+                    "--prefix-cache-entries", "4",
+                    "--conversation-head", "--semantic-anchors",
+                ])
+            self.assertEqual(missing, 2)
+            self.assertEqual(combined, 2)
+            open_.assert_not_called()
+        finally:
+            shutil.rmtree(tmp, ignore_errors=True)
 
     def test_strict_profile_rejects_effective_reader_mismatch(self):
         tmp = tempfile.mkdtemp(prefix="waste-main-test-")

@@ -51,6 +51,7 @@ class CacheUse:
     promoted_tokens: int = 0
     restored_kind: str | None = None
     head_cached_tokens: int = 0
+    anchor_cached_tokens: int = 0
 
     def response(self) -> dict[str, Any]:
         hit = self.status == "hit"
@@ -66,6 +67,7 @@ class CacheUse:
             "promoted_tokens": self.promoted_tokens,
             "restored_kind": self.restored_kind,
             "head_cached_tokens": self.head_cached_tokens,
+            "anchor_cached_tokens": self.anchor_cached_tokens,
         }
 
 
@@ -81,10 +83,11 @@ class _Entry:
 
 
 class PrefixCache:
-    """Deterministic LRU over exact roots and one optional mutable head."""
+    """Deterministic LRU over exact roots and optional conversation state."""
 
     def __init__(self, max_bytes: int, max_entries: int, identity: Any,
-                 *, conversation_head: bool = False):
+                 *, conversation_head: bool = False,
+                 semantic_anchors: bool = False):
         if max_bytes < 0 or max_entries < 0:
             raise ValueError("prefix cache limits must be non-negative")
         if (max_bytes > 0 and max_entries > 0 and
@@ -95,6 +98,10 @@ class PrefixCache:
         self.max_bytes = int(max_bytes)
         self.max_entries = int(max_entries)
         self.conversation_head = bool(conversation_head)
+        self.semantic_anchors = bool(semantic_anchors)
+        if self.conversation_head and self.semantic_anchors:
+            raise ValueError(
+                "conversation head and semantic anchors are mutually exclusive")
         self._controller_bytes = (CONTROLLER_OVERHEAD_BYTES
                                   if max_bytes > 0 and max_entries > 0 else 0)
         self._identity = identity
@@ -110,12 +117,14 @@ class PrefixCache:
             "restores": 0,
             "root_hits": 0,
             "head_hits": 0,
+            "anchor_hits": 0,
             "restore_failures": 0,
             "restored_tokens": 0,
             "replayed_tokens": 0,
             "admissions": 0,
             "root_admissions": 0,
             "head_admissions": 0,
+            "anchor_admissions": 0,
             "head_replacements": 0,
             "promotions": 0,
             "promoted_tokens": 0,
@@ -154,7 +163,10 @@ class PrefixCache:
                 "entries": len(self._entries),
                 "root_entries": sum(e.kind == "root" for e in self._entries),
                 "head_entries": sum(e.kind == "head" for e in self._entries),
+                "anchor_entries": sum(e.kind == "anchor"
+                                      for e in self._entries),
                 "conversation_head": self.conversation_head,
+                "semantic_anchors": self.semantic_anchors,
                 **self._counters,
             }
 
@@ -168,6 +180,8 @@ class PrefixCache:
                 self._counters["restored_tokens"] += use.restored_tokens
                 if use.restored_kind == "head":
                     self._counters["head_hits"] += 1
+                elif use.restored_kind == "anchor":
+                    self._counters["anchor_hits"] += 1
                 else:
                     self._counters["root_hits"] += 1
                 if use.promoted_tokens:
@@ -247,14 +261,44 @@ class PrefixCache:
                     len(self._entries) >= self.max_entries):
                 self._counters["admission_rejects"] += 1
                 return 0
+            # Semantic anchors form a bounded LRU. They may replace older
+            # anchors but never a stable family root; the root remains the
+            # cheap recovery point when a conversation changes early.
+            if kind == "anchor":
+                roots = [e for e in self._entries if e.kind == "root"]
+                root_bytes = (self._controller_bytes +
+                              sum(e.charge for e in roots))
+                # Prove the candidate can coexist with every protected root
+                # before evicting a useful old anchor. Snapshot size grows
+                # with context, so a later candidate can legitimately stop
+                # fitting even though an earlier one did.
+                if (root_bytes + charge > self.max_bytes or
+                        len(roots) + 1 > self.max_entries):
+                    self._counters["admission_rejects"] += 1
+                    return 0
+                while (self._bytes_used + charge > self.max_bytes or
+                       len(self._entries) >= self.max_entries):
+                    anchors = [e for e in self._entries
+                               if e.kind == "anchor"]
+                    if not anchors:
+                        self._counters["admission_rejects"] += 1
+                        return 0
+                    self._remove(min(
+                        anchors,
+                        key=lambda e: (e.last_used, e.created,
+                                       e.token_bytes)))
+                    self._counters["evictions"] += 1
+                return charge
             while (self._entries and
                    (self._bytes_used + charge > self.max_bytes or
                     len(self._entries) >= self.max_entries)):
-                heads = [e for e in self._entries if e.kind == "head"]
-                if heads:
-                    self._remove(min(heads,
-                                     key=lambda e: (e.last_used, e.created,
-                                                    e.token_bytes)))
+                accelerators = [e for e in self._entries
+                                if e.kind in ("head", "anchor")]
+                if accelerators:
+                    self._remove(min(
+                        accelerators,
+                        key=lambda e: (e.last_used, e.created,
+                                       e.token_bytes)))
                     self._counters["evictions"] += 1
                 else:
                     self._evict_one()
@@ -272,7 +316,18 @@ class PrefixCache:
             while (self._entries and
                    (self._bytes_used + charge > self.max_bytes or
                     len(self._entries) >= self.max_entries)):
-                self._evict_one()
+                if kind in ("head", "anchor"):
+                    accelerators = [e for e in self._entries
+                                    if e.kind != "root"]
+                    if not accelerators:
+                        break
+                    victim = min(accelerators,
+                                 key=lambda e: (e.last_used, e.created,
+                                                e.token_bytes))
+                    self._remove(victim)
+                    self._counters["evictions"] += 1
+                else:
+                    self._evict_one()
             if (self._bytes_used + charge > self.max_bytes or
                     len(self._entries) >= self.max_entries):
                 self._counters["admission_rejects"] += 1
@@ -304,7 +359,8 @@ class PrefixCache:
             return entry.n_tokens if entry in self._entries else 0
 
     def _prepare_enabled(self, engine, tokens: list[int],
-                         boundaries: Iterable[int]
+                         boundaries: Iterable[int],
+                         semantic_boundaries: Iterable[int]
                          ) -> tuple[list[int], CacheUse]:
         """Allocation-fallible cache path, isolated for clean unwinding."""
         try:
@@ -314,23 +370,35 @@ class PrefixCache:
         aligned = sorted({(int(b) // chunk) * chunk for b in boundaries
                           if chunk > 0 and isinstance(b, int)})
         aligned = [b for b in aligned if 0 < b < len(tokens)]
-        if not aligned:
+        semantic = sorted({(int(b) // chunk) * chunk
+                           for b in semantic_boundaries
+                           if chunk > 0 and isinstance(b, int)})
+        semantic = [b for b in semantic if 0 < b < len(tokens)]
+        if not aligned and not (self.semantic_anchors and semantic):
             use = CacheUse("bypass_no_root", 0, len(tokens))
             return tokens, self._record_use(use)
 
-        root_tokens = aligned[-1]
+        root_tokens = aligned[-1] if aligned else 0
         # Keep generate() a non-empty call. If the prompt length itself is a
         # chunk multiple, the previous boundary is the deepest state that can
         # be restored while preserving the ordinary chunked-prefill sequence.
         head_tokens = ((len(tokens) - 1) // chunk) * chunk
         if not self.conversation_head or head_tokens <= root_tokens:
             head_tokens = root_tokens
-        targets = [("root", root_tokens)]
+        anchor_tokens = semantic[-1] if self.semantic_anchors and semantic else 0
+        if anchor_tokens <= root_tokens:
+            anchor_tokens = 0
+        targets = []
+        if root_tokens:
+            targets.append(("root", root_tokens))
         if head_tokens > root_tokens:
             targets.append(("head", head_tokens))
+        elif anchor_tokens:
+            targets.append(("anchor", anchor_tokens))
 
         prompt_bytes = _pack(tokens)
-        entry = self._lookup(prompt_bytes, len(tokens), head_tokens)
+        max_tokens = targets[-1][1]
+        entry = self._lookup(prompt_bytes, len(tokens), max_tokens)
         restore_failed = False
         restored_tokens = 0
         restored_kind = None
@@ -359,6 +427,9 @@ class PrefixCache:
         head_cached_tokens = (cached_tokens
                               if entry is not None and entry.kind == "head"
                               else 0)
+        anchor_cached_tokens = (cached_tokens
+                                if entry is not None and entry.kind == "anchor"
+                                else 0)
         try:
             root_key = prompt_bytes[:root_tokens * _TOKEN_BYTES]
             for kind, target in targets:
@@ -394,6 +465,8 @@ class PrefixCache:
                     cached_tokens = max(cached_tokens, target)
                     if kind == "head":
                         head_cached_tokens = target
+                    elif kind == "anchor":
+                        anchor_cached_tokens = target
         except EngineError:
             # We cannot prove the checkpoint is sound. Re-evaluate from a
             # clean state rather than continuing from an uncertain prefix.
@@ -411,16 +484,19 @@ class PrefixCache:
                            cached_tokens=cached_tokens,
                            promoted_tokens=promoted,
                            restored_kind=restored_kind,
-                           head_cached_tokens=head_cached_tokens)
+                           head_cached_tokens=head_cached_tokens,
+                           anchor_cached_tokens=anchor_cached_tokens)
         else:
             status = "restore_failed" if restore_failed else "miss"
             use = CacheUse(status, 0, len(tokens),
                            cached_tokens=cached_tokens,
-                           head_cached_tokens=head_cached_tokens)
+                           head_cached_tokens=head_cached_tokens,
+                           anchor_cached_tokens=anchor_cached_tokens)
         return tokens[start:], self._record_use(use)
 
     def prepare(self, engine, tokens: list[int], boundaries: Iterable[int],
-                identity: Any) -> tuple[list[int], CacheUse]:
+                identity: Any, semantic_boundaries: Iterable[int] = ()
+                ) -> tuple[list[int], CacheUse]:
         """Restore the deepest ancestor or build one cold family root.
 
         The caller must hold the engine lock and reset its state first.
@@ -435,7 +511,8 @@ class PrefixCache:
             return tokens, self._record_use(use)
 
         try:
-            return self._prepare_enabled(engine, tokens, boundaries)
+            return self._prepare_enabled(
+                engine, tokens, boundaries, semantic_boundaries)
         except (MemoryError, OverflowError):
             # Snapshot allocation can be hundreds of MiB on K3. Allocation
             # failure is a cache miss, not a partially-prefilled HTTP failure:

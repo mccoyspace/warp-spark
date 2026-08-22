@@ -88,6 +88,7 @@ class ChatServer(ThreadingHTTPServer):
                  prefix_cache_bytes: int = 0,
                  prefix_cache_entries: int = 8,
                  conversation_head: bool = False,
+                 semantic_anchors: bool = False,
                  request_qos=None,
                  performance_profile: Optional[dict] = None):
         if prefix_cache_bytes < 0 or prefix_cache_entries < 0:
@@ -99,6 +100,14 @@ class ChatServer(ThreadingHTTPServer):
             raise ValueError(
                 "conversation head needs an enabled prefix cache and at "
                 "least two entries")
+        if semantic_anchors and (
+                not prefix_cache_bytes or prefix_cache_entries < 2):
+            raise ValueError(
+                "semantic anchors need an enabled prefix cache and at "
+                "least two entries")
+        if conversation_head and semantic_anchors:
+            raise ValueError(
+                "conversation head and semantic anchors are mutually exclusive")
         if (prefix_cache_bytes and
                 prefix_cache_bytes < CONTROLLER_OVERHEAD_BYTES):
             raise ValueError(
@@ -181,7 +190,8 @@ class ChatServer(ThreadingHTTPServer):
         self.prefix_cache = PrefixCache(
             prefix_cache_bytes, prefix_cache_entries,
             self.prefix_cache_identity,
-            conversation_head=conversation_head)
+            conversation_head=conversation_head,
+            semantic_anchors=semantic_anchors)
 
     def server_close(self):
         try:
@@ -481,7 +491,8 @@ class Handler(BaseHTTPRequestHandler):
         with self.server.request_qos.scope(request_id) as qos_lease:
             run_tokens, cache_use = self.server.prefix_cache.prepare(
                 engine, prompt.tokens, prompt.cache_boundaries,
-                self.server.prefix_cache_identity)
+                self.server.prefix_cache_identity,
+                prompt.semantic_boundaries)
             if before_generate is not None:
                 before_generate()
             completed = engine.generate(
@@ -719,6 +730,7 @@ def serve(engine: Engine, *, host: str = "127.0.0.1", port: int = 8000,
           prefix_cache_bytes: int = 0,
           prefix_cache_entries: int = 8,
           conversation_head: bool = False,
+          semantic_anchors: bool = False,
           request_qos=None,
           performance_profile: Optional[dict] = None) -> ChatServer:
     """Build the server. The caller decides whether to serve_forever."""
@@ -734,6 +746,7 @@ def serve(engine: Engine, *, host: str = "127.0.0.1", port: int = 8000,
                      prefix_cache_bytes=prefix_cache_bytes,
                      prefix_cache_entries=prefix_cache_entries,
                      conversation_head=conversation_head,
+                     semantic_anchors=semantic_anchors,
                      request_qos=request_qos,
                      performance_profile=performance_profile)
     if ready is not None:

@@ -163,6 +163,11 @@ examples:
                    help="retain one exact mutable conversation checkpoint in "
                         "addition to stable family roots; requires a prefix "
                         "cache and at least two entries")
+    s.add_argument("--semantic-anchors", action="store_true",
+                   help="retain a bounded LRU of exact completed-message "
+                        "checkpoints; requires a prefix cache and at least "
+                        "two entries; mutually exclusive with conversation "
+                        "head")
     s.add_argument("--plan", action="store_true",
                    help="print the memory plan and exit without loading")
 
@@ -180,6 +185,15 @@ examples:
             not args.prefix_cache or args.prefix_cache_entries < 2):
         print("--conversation-head requires --prefix-cache and at least two "
               "prefix-cache entries", file=sys.stderr)
+        return 2
+    if args.semantic_anchors and (
+            not args.prefix_cache or args.prefix_cache_entries < 2):
+        print("--semantic-anchors requires --prefix-cache and at least two "
+              "prefix-cache entries", file=sys.stderr)
+        return 2
+    if args.conversation_head and args.semantic_anchors:
+        print("--conversation-head and --semantic-anchors are mutually "
+              "exclusive", file=sys.stderr)
         return 2
 
     model = Path(args.model).expanduser()
@@ -299,12 +313,15 @@ examples:
         print(f"memory   {human(used['floor_bytes'])} resident, "
               f"expert cache {human(used['min_expert_cache'])}")
         if args.prefix_cache:
-            entry_kind = ("snapshots" if args.conversation_head
+            entry_kind = ("snapshots" if (args.conversation_head or
+                                           args.semantic_anchors)
                           else "family roots")
             print(f"prefix   {human(args.prefix_cache)} reserved, "
                   f"at most {args.prefix_cache_entries} {entry_kind}")
             if args.conversation_head:
                 print("head     one exact mutable conversation checkpoint")
+            if args.semantic_anchors:
+                print("anchors  exact completed-message checkpoints, LRU")
         print(f"thinking {'off by default' if args.no_thinking else 'on'}"
               f" — reasoning_effort per request")
         profile_note = (" — bounded request-scoped Q0"
@@ -326,6 +343,7 @@ examples:
                     prefix_cache_bytes=args.prefix_cache,
                     prefix_cache_entries=args.prefix_cache_entries,
                     conversation_head=args.conversation_head,
+                    semantic_anchors=args.semantic_anchors,
                     request_qos=request_qos,
                     performance_profile=public_profile)
     except (EngineError, OSError, QosError, ValueError) as e:

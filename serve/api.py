@@ -279,7 +279,7 @@ def resolve_image(ref: str, tmpdir: str, *,
 # Bump whenever build_prompt/build_chat_segments changes the token meaning of
 # a cacheable family root. Prefix caches are process-local, but making the
 # template component explicit keeps accidental engine reuse fail-closed.
-PROMPT_CACHE_VERSION = 1
+PROMPT_CACHE_VERSION = 2
 
 
 class Prompt:
@@ -287,11 +287,32 @@ class Prompt:
 
     def __init__(self, tokens: list[int], *, thinking: bool,
                  n_images: int = 0,
-                 cache_boundaries: Optional[list[int]] = None):
+                 cache_boundaries: Optional[list[int]] = None,
+                 semantic_boundaries: Optional[list[int]] = None):
         self.tokens = tokens
         self.thinking = thinking
         self.n_images = n_images
         self.cache_boundaries = tuple(cache_boundaries or ())
+        self.semantic_boundaries = tuple(semantic_boundaries or ())
+
+
+def _tokenize_segment_boundaries(engine: Engine, segments: list[Any],
+                                 ends: list[int]
+                                 ) -> tuple[list[int], dict[int, int]]:
+    """Tokenize every segment once and report exact token prefix lengths."""
+    valid = sorted({int(end) for end in ends
+                    if isinstance(end, int) and 0 < end <= len(segments)})
+    offsets: dict[int, int] = {}
+    tokens: list[int] = []
+    start = 0
+    for end in valid:
+        if end > start:
+            tokens.extend(engine.tokenize_segments(segments[start:end]))
+        offsets[end] = len(tokens)
+        start = end
+    if start < len(segments):
+        tokens.extend(engine.tokenize_segments(segments[start:]))
+    return tokens, offsets
 
 
 def build_prompt(engine: Engine, body: dict, *, default_thinking: bool,
@@ -383,17 +404,20 @@ def build_prompt(engine: Engine, body: dict, *, default_thinking: bool,
         kwargs["response_format"] = response_format
 
     family_root_end: list[int] = []
+    semantic_anchor_end: list[int] = []
     try:
         segments = fmt.build_chat_segments(
             messages, tools, thinking=thinking, add_generation_prompt=True,
             image_prompts=image_prompts or None,
-            family_root_end=family_root_end, **kwargs)
+            family_root_end=family_root_end,
+            semantic_anchor_end=semantic_anchor_end, **kwargs)
     except chatfmt.ChatFormatError as e:
         raise APIError(str(e), param=e.param or "messages")
     except xtml.XTMLError as e:
         raise APIError(str(e), param="messages")
 
-    tokens = engine.tokenize_segments(segments)
+    tokens, boundary_offsets = _tokenize_segment_boundaries(
+        engine, segments, family_root_end + semantic_anchor_end)
     if n_images:
         tokens = engine.image_expand(tokens)
 
@@ -405,17 +429,24 @@ def build_prompt(engine: Engine, body: dict, *, default_thinking: bool,
             param="messages")
 
     cache_boundaries: list[int] = []
-    if family_root_end and not n_images:
-        # Segment tokenization is deliberately non-associative. Re-tokenize
-        # exactly the reported segment prefix, then prove it is a byte-for-
-        # byte token prefix before offering it to the cache. Images bypass:
-        # equal media marker tokens do not identify equal pixel embeddings.
-        root = engine.tokenize_segments(segments[:family_root_end[-1]])
-        if root and len(root) < len(tokens) and tokens[:len(root)] == root:
-            cache_boundaries.append(len(root))
+    semantic_boundaries: list[int] = []
+    if not n_images:
+        # Segment tokenization is deliberately non-associative. The helper
+        # tokenizes each segment exactly once and records offsets in that
+        # same token stream. Images bypass: equal media marker tokens do not
+        # identify equal pixel embeddings.
+        if family_root_end:
+            root = boundary_offsets.get(family_root_end[-1], 0)
+            if 0 < root < len(tokens):
+                cache_boundaries.append(root)
+        if semantic_anchor_end:
+            anchor = boundary_offsets.get(semantic_anchor_end[-1], 0)
+            if 0 < anchor < len(tokens):
+                semantic_boundaries.append(anchor)
 
     return Prompt(tokens, thinking=thinking, n_images=n_images,
-                  cache_boundaries=cache_boundaries)
+                  cache_boundaries=cache_boundaries,
+                  semantic_boundaries=semantic_boundaries)
 
 
 # ---- sampling ------------------------------------------------------------

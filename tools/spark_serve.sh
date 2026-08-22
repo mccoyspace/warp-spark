@@ -49,6 +49,16 @@ max_hold=${WASTE_SPARK_MAX_HOLD_SECONDS:-3600}
 startup_timeout=${WASTE_SPARK_STARTUP_TIMEOUT_SECONDS:-900}
 artifact_dir=${WASTE_SPARK_QOS_DIR:-/var/tmp/waste-spark-qos-$(id -u)}
 
+# Preserve the qualified head by default, but let a caller select the separate
+# semantic-anchor experiment without the wrapper supplying both policies.
+prefix_policy=(--conversation-head)
+for arg in "$@"; do
+    if [[ $arg == --semantic-anchors ]]; then
+        prefix_policy=()
+        break
+    fi
+done
+
 # These configure this wrapper, not the engine. The strict profile rejects
 # undeclared WASTE_* selectors, so do not let exported launcher knobs leak
 # through the holder's deliberately broad WASTE_* allowlist.
@@ -85,7 +95,7 @@ sudo -n python3 "$repo_dir/tools/pm_qos_exec.py" \
         --budget "$budget" \
         --prefix-cache "$prefix_cache" \
         --prefix-cache-entries "$prefix_entries" \
-        --conversation-head \
+        "${prefix_policy[@]}" \
         --performance-profile spark-q0 \
         "$@" &
 holder_pid=$!

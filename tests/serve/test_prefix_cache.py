@@ -148,6 +148,108 @@ class TestPrefixCachePolicy(unittest.TestCase):
         self.assertEqual(stats["head_entries"], 0)
         self.assertEqual(stats["admission_rejects"], 1)
 
+    def test_semantic_lru_retains_multiple_exact_turn_ancestors(self):
+        identity = ("one engine",)
+        cache = PrefixCache(1 << 20, 4, identity, semantic_anchors=True)
+        engine = FakeEngine(host_reserved_bytes=1 << 20, prefill_chunk=4)
+        first = list(range(1, 22))
+
+        engine.state_reset()
+        suffix, cold = cache.prepare(
+            engine, first, [8], identity, [17])
+        self.assertEqual(cold.status, "miss")
+        self.assertEqual(cold.anchor_cached_tokens, 16)
+        self.assertEqual(suffix, first[16:])
+
+        extended = first + list(range(101, 110))
+        engine.state_reset()
+        suffix, warm = cache.prepare(
+            engine, extended, [8], identity, [25])
+        self.assertEqual(warm.status, "hit")
+        self.assertEqual(warm.restored_kind, "anchor")
+        self.assertEqual(warm.restored_tokens, 16)
+        self.assertEqual(warm.anchor_cached_tokens, 24)
+        self.assertEqual(suffix, extended[24:])
+
+        changed = list(extended)
+        changed[20] = 999
+        engine.state_reset()
+        suffix, fallback = cache.prepare(
+            engine, changed, [8], identity, [25])
+        self.assertEqual(fallback.status, "hit")
+        self.assertEqual(fallback.restored_kind, "anchor")
+        self.assertEqual(fallback.restored_tokens, 16)
+        self.assertEqual(suffix, changed[24:])
+        stats = cache.stats()
+        self.assertEqual(stats["root_entries"], 1)
+        self.assertEqual(stats["anchor_entries"], 3)
+        self.assertEqual(stats["anchor_hits"], 2)
+
+    def test_semantic_anchor_pressure_evicts_anchor_not_root(self):
+        identity = ("one engine",)
+        cache = PrefixCache(1 << 20, 2, identity, semantic_anchors=True)
+        engine = FakeEngine(host_reserved_bytes=1 << 20, prefill_chunk=4)
+        first = list(range(1, 22))
+        second = first + list(range(101, 110))
+
+        engine.state_reset()
+        cache.prepare(engine, first, [8], identity, [17])
+        old_anchor = next(e.token_bytes for e in cache._entries
+                          if e.kind == "anchor")
+        engine.state_reset()
+        cache.prepare(engine, second, [8], identity, [25])
+
+        stats = cache.stats()
+        self.assertEqual(stats["root_entries"], 1)
+        self.assertEqual(stats["anchor_entries"], 1)
+        self.assertEqual(stats["evictions"], 1)
+        self.assertNotIn(old_anchor,
+                         [e.token_bytes for e in cache._entries])
+
+    def test_oversized_later_anchor_preserves_smaller_old_anchor(self):
+        identity = ("one engine",)
+        engine = FakeEngine(prefill_chunk=4)
+        first = list(range(1, 18))
+        root_snapshot = 8 + 4 * 8
+        root_charge = root_snapshot + 4 * 8 + ENTRY_OVERHEAD_BYTES
+        old_snapshot = 8 + 4 * 12
+        old_charge = old_snapshot + 4 * 12 + ENTRY_OVERHEAD_BYTES
+        limit = CONTROLLER_OVERHEAD_BYTES + root_charge + old_charge
+        engine.host_reserved_bytes = limit
+        cache = PrefixCache(limit, 3, identity, semantic_anchors=True)
+
+        engine.state_reset()
+        cache.prepare(engine, first, [8], identity, [13])
+        old_anchor = next(e for e in cache._entries if e.kind == "anchor")
+        old_key = old_anchor.token_bytes
+        old_blob = bytes(old_anchor.blob)
+
+        extended = first + list(range(101, 110))
+        engine.state_reset()
+        _, use = cache.prepare(engine, extended, [8], identity, [21])
+        self.assertEqual(use.status, "hit")
+        self.assertEqual(use.restored_tokens, 12)
+        anchors = [e for e in cache._entries if e.kind == "anchor"]
+        self.assertEqual(len(anchors), 1)
+        self.assertEqual(anchors[0].token_bytes, old_key)
+        self.assertEqual(bytes(anchors[0].blob), old_blob)
+        self.assertEqual(cache.stats()["admission_rejects"], 1)
+
+    def test_semantic_anchor_works_without_a_family_root(self):
+        identity = ("one engine",)
+        cache = PrefixCache(1 << 20, 2, identity, semantic_anchors=True)
+        engine = FakeEngine(host_reserved_bytes=1 << 20, prefill_chunk=4)
+        tokens = list(range(1, 22))
+
+        engine.state_reset()
+        cache.prepare(engine, tokens, [], identity, [13])
+        engine.state_reset()
+        suffix, use = cache.prepare(engine, tokens, [], identity, [13])
+        self.assertEqual(use.status, "hit")
+        self.assertEqual(use.restored_kind, "anchor")
+        self.assertEqual(use.restored_tokens, 12)
+        self.assertEqual(suffix, tokens[12:])
+
     def test_shallow_hit_promotes_deeper_root_and_preserves_full_state(self):
         identity = ("one engine",)
         cache = PrefixCache(1 << 20, 4, identity)

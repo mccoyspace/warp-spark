@@ -245,6 +245,16 @@ branch while retaining its stable family root. It requires an enabled prefix
 cache and at least two entries. The old head is replaced rather than forming a
 block tree; altered history falls back to the root.
 
+`--semantic-anchors` is the agent-edit-oriented alternative. It retains a
+bounded LRU of exact completed-message checkpoints, using the same byte and
+entry limits and the same engine reservation. It can restore the last exact
+turn before an edited reasoning/tool block; anchors evict only anchors, never
+the stable family root. It is mutually exclusive with `--conversation-head`
+and requires at least two configured entries. The initial GN100 experiment is
+`--prefix-cache 2G --prefix-cache-entries 4 --semantic-anchors`; the byte bound
+may admit fewer than four long-context K3 snapshots. See
+[PREFIX_CACHE.md](PREFIX_CACHE.md).
+
 ### Concurrency
 
 `waste.h`: a `waste_ctx` is not thread-safe. So generations serialize on
@@ -487,5 +497,6 @@ python3 -m serve MODEL [options]
   --prefix-cache SIZE          exact-prefix snapshot bytes (off by default)
   --prefix-cache-entries N     hard entry limit (default 8)
   --conversation-head          one exact mutable chat checkpoint (needs cache)
+  --semantic-anchors           completed-message checkpoint LRU (needs cache)
   --plan             print the memory plan and exit
 ```

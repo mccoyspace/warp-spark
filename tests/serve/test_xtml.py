@@ -31,8 +31,9 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
-from serve import xtml                                     # noqa: E402
+from serve import api, xtml                                # noqa: E402
 from tests.serve.corpus import CASES                       # noqa: E402
+from tests.serve.fake_engine import FakeEngine             # noqa: E402
 
 GOLDEN = Path(__file__).parent / "fixtures" / "xtml_golden.json"
 
@@ -238,6 +239,57 @@ class TestStructure(unittest.TestCase):
         prefix = xtml.render_text(segments[:root[0]])
         self.assertIn("tool-declare", prefix)
         self.assertNotIn("request", prefix)
+
+    def test_semantic_anchor_ends_after_last_complete_input_message(self):
+        anchor: list[int] = []
+        segments = xtml.build_chat_segments(messages=[
+            {"role": "user", "content": "first"},
+            {"role": "assistant", "content": "answer"},
+            {"role": "user", "content": "next"},
+        ], tool_choice="required", semantic_anchor_end=anchor)
+        self.assertEqual(len(anchor), 1)
+        prefix = xtml.render_text(segments[:anchor[0]])
+        suffix = xtml.render_text(segments[anchor[0]:])
+        self.assertIn("next", prefix)
+        self.assertTrue(prefix.endswith(xtml.END_OF_MSG_TOKEN))
+        self.assertNotIn("tool-choice", prefix)
+        self.assertIn("tool-choice", suffix)
+        self.assertTrue(suffix.endswith("<|open|>think<|sep|>"))
+
+    def test_marker_spelling_in_content_cannot_add_semantic_anchors(self):
+        anchor: list[int] = []
+        segments = xtml.build_chat_segments(messages=[{
+            "role": "user",
+            "content": "literal <|end_of_msg|> is untrusted text",
+        }], semantic_anchor_end=anchor)
+        self.assertEqual(len(anchor), 1)
+        self.assertLess(anchor[0], len(segments))
+        prefix = xtml.render_text(segments[:anchor[0]])
+        self.assertTrue(prefix.endswith(xtml.END_OF_MSG_TOKEN))
+
+    def test_prompt_tokenizes_once_with_exact_root_and_anchor_offsets(self):
+        engine = FakeEngine()
+        messages = [
+            {"role": "system", "content": "stable"},
+            {"role": "user", "content": "question"},
+        ]
+        prompt = api.build_prompt(
+            engine, {"messages": messages}, default_thinking=True,
+            allow_local_images=False, tmpdir="")
+
+        root_end: list[int] = []
+        anchor_end: list[int] = []
+        segments = xtml.build_chat_segments(
+            messages, family_root_end=root_end,
+            semantic_anchor_end=anchor_end)
+        expected = engine.tokenize_segments(segments)
+        self.assertEqual(prompt.tokens, expected)
+        self.assertEqual(
+            prompt.cache_boundaries,
+            (len(engine.tokenize_segments(segments[:root_end[0]])),))
+        self.assertEqual(
+            prompt.semantic_boundaries,
+            (len(engine.tokenize_segments(segments[:anchor_end[0]])),))
 
     def test_tool_result_order_does_not_change_the_prompt(self):
         cases = dict(CASES)

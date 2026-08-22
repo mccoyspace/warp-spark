@@ -594,6 +594,7 @@ def build_chat_segments(messages: list[Any],
                         thinking: bool = True,
                         image_prompts: Optional[list[str]] = None,
                         family_root_end: Optional[list[int]] = None,
+                        semantic_anchor_end: Optional[list[int]] = None,
                         **kwargs: Any) -> list[Segment]:
     """Render a conversation into segments, in K3's own order.
 
@@ -611,9 +612,16 @@ def build_chat_segments(messages: list[Any],
     note, and consecutive leading system/developer messages. Request-tail
     controls and user turns are deliberately excluded. The caller still has
     to prove the encoded prefix and choose an engine-safe checkpoint offset.
+
+    `semantic_anchor_end` receives the segment offset after the final complete
+    input message, before request-tail controls and the generation opener. It
+    is an exact turn boundary suitable for a process-local state checkpoint;
+    callers still align it to the engine's prefill chunk size.
     """
     if family_root_end is not None:
         family_root_end.clear()
+    if semantic_anchor_end is not None:
+        semantic_anchor_end.clear()
     # Re-sort tool results at the lowest layer, so every caller gets
     # correctly ordered XTML whether it came through the server or not.
     messages = normalize_xtml_tool_result_messages(messages)
@@ -635,6 +643,7 @@ def build_chat_segments(messages: list[Any],
     tool_calls = None
     tool_index = 0
     root_end = 0
+    anchor_end = 0
 
     if tools:
         segments.extend(_render_tool_declare(tools))
@@ -715,6 +724,9 @@ def build_chat_segments(messages: list[Any],
             segments.extend(_close_tag("message"))
             segments.extend(_end_of_msg())
 
+        if role in ("user", "system", "tool", "assistant"):
+            anchor_end = len(segments)
+
         if leading_system and role == "system":
             root_end = len(segments)
 
@@ -758,6 +770,8 @@ def build_chat_segments(messages: list[Any],
     image_state.assert_consumed()
     if family_root_end is not None and root_end:
         family_root_end.append(root_end)
+    if semantic_anchor_end is not None and anchor_end:
+        semantic_anchor_end.append(anchor_end)
     return segments
 
 

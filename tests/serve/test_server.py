@@ -560,6 +560,69 @@ class TestConversationHeadLimits(unittest.TestCase):
                   conversation_head=True)
 
 
+class TestSemanticAnchors(ServerTestCase):
+    """Several exact completed-message checkpoints survive branch edits."""
+
+    engine_kwargs = {"host_reserved_bytes": 1 << 20, "prefill_chunk": 4}
+    server_kwargs = {"prefix_cache_bytes": 1 << 20,
+                     "prefix_cache_entries": 4,
+                     "semantic_anchors": True}
+
+    def test_edited_tool_result_restores_preceding_semantic_anchor(self):
+        system = {"role": "system", "content": "stable policy " * 10}
+        question = {"role": "user", "content": "weather in Paris?"}
+        _, first = self.chat(messages=[system, question])
+        first_cache = first["waste"]["prefix_cache"]
+        self.assertEqual(first_cache["status"], "miss")
+        self.assertGreater(first_cache["anchor_cached_tokens"], 0)
+
+        call = {"role": "assistant", "content": "", "tool_calls": [{
+            "id": "call_1", "type": "function",
+            "function": {"name": "weather",
+                         "arguments": '{"city":"Paris"}'},
+        }]}
+        result = {"role": "tool", "tool_call_id": "call_1",
+                  "content": "18C, clear"}
+        _, second = self.chat(messages=[system, question, call, result])
+        second_cache = second["waste"]["prefix_cache"]
+        self.assertEqual(second_cache["status"], "hit")
+        self.assertEqual(second_cache["restored_kind"], "anchor")
+        self.assertGreater(second_cache["anchor_cached_tokens"],
+                           first_cache["anchor_cached_tokens"])
+
+        changed = dict(result)
+        changed["content"] = "12C, rain"
+        _, edited = self.chat(messages=[system, question, call, changed])
+        edited_cache = edited["waste"]["prefix_cache"]
+        self.assertEqual(edited_cache["status"], "hit")
+        self.assertEqual(edited_cache["restored_kind"], "anchor")
+        self.assertEqual(edited_cache["restored_tokens"],
+                         first_cache["anchor_cached_tokens"])
+
+        health = self.get("/health")[1]["prefix_cache"]
+        self.assertTrue(health["semantic_anchors"])
+        self.assertEqual(health["root_entries"], 1)
+        self.assertGreaterEqual(health["anchor_entries"], 2)
+
+
+class TestSemanticAnchorLimits(unittest.TestCase):
+    def test_anchors_require_cache_two_entries_and_exclusive_policy(self):
+        engine = FakeEngine(host_reserved_bytes=1 << 20)
+        with self.assertRaises(ValueError):
+            serve(engine, host="127.0.0.1", port=0,
+                  semantic_anchors=True)
+        with self.assertRaises(ValueError):
+            serve(engine, host="127.0.0.1", port=0,
+                  prefix_cache_bytes=1 << 20,
+                  prefix_cache_entries=1,
+                  semantic_anchors=True)
+        with self.assertRaises(ValueError):
+            serve(engine, host="127.0.0.1", port=0,
+                  prefix_cache_bytes=1 << 20,
+                  prefix_cache_entries=2,
+                  conversation_head=True, semantic_anchors=True)
+
+
 class TestPrefixCacheLimits(unittest.TestCase):
     def test_cache_must_be_precharged_to_the_engine(self):
         engine = FakeEngine(host_reserved_bytes=CONTROLLER_OVERHEAD_BYTES)

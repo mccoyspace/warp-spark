@@ -189,6 +189,7 @@ class ChatFormat:
                             add_generation_prompt: bool = True,
                             thinking: bool = True,
                             image_prompts: Optional[list[str]] = None,
+                            semantic_anchor_end: Optional[list[int]] = None,
                             **kwargs: Any) -> list[Segment]:
         """Render a conversation. Same signature as xtml.build_chat_segments.
 
@@ -216,6 +217,8 @@ class ChatFormat:
                 "this container is served from its chat.json, which cannot "
                 "place an image")
 
+        if semantic_anchor_end is not None:
+            semantic_anchor_end.clear()
         segments: list[Segment] = []
         for i, message in enumerate(messages):
             role = message.get("role")
@@ -235,6 +238,8 @@ class ChatFormat:
             segments.append(Segment(prefix, markup=True))
             segments.extend(_content_segments(message.get("content"), i))
             segments.append(Segment(suffix, markup=True))
+            if semantic_anchor_end is not None:
+                semantic_anchor_end[:] = [len(segments)]
 
         if add_generation_prompt:
             segments.append(Segment(self.opening, markup=True))

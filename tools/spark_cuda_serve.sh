@@ -49,6 +49,17 @@ port=${WASTE_SPARK_CUDA_PORT:-8000}
 startup_timeout=${WASTE_SPARK_CUDA_STARTUP_TIMEOUT_SECONDS:-900}
 status_path=${WASTE_SPARK_CUDA_QOS_STATUS:-/var/lib/waste-qos/spark-cuda-status.json}
 
+# The qualified default remains the singular conversation head. An explicit
+# semantic experiment replaces that default flag; serve/__main__.py still
+# validates its cache/entry requirements and rejects both policies together.
+prefix_policy=(--conversation-head)
+for arg in "$@"; do
+    if [[ $arg == --semantic-anchors ]]; then
+        prefix_policy=()
+        break
+    fi
+done
+
 unset WASTE_SPARK_CUDA_CPU_LIST WASTE_SPARK_CUDA_BUDGET
 unset WASTE_SPARK_CUDA_PREFIX_CACHE WASTE_SPARK_CUDA_PREFIX_ENTRIES
 unset WASTE_SPARK_CUDA_HOST WASTE_SPARK_CUDA_PORT
@@ -78,7 +89,7 @@ sudo -n python3 "$repo_dir/tools/pm_qos_exec.py" \
         --budget "$budget" \
         --prefix-cache "$prefix_cache" \
         --prefix-cache-entries "$prefix_entries" \
-        --conversation-head \
+        "${prefix_policy[@]}" \
         --performance-profile spark-cuda \
         "$@" &
 holder_pid=$!

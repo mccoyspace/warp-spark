@@ -1,4 +1,4 @@
-# Exact server prefix cache and conversation head
+# Exact server prefix cache, conversation head, and semantic anchors
 
 K3's KDA-heavy state makes a prompt checkpoint much smaller than a
 conventional full KV cache. The server can keep a bounded number of those
@@ -21,7 +21,7 @@ limit larger than the engine reservation.
 
 ## What is cached
 
-Version 1 recognizes the stable beginning of a rendered chat prompt:
+The base policy recognizes the stable beginning of a rendered chat prompt:
 
 - the key-normalized tool declaration (tool-list order is preserved);
 - an explicit thinking-effort note; and
@@ -72,6 +72,49 @@ rejected. An altered prior turn fails the exact-token match and falls back to
 the family root. Images, raw completions, and prompts without a stable root
 retain the existing bypass behavior.
 
+## Optional semantic-anchor LRU
+
+Agent clients often edit or discard an earlier reasoning block or tool result.
+The singular conversation head then misses and can use only the stable family
+root. Semantic-anchor mode instead retains several exact completed-message
+checkpoints inside the same bounded reservation:
+
+```bash
+python3 -m serve ~/models/k3.waste \
+  --prefix-cache 2G --prefix-cache-entries 4 --semantic-anchors
+```
+
+`--semantic-anchors` and `--conversation-head` are mutually exclusive. The
+renderer reports the end of the final complete input message, before
+request-tail controls and the unclosed assistant generation prompt. That
+trusted segment boundary is converted to an offset during the same
+per-segment tokenization pass that builds the prompt, then rounded backward to
+the engine chunk boundary. User or tool text that happens to spell an XTML
+marker cannot create a checkpoint. Images and raw completions still bypass.
+
+One new semantic anchor is considered per request. Existing exact anchors from
+earlier turns remain in a deterministic LRU, so a request whose middle history
+changed can restore the deepest surviving completed-message ancestor. Anchors
+may evict older anchors but never a stable family root. When no family root
+exists, the opt-in semantic policy can still retain an exact ordinary-chat
+turn boundary. The byte limit remains authoritative: K3 snapshot size grows
+with populated MLA state, so four configured entries are a ceiling rather
+than a promise that four long-context snapshots fit.
+
+This first implementation snapshots only state rebuilt from request input. It
+does not capture generated state from the token callback; the first follow-up
+still evaluates the previous assistant output before a later request can reuse
+the resulting boundary.
+
+The qualified Spark launchers retain `--conversation-head` by default. An
+explicit semantic experiment suppresses that default while preserving their
+affinity, budget, CUDA, direct-I/O, and Q0 controls:
+
+```bash
+WASTE_SPARK_CUDA_PREFIX_ENTRIES=4 \
+  tools/spark_cuda_serve.sh ~/models/k3.waste --semantic-anchors
+```
+
 ## Bounds, eviction, and identity
 
 Both retained-cache accounting limits are hard. An enabled cache first charges
@@ -118,8 +161,9 @@ Every chat response carries its request result under
   "replayed_tokens": 37,
   "cached_tokens": 704,
   "promoted_tokens": 64,
-  "restored_kind": "head",
-  "head_cached_tokens": 704
+  "restored_kind": "anchor",
+  "head_cached_tokens": 0,
+  "anchor_cached_tokens": 704
 }
 ```
 
@@ -129,7 +173,9 @@ requests, hits, misses, bypasses, restored, replayed, and promoted tokens,
 admissions, promotions, rejects, evictions, invalidations, restore failures,
 snapshot/allocation failures, entries, controller bytes, entry bytes, and
 total accounted bytes. With conversation heads enabled it also separates root
-and head entries, hits, admissions, and replacements.
+and head entries, hits, admissions, and replacements. Semantic mode adds its
+enabled flag plus anchor entries, hits, and admissions; it never exposes token
+keys or retained prompt content.
 
 ## Upstream dependency
 
@@ -144,8 +190,8 @@ The acceptance tests compare shallow restore plus promotion, deep restore,
 conversation-head restore plus tail replay, and ordinary unsplit generation
 on a real synthetic container. Greedy output tokens and the entire
 post-generation state blob must be byte-identical. Policy tests additionally
-cover altered history, head replacement, and preserving the root when the
-second snapshot does not fit.
+cover altered history, head replacement, multiple semantic ancestors, anchor
+pressure, root preservation, and semantic operation without a family root.
 
 ## GN100 qualification
 
