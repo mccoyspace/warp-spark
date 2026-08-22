@@ -199,10 +199,10 @@ typedef struct {
     int8_t  *mmxq;                  /* int8 activations for the SMMLA path */
     float   *mmxs;
     size_t   mmx_cap, mms_cap;
-    /* Experimental Q4/VQ offload. Q4 projections remain decode-only; the
-     * explicit prefill pilot below reuses only the mode-2 VQ primitive. The
-     * context is opaque so a normal build has no CUDA headers or runtime
-     * dependency. KDA mode 0 is
+    /* Experimental Q4/VQ offload. Q4 projections are decode-only by default;
+     * the two explicit prefill pilots below reuse only already-qualified
+     * dense and mode-2 VQ primitives. The context is opaque so a normal build
+     * has no CUDA headers or runtime dependency. KDA mode 0 is
      * CPU, 1 is the fast reduction, and 2 uses a four-lane/group reduction;
      * on allowlisted all-MLA models it selects that Q4 kernel while KDA
      * effective mode/calls correctly remain zero. Dense scope is cumulative: 0
@@ -211,9 +211,11 @@ typedef struct {
     void    *cuda_kda_ctx;
     int      cuda_kda_mode, cuda_kda_effective, cuda_kda_failed;
     int      cuda_dense_scope, cuda_dense_effective;
+    int      cuda_dense_preflight_scope;
     int      cuda_vq_mode, cuda_vq_effective, cuda_vq_preflight_modes;
     int      cuda_vq_group;          /* experts between mode-2 stream syncs */
     int      cuda_prefill_vq;        /* opt-in GLM Flash chunk VQ3R pilot   */
+    int      cuda_prefill_dense;     /* opt-in GLM Flash MLA Q4 pilot       */
     int      cuda_kda_state_dirty;
     uint64_t cuda_kda_fallbacks, cuda_kda_calls, cuda_dense_calls;
     uint64_t cuda_vq_experts, cuda_vq_applies, cuda_vq_lut_builds;
@@ -253,6 +255,7 @@ int waste_model_cuda_glm47_flash_vq3r_compatible(const waste_model *m);
 int waste_model_cuda_vq_dense_scope_compatible(const waste_model *m,
                                                 int scope);
 int waste_model_cuda_prefill_vq_compatible(const waste_model *m);
+int waste_model_cuda_prefill_dense_compatible(const waste_model *m);
 int waste_model_sort_route_copy(const int *src_ids, const float *src_weights,
                                 int n, int *dst_ids, float *dst_weights);
 

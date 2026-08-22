@@ -609,6 +609,18 @@ int waste_model_cuda_prefill_vq_compatible(const waste_model *m)
            waste_model_cuda_glm47_flash_vq3r_compatible(m);
 }
 
+/* Keep this pilot on the already-qualified GLM Flash dense profile. Scope 3
+ * and KDA mode 1 are intentional rather than minimum bounds: they name the
+ * measured decode configuration, while the recorded preflight scope proves
+ * that every required Q4 tensor and one real launch passed before prefill. */
+int waste_model_cuda_prefill_dense_compatible(const waste_model *m)
+{
+    return m && m->cuda_prefill_dense && !m->cuda_kda_failed &&
+           m->cuda_kda_mode == 1 && m->cuda_dense_scope == 3 &&
+           m->cuda_dense_preflight_scope == 3 &&
+           waste_model_cuda_glm47_flash_dense_compatible(m);
+}
+
 /* Preserve the CPU chunk contract without disturbing the router-owned
  * arrays (and therefore its trace): the CUDA pilot accumulates each token's
  * expert outputs in ascending expert-id order, exactly as moe_chunk's
@@ -721,6 +733,7 @@ fail:
  * Scope 3: non-MoE dense FFNs too. Router arithmetic stays CPU in all arms. */
 static int cuda_dense_preflight(waste_model *m, int scope)
 {
+    m->cuda_dense_preflight_scope = 0;
     if (!scope) return 0;
     if (!m->cuda_kda_mode) {
         fprintf(stderr, "waste: CUDA dense scope requires CUDA KDA mode 1 or 2\n");
@@ -800,6 +813,7 @@ static int cuda_dense_preflight(waste_model *m, int scope)
                              first->shape[0], first->shape[1],
                              m->cuda_kda_mode))
         goto fail;
+    m->cuda_dense_preflight_scope = scope;
     return 0;
 
 fail:
@@ -1688,6 +1702,8 @@ int waste_model_load(waste_model *m, const char *dir, int kv_cap,
         int vq_group = e ? atoi(e) : 1;
         e = getenv("WASTE_CUDA_PREFILL_VQ");
         int prefill_vq = e ? atoi(e) != 0 : 0;
+        e = getenv("WASTE_CUDA_PREFILL_DENSE");
+        int prefill_dense = e ? atoi(e) != 0 : 0;
         const char *backend = getenv("WASTE_BACKEND");
         if (backend && !strcmp(backend, "cpu")) {
             mode = 0;
@@ -1695,6 +1711,7 @@ int waste_model_load(waste_model *m, const char *dir, int kv_cap,
             vq_mode = 0;
             vq_group = 1;
             prefill_vq = 0;
+            prefill_dense = 0;
         }
         if (mode < 0) mode = 0;
         if (mode > 2) mode = 2;
@@ -1718,6 +1735,7 @@ int waste_model_load(waste_model *m, const char *dir, int kv_cap,
         m->cuda_vq_mode = vq_mode;
         m->cuda_vq_group = vq_group;
         m->cuda_prefill_vq = prefill_vq;
+        m->cuda_prefill_dense = prefill_dense;
     }
 #endif
     m->kv_cap = kv_cap;
@@ -2179,6 +2197,14 @@ int waste_model_load(waste_model *m, const char *dir, int kv_cap,
         fprintf(stderr,
                 "waste: WASTE_CUDA_PREFILL_VQ requires CUDA VQ mode 2, "
                 "completed preflight, and exact GLM-4.7-Flash VQ3R geometry\n");
+        return -1;
+    }
+    if (m->cuda_prefill_dense &&
+        !waste_model_cuda_prefill_dense_compatible(m)) {
+        fprintf(stderr,
+                "waste: WASTE_CUDA_PREFILL_DENSE requires CUDA KDA mode 1, "
+                "dense scope 3 with completed preflight, and exact "
+                "GLM-4.7-Flash geometry\n");
         return -1;
     }
     if (m->cuda_vq_mode && xpar_on)
@@ -4363,6 +4389,7 @@ int waste_model_set_cuda_dense(waste_model *m, int scope)
           (waste_model_cuda_k2_vq3r_compatible(m) ||
            waste_model_cuda_glm47_flash_vq3r_compatible(m)))) return -1;
     m->cuda_dense_scope = scope;
+    m->cuda_dense_preflight_scope = 0;
     m->cuda_dense_effective = 0;
     m->cuda_dense_calls = 0;
     if (!m->cuda_kda_failed) m->cuda_kda_fallbacks = 0;
@@ -5269,6 +5296,13 @@ const float *waste_model_prefill(waste_model *m, const int *tokens, int n,
         if (cm && (pos0 < 0 || pos0 > cm - n)) { m->ctx_full = 1; return NULL; }
     }
     if (prefill_alloc(m, n)) return NULL;
+#if defined(WASTE_ENABLE_CUDA)
+    if (m->cuda_prefill_dense &&
+        !waste_model_cuda_prefill_dense_compatible(m)) {
+        cuda_projection_failed(m, "prefill dense guard");
+        return NULL;
+    }
+#endif
 
     for (int t = 0; t < n; t++) {
         float *dst = m->cx + (size_t)t * hid;
@@ -5343,14 +5377,21 @@ const float *waste_model_prefill(waste_model *m, const int *tokens, int n,
 
         /* attention: per token, but on the batched norm buffer */
         if (r) r->attention_s = pnow();
+        int attention_failed = 0;
         for (int t = 0; t < n; t++) {
             if (c->kda_layer[L])
                 (void)kda_layer(m, L, m->cnorm + (size_t)t * hid,
                                 m->cresid + (size_t)t * hid, 0);
-            else (void)mla_layer(m, L, m->cnorm + (size_t)t * hid,
-                                 m->cresid + (size_t)t * hid, pos0 + t, 0);
+            else if (mla_layer(
+                    m, L, m->cnorm + (size_t)t * hid,
+                    m->cresid + (size_t)t * hid, pos0 + t,
+                    m->cuda_prefill_dense ? m->cuda_dense_scope : 0)) {
+                attention_failed = 1;
+                break;
+            }
         }
         if (r) r->attention_s = pnow() - r->attention_s;
+        if (attention_failed) break;
 
         if (ares_on) {
             if (ps_live) for (int i = 0; i < n * hid; i++) m->cprefix[i] += m->cresid[i];
