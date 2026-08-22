@@ -402,11 +402,13 @@ int main(int argc, char **argv)
         waste_model_free(&m);
         return 1;
     }
-    if (is_vq && (waste_model_get_cuda_kda(&m) != 1 ||
-                  waste_model_get_cuda_dense(&m) != 2)) {
+    const int vq_dense_scope = waste_model_get_cuda_dense(&m);
+    const int vq_dense_ok = vq_dense_scope == 2 ||
+        (vq_dense_scope == 3 && waste_model_cuda_k2_vq3r_compatible(&m));
+    if (is_vq && (waste_model_get_cuda_kda(&m) != 1 || !vq_dense_ok)) {
         fprintf(stderr,
                 "cuda_vq sweep requires WASTE_CUDA_KDA=1 and "
-                "WASTE_CUDA_DENSE=2\n");
+                "WASTE_CUDA_DENSE=2 (or 3 on allowlisted K2)\n");
         waste_model_free(&m);
         return 1;
     }

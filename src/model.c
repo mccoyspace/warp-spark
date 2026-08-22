@@ -732,10 +732,14 @@ static int cuda_vq_preflight(waste_model *m, int mode)
 {
     if (!mode) return 0;
     const waste_config *c = &m->cfg;
+    const int k2_geometry = waste_model_cuda_k2_vq3r_compatible(m);
+    const int dense_scope_ok = m->cuda_dense_scope == 2 ||
+        (k2_geometry && m->cuda_dense_scope == 3);
     if (mode < 1 || mode > 2 || m->cuda_kda_mode != 1 ||
-        m->cuda_dense_scope != 2) {
+        !dense_scope_ok) {
         fprintf(stderr,
-                "waste: CUDA VQ requires CUDA KDA mode 1 and dense scope 2\n");
+                "waste: CUDA VQ requires CUDA KDA mode 1 and dense scope 2 "
+                "(or scope 3 on allowlisted K2)\n");
         goto fail;
     }
     if (m->index_bits != 8) {
@@ -746,7 +750,6 @@ static int cuda_vq_preflight(waste_model *m, int mode)
     }
     const int k3_geometry =
         c->latent_dim == 3584 && c->moe_inter == 3072 && c->top_k == 16;
-    const int k2_geometry = waste_model_cuda_k2_vq3r_compatible(m);
     if (m->stages != 3 || m->vec_dim != 8 || m->cb_entries != 256 ||
         (!k3_geometry && !k2_geometry) || !m->codebooksT || m->n_books < 9) {
         fprintf(stderr,

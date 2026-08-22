@@ -150,7 +150,7 @@ class CompareGpuRunsTest(unittest.TestCase):
         return control, candidate
 
     @staticmethod
-    def vq_arms(mode=1, group=1, zero_kda=False):
+    def vq_arms(mode=1, group=1, zero_kda=False, dense_scope=2):
         kda_calls = 0 if zero_kda else 24
         base = {
             "key": "cuda_vq",
@@ -159,8 +159,8 @@ class CompareGpuRunsTest(unittest.TestCase):
             "kda_effective": 0 if zero_kda else 1,
             "kda_calls": kda_calls,
             "kda_expected_calls": kda_calls,
-            "dense_scope": 2,
-            "dense_effective": 2,
+            "dense_scope": dense_scope,
+            "dense_effective": dense_scope,
             "dense_calls": 30,
             "dense_expected_calls": 30,
             "vq_group": group,
@@ -359,6 +359,16 @@ class CompareGpuRunsTest(unittest.TestCase):
         self.assertEqual(result["arms"]["gpu"]["kda_effective"], 0)
         self.assertEqual(result["arms"]["gpu"]["kda_expected_calls"], 0)
         self.assertEqual(result["arms"]["gpu"]["vq_mode"], 2)
+
+    def test_vq_accepts_scope_three_only_for_zero_kda_base(self):
+        control, candidate = self.vq_arms(
+            2, zero_kda=True, dense_scope=3)
+        result = self.compare(cpu_arm=control, gpu_arm=candidate)
+        self.assertEqual(result["arms"]["gpu"]["dense_scope"], 3)
+
+        control, candidate = self.vq_arms(2, dense_scope=3)
+        with self.assertRaises(COMPARE.CaptureError):
+            self.compare(cpu_arm=control, gpu_arm=candidate)
 
     def test_zero_kda_base_rejects_false_effective_mode(self):
         control, candidate = self.dense_arms(zero_kda=True)

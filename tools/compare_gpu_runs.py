@@ -455,7 +455,10 @@ def _validate_cuda_arms(cpu: Capture, gpu: Capture) -> dict[str, Any] | None:
                 raise CaptureError(
                     f"CUDA VQ {label} has invalid KDA/Q4=1 base metadata"
                 )
-            if (arm.dense_scope != 2 or arm.dense_effective != 2 or
+            dense_scope_ok = arm.dense_scope == 2 or (
+                arm.dense_scope == 3 and arm.kda_expected_calls == 0
+            )
+            if (not dense_scope_ok or arm.dense_effective != arm.dense_scope or
                     arm.dense_calls is None or
                     arm.dense_expected_calls is None or
                     arm.dense_calls != arm.dense_expected_calls or
