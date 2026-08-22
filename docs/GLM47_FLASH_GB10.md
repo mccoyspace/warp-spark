@@ -120,6 +120,40 @@ This result applies a specific lesson from the vLLM comparison without changing
 WARP's architecture: move the measured prefill bottleneck onto a proven GPU
 kernel while retaining the compact VQ3R container and streaming expert cache.
 
+### Optional dense-prefill profile
+
+A second default-off arm reuses the qualified CUDA Q4 projection kernel for
+the four token-serial MLA projections. It leaves routing, absorbed `kv_b`,
+attention scores and values, FFNs, and the language-model head on the CPU:
+
+```text
+WASTE_CUDA_PREFILL_DENSE=1
+```
+
+On the 461-token fixture, VQ-only controls measured 66.34 and 65.35 seconds;
+the fast dense+VQ arm measured 37.19 seconds, or **43.5% faster** than their
+65.85-second mean. The CPU/NEON-ordered diagnostic (`=2`) took 44.67 seconds
+but followed the same downstream route-divergence pattern, so it is not the
+selected practical arm.
+
+Fast mode deliberately has a different contract from VQ-only. On the long
+fixture, 81 of 21,206 prefill route rows changed expert membership and final
+maximum logit difference was `0.0379`; it must not be described as numerically
+equivalent. A small practical screen nevertheless found identical 64-token
+greedy output on three prompt types:
+
+| Prompt type | Control wall | Fast wall | Gain | Output tokens |
+| --- | ---: | ---: | ---: | --- |
+| Studio planning, 461 input tokens | 73.53 s | 45.65 s | **37.9%** | 64/64 identical |
+| Technical review, 249 input tokens | 43.42 s | 27.74 s | **36.1%** | 64/64 identical |
+| Editorial rewrite, 340 input tokens | 56.15 s | 35.76 s | **36.3%** | 64/64 identical |
+
+The latter two cases had zero route-membership changes; the studio case had
+86 over its full 24,150 prefill-plus-decode route rows. These rows support an
+explicit aggressive profile for interactive utility, not a general quality
+equivalence claim. The VQ-only profile remains available when numerical
+identity is the priority.
+
 ## Functional scope
 
 A simple factual continuation produced the expected answer and stopped on a
