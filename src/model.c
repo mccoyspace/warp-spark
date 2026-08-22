@@ -782,7 +782,10 @@ static int cuda_vq_preflight(waste_model *m, int mode)
             fprintf(stderr, "waste: CUDA VQ requires VQ3R expert records\n");
             goto fail;
         }
-        const int lat = c->latent_dim;
+        /* K3 routes experts through its narrower latent width; all-MLA K2
+         * routes the hidden state directly. Match moe_layer and the CUDA
+         * allocator instead of treating K2's absent latent as width zero. */
+        const int lat = c->latent_dim ? c->latent_dim : c->hidden;
         const int inter = c->moe_inter;
         const int lut_sz =
             ((c->hidden > lat ? c->hidden : lat) / m->vec_dim) *
