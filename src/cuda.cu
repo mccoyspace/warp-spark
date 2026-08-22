@@ -13,6 +13,7 @@
 
 #include "model.h"
 #include "waste_backend.h"
+#include "waste_format.h"
 
 #include <cuda_runtime.h>
 
@@ -28,7 +29,7 @@ enum {
     VQ_STAGES = 3,
     VQ_VEC_DIM = 8,
     VQ_ENTRIES = 256,
-    VQ_INDEX_BLOCK = 64,
+    VQ_INDEX_BLOCK = WASTE_VQ_INDEX_BLOCK,
     VQ_BUILD_THREADS = 256,
     VQ_DOWN_THREADS = 256,
     VQ_GROUP_MAX = 16,
@@ -435,7 +436,7 @@ extern "C" int waste_cuda_vq_init(waste_model *m)
 {
     if (!m || !m->codebooksT || m->n_books < 1 ||
         m->stages != VQ_STAGES || m->vec_dim != VQ_VEC_DIM ||
-        m->cb_entries != VQ_ENTRIES)
+        m->cb_entries != VQ_ENTRIES || m->index_block != VQ_INDEX_BLOCK)
         return -1;
     waste_cuda_kda *ctx = (waste_cuda_kda *)m->cuda_kda_ctx;
     if (!ctx) {

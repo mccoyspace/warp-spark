@@ -130,7 +130,7 @@ typedef struct {
     int n_tensors;
     float *codebooks;                /* [n_books][256][8]                   */
     float *codebooksT;               /* [n_books][8][256], for the LUT build*/
-    int n_books, vec_dim, cb_entries, stages;
+    int n_books, vec_dim, cb_entries, stages, index_block;
     /* 8 = one whole byte of index per stage (VQ3R/VQ2R). 6 = WQ_VQ4P, four
      * indices packed into three bytes, which is what lets a stage table be
      * 64 bytes and so live in a NEON register. Sets the per-row stride of
@@ -197,9 +197,11 @@ typedef struct {
     size_t   mmx_cap, mms_cap;
     /* Experimental decode-only Q4 offload. The context is opaque so a
      * normal build has no CUDA headers or runtime dependency. KDA mode 0 is
-     * CPU, 1 is the fast reduction, and 2 uses a four-lane/group reduction.
-     * Dense scope is cumulative: 0 KDA-only, 1 shared+latent MoE, 2 ordinary
-     * MLA projections too, 3 the non-MoE dense FFN too. */
+     * CPU, 1 is the fast reduction, and 2 uses a four-lane/group reduction;
+     * on allowlisted all-MLA K2 it selects that Q4 kernel while KDA effective
+     * mode/calls correctly remain zero. Dense scope is cumulative: 0
+     * KDA-only, 1 shared+latent MoE, 2 ordinary MLA projections too, 3 the
+     * non-MoE dense FFN too. */
     void    *cuda_kda_ctx;
     int      cuda_kda_mode, cuda_kda_effective, cuda_kda_failed;
     int      cuda_dense_scope, cuda_dense_effective;
@@ -233,6 +235,12 @@ typedef struct {
      * the bank table, the expert shapes, `verify` — is fixed at load. */
     pthread_mutex_t fetch_mu;
 } waste_model;
+
+/* Internal accelerator allowlists. These are deliberately model-free so the
+ * exact K2 geometry gate can be tested without model weights or a CUDA host.
+ * Dense covers only the Q4 trunk shape; VQ adds the expert format. */
+int waste_model_cuda_k2_dense_compatible(const waste_model *m);
+int waste_model_cuda_k2_vq3r_compatible(const waste_model *m);
 
 /* Everything the load needs that is not in the container. These are
  * parameters rather than fields set beforehand because the first thing

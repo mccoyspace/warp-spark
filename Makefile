@@ -238,7 +238,7 @@ waste$(EXE): cli/main.o libwaste.a
 # `test` builds and `clean` forgets defeats the check meant to notice it.
 TESTNAMES := test_kda test_container test_forward test_tokenizer test_k3parts \
              test_state test_vision test_image test_memory test_cpus test_lock \
-             test_abi test_ecache sweep
+             test_abi test_ecache test_cuda_geometry sweep
 TESTBINS  := $(addsuffix $(EXE),$(TESTNAMES))
 
 test: $(TESTBINS)
@@ -259,6 +259,9 @@ test_forward$(EXE): tests/test_forward.o libwaste.a
 	$(CC) $(CFLAGS) -o $@ $^ $(LDLIBS)
 
 test_ecache$(EXE): tests/test_ecache.o libwaste.a
+	$(CC) $(CFLAGS) -o $@ $^ $(LDLIBS)
+
+test_cuda_geometry$(EXE): tests/test_cuda_geometry.o libwaste.a
 	$(CC) $(CFLAGS) -o $@ $^ $(LDLIBS)
 
 # Not a check — a measurement harness. It is here because it links the same

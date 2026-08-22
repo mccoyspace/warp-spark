@@ -36,6 +36,8 @@
  *   WASTE_CUDA_KDA=1 sweep CONTAINER ids,.. n_gen cuda_dense=0,1,2,3 [repeat]
  *   WASTE_CUDA_KDA=1 WASTE_CUDA_DENSE=2 \
  *     sweep CONTAINER ids,.. n_gen cuda_vq=0,1,2 [repeat]
+ * K2 is all MLA, so WASTE_CUDA_KDA selects the Q4 kernel for its dense arm
+ * but executes and reports zero KDA calls.
  *
  * `cache` is in MB and re-makes the expert cache in place. The trunk is what
  * a load costs, not the cache, so a budget sweep no longer needs a process
@@ -394,6 +396,12 @@ int main(int argc, char **argv)
         waste_model_free(&m);
         return 1;
     }
+    if (is_cuda && cuda_call_target(&m, 1) == 0) {
+        fprintf(stderr,
+                "cuda KDA sweep requires KDA layers; use cuda_dense for K2\n");
+        waste_model_free(&m);
+        return 1;
+    }
     if (is_vq && (waste_model_get_cuda_kda(&m) != 1 ||
                   waste_model_get_cuda_dense(&m) != 2)) {
         fprintf(stderr,
@@ -639,6 +647,8 @@ int main(int argc, char **argv)
             const uint64_t vq_syncs = waste_model_cuda_vq_syncs(&m);
             const uint64_t expected_kda_calls = decode_cuda_mode
                 ? cuda_call_target(&m, n_gen) : UINT64_C(0);
+            const int expected_kda_effective = expected_kda_calls
+                ? decode_cuda_mode : 0;
             const uint64_t expected_dense_calls = cuda_dense_call_target(
                 &m, decode_dense_scope, n_gen);
             const cuda_vq_target expected_vq = cuda_vq_targets(
@@ -691,7 +701,8 @@ int main(int argc, char **argv)
                 return 1;
             }
             if (is_dense &&
-                (cuda_effective != decode_cuda_mode || cuda_fallbacks != 0 ||
+                (cuda_effective != expected_kda_effective ||
+                 cuda_fallbacks != 0 ||
                  cuda_calls != expected_kda_calls ||
                  (value == 0 && (dense_effective != 0 || dense_calls != 0)) ||
                  (value != 0 && (dense_effective != value ||
@@ -709,7 +720,7 @@ int main(int argc, char **argv)
                 return 1;
             }
             if (is_vq &&
-                (cuda_effective != decode_cuda_mode ||
+                (cuda_effective != expected_kda_effective ||
                  decode_cuda_mode != 1 || cuda_fallbacks != 0 ||
                  cuda_calls != expected_kda_calls ||
                  dense_effective != decode_dense_scope ||

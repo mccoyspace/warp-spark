@@ -118,6 +118,12 @@ else
     no "sweep cache reset or lookahead bounds"
 fi
 
+if ./test_cuda_geometry 2>/dev/null | grep -q "^CUDA GEOMETRY OK"; then
+    ok "K2 CUDA allowlist accepts only the exact all-MLA/VQ3R geometry"
+else
+    no "K2 CUDA geometry allowlist"
+fi
+
 SWEEP_MODEL="$TMP/sweep-test.waste"
 if python3 tools/make_test_container.py "$SWEEP_MODEL" >/dev/null 2>&1; then
     sweep_err="$TMP/sweep-test.err"
@@ -1542,7 +1548,7 @@ fi
 if ! command -v python3 >/dev/null 2>&1; then
     sk "GPU capture comparator" "python3 not installed"
 elif python3 -m unittest -q tests.test_compare_gpu_runs >/dev/null 2>&1; then
-    ok "GPU capture comparator (13 checks)"
+    ok "GPU capture comparator (20 checks)"
 else
     no "GPU capture comparator"
 fi

@@ -524,6 +524,37 @@ static int dense_matvec_t(waste_model *m, float *y, const waste_tensor *t,
                                 m->cuda_dense_scope, min_scope);
 }
 
+int waste_model_cuda_k2_dense_compatible(const waste_model *m)
+{
+    if (!m) return 0;
+    const waste_config *c = &m->cfg;
+    if (strcmp(c->arch, "DeepseekV3ForCausalLM") ||
+        c->n_layers != 61 || c->hidden != 7168 ||
+        c->n_experts != 384 || c->top_k != 8 ||
+        c->moe_inter != 2048 || c->dense_inter != 18432 ||
+        c->n_shared != 1 || c->first_dense != 1 ||
+        c->n_heads != 64 || c->kv_lora != 512 || c->q_lora != 1536 ||
+        c->qk_nope != 128 || c->qk_rope != 64 || c->v_head != 128 ||
+        c->latent_dim != 0 || c->kda_heads != 0 || c->kda_dim != 0 ||
+        m->expert_m[0] != 2048 || m->expert_m[1] != 2048 ||
+        m->expert_m[2] != 7168 || m->expert_n[0] != 7168 ||
+        m->expert_n[1] != 7168 || m->expert_n[2] != 2048)
+        return 0;
+    for (int L = 0; L < c->n_layers; L++)
+        if (c->kda_layer[L]) return 0;
+    return 1;
+}
+
+int waste_model_cuda_k2_vq3r_compatible(const waste_model *m)
+{
+    return waste_model_cuda_k2_dense_compatible(m) &&
+           m->index_bits == 8 && m->stages == 3 && m->vec_dim == 8 &&
+           m->cb_entries == 256 &&
+           m->index_block == WASTE_VQ_INDEX_BLOCK &&
+           m->expert_m[0] % (int)WASTE_VQ_INDEX_BLOCK == 0 &&
+           m->expert_m[2] % (int)WASTE_VQ_INDEX_BLOCK == 0;
+}
+
 #if defined(WASTE_ENABLE_CUDA)
 static int cuda_kda_tensor_ok(waste_model *m, int layer, const char *projection,
                               const waste_tensor **first)
@@ -574,7 +605,13 @@ static int cuda_kda_preflight(waste_model *m, int mode)
         }
     }
     if (!first || !kda_layers) {
-        fprintf(stderr, "waste: CUDA KDA requested for a model with no KDA layers\n");
+        /* K2 is all MLA. WASTE_CUDA_KDA remains the Q4 kernel selector for
+         * its dense projections, but it must execute zero KDA calls. Only
+         * the exact qualified K2 geometry may use that otherwise-no-op base
+         * mode; every other zero-KDA model still fails closed. */
+        if (waste_model_cuda_k2_dense_compatible(m)) return 0;
+        fprintf(stderr,
+                "waste: CUDA KDA requested for a model with no KDA layers\n");
         goto fail;
     }
     {
@@ -606,6 +643,13 @@ static int cuda_dense_preflight(waste_model *m, int scope)
         goto fail;
     }
     const waste_config *c = &m->cfg;
+    int kda_layers = 0;
+    for (int L = 0; L < c->n_layers; L++) kda_layers += !!c->kda_layer[L];
+    if (!kda_layers && !waste_model_cuda_k2_dense_compatible(m)) {
+        fprintf(stderr,
+                "waste: CUDA dense zero-KDA path requires exact K2 geometry\n");
+        goto fail;
+    }
     const waste_tensor *first = NULL;
     int moe_layers = 0, mla_layers = 0, dense_layers = 0;
     for (int L = 0; L < c->n_layers; L++) {
@@ -700,13 +744,14 @@ static int cuda_vq_preflight(waste_model *m, int mode)
                 "pending its own correctness contract\n");
         goto fail;
     }
+    const int k3_geometry =
+        c->latent_dim == 3584 && c->moe_inter == 3072 && c->top_k == 16;
+    const int k2_geometry = waste_model_cuda_k2_vq3r_compatible(m);
     if (m->stages != 3 || m->vec_dim != 8 || m->cb_entries != 256 ||
-        c->latent_dim != 3584 ||
-        c->moe_inter != 3072 || c->top_k != 16 || !m->codebooksT ||
-        m->n_books < 9) {
+        (!k3_geometry && !k2_geometry) || !m->codebooksT || m->n_books < 9) {
         fprintf(stderr,
-                "waste: CUDA VQ requires K3 VQ3R 3584/3072, top-16, "
-                "3-stage/256-entry geometry\n");
+                "waste: CUDA VQ requires K3 VQ3R 3584/3072 top-16 or "
+                "allowlisted K2 VQ3R 7168/2048 top-8 geometry\n");
         goto fail;
     }
     if (waste_cuda_vq_init(m)) {
@@ -1618,6 +1663,8 @@ int waste_model_load(waste_model *m, const char *dir, int kv_cap,
     m->stages = (int)js_int(&d, js_get(&d, eq, "stages"), 3);
     m->vec_dim = (int)js_int(&d, js_get(&d, eq, "vec_dim"), 8);
     m->cb_entries = (int)js_int(&d, js_get(&d, eq, "entries"), 256);
+    m->index_block = (int)js_int(&d, js_get(&d, eq, "index_block"),
+                                 WASTE_VQ_INDEX_BLOCK);
     /* Absent in every v0 container written before VQ4P, and 8 is what those
      * mean: one whole byte of index per stage. */
     m->index_bits = (int)js_int(&d, js_get(&d, eq, "index_bits"), 8);
@@ -1629,10 +1676,11 @@ int waste_model_load(waste_model *m, const char *dir, int kv_cap,
      * above 256 could never be addressed anyway. */
     if (m->stages < 1 || m->stages > 8 ||
         m->vec_dim < 1 || m->vec_dim > 64 ||
-        m->cb_entries < 1 || m->cb_entries > 256) {
+        m->cb_entries < 1 || m->cb_entries > 256 ||
+        m->index_block != WASTE_VQ_INDEX_BLOCK) {
         fprintf(stderr, "waste: manifest expert_quant is out of range "
-                        "(%d stages, vec_dim %d, %d entries)\n",
-                m->stages, m->vec_dim, m->cb_entries);
+                        "(%d stages, vec_dim %d, %d entries, block %d)\n",
+                m->stages, m->vec_dim, m->cb_entries, m->index_block);
         js_free(&d); free(src);
         return -2;                        /* -> WASTE_E_FORMAT */
     }
@@ -2430,7 +2478,7 @@ typedef struct {
  * table is read M/64 times and the tile's indices (55 KB) stay in L1.
  * This is a cache-blocking win, not a SIMD one: the inner op is a gather,
  * which NEON cannot vectorize. */
-#define VQ_TILE 64          /* must equal the container's index_block */
+#define VQ_TILE WASTE_VQ_INDEX_BLOCK
 #ifndef VQ_SUPER
 #define VQ_SUPER 2          /* index blocks handled per pass (swept: 2 wins) */
 #endif

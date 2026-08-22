@@ -40,6 +40,10 @@
 
 #define WASTE_ALIGN 4096u
 
+/* Rows in one blocked VQ index tile. This is part of format v0's physical
+ * layout: the converter, CPU gather and CUDA gather must all agree. */
+#define WASTE_VQ_INDEX_BLOCK 64
+
 /* ---- quantization formats (docs/FORMAT.md table) ----------------------- */
 
 typedef enum {

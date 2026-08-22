@@ -424,6 +424,23 @@ def _vq_route_work(capture: Capture) -> tuple[int, int]:
     return layer_runs, layer_runs * capture.top_k
 
 
+def _valid_kda_base(arm: Arm, modes: tuple[int, ...]) -> bool:
+    """Audit the CUDA-Q4 selector shared by KDA and dense projections.
+
+    K3 executes KDA calls, while all-MLA K2 deliberately reports effective
+    mode and calls as zero. In both cases the requested mode remains the Q4
+    kernel selector and the declared expected count decides which contract
+    applies.
+    """
+    if (arm.kda_mode not in modes or arm.kda_effective is None or
+            arm.kda_calls is None or arm.kda_expected_calls is None or
+            arm.kda_calls != arm.kda_expected_calls):
+        return False
+    if arm.kda_expected_calls == 0:
+        return arm.kda_calls == 0 and arm.kda_effective == 0
+    return arm.kda_calls > 0 and arm.kda_effective == arm.kda_mode
+
+
 def _validate_cuda_arms(cpu: Capture, gpu: Capture) -> dict[str, Any] | None:
     if cpu.arm is None or gpu.arm is None:
         raise CaptureError("both captures must have arm metadata")
@@ -434,12 +451,9 @@ def _validate_cuda_arms(cpu: Capture, gpu: Capture) -> dict[str, Any] | None:
     if cpu.arm.key == "cuda_vq":
         counter_names = ("experts", "applies", "lut_builds", "launches", "syncs")
         for label, arm in (("control", cpu.arm), ("candidate", gpu.arm)):
-            if (arm.kda_mode != 1 or arm.kda_effective != 1 or
-                    arm.kda_calls is None or arm.kda_expected_calls is None or
-                    arm.kda_calls != arm.kda_expected_calls or
-                    arm.kda_calls == 0):
+            if not _valid_kda_base(arm, (1,)):
                 raise CaptureError(
-                    f"CUDA VQ {label} has invalid KDA=1 base metadata"
+                    f"CUDA VQ {label} has invalid KDA/Q4=1 base metadata"
                 )
             if (arm.dense_scope != 2 or arm.dense_effective != 2 or
                     arm.dense_calls is None or
@@ -469,6 +483,7 @@ def _validate_cuda_arms(cpu: Capture, gpu: Capture) -> dict[str, Any] | None:
                 )
 
         if (cpu.arm.kda_calls != gpu.arm.kda_calls or
+                cpu.arm.kda_expected_calls != gpu.arm.kda_expected_calls or
                 cpu.arm.dense_calls != gpu.arm.dense_calls):
             raise CaptureError("CUDA VQ captures use different base workloads")
         if (cpu.arm.value != 0 or cpu.arm.effective != 0 or
@@ -527,19 +542,16 @@ def _validate_cuda_arms(cpu: Capture, gpu: Capture) -> dict[str, Any] | None:
 
     if cpu.arm.key == "cuda_dense":
         for label, arm in (("control", cpu.arm), ("candidate", gpu.arm)):
-            if (arm.kda_mode not in (1, 2) or
-                    arm.kda_effective != arm.kda_mode or
-                    arm.kda_calls is None or arm.kda_expected_calls is None or
-                    arm.kda_calls != arm.kda_expected_calls or
-                    arm.kda_calls == 0):
+            if not _valid_kda_base(arm, (1, 2)):
                 raise CaptureError(
-                    f"CUDA dense {label} has invalid KDA base metadata"
+                    f"CUDA dense {label} has invalid KDA/Q4 base metadata"
                 )
             if arm.fallbacks != 0:
                 raise CaptureError(
                     f"CUDA dense {label} reported a CUDA fallback/failure"
                 )
-        if cpu.arm.kda_mode != gpu.arm.kda_mode:
+        if (cpu.arm.kda_mode != gpu.arm.kda_mode or
+                cpu.arm.kda_expected_calls != gpu.arm.kda_expected_calls):
             raise CaptureError("CUDA dense captures use different KDA base modes")
         if (cpu.arm.value != 0 or cpu.arm.effective != 0 or
                 cpu.arm.calls != 0 or cpu.arm.expected_calls != 0):

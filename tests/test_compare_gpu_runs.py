@@ -130,13 +130,14 @@ class CompareGpuRunsTest(unittest.TestCase):
         return cpu, gpu
 
     @staticmethod
-    def dense_arms():
+    def dense_arms(zero_kda=False):
+        kda_calls = 0 if zero_kda else 24
         base = {
             "fallbacks": 0,
             "kda_mode": 1,
-            "kda_effective": 1,
-            "kda_calls": 24,
-            "kda_expected_calls": 24,
+            "kda_effective": 0 if zero_kda else 1,
+            "kda_calls": kda_calls,
+            "kda_expected_calls": kda_calls,
         }
         control = {
             **base, "key": "cuda_dense", "value": 0, "effective": 0,
@@ -149,14 +150,15 @@ class CompareGpuRunsTest(unittest.TestCase):
         return control, candidate
 
     @staticmethod
-    def vq_arms(mode=1, group=1):
+    def vq_arms(mode=1, group=1, zero_kda=False):
+        kda_calls = 0 if zero_kda else 24
         base = {
             "key": "cuda_vq",
             "fallbacks": 0,
             "kda_mode": 1,
-            "kda_effective": 1,
-            "kda_calls": 24,
-            "kda_expected_calls": 24,
+            "kda_effective": 0 if zero_kda else 1,
+            "kda_calls": kda_calls,
+            "kda_expected_calls": kda_calls,
             "dense_scope": 2,
             "dense_effective": 2,
             "dense_calls": 30,
@@ -320,6 +322,13 @@ class CompareGpuRunsTest(unittest.TestCase):
         self.assertEqual(result["arms"]["gpu"]["value"], 3)
         self.assertEqual(result["arms"]["gpu"]["calls"], 30)
 
+    def test_dense_scope_accepts_zero_kda_k2_base(self):
+        control, candidate = self.dense_arms(zero_kda=True)
+        result = self.compare(cpu_arm=control, gpu_arm=candidate)
+        self.assertEqual(result["arms"]["cpu"]["kda_effective"], 0)
+        self.assertEqual(result["arms"]["gpu"]["kda_calls"], 0)
+        self.assertEqual(result["arms"]["gpu"]["calls"], 30)
+
     def test_dense_scope_rejects_bad_base_or_call_shortfall(self):
         control, candidate = self.dense_arms()
         for mutation in ({"kda_calls": 23}, {"calls": 29}, {"fallbacks": 1}):
@@ -343,6 +352,19 @@ class CompareGpuRunsTest(unittest.TestCase):
         result = self.compare(cpu_arm=control, gpu_arm=candidate)
         self.assertEqual(result["arms"]["gpu"]["vq_group"], 2)
         self.assertEqual(result["arms"]["gpu"]["vq_syncs"], 8)
+
+    def test_vq_accepts_zero_kda_k2_base(self):
+        control, candidate = self.vq_arms(2, zero_kda=True)
+        result = self.compare(cpu_arm=control, gpu_arm=candidate)
+        self.assertEqual(result["arms"]["gpu"]["kda_effective"], 0)
+        self.assertEqual(result["arms"]["gpu"]["kda_expected_calls"], 0)
+        self.assertEqual(result["arms"]["gpu"]["vq_mode"], 2)
+
+    def test_zero_kda_base_rejects_false_effective_mode(self):
+        control, candidate = self.dense_arms(zero_kda=True)
+        candidate["kda_effective"] = 1
+        with self.assertRaises(COMPARE.CaptureError):
+            self.compare(cpu_arm=control, gpu_arm=candidate)
 
     def test_vq_rejects_bad_base_fallback_or_counter_shortfall(self):
         control, candidate = self.vq_arms(1)
