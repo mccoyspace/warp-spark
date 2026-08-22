@@ -64,7 +64,7 @@ typedef struct {
  * rotation on a wider slice is refused at load rather than run unrotated. */
 #define WASTE_MAX_ROPE_HALF 64
     int kda_layer[WASTE_MAX_LAYERS]; /* 1 if layer is KDA                   */
-    float eps, routed_scale;
+    float eps, mla_rms_norm_eps, routed_scale;
     int renorm;
 
     /* --- K3 additions (all absent/0 for Kimi-Linear) ------------------- */
@@ -95,6 +95,7 @@ typedef struct {
      * position-free by construction, so skipping it leaves attention unable
      * to order the sequence. */
     int   mla_nope;                  /* mla_use_nope: 1 = no rotation       */
+    int   rope_interleave;           /* 1 = GPT-J adjacent-pair layout      */
     float rope_inv_freq[WASTE_MAX_ROPE_HALF];   /* qk_rope/2 used, YaRN-adjusted */
     float att_mul;                   /* YaRN mscale^2 on the attn scale, 1 = none */
     char  rope_err[128];             /* non-empty: a shape rope_init does not
@@ -198,8 +199,8 @@ typedef struct {
     /* Experimental decode-only Q4 offload. The context is opaque so a
      * normal build has no CUDA headers or runtime dependency. KDA mode 0 is
      * CPU, 1 is the fast reduction, and 2 uses a four-lane/group reduction;
-     * on allowlisted all-MLA K2 it selects that Q4 kernel while KDA effective
-     * mode/calls correctly remain zero. Dense scope is cumulative: 0
+     * on allowlisted all-MLA models it selects that Q4 kernel while KDA
+     * effective mode/calls correctly remain zero. Dense scope is cumulative: 0
      * KDA-only, 1 shared+latent MoE, 2 ordinary MLA projections too, 3 the
      * non-MoE dense FFN too. */
     void    *cuda_kda_ctx;
@@ -237,10 +238,12 @@ typedef struct {
 } waste_model;
 
 /* Internal accelerator allowlists. These are deliberately model-free so the
- * exact K2 geometry gate can be tested without model weights or a CUDA host.
- * Dense covers only the Q4 trunk shape; VQ adds the expert format. */
+ * exact all-MLA geometry gates can be tested without model weights or a CUDA
+ * host. Dense covers only the Q4 trunk shape; VQ adds the expert format. */
 int waste_model_cuda_k2_dense_compatible(const waste_model *m);
 int waste_model_cuda_k2_vq3r_compatible(const waste_model *m);
+int waste_model_cuda_glm47_flash_dense_compatible(const waste_model *m);
+int waste_model_cuda_glm47_flash_vq3r_compatible(const waste_model *m);
 
 /* Everything the load needs that is not in the container. These are
  * parameters rather than fields set beforehand because the first thing

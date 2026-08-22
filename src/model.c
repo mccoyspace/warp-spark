@@ -555,6 +555,38 @@ int waste_model_cuda_k2_vq3r_compatible(const waste_model *m)
            m->expert_m[2] % (int)WASTE_VQ_INDEX_BLOCK == 0;
 }
 
+int waste_model_cuda_glm47_flash_dense_compatible(const waste_model *m)
+{
+    if (!m) return 0;
+    const waste_config *c = &m->cfg;
+    if (strcmp(c->arch, "Glm4MoeLiteForCausalLM") ||
+        c->n_layers != 47 || c->hidden != 2048 ||
+        c->n_experts != 64 || c->top_k != 4 ||
+        c->moe_inter != 1536 || c->dense_inter != 10240 ||
+        c->n_shared != 1 || c->first_dense != 1 ||
+        c->n_heads != 20 || c->kv_lora != 512 || c->q_lora != 768 ||
+        c->qk_nope != 192 || c->qk_rope != 64 || c->v_head != 256 ||
+        c->rope_interleave != 1 ||
+        c->latent_dim != 0 || c->kda_heads != 0 || c->kda_dim != 0 ||
+        m->expert_m[0] != 1536 || m->expert_m[1] != 1536 ||
+        m->expert_m[2] != 2048 || m->expert_n[0] != 2048 ||
+        m->expert_n[1] != 2048 || m->expert_n[2] != 1536)
+        return 0;
+    for (int L = 0; L < c->n_layers; L++)
+        if (c->kda_layer[L]) return 0;
+    return 1;
+}
+
+int waste_model_cuda_glm47_flash_vq3r_compatible(const waste_model *m)
+{
+    return waste_model_cuda_glm47_flash_dense_compatible(m) &&
+           m->index_bits == 8 && m->stages == 3 && m->vec_dim == 8 &&
+           m->cb_entries == 256 &&
+           m->index_block == WASTE_VQ_INDEX_BLOCK &&
+           m->expert_m[0] % (int)WASTE_VQ_INDEX_BLOCK == 0 &&
+           m->expert_m[2] % (int)WASTE_VQ_INDEX_BLOCK == 0;
+}
+
 #if defined(WASTE_ENABLE_CUDA)
 static int cuda_kda_tensor_ok(waste_model *m, int layer, const char *projection,
                               const waste_tensor **first)
@@ -605,11 +637,12 @@ static int cuda_kda_preflight(waste_model *m, int mode)
         }
     }
     if (!first || !kda_layers) {
-        /* K2 is all MLA. WASTE_CUDA_KDA remains the Q4 kernel selector for
-         * its dense projections, but it must execute zero KDA calls. Only
-         * the exact qualified K2 geometry may use that otherwise-no-op base
-         * mode; every other zero-KDA model still fails closed. */
-        if (waste_model_cuda_k2_dense_compatible(m)) return 0;
+        /* K2 and GLM-4.7-Flash are all MLA. WASTE_CUDA_KDA remains the Q4
+         * kernel selector for their dense projections, but it must execute
+         * zero KDA calls. Only the exact qualified geometries may use that
+         * otherwise-no-op base mode; every other zero-KDA model fails closed. */
+        if (waste_model_cuda_k2_dense_compatible(m) ||
+            waste_model_cuda_glm47_flash_dense_compatible(m)) return 0;
         fprintf(stderr,
                 "waste: CUDA KDA requested for a model with no KDA layers\n");
         goto fail;
@@ -645,9 +678,11 @@ static int cuda_dense_preflight(waste_model *m, int scope)
     const waste_config *c = &m->cfg;
     int kda_layers = 0;
     for (int L = 0; L < c->n_layers; L++) kda_layers += !!c->kda_layer[L];
-    if (!kda_layers && !waste_model_cuda_k2_dense_compatible(m)) {
+    if (!kda_layers && !waste_model_cuda_k2_dense_compatible(m) &&
+        !waste_model_cuda_glm47_flash_dense_compatible(m)) {
         fprintf(stderr,
-                "waste: CUDA dense zero-KDA path requires exact K2 geometry\n");
+                "waste: CUDA dense zero-KDA path requires exact K2 or "
+                "GLM-4.7-Flash geometry\n");
         goto fail;
     }
     const waste_tensor *first = NULL;
@@ -733,13 +768,16 @@ static int cuda_vq_preflight(waste_model *m, int mode)
     if (!mode) return 0;
     const waste_config *c = &m->cfg;
     const int k2_geometry = waste_model_cuda_k2_vq3r_compatible(m);
+    const int glm47_flash_geometry =
+        waste_model_cuda_glm47_flash_vq3r_compatible(m);
+    const int qualified_all_mla = k2_geometry || glm47_flash_geometry;
     const int dense_scope_ok = m->cuda_dense_scope == 2 ||
-        (k2_geometry && m->cuda_dense_scope == 3);
+        (qualified_all_mla && m->cuda_dense_scope == 3);
     if (mode < 1 || mode > 2 || m->cuda_kda_mode != 1 ||
         !dense_scope_ok) {
         fprintf(stderr,
                 "waste: CUDA VQ requires CUDA KDA mode 1 and dense scope 2 "
-                "(or scope 3 on allowlisted K2)\n");
+                "(or scope 3 on qualified all-MLA geometry)\n");
         goto fail;
     }
     if (m->index_bits != 8) {
@@ -751,10 +789,12 @@ static int cuda_vq_preflight(waste_model *m, int mode)
     const int k3_geometry =
         c->latent_dim == 3584 && c->moe_inter == 3072 && c->top_k == 16;
     if (m->stages != 3 || m->vec_dim != 8 || m->cb_entries != 256 ||
-        (!k3_geometry && !k2_geometry) || !m->codebooksT || m->n_books < 9) {
+        (!k3_geometry && !qualified_all_mla) ||
+        !m->codebooksT || m->n_books < 9) {
         fprintf(stderr,
                 "waste: CUDA VQ requires K3 VQ3R 3584/3072 top-16 or "
-                "allowlisted K2 VQ3R 7168/2048 top-8 geometry\n");
+                "allowlisted K2 7168/2048 top-8 or GLM-4.7-Flash "
+                "2048/1536 top-4 VQ3R geometry\n");
         goto fail;
     }
     if (waste_cuda_vq_init(m)) {
@@ -785,9 +825,9 @@ static int cuda_vq_preflight(waste_model *m, int mode)
             fprintf(stderr, "waste: CUDA VQ requires VQ3R expert records\n");
             goto fail;
         }
-        /* K3 routes experts through its narrower latent width; all-MLA K2
-         * routes the hidden state directly. Match moe_layer and the CUDA
-         * allocator instead of treating K2's absent latent as width zero. */
+        /* K3 routes experts through its narrower latent width; qualified
+         * all-MLA models route the hidden state directly. Match moe_layer
+         * and the CUDA allocator instead of treating absent latent as zero. */
         const int lat = c->latent_dim ? c->latent_dim : c->hidden;
         const int inter = c->moe_inter;
         const int lut_sz =
@@ -1279,6 +1319,8 @@ static int cfg_sane(const waste_config *c)
     if (c->vocab    < 1 || c->vocab    > (1 << 24)) return 0;
     if (c->n_heads  < 1 || c->n_heads  > (1 << 16)) return 0;
     if (c->eps <= 0.0f || !(c->eps < 1.0f)) return 0;      /* also catches NaN */
+    if (c->mla_rms_norm_eps <= 0.0f ||
+        !(c->mla_rms_norm_eps < 1.0f)) return 0;
     /* MoE is optional, but if there are experts the routing has to make
      * sense: top_k above the pool overruns the per-token index array. */
     if (c->n_experts < 0 || c->n_experts > (1 << 20)) return 0;
@@ -1340,6 +1382,25 @@ static void rope_init(waste_config *c, const js_doc *d, int cfg)
     const double PI = 3.14159265358979323846;
     c->att_mul = 1.0f;
     c->rope_err[0] = 0;
+    const int interleave = js_get(d, cfg, "rope_interleave");
+    c->rope_interleave = 1;
+    if (interleave >= 0 && js_typeof(d, interleave) != JS_BOOL) {
+        if (!strcmp(c->arch, "Glm4MoeLiteForCausalLM")) {
+            snprintf(c->rope_err, sizeof c->rope_err,
+                     "GLM-4.7-Flash rope_interleave is not true or false");
+            return;
+        }
+    } else {
+        c->rope_interleave = js_bool(d, interleave, 1);
+    }
+    /* rope_apply implements the adjacent-pair layout used by Flash. An
+     * explicit half-split layout needs a different kernel, not a fallback. */
+    if (!c->rope_interleave &&
+        !strcmp(c->arch, "Glm4MoeLiteForCausalLM")) {
+        snprintf(c->rope_err, sizeof c->rope_err,
+                 "GLM-4.7-Flash rope_interleave=false is not implemented");
+        return;
+    }
     /* By value, not by presence: a container carrying "mla_use_nope": false
      * has to rotate. The presence idiom used for the other flags costs a
      * feature when it misreads; here it costs the sequence order.
@@ -1445,6 +1506,8 @@ static void cfg_from_json(waste_config *c, const js_doc *d, int cfg)
     c->qk_rope = (int)js_int(d, js_get(d, cfg, "qk_rope_head_dim"), 0);
     c->v_head = (int)js_int(d, js_get(d, cfg, "v_head_dim"), 0);
     c->eps = (float)js_num(d, js_get(d, cfg, "rms_norm_eps"), 1e-5);
+    c->mla_rms_norm_eps = (float)js_num(
+        d, js_get(d, cfg, "mla_rms_norm_eps"), c->eps);
     c->routed_scale = (float)js_num(d, js_get(d, cfg, "routed_scaling_factor"), 1.0);
     c->renorm = js_get(d, cfg, "moe_renormalize") >= 0;
 
@@ -3184,7 +3247,8 @@ static int mla_layer(waste_model *m, int L, const float *in, float *out,
                 "%smodel.layers.%d.self_attn.q_a_proj.weight", c->prefix, L)),
                 in, c->q_lora, hid, cuda_scope, 2)) return -1;
         waste_rmsnorm(qa, qa, waste_find(m, tname("%smodel.layers.%d.self_attn.q_a_layernorm.weight",
-                                            c->prefix, L))->data, c->q_lora, c->eps);
+                                            c->prefix, L))->data, c->q_lora,
+                     c->mla_rms_norm_eps);
         if (dense_matvec_scope_t(m, q, waste_find(m, tname(
                 "%smodel.layers.%d.self_attn.q_b_proj.weight", c->prefix, L)),
                 qa, nh * qd, c->q_lora, cuda_scope, 2)) return -1;
@@ -3197,7 +3261,7 @@ static int mla_layer(waste_model *m, int L, const float *in, float *out,
             "%smodel.layers.%d.self_attn.kv_a_proj_with_mqa.weight", c->prefix, L)),
             in, c->kv_lora + c->qk_rope, hid, cuda_scope, 2)) return -1;
     waste_rmsnorm(ckv, ckv, T(m, "%smodel.layers.%d.self_attn.kv_a_layernorm.weight", c->prefix, L),
-            c->kv_lora, c->eps);
+            c->kv_lora, c->mla_rms_norm_eps);
     /* Rotate before caching, not after: the cached entry is reused by every
      * later query and carries this token's position, while the query carries
      * the querying token's. Rotating on read would need the pair of positions
@@ -4209,7 +4273,9 @@ int waste_model_set_cuda_dense(waste_model *m, int scope)
     if (scope && backend && !strcmp(backend, "cpu")) return -1;
     if (scope && (!m->cuda_kda_mode || m->cuda_kda_failed)) return -1;
     if (m->cuda_vq_mode && scope != 2 &&
-        !(scope == 3 && waste_model_cuda_k2_vq3r_compatible(m))) return -1;
+        !(scope == 3 &&
+          (waste_model_cuda_k2_vq3r_compatible(m) ||
+           waste_model_cuda_glm47_flash_vq3r_compatible(m)))) return -1;
     m->cuda_dense_scope = scope;
     m->cuda_dense_effective = 0;
     m->cuda_dense_calls = 0;

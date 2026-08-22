@@ -322,7 +322,7 @@ class CompareGpuRunsTest(unittest.TestCase):
         self.assertEqual(result["arms"]["gpu"]["value"], 3)
         self.assertEqual(result["arms"]["gpu"]["calls"], 30)
 
-    def test_dense_scope_accepts_zero_kda_k2_base(self):
+    def test_dense_scope_accepts_qualified_all_mla_zero_kda_base(self):
         control, candidate = self.dense_arms(zero_kda=True)
         result = self.compare(cpu_arm=control, gpu_arm=candidate)
         self.assertEqual(result["arms"]["cpu"]["kda_effective"], 0)
@@ -353,7 +353,7 @@ class CompareGpuRunsTest(unittest.TestCase):
         self.assertEqual(result["arms"]["gpu"]["vq_group"], 2)
         self.assertEqual(result["arms"]["gpu"]["vq_syncs"], 8)
 
-    def test_vq_accepts_zero_kda_k2_base(self):
+    def test_vq_accepts_qualified_all_mla_zero_kda_base(self):
         control, candidate = self.vq_arms(2, zero_kda=True)
         result = self.compare(cpu_arm=control, gpu_arm=candidate)
         self.assertEqual(result["arms"]["gpu"]["kda_effective"], 0)

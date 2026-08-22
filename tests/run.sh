@@ -119,9 +119,9 @@ else
 fi
 
 if ./test_cuda_geometry 2>/dev/null | grep -q "^CUDA GEOMETRY OK"; then
-    ok "K2 CUDA allowlist accepts only the exact all-MLA/VQ3R geometry"
+    ok "K2/GLM-4.7-Flash CUDA allowlists accept exact all-MLA/VQ3R geometry"
 else
-    no "K2 CUDA geometry allowlist"
+    no "K2/GLM-4.7-Flash CUDA geometry allowlists"
 fi
 
 SWEEP_MODEL="$TMP/sweep-test.waste"
@@ -1496,11 +1496,13 @@ fi
 # ByteLevel-BPE shape is translated; native rank files must keep precedence,
 # and an unsupported tokenizer must fail before publishing a partial file.
 if ! command -v python3 >/dev/null 2>&1; then
-    sk "tokenizer.json conversion" "python3 not installed"
-elif python3 -m unittest -q tests.test_convert_tokenizer_json >/dev/null 2>&1; then
-    ok "qualified tokenizer.json converts atomically and native ranks win"
+    sk "GLM converter metadata" "python3 not installed"
+elif python3 -m unittest -q \
+        tests.test_convert_tokenizer_json tests.test_convert_glm \
+        >/dev/null 2>&1; then
+    ok "GLM tokenizer, EOS and source-layer boundaries convert safely"
 else
-    no "tokenizer.json conversion"
+    no "GLM converter metadata"
 fi
 
 # ---------------------------------------------------------------- serve ----
@@ -1559,7 +1561,7 @@ fi
 if ! command -v python3 >/dev/null 2>&1; then
     sk "GPU capture comparator" "python3 not installed"
 elif python3 -m unittest -q tests.test_compare_gpu_runs >/dev/null 2>&1; then
-    ok "GPU capture comparator (20 checks)"
+    ok "GPU capture comparator (21 checks)"
 else
     no "GPU capture comparator"
 fi

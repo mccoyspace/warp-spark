@@ -427,10 +427,10 @@ def _vq_route_work(capture: Capture) -> tuple[int, int]:
 def _valid_kda_base(arm: Arm, modes: tuple[int, ...]) -> bool:
     """Audit the CUDA-Q4 selector shared by KDA and dense projections.
 
-    K3 executes KDA calls, while all-MLA K2 deliberately reports effective
-    mode and calls as zero. In both cases the requested mode remains the Q4
-    kernel selector and the declared expected count decides which contract
-    applies.
+    K3 executes KDA calls, while qualified all-MLA models (K2 and
+    GLM-4.7-Flash) deliberately report effective mode and calls as zero. In
+    both cases the requested mode remains the Q4 kernel selector and the
+    declared expected count decides which contract applies.
     """
     if (arm.kda_mode not in modes or arm.kda_effective is None or
             arm.kda_calls is None or arm.kda_expected_calls is None or
