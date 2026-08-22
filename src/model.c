@@ -625,6 +625,41 @@ int waste_model_cuda_prefill_dense_compatible(const waste_model *m)
            waste_model_cuda_glm47_flash_dense_compatible(m);
 }
 
+int waste_model_glm47_gqa_compatible(const waste_model *m)
+{
+    if (!m) return 0;
+    const waste_config *c = &m->cfg;
+    const double rotary = (double)c->head_dim *
+                          (double)c->partial_rotary_factor;
+    if (strcmp(c->arch, "Glm4MoeForCausalLM") ||
+        strcmp(c->model_type, "glm4_moe") ||
+        c->attention_kind != WASTE_ATTN_GQA ||
+        c->n_layers < 1 || c->n_layers > WASTE_MAX_LAYERS ||
+        c->n_heads < 1 || c->n_kv_heads < 1 ||
+        c->n_heads % c->n_kv_heads != 0 ||
+        c->head_dim < 1 || c->qk_rope < 2 ||
+        (c->qk_rope & 1) || c->qk_rope > 2 * WASTE_MAX_ROPE_HALF ||
+        c->qk_nope != c->head_dim - c->qk_rope ||
+        c->v_head != c->head_dim ||
+        !(c->partial_rotary_factor > 0.0f) ||
+        !(c->partial_rotary_factor <= 1.0f) ||
+        !isfinite(rotary) || fabs(rotary - (double)c->qk_rope) > 1e-6 ||
+        !c->qkv_bias || !c->qk_norm || c->rope_interleave || c->mla_nope ||
+        c->router_n_group != 1 || c->router_topk_group != 1 ||
+        strcmp(c->topk_method, "noaux_tc") ||
+        strcmp(c->router_activation, "sigmoid") || !c->renorm ||
+        strcmp(c->hidden_act, "silu") || c->act_situ ||
+        fabsf(c->routed_scale - 2.5f) > 1e-6f ||
+        c->max_position_embeddings < 1 || c->kv_lora || c->q_lora ||
+        c->attn_res_block || c->mla_output_gate ||
+        (int64_t)c->n_heads * c->head_dim > INT_MAX ||
+        (int64_t)c->n_kv_heads * c->head_dim > INT_MAX)
+        return 0;
+    for (int L = 0; L < c->n_layers; L++)
+        if (c->kda_layer[L]) return 0;
+    return 1;
+}
+
 /* Preserve the CPU chunk contract without disturbing the router-owned
  * arrays (and therefore its trace): the CUDA pilot accumulates each token's
  * expert outputs in ascending expert-id order, exactly as moe_chunk's
@@ -1341,7 +1376,28 @@ static int validate_text_tensors(waste_model *m)
         REQUIRE_VECTOR(tname("%smodel.layers.%d.input_layernorm.weight", c->prefix, L), hid);
         REQUIRE_VECTOR(tname("%smodel.layers.%d.post_attention_layernorm.weight", c->prefix, L), hid);
 
-        if (c->kda_layer[L]) {
+        if (c->attention_kind == WASTE_ATTN_GQA) {
+            const int qrows = c->n_heads * c->head_dim;
+            const int kvrows = c->n_kv_heads * c->head_dim;
+            REQUIRE_MATRIX(tname("%smodel.layers.%d.self_attn.q_proj.weight",
+                                 c->prefix, L), qrows, hid);
+            REQUIRE_VECTOR(tname("%smodel.layers.%d.self_attn.q_proj.bias",
+                                 c->prefix, L), qrows);
+            REQUIRE_MATRIX(tname("%smodel.layers.%d.self_attn.k_proj.weight",
+                                 c->prefix, L), kvrows, hid);
+            REQUIRE_VECTOR(tname("%smodel.layers.%d.self_attn.k_proj.bias",
+                                 c->prefix, L), kvrows);
+            REQUIRE_MATRIX(tname("%smodel.layers.%d.self_attn.v_proj.weight",
+                                 c->prefix, L), kvrows, hid);
+            REQUIRE_VECTOR(tname("%smodel.layers.%d.self_attn.v_proj.bias",
+                                 c->prefix, L), kvrows);
+            REQUIRE_VECTOR(tname("%smodel.layers.%d.self_attn.q_norm.weight",
+                                 c->prefix, L), c->head_dim);
+            REQUIRE_VECTOR(tname("%smodel.layers.%d.self_attn.k_norm.weight",
+                                 c->prefix, L), c->head_dim);
+            REQUIRE_MATRIX(tname("%smodel.layers.%d.self_attn.o_proj.weight",
+                                 c->prefix, L), hid, qrows);
+        } else if (c->kda_layer[L]) {
             const int H = c->kda_heads, D = c->kda_dim, C = H * D;
             const char *kind[3] = { "q", "k", "v" };
             for (int i = 0; i < 3; i++) {
@@ -1391,6 +1447,9 @@ static int validate_text_tensors(waste_model *m)
             const int lat = c->latent_dim ? c->latent_dim : hid;
             const int shared = c->moe_inter * (c->n_shared ? c->n_shared : 1);
             REQUIRE_MATRIX(tname("%smodel.layers.%d.block_sparse_moe.gate.weight", c->prefix, L), c->n_experts, hid);
+            if (c->attention_kind == WASTE_ATTN_GQA)
+                REQUIRE_VECTOR(tname("%smodel.layers.%d.block_sparse_moe.gate.e_score_correction_bias",
+                                     c->prefix, L), c->n_experts);
             REQUIRE_MATRIX(tname("%smodel.layers.%d.block_sparse_moe.shared_experts.gate_proj.weight", c->prefix, L), shared, hid);
             REQUIRE_MATRIX(tname("%smodel.layers.%d.block_sparse_moe.shared_experts.up_proj.weight", c->prefix, L), shared, hid);
             REQUIRE_MATRIX(tname("%smodel.layers.%d.block_sparse_moe.shared_experts.down_proj.weight", c->prefix, L), hid, shared);
@@ -1428,6 +1487,8 @@ static int cfg_sane(const waste_config *c)
     if (c->hidden   < 1 || c->hidden   > (1 << 20)) return 0;
     if (c->vocab    < 1 || c->vocab    > (1 << 24)) return 0;
     if (c->n_heads  < 1 || c->n_heads  > (1 << 16)) return 0;
+    if (c->attention_kind != WASTE_ATTN_LATENT &&
+        c->attention_kind != WASTE_ATTN_GQA) return 0;
     if (c->n_eos < 0 || c->n_eos > WASTE_MAX_EOS) return 0;
     for (int i = 0; i < c->n_eos; i++) {
         if (c->eos_token_ids[i] < 0 || c->eos_token_ids[i] >= c->vocab)
@@ -1463,7 +1524,16 @@ static int cfg_sane(const waste_config *c)
         if (c->kda_heads < 1 || c->kda_dim < 1 || c->conv_k < 1) return 0;
         if ((int64_t)c->kda_heads * c->kda_dim > INT_MAX) return 0;
     }
-    if (n_kda < c->n_layers) {
+    if (c->attention_kind == WASTE_ATTN_GQA) {
+        if (n_kda || c->n_kv_heads < 1 || c->n_kv_heads > c->n_heads ||
+            c->n_heads % c->n_kv_heads || c->head_dim < 1 ||
+            c->head_dim > (1 << 16) ||
+            c->qk_nope + c->qk_rope != c->head_dim ||
+            c->v_head != c->head_dim ||
+            (int64_t)c->n_heads * c->head_dim > INT_MAX ||
+            (int64_t)c->n_kv_heads * c->head_dim > INT_MAX)
+            return 0;
+    } else if (n_kda < c->n_layers) {
         const int64_t qd = (int64_t)c->qk_nope + c->qk_rope;
         if (c->kv_lora < 1 || qd < 1 || c->v_head < 1) return 0;
         if ((int64_t)c->n_heads * qd > INT_MAX ||
@@ -1500,18 +1570,24 @@ static void rope_init(waste_config *c, const js_doc *d, int cfg)
     c->att_mul = 1.0f;
     c->rope_err[0] = 0;
     const int interleave = js_get(d, cfg, "rope_interleave");
-    c->rope_interleave = 1;
+    /* Full GLM uses LLaMA's half-split layout on the first rotary slice;
+     * Flash uses the GPT-J adjacent-pair layout.  Both release configs omit
+     * this engine-specific spelling, so architecture supplies the default. */
+    const int interleave_default =
+        strcmp(c->arch, "Glm4MoeForCausalLM") != 0;
+    c->rope_interleave = interleave_default;
     if (interleave >= 0 && js_typeof(d, interleave) != JS_BOOL) {
-        if (!strcmp(c->arch, "Glm4MoeLiteForCausalLM")) {
+        if (!strcmp(c->arch, "Glm4MoeLiteForCausalLM") ||
+            !strcmp(c->arch, "Glm4MoeForCausalLM")) {
             snprintf(c->rope_err, sizeof c->rope_err,
-                     "GLM-4.7-Flash rope_interleave is not true or false");
+                     "GLM-4.7 rope_interleave is not true or false");
             return;
         }
     } else {
-        c->rope_interleave = js_bool(d, interleave, 1);
+        c->rope_interleave = js_bool(d, interleave, interleave_default);
     }
-    /* rope_apply implements the adjacent-pair layout used by Flash. An
-     * explicit half-split layout needs a different kernel, not a fallback. */
+    /* Flash's MLA path implements only its adjacent-pair layout. Full GLM's
+     * standard-GQA path has a separate half-split primitive below. */
     if (!c->rope_interleave &&
         !strcmp(c->arch, "Glm4MoeLiteForCausalLM")) {
         snprintf(c->rope_err, sizeof c->rope_err,
@@ -1543,6 +1619,12 @@ static void rope_init(waste_config *c, const js_doc *d, int cfg)
     }
 
     const double base = js_num(d, js_get(d, cfg, "rope_theta"), 10000.0);
+    c->rope_theta = (float)base;
+    if (!isfinite(base) || base <= 0.0) {
+        snprintf(c->rope_err, sizeof c->rope_err,
+                 "rope_theta must be finite and positive");
+        return;
+    }
     for (int j = 0; j < half; j++)
         c->rope_inv_freq[j] = (float)(1.0 / pow(base, (double)(2 * j) / dim));
 
@@ -1604,6 +1686,116 @@ static void rope_init(waste_config *c, const js_doc *d, int cfg)
     }
 }
 
+static void attention_error(waste_config *c, const char *fmt, ...)
+{
+    if (c->attention_err[0]) return;
+    va_list ap;
+    va_start(ap, fmt);
+    vsnprintf(c->attention_err, sizeof c->attention_err, fmt, ap);
+    va_end(ap);
+}
+
+static int config_bool(const js_doc *d, int cfg, const char *name,
+                       int required, int fallback, int *ok)
+{
+    const int tok = js_get(d, cfg, name);
+    if (tok < 0) {
+        if (required) *ok = 0;
+        return fallback;
+    }
+    if (js_typeof(d, tok) != JS_BOOL) {
+        *ok = 0;
+        return fallback;
+    }
+    return js_bool(d, tok, fallback);
+}
+
+/* Select the attention representation from the declared architecture, then
+ * record every standard-GQA semantic the forward pass relies on.  A missing
+ * linear_attn_config is not evidence of MLA: treating a future architecture
+ * as latent attention would read differently named tensors and, worse,
+ * serialize a different kind of cache. */
+static void attention_init(waste_config *c, const js_doc *d, int cfg)
+{
+    c->attention_kind = 0;
+    c->attention_err[0] = 0;
+    js_str(d, js_get(d, cfg, "model_type"), c->model_type,
+           sizeof c->model_type);
+
+    if (!strcmp(c->arch, "Glm4MoeForCausalLM")) {
+        int ok = 1;
+        c->attention_kind = WASTE_ATTN_GQA;
+        c->n_kv_heads = (int)js_int(
+            d, js_get(d, cfg, "num_key_value_heads"), 0);
+        c->head_dim = (int)js_int(d, js_get(d, cfg, "head_dim"), 0);
+        c->partial_rotary_factor = (float)js_num(
+            d, js_get(d, cfg, "partial_rotary_factor"), -1.0);
+        c->max_position_embeddings = (int)js_int(
+            d, js_get(d, cfg, "max_position_embeddings"), 0);
+        c->qkv_bias = config_bool(d, cfg, "attention_bias", 1, 0, &ok);
+        c->qk_norm = config_bool(d, cfg, "use_qk_norm", 1, 0, &ok);
+        c->renorm = config_bool(d, cfg, "moe_renormalize", 1, 0, &ok);
+        c->router_n_group = (int)js_int(d, js_get(d, cfg, "n_group"), -1);
+        c->router_topk_group = (int)js_int(
+            d, js_get(d, cfg, "topk_group"), -1);
+        {
+            const int method = js_get(d, cfg, "topk_method");
+            if (method < 0)
+                snprintf(c->topk_method, sizeof c->topk_method, "noaux_tc");
+            else
+                js_str(d, method, c->topk_method, sizeof c->topk_method);
+            const int activation = js_get(
+                d, cfg, "moe_router_activation_func");
+            if (activation < 0)
+                snprintf(c->router_activation,
+                         sizeof c->router_activation, "sigmoid");
+            else
+                js_str(d, activation, c->router_activation,
+                       sizeof c->router_activation);
+        }
+        if (strcmp(c->model_type, "glm4_moe"))
+            attention_error(c, "Glm4MoeForCausalLM requires model_type glm4_moe");
+        if (!ok)
+            attention_error(c, "GLM-4.7 attention_bias/use_qk_norm/moe_renormalize must be explicit booleans");
+        {
+            const int scaling = js_get(d, cfg, "rope_scaling");
+            if (scaling >= 0 &&
+                !(js_typeof(d, scaling) == JS_NULL ||
+                  (js_typeof(d, scaling) == JS_OBJ &&
+                   js_size(d, scaling) == 0)))
+                attention_error(c,
+                                "GLM-4.7 GQA rope_scaling is not implemented");
+        }
+
+        const double rd = (double)c->head_dim *
+                          (double)c->partial_rotary_factor;
+        int rope = 0;
+        if (!isfinite(rd) || rd < 0.0 || rd > (double)INT_MAX) {
+            attention_error(c, "GLM-4.7 partial rotary width is out of range");
+        } else {
+            rope = (int)llround(rd);
+        }
+        if (isfinite(rd) && rd >= 0.0 && rd <= (double)INT_MAX &&
+            fabs(rd - (double)rope) > 1e-9)
+            attention_error(c, "GLM-4.7 partial rotary width is not integral");
+        c->qk_rope = rope;
+        c->qk_nope = c->head_dim - rope;
+        c->v_head = c->head_dim;
+        return;
+    }
+
+    if (!strcmp(c->arch, "KimiLinearForCausalLM") ||
+        !strcmp(c->arch, "KimiK3ForConditionalGeneration") ||
+        !strcmp(c->arch, "DeepseekV3ForCausalLM") ||
+        !strcmp(c->arch, "Glm4MoeLiteForCausalLM")) {
+        c->attention_kind = WASTE_ATTN_LATENT;
+        return;
+    }
+
+    attention_error(c, "unsupported attention architecture: %s",
+                    c->arch[0] ? c->arch : "(missing)");
+}
+
 static void cfg_from_json(waste_config *c, const js_doc *d, int cfg)
 {
     c->n_layers = (int)js_int(d, js_get(d, cfg, "num_hidden_layers"), 0);
@@ -1647,11 +1839,9 @@ static void cfg_from_json(waste_config *c, const js_doc *d, int cfg)
     c->latent_norm = js_get(d, cfg, "latent_moe_use_norm") >= 0;
     c->attn_res_block = (int)js_int(d, js_get(d, cfg, "attn_res_block_size"), 0);
     c->mla_output_gate = js_get(d, cfg, "mla_use_output_gate") >= 0;
-    {
-        char act[32];
-        js_str(d, js_get(d, cfg, "hidden_act"), act, sizeof act);
-        c->act_situ = strcmp(act, "situ") == 0;
-    }
+    js_str(d, js_get(d, cfg, "hidden_act"), c->hidden_act,
+           sizeof c->hidden_act);
+    c->act_situ = strcmp(c->hidden_act, "situ") == 0;
     c->situ_beta = (float)js_num(d, js_get(d, cfg, "activation_situ_beta"), 1.0);
     c->situ_linear_beta = (float)js_num(d, js_get(d, cfg, "activation_situ_linear_beta"), 0.0);
 
@@ -1665,6 +1855,7 @@ static void cfg_from_json(waste_config *c, const js_doc *d, int cfg)
         js_str(d, js_at(d, a, 0), c->arch, sizeof c->arch);
     }
 
+    attention_init(c, d, cfg);
     rope_init(c, d, cfg);
 
     int lac = js_get(d, cfg, "linear_attn_config");
@@ -1855,6 +2046,11 @@ int waste_model_load(waste_model *m, const char *dir, int kv_cap,
         }
         cfg_from_json(&m->cfg, &d, cfg);
     }
+    if (m->cfg.attention_err[0]) {
+        fprintf(stderr, "waste: %s\n", m->cfg.attention_err);
+        js_free(&d); free(src);
+        return -2;
+    }
     if (!cfg_sane(&m->cfg)) {
         fprintf(stderr, "waste: manifest config is out of range "
                         "(%d layers, hidden %d, vocab %d, %d experts top-%d)\n",
@@ -1862,6 +2058,14 @@ int waste_model_load(waste_model *m, const char *dir, int kv_cap,
                 m->cfg.n_experts, m->cfg.top_k);
         js_free(&d); free(src);
         return -2;                        /* -> WASTE_E_FORMAT */
+    }
+    if (m->cfg.attention_kind == WASTE_ATTN_GQA &&
+        !waste_model_glm47_gqa_compatible(m)) {
+        fprintf(stderr,
+                "waste: Glm4MoeForCausalLM standard-GQA semantics are "
+                "unsupported or incomplete\n");
+        js_free(&d); free(src);
+        return -2;
     }
     /* rope_init leaves no table for a shape it does not implement. Running
      * anyway would apply no rotation, which is not a degraded result but an
@@ -2076,7 +2280,14 @@ int waste_model_load(waste_model *m, const char *dir, int kv_cap,
     /* state + scratch */
     const int H = c->kda_heads, D = c->kda_dim, C = H * D;
     for (int L = 0; L < c->n_layers; L++) {
-        if (c->kda_layer[L]) {
+        if (c->attention_kind == WASTE_ATTN_GQA) {
+            const size_t width = (size_t)c->n_kv_heads * c->head_dim;
+            m->has_mla = 1;      /* any per-token KV makes ctx a hard bound */
+            m->kcache[L] = (float *)calloc((size_t)kv_cap * width,
+                                           sizeof(float));
+            m->vcache[L] = (float *)calloc((size_t)kv_cap * width,
+                                           sizeof(float));
+        } else if (c->kda_layer[L]) {
             m->S[L] = (float *)calloc((size_t)H * D * D, sizeof(float));
             m->conv[L] = (float *)calloc((size_t)3 * C * (c->conv_k - 1), sizeof(float));
         } else {
@@ -2085,7 +2296,10 @@ int waste_model_load(waste_model *m, const char *dir, int kv_cap,
                 (size_t)kv_cap * (c->kv_lora + c->qk_rope), sizeof(float));
         }
     }
-    const int big = c->hidden > C ? c->hidden : C;
+    int big = c->hidden > C ? c->hidden : C;
+    if (c->attention_kind == WASTE_ATTN_GQA &&
+        c->n_heads * c->head_dim > big)
+        big = c->n_heads * c->head_dim;
     m->x = (float *)calloc((size_t)c->hidden, sizeof(float));
     m->h = (float *)calloc((size_t)c->hidden, sizeof(float));
     m->tmp = (float *)calloc((size_t)8 * big + 8 * c->moe_inter + 8 * c->dense_inter
@@ -2224,8 +2438,11 @@ int waste_model_load(waste_model *m, const char *dir, int kv_cap,
         return -1;
     if (m->index_bits == 6 && (!m->lut8 || !m->lut8_scale)) return -1;
     for (int L = 0; L < c->n_layers; L++) {
-        if (c->kda_layer[L]) { if (!m->S[L] || !m->conv[L]) return -1; }
-        else if (!m->latcache[L]) return -1;
+        if (c->attention_kind == WASTE_ATTN_GQA) {
+            if (!m->kcache[L] || !m->vcache[L]) return -1;
+        } else if (c->kda_layer[L]) {
+            if (!m->S[L] || !m->conv[L]) return -1;
+        } else if (!m->latcache[L]) return -1;
     }
     if (c->attn_res_block && !m->blockres) return -1;
 #if defined(WASTE_ENABLE_CUDA)
@@ -2299,6 +2516,7 @@ void waste_model_free(waste_model *m)
     free(m->codebooksT);
     for (int L = 0; L < 128; L++) {
         free(m->S[L]); free(m->conv[L]); free(m->latcache[L]);
+        free(m->kcache[L]); free(m->vcache[L]);
         if (m->bank[L].fd >= 0) close(m->bank[L].fd);
     }
     free(m->x); free(m->h); free(m->tmp); free(m->att); free(m->logits);
@@ -3338,6 +3556,143 @@ static void rope_apply(int half, float *x, const float *cs, const float *sn)
     }
 }
 
+/* LLaMA-style half-split rotation: pair dimension j with j + rotary/2.
+ * Full GLM applies this only to the first 64 dimensions of each 128-wide
+ * query/key head; the remaining dimensions pass through unchanged. */
+void waste_model_rope_half(float *x, int rotary_dim,
+                           const float *cs, const float *sn)
+{
+    if (!x || !cs || !sn || rotary_dim < 2 || (rotary_dim & 1) ||
+        rotary_dim > 2 * WASTE_MAX_ROPE_HALF)
+        return;
+    const int half = rotary_dim / 2;
+    for (int j = 0; j < half; j++) {
+        const float a = x[j], b = x[j + half];
+        x[j]        = a * cs[j] - b * sn[j];
+        x[j + half] = a * sn[j] + b * cs[j];
+    }
+}
+
+int waste_model_gqa_kv_head(int q_head, int n_q_heads, int n_kv_heads)
+{
+    if (q_head < 0 || n_q_heads < 1 || n_kv_heads < 1 ||
+        q_head >= n_q_heads || n_q_heads % n_kv_heads)
+        return -1;
+    return q_head / (n_q_heads / n_kv_heads);
+}
+
+typedef struct {
+    waste_model *m;
+    const float *q, *k, *v;
+    float *o;
+    int S, q_heads, kv_heads, head_dim;
+    float scale;
+} gqa_par;
+
+static void gqa_head_range(int lo, int hi, void *ap)
+{
+    const gqa_par *a = (const gqa_par *)ap;
+    const int D = a->head_dim;
+    const size_t kv_stride = (size_t)a->kv_heads * D;
+    for (int h = lo; h < hi; h++) {
+        const int kh = waste_model_gqa_kv_head(
+            h, a->q_heads, a->kv_heads);
+        const float *q = a->q + (size_t)h * D;
+        float *score = a->m->att + (size_t)h * a->S;
+        for (int s = 0; s < a->S; s++) {
+            const float *k = a->k + (size_t)s * kv_stride +
+                             (size_t)kh * D;
+            score[s] = dotf(q, k, D) * a->scale;
+        }
+        softmax(score, a->S);
+        float *o = a->o + (size_t)h * D;
+        memset(o, 0, (size_t)D * sizeof(float));
+        for (int s = 0; s < a->S; s++) {
+            const float w = score[s];
+            const float *v = a->v + (size_t)s * kv_stride +
+                             (size_t)kh * D;
+            for (int j = 0; j < D; j++) o[j] += w * v[j];
+        }
+    }
+}
+
+/* CPU-correct standard grouped-query attention for full GLM-4.7.  This is
+ * intentionally the plain representation first: separate q/k/v projections,
+ * fp32 caches, and one causal head loop.  There is no MLA absorption or CUDA
+ * fallback hidden behind the architecture switch. */
+static int gqa_layer(waste_model *m, int L, const float *in, float *out,
+                     int pos)
+{
+    const waste_config *c = &m->cfg;
+    if (!waste_model_glm47_gqa_compatible(m)) return -1;
+    const int D = c->head_dim;
+    const int qrows = c->n_heads * D;
+    const int kvrows = c->n_kv_heads * D;
+    float *q = m->tmp;
+    float *k = q + qrows;
+    float *v = k + kvrows;
+    float *o = v + kvrows;
+
+    const waste_tensor *qw = waste_find(m, tname(
+        "%smodel.layers.%d.self_attn.q_proj.weight", c->prefix, L));
+    const waste_tensor *kw = waste_find(m, tname(
+        "%smodel.layers.%d.self_attn.k_proj.weight", c->prefix, L));
+    const waste_tensor *vw = waste_find(m, tname(
+        "%smodel.layers.%d.self_attn.v_proj.weight", c->prefix, L));
+    matvec_t(m, q, qw, in, qrows, c->hidden);
+    matvec_t(m, k, kw, in, kvrows, c->hidden);
+    matvec_t(m, v, vw, in, kvrows, c->hidden);
+
+    const float *qb = T(m, "%smodel.layers.%d.self_attn.q_proj.bias",
+                        c->prefix, L);
+    const float *kb = T(m, "%smodel.layers.%d.self_attn.k_proj.bias",
+                        c->prefix, L);
+    const float *vb = T(m, "%smodel.layers.%d.self_attn.v_proj.bias",
+                        c->prefix, L);
+    for (int i = 0; i < qrows; i++) q[i] += qb[i];
+    for (int i = 0; i < kvrows; i++) {
+        k[i] += kb[i];
+        v[i] += vb[i];
+    }
+
+    const float *qn = T(m, "%smodel.layers.%d.self_attn.q_norm.weight",
+                        c->prefix, L);
+    const float *kn = T(m, "%smodel.layers.%d.self_attn.k_norm.weight",
+                        c->prefix, L);
+    for (int h = 0; h < c->n_heads; h++)
+        waste_rmsnorm(q + (size_t)h * D, q + (size_t)h * D,
+                      qn, D, c->eps);
+    for (int h = 0; h < c->n_kv_heads; h++)
+        waste_rmsnorm(k + (size_t)h * D, k + (size_t)h * D,
+                      kn, D, c->eps);
+
+    float cs[WASTE_MAX_ROPE_HALF], sn[WASTE_MAX_ROPE_HALF];
+    rope_tables(c, pos, cs, sn);
+    for (int h = 0; h < c->n_heads; h++)
+        waste_model_rope_half(q + (size_t)h * D, c->qk_rope, cs, sn);
+    for (int h = 0; h < c->n_kv_heads; h++)
+        waste_model_rope_half(k + (size_t)h * D, c->qk_rope, cs, sn);
+
+    const size_t width = (size_t)kvrows;
+    memcpy(m->kcache[L] + (size_t)pos * width, k,
+           width * sizeof(float));
+    memcpy(m->vcache[L] + (size_t)pos * width, v,
+           width * sizeof(float));
+    m->n_kv[L] = pos + 1;
+
+    gqa_par a = {
+        .m = m, .q = q, .k = m->kcache[L], .v = m->vcache[L], .o = o,
+        .S = m->n_kv[L], .q_heads = c->n_heads,
+        .kv_heads = c->n_kv_heads, .head_dim = D,
+        .scale = 1.0f / sqrtf((float)D),
+    };
+    waste_parallel_for(c->n_heads, 1, gqa_head_range, &a);
+    matvec_t(m, out, waste_find(m, tname(
+        "%smodel.layers.%d.self_attn.o_proj.weight", c->prefix, L)),
+        o, c->hidden, qrows);
+    return 0;
+}
+
 typedef struct {
     waste_model *m;
     const waste_tensor *kvb;
@@ -3550,7 +3905,7 @@ static int predict_next_moe(waste_model *m, int L, const float *in, int *out, in
  * This has its own CSV rather than extending WASTE_DUMP_ROUTE: the native
  * route trace has a deliberately fixed 3*K shape consumed by
  * tools/routing_stats.py and by archived campaign scripts. */
-static void route_margin_row(char phase, int pos, int L, int is_kda,
+static void route_margin_row(char phase, int pos, int L, const char *attention,
                              const float *in, int hid,
                              const float *logit, const float *prob,
                              const float *bias, int E,
@@ -3600,7 +3955,7 @@ static void route_margin_row(char phase, int pos, int L, int is_kda,
               "boundary_ties,nonfinite_scores,score_std,input_rms\n", df);
     fprintf(df, "1,%c,%d,%d,%s,%d,%d,%d,%d,%.9g,%.9g,%.9g,%.9g,%.9g,"
                 "%.9g,%.9g,%.9g,%.9g,%d,%d,%.9g,%.9g\n",
-            phase, pos, L, is_kda ? "KDA" : "MLA", K, E, kth, next,
+            phase, pos, L, attention, K, E, kth, next,
             kth_score, next_score,
             kth_score - next_score, logit[kth], logit[next],
             prob[kth], prob[next], kth_bias, next_bias,
@@ -3784,7 +4139,9 @@ static int moe_layer(waste_model *m, int L, const float *in, float *out, int *ro
         idx[j] = best;
         w[j] = score[best];
     }
-    route_margin_row('D', dump_pos0, L, c->kda_layer[L], in, hid,
+    const char *attention = c->attention_kind == WASTE_ATTN_GQA ? "GQA" :
+                            c->kda_layer[L] ? "KDA" : "MLA";
+    route_margin_row('D', dump_pos0, L, attention, in, hid,
                      sc, score, bias, E, idx, K);
     if (c->renorm && K > 1) {
         float s = 0;
@@ -4175,6 +4532,10 @@ static int state_add_bytes(uint64_t *total, uint64_t count, uint64_t width)
 int waste_model_state_size(const waste_model *m, int pos, size_t *bytes)
 {
     if (!m || !bytes) return -1;
+    /* v1 snapshots encode every non-KDA layer as one MLA latent cache. A
+     * standard-GQA K/V pair needs a new header/version and is deliberately
+     * unsupported in this first runtime slice. */
+    if (m->cfg.attention_kind == WASTE_ATTN_GQA) return -1;
     /* A failed CUDA projection may have changed only part of the recurrent
      * state. Never let that invalid intermediate state escape into a prefix
      * cache or session file and become valid again in a fresh process. */
@@ -4262,6 +4623,7 @@ int waste_model_state_import(waste_model *m, const void *src, size_t bytes,
                              int *pos)
 {
     if (!m || !src || bytes < sizeof(waste_state_hdr)) return -2;
+    if (m->cfg.attention_kind == WASTE_ATTN_GQA) return -2;
     const waste_config *c = &m->cfg;
     waste_state_hdr h, want;
     memcpy(&h, src, sizeof h);
@@ -4637,6 +4999,7 @@ int waste_model_state_save(const waste_model *m, const char *path, int pos)
 int waste_model_state_load(waste_model *m, const char *path, int *pos)
 {
     const waste_config *c = &m->cfg;
+    if (c->attention_kind == WASTE_ATTN_GQA) return -2;
     FILE *f = fopen(path, "rb");
     if (!f) return -1;
     waste_state_hdr h, want;
@@ -5038,7 +5401,8 @@ static int moe_chunk(waste_model *m, int L, const float *in, float *out,
             }
             idx[j] = best; w[j] = score[best];
         }
-        route_margin_row('P', dump_pos0 + t, L, c->kda_layer[L],
+        const char *attention = c->kda_layer[L] ? "KDA" : "MLA";
+        route_margin_row('P', dump_pos0 + t, L, attention,
                          in + (size_t)t * hid, hid,
                          sc, score, bias, E, idx, K);
         if (c->renorm && K > 1) {
@@ -5359,6 +5723,17 @@ const float *waste_model_prefill(waste_model *m, const int *tokens, int n,
         const int cm = waste_model_ctx_max(m);
         if (cm && (pos0 < 0 || pos0 > cm - n)) { m->ctx_full = 1; return NULL; }
     }
+    /* The first standard-GQA milestone is deliberately token-serial.  It
+     * exercises exactly the decode kernel and its fp32 K/V state instead of
+     * teaching the MLA chunk machinery a second attention representation. */
+    if (c->attention_kind == WASTE_ATTN_GQA) {
+        const float *logits = NULL;
+        for (int t = 0; t < n; t++) {
+            logits = waste_model_step(m, tokens[t], pos0 + t, NULL);
+            if (!logits) return NULL;
+        }
+        return logits;
+    }
     if (prefill_alloc(m, n)) return NULL;
 #if defined(WASTE_ENABLE_CUDA)
     if (m->cuda_prefill_dense &&
@@ -5616,7 +5991,13 @@ const float *waste_model_step(waste_model *m, int token, int pos, int *routed)
 
         snprintf(b, sizeof b, "%smodel.layers.%d.input_layernorm.weight", c->prefix, L);
         waste_rmsnorm(norm, m->x, waste_find(m, b)->data, hid, c->eps);
-        if (c->kda_layer[L]) {
+        if (c->attention_kind == WASTE_ATTN_GQA) {
+            PROF_START(P_MLA);
+            const int failed = gqa_layer(m, L, norm, resid, pos);
+            PROF_END(P_MLA);
+            if (failed) break;
+        }
+        else if (c->kda_layer[L]) {
             PROF_START(P_KDA);
             const int failed = kda_layer(m, L, norm, resid,
                                          m->cuda_kda_mode);

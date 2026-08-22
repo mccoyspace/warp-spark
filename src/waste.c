@@ -427,9 +427,42 @@ waste_status waste_plan_memory_v2(const char *model_path, uint32_t ctx_tokens,
     const int hidden = (int)js_int(&d, js_get(&d, cfg, "hidden_size"), 0);
     const int nheads = (int)js_int(&d, js_get(&d, cfg, "num_attention_heads"), 0);
     const int kv_lora = (int)js_int(&d, js_get(&d, cfg, "kv_lora_rank"), 0);
-    const int qk_rope = (int)js_int(&d, js_get(&d, cfg, "qk_rope_head_dim"), 0);
-    const int qk_nope = (int)js_int(&d, js_get(&d, cfg, "qk_nope_head_dim"), 0);
-    const int v_head = (int)js_int(&d, js_get(&d, cfg, "v_head_dim"), 0);
+    int qk_rope = (int)js_int(&d, js_get(&d, cfg, "qk_rope_head_dim"), 0);
+    int qk_nope = (int)js_int(&d, js_get(&d, cfg, "qk_nope_head_dim"), 0);
+    int v_head = (int)js_int(&d, js_get(&d, cfg, "v_head_dim"), 0);
+    char arch[64], model_type[32];
+    const int arches = js_get(&d, cfg, "architectures");
+    js_str(&d, js_at(&d, arches, 0), arch, sizeof arch);
+    js_str(&d, js_get(&d, cfg, "model_type"), model_type,
+           sizeof model_type);
+    const int standard_gqa = !strcmp(arch, "Glm4MoeForCausalLM") &&
+                             !strcmp(model_type, "glm4_moe");
+    const int n_kv_heads = (int)js_int(
+        &d, js_get(&d, cfg, "num_key_value_heads"), 0);
+    const int head_dim = (int)js_int(&d, js_get(&d, cfg, "head_dim"), 0);
+    int gqa_q_width = 0;
+    if (standard_gqa) {
+        const double partial = js_num(
+            &d, js_get(&d, cfg, "partial_rotary_factor"), -1.0);
+        const double rotary = (double)head_dim * partial;
+        const int64_t q_width = (int64_t)nheads * head_dim;
+        if (layers < 1 || layers > WASTE_MAX_LAYERS ||
+            hidden < 1 || hidden > (1 << 20) ||
+            nheads < 1 || nheads > (1 << 16) || n_kv_heads < 1 ||
+            n_kv_heads > nheads || nheads % n_kv_heads || head_dim < 1 ||
+            head_dim > (1 << 16) ||
+            q_width < 1 || q_width > INT_MAX || !isfinite(rotary) ||
+            rotary < 2.0 || rotary > 2.0 * WASTE_MAX_ROPE_HALF ||
+            rotary > (double)head_dim ||
+            fabs(rotary - round(rotary)) > 1e-9 ||
+            ((int)llround(rotary) & 1)) {
+            js_free(&d); free(src); return WASTE_E_FORMAT;
+        }
+        gqa_q_width = (int)q_width;
+        qk_rope = (int)llround(rotary);
+        qk_nope = head_dim - qk_rope;
+        v_head = head_dim;
+    }
     const int lac = js_get(&d, cfg, "linear_attn_config");
     const int kh = (int)js_int(&d, js_get(&d, lac, "num_heads"), 0);
     const int kd = (int)js_int(&d, js_get(&d, lac, "head_dim"), 0);
@@ -438,14 +471,17 @@ waste_status waste_plan_memory_v2(const char *model_path, uint32_t ctx_tokens,
     const int n_kda = js_size(&d, kl);
     const int n_mla = layers - n_kda;
 
-    /* MLA caches the latent plus the rope dims, not the expanded per-head
-     * K and V — kv_b_proj is absorbed into the query and the output. That
-     * is 576 floats per token per layer here rather than 30720. */
-    out->state_bytes = (uint64_t)n_kda * kh * kd * kd * 4                /* S */
-                     + (uint64_t)n_kda * 3 * (ck - 1) * kh * kd * 4      /* conv */
-                     + (uint64_t)n_mla * ctx_tokens *
-                       ((uint64_t)kv_lora + qk_rope) * 4;                /* KV */
-    (void)qk_nope; (void)v_head;
+    if (standard_gqa) {
+        /* Separate fp32 K and V, [layer][token][kv_head][head_dim]. */
+        out->state_bytes = (uint64_t)layers * ctx_tokens * 2u *
+                           (uint64_t)n_kv_heads * head_dim * 4u;
+    } else {
+        /* MLA caches the latent plus the rope dims, not expanded K/V. */
+        out->state_bytes = (uint64_t)n_kda * kh * kd * kd * 4
+                         + (uint64_t)n_kda * 3 * (ck - 1) * kh * kd * 4
+                         + (uint64_t)n_mla * ctx_tokens *
+                           ((uint64_t)kv_lora + qk_rope) * 4;
+    }
 
     /* Scratch, counted rather than guessed. The old flat 64 MB was out by
      * 4x on the decode buffers alone (e_gate/e_up/e_down are 252 MB on K3)
@@ -467,7 +503,8 @@ waste_status waste_plan_memory_v2(const char *model_path, uint32_t ctx_tokens,
         js_free(&d); free(src); return WASTE_E_FORMAT;
     }
     const int nb = ares ? layers / ares + 2 : 1;
-    const int big = hidden > kh * kd ? hidden : kh * kd;
+    int big = hidden > kh * kd ? hidden : kh * kd;
+    if (standard_gqa && gqa_q_width > big) big = gqa_q_width;
     const int wide = hidden > lat ? hidden : lat;
     int lut_wide = wide > moe_inter ? wide : moe_inter;
     const int T = WASTE_CHUNK_MAX;
@@ -488,7 +525,11 @@ waste_status waste_plan_memory_v2(const char *model_path, uint32_t ctx_tokens,
         sc += (att + 1024) * 4;
     }
     sc += (uint64_t)vocab * 4;                              /* logits          */
-    sc += ((uint64_t)8 * big + 8 * moe_inter + 8 * dense_inter + 512) * 4;
+    const uint64_t tmp_tail = standard_gqa
+        ? (uint64_t)4 * nheads * (v_head + qk_nope + qk_rope) + 258u
+        : 512u;
+    sc += ((uint64_t)8 * big + 8 * moe_inter + 8 * dense_inter +
+           tmp_tail) * 4;
     sc += (uint64_t)3 * nheads * (kv_lora ? kv_lora : 1) * 4;   /* MLA absorb  */
     sc += (uint64_t)(nb + 4) * hidden * 4;                  /* AttnRes buffers */
     /* chunked prefill, allocated on first use and never freed */

@@ -48,6 +48,21 @@ typedef struct {
     int n_layers, hidden, n_experts, top_k, moe_inter, dense_inter;
     int n_shared, first_dense, vocab, n_heads;
     int kv_lora, q_lora, qk_nope, qk_rope, v_head;
+    /* Attention is an explicit format contract.  KDA is still selected per
+     * layer inside the latent-attention family; standard GQA has a different
+     * projection set and a full fp32 K/V cache and may never fall through to
+     * the MLA interpretation just because linear_attn_config is absent. */
+#define WASTE_ATTN_LATENT 1
+#define WASTE_ATTN_GQA    2
+    int attention_kind;
+    int n_kv_heads, head_dim;
+    int qkv_bias, qk_norm;
+    int router_n_group, router_topk_group;
+    int max_position_embeddings;
+    float partial_rotary_factor, rope_theta;
+    char model_type[32], hidden_act[16], topk_method[32];
+    char router_activation[16];
+    char attention_err[160];
     int kda_heads, kda_dim, conv_k;
 #define WASTE_MAX_LAYERS 128
 
@@ -173,13 +188,17 @@ typedef struct {
     /* MLA caches the latent, not the expanded per-head K and V: kv_b_proj
      * is absorbed into the query and the output instead (see mla_layer). */
     float *latcache[WASTE_MAX_LAYERS];            /* [kv_cap][kv_lora + qk_rope]         */
+    /* Standard GQA deliberately starts with the simple, auditable fp32
+     * representation: [kv_cap][n_kv_heads][head_dim] for each of K and V. */
+    float *kcache[WASTE_MAX_LAYERS];
+    float *vcache[WASTE_MAX_LAYERS];
     int n_kv[WASTE_MAX_LAYERS], kv_cap;
 
     /* scratch */
     float *x, *h, *tmp, *att, *logits;
-    /* 1 when at least one layer is MLA, i.e. when the sequence is bounded
-     * by kv_cap. KDA state is O(1) in context and imposes no such limit,
-     * so a container that is all KDA is not capped by ctx_tokens. */
+    /* 1 when at least one layer owns per-token attention state (MLA or
+     * standard GQA), i.e. when the sequence is bounded by kv_cap. KDA state
+     * is O(1) in context and imposes no such limit. */
     int   has_mla;
     /* Set when a step was asked for a position outside kv_cap. Sticky
      * like read_error and cleared by the same call, because the caller
@@ -257,6 +276,13 @@ int waste_model_cuda_vq_dense_scope_compatible(const waste_model *m,
                                                 int scope);
 int waste_model_cuda_prefill_vq_compatible(const waste_model *m);
 int waste_model_cuda_prefill_dense_compatible(const waste_model *m);
+/* Model-free semantic gate for the standard-GQA runtime.  Conversion owns
+ * the exact released H/L/source contract; this gate owns the invariants the
+ * forward pass actually interprets. */
+int waste_model_glm47_gqa_compatible(const waste_model *m);
+void waste_model_rope_half(float *x, int rotary_dim,
+                           const float *cs, const float *sn);
+int waste_model_gqa_kv_head(int q_head, int n_q_heads, int n_kv_heads);
 int waste_model_sort_route_copy(const int *src_ids, const float *src_weights,
                                 int n, int *dst_ids, float *dst_weights);
 

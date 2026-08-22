@@ -1,7 +1,7 @@
 /* SPDX-License-Identifier: Apache-2.0
  * Copyright 2026 SQLite Cloud, Inc.
  */
-/* Model-free tests for the exact all-MLA CUDA allowlists. */
+/* Model-free tests for accelerator allowlists and attention-format gates. */
 
 #include <stdio.h>
 #include <string.h>
@@ -81,6 +81,37 @@ static waste_model glm47_flash(void)
     return m;
 }
 
+static waste_model glm47_full_gqa(void)
+{
+    waste_model m;
+    memset(&m, 0, sizeof m);
+    strcpy(m.cfg.arch, "Glm4MoeForCausalLM");
+    strcpy(m.cfg.model_type, "glm4_moe");
+    strcpy(m.cfg.hidden_act, "silu");
+    strcpy(m.cfg.topk_method, "noaux_tc");
+    strcpy(m.cfg.router_activation, "sigmoid");
+    m.cfg.n_layers = 4;
+    m.cfg.hidden = 96;
+    m.cfg.n_experts = 8;
+    m.cfg.top_k = 2;
+    m.cfg.attention_kind = WASTE_ATTN_GQA;
+    m.cfg.n_heads = 12;
+    m.cfg.n_kv_heads = 1;
+    m.cfg.head_dim = 8;
+    m.cfg.qk_nope = 4;
+    m.cfg.qk_rope = 4;
+    m.cfg.v_head = 8;
+    m.cfg.partial_rotary_factor = 0.5f;
+    m.cfg.qkv_bias = 1;
+    m.cfg.qk_norm = 1;
+    m.cfg.router_n_group = 1;
+    m.cfg.router_topk_group = 1;
+    m.cfg.max_position_embeddings = 202752;
+    m.cfg.renorm = 1;
+    m.cfg.routed_scale = 2.5f;
+    return m;
+}
+
 #define REJECT_DENSE(field, value) do {                                     \
     waste_model changed = k2();                                             \
     changed.field = (value);                                                \
@@ -122,6 +153,56 @@ int main(void)
     CHECK(waste_model_cuda_vq_dense_scope_compatible(&exact, 3));
     CHECK(!waste_model_cuda_vq_dense_scope_compatible(&exact, 1));
     CHECK(!waste_model_cuda_vq_dense_scope_compatible(NULL, 2));
+
+    {
+        waste_model gqa = glm47_full_gqa();
+        CHECK(!waste_model_glm47_gqa_compatible(NULL));
+        CHECK(waste_model_glm47_gqa_compatible(&gqa));
+        gqa.cfg.n_layers = WASTE_MAX_LAYERS + 1;
+        CHECK(!waste_model_glm47_gqa_compatible(&gqa));
+        gqa = glm47_full_gqa();
+        gqa.cfg.n_kv_heads = 5;
+        CHECK(!waste_model_glm47_gqa_compatible(&gqa));
+        gqa = glm47_full_gqa(); gqa.cfg.qk_rope = 3;
+        CHECK(!waste_model_glm47_gqa_compatible(&gqa));
+        gqa = glm47_full_gqa(); gqa.cfg.partial_rotary_factor = 0.51f;
+        CHECK(!waste_model_glm47_gqa_compatible(&gqa));
+        gqa = glm47_full_gqa(); gqa.cfg.qkv_bias = 0;
+        CHECK(!waste_model_glm47_gqa_compatible(&gqa));
+        gqa = glm47_full_gqa(); gqa.cfg.qk_norm = 0;
+        CHECK(!waste_model_glm47_gqa_compatible(&gqa));
+        gqa = glm47_full_gqa(); gqa.cfg.rope_interleave = 1;
+        CHECK(!waste_model_glm47_gqa_compatible(&gqa));
+        gqa = glm47_full_gqa(); gqa.cfg.router_n_group = 2;
+        CHECK(!waste_model_glm47_gqa_compatible(&gqa));
+        gqa = glm47_full_gqa(); strcpy(gqa.cfg.topk_method, "greedy");
+        CHECK(!waste_model_glm47_gqa_compatible(&gqa));
+        gqa = glm47_full_gqa(); strcpy(gqa.cfg.router_activation, "softmax");
+        CHECK(!waste_model_glm47_gqa_compatible(&gqa));
+        gqa = glm47_full_gqa(); gqa.cfg.renorm = 0;
+        CHECK(!waste_model_glm47_gqa_compatible(&gqa));
+        gqa = glm47_full_gqa(); gqa.cfg.routed_scale = 1.0f;
+        CHECK(!waste_model_glm47_gqa_compatible(&gqa));
+        gqa = glm47_full_gqa(); gqa.cfg.kda_layer[0] = 1;
+        CHECK(!waste_model_glm47_gqa_compatible(&gqa));
+
+        CHECK(waste_model_gqa_kv_head(0, 12, 3) == 0);
+        CHECK(waste_model_gqa_kv_head(3, 12, 3) == 0);
+        CHECK(waste_model_gqa_kv_head(4, 12, 3) == 1);
+        CHECK(waste_model_gqa_kv_head(11, 12, 3) == 2);
+        CHECK(waste_model_gqa_kv_head(12, 12, 3) == -1);
+        CHECK(waste_model_gqa_kv_head(0, 11, 3) == -1);
+
+        float x[8] = { 1, 2, 3, 4, 50, 60, 70, 80 };
+        const float cs[2] = { 0, 1 }, sn[2] = { 1, 0 };
+        waste_model_rope_half(x, 4, cs, sn);
+        CHECK(x[0] == -3 && x[1] == 2 && x[2] == 1 && x[3] == 4);
+        CHECK(x[4] == 50 && x[5] == 60 && x[6] == 70 && x[7] == 80);
+
+        size_t state_bytes = 0;
+        gqa = glm47_full_gqa();
+        CHECK(waste_model_state_size(&gqa, 0, &state_bytes) == -1);
+    }
 
     /* K2 is qualified for decode but never for this GLM-only pilot. */
     exact.cuda_prefill_vq = 1;
