@@ -63,6 +63,7 @@ typedef struct {
  * rope slice; every model in the family uses 64. A container needing
  * rotation on a wider slice is refused at load rather than run unrotated. */
 #define WASTE_MAX_ROPE_HALF 64
+#define WASTE_MAX_EOS 8
     int kda_layer[WASTE_MAX_LAYERS]; /* 1 if layer is KDA                   */
     float eps, mla_rms_norm_eps, routed_scale;
     int renorm;
@@ -77,11 +78,13 @@ typedef struct {
     int   act_situ;                  /* 1 = SiTU instead of SiLU            */
     float situ_beta, situ_linear_beta;
     char  prefix[64];                /* "" or "language_model." (K3)        */
-    /* generation_config.json's eos_token_id, mirrored into the container
-     * config. The tokenizer used to derive this positionally as
-     * base_vocab + 2, which is right on both Kimi models by luck of the
-     * reserved-block layout and is a guess everywhere else. Read it. */
-    int   eos_token_id;              /* 0 = not stated, keep the default    */
+    /* generation_config.json's EOS ids, mirrored into the container config.
+     * Kimi carries one; GLM-4.7-Flash carries three terminal turn markers.
+     * Keep the first scalar for older containers/tokenizer callers and the
+     * bounded set for generation. */
+    int   eos_token_id;              /* primary; 0 = keep tokenizer default */
+    int   eos_token_ids[WASTE_MAX_EOS];
+    int   n_eos;
     /* The HF architecture the container was built from. Both models call
      * themselves model_type "kimi_linear", so this is the only field that
      * tells them apart by name rather than by feature. */

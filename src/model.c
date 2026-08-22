@@ -1318,6 +1318,13 @@ static int cfg_sane(const waste_config *c)
     if (c->hidden   < 1 || c->hidden   > (1 << 20)) return 0;
     if (c->vocab    < 1 || c->vocab    > (1 << 24)) return 0;
     if (c->n_heads  < 1 || c->n_heads  > (1 << 16)) return 0;
+    if (c->n_eos < 0 || c->n_eos > WASTE_MAX_EOS) return 0;
+    for (int i = 0; i < c->n_eos; i++) {
+        if (c->eos_token_ids[i] < 0 || c->eos_token_ids[i] >= c->vocab)
+            return 0;
+        for (int j = 0; j < i; j++)
+            if (c->eos_token_ids[i] == c->eos_token_ids[j]) return 0;
+    }
     if (c->eps <= 0.0f || !(c->eps < 1.0f)) return 0;      /* also catches NaN */
     if (c->mla_rms_norm_eps <= 0.0f ||
         !(c->mla_rms_norm_eps < 1.0f)) return 0;
@@ -1499,6 +1506,21 @@ static void cfg_from_json(waste_config *c, const js_doc *d, int cfg)
     c->first_dense = (int)js_int(d, js_get(d, cfg, "first_k_dense_replace"), 0);
     c->vocab = (int)js_int(d, js_get(d, cfg, "vocab_size"), 0);
     c->eos_token_id = (int)js_int(d, js_get(d, cfg, "eos_token_id"), 0);
+    c->n_eos = 0;
+    {
+        const int ids = js_get(d, cfg, "eos_token_ids");
+        if (ids >= 0) {
+            const int n = js_size(d, ids);
+            if (js_typeof(d, ids) != JS_ARR || n < 1 || n > WASTE_MAX_EOS) {
+                c->n_eos = -1;             /* cfg_sane refuses the manifest */
+            } else {
+                c->n_eos = n;
+                for (int i = 0; i < n; i++)
+                    c->eos_token_ids[i] =
+                        (int)js_int(d, js_at(d, ids, i), -1);
+            }
+        }
+    }
     c->n_heads = (int)js_int(d, js_get(d, cfg, "num_attention_heads"), 0);
     c->kv_lora = (int)js_int(d, js_get(d, cfg, "kv_lora_rank"), 0);
     c->q_lora = (int)js_int(d, js_get(d, cfg, "q_lora_rank"), 0);

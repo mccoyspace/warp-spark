@@ -1186,6 +1186,8 @@ waste_status waste_generate(waste_ctx *c, const int32_t *prompt, size_t n,
 
         int stop = 0;
         for (size_t s = 0; s < p.n_stop; s++) if (p.stop_tokens[s] == cur) stop = 1;
+        for (int e = 0; e < c->m.cfg.n_eos; e++)
+            if (cur == c->m.cfg.eos_token_ids[e]) stop = 1;
         if (c->tok && cur == waste_tok_eos(c->tok)) stop = 1;
 
         if (cb) {

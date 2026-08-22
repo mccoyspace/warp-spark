@@ -1505,6 +1505,40 @@ else
     no "GLM converter metadata"
 fi
 
+# Flash names three terminal turn markers.  A valid bounded set must load;
+# malformed sets must fail with a format error before generation.  Scalar-only
+# Kimi manifests keep the old tokenizer path and are exercised everywhere else
+# in this suite.
+if [ ! -f "$LOCK_MODEL/manifest.json" ]; then
+    sk "multiple EOS manifest" "no synthetic container"
+elif python3 - "$LOCK_MODEL" "$TMP" <<'PY_EOS'
+import json, os, shutil, sys
+src, tmp = sys.argv[1:]
+for name, value in (("eos-valid", [2, 3, 4]),
+                    ("eos-duplicate", [2, 2]),
+                    ("eos-range", [256]),
+                    ("eos-shape", "2,3,4")):
+    dst = os.path.join(tmp, name)
+    shutil.copytree(src, dst)
+    path = os.path.join(dst, "manifest.json")
+    manifest = json.load(open(path))
+    manifest["config"]["eos_token_ids"] = value
+    with open(path, "w") as stream:
+        json.dump(manifest, stream)
+PY_EOS
+then
+    if ./waste info "$TMP/eos-valid" >/dev/null 2>&1 &&
+       ! ./waste info "$TMP/eos-duplicate" >/dev/null 2>&1 &&
+       ! ./waste info "$TMP/eos-range" >/dev/null 2>&1 &&
+       ! ./waste info "$TMP/eos-shape" >/dev/null 2>&1; then
+        ok "multiple EOS list is bounded, typed, unique and in vocabulary"
+    else
+        no "multiple EOS manifest validation"
+    fi
+else
+    no "multiple EOS test setup"
+fi
+
 # ---------------------------------------------------------------- serve ----
 head_ "serve (OpenAI-compatible server)"
 
