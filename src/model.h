@@ -215,7 +215,8 @@ typedef struct {
     int      cuda_vq_mode, cuda_vq_effective, cuda_vq_preflight_modes;
     int      cuda_vq_group;          /* experts between mode-2 stream syncs */
     int      cuda_prefill_vq;        /* opt-in GLM Flash chunk VQ3R pilot   */
-    int      cuda_prefill_dense;     /* opt-in GLM Flash MLA Q4 pilot       */
+    int      cuda_prefill_dense;     /* 1 fast diagnostic, 2 ordered-exact */
+    int      cuda_prefill_dense_preflight_mode;
     int      cuda_kda_state_dirty;
     uint64_t cuda_kda_fallbacks, cuda_kda_calls, cuda_dense_calls;
     uint64_t cuda_vq_experts, cuda_vq_applies, cuda_vq_lut_builds;

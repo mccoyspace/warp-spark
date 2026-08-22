@@ -186,7 +186,17 @@ int main(void)
         dense.cuda_dense_preflight_scope = 3;
         CHECK(!waste_model_cuda_prefill_dense_compatible(&dense));
         dense.cuda_prefill_dense = 1;
+        dense.cuda_prefill_dense_preflight_mode = 1;
         CHECK(waste_model_cuda_prefill_dense_compatible(&dense));
+        dense.cuda_prefill_dense = 2;
+        CHECK(!waste_model_cuda_prefill_dense_compatible(&dense));
+        dense.cuda_prefill_dense_preflight_mode = 2;
+        CHECK(waste_model_cuda_prefill_dense_compatible(&dense));
+        dense.cuda_prefill_dense = 3;
+        dense.cuda_prefill_dense_preflight_mode = 3;
+        CHECK(!waste_model_cuda_prefill_dense_compatible(&dense));
+        dense.cuda_prefill_dense = 2;
+        dense.cuda_prefill_dense_preflight_mode = 2;
         dense.cuda_dense_preflight_scope = 2;
         CHECK(!waste_model_cuda_prefill_dense_compatible(&dense));
         dense.cuda_dense_preflight_scope = 3;

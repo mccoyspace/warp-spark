@@ -511,9 +511,10 @@ static int kda_matvec_t(waste_model *m, float *y, const waste_tensor *t,
 
 static int dense_matvec_scope_t(waste_model *m, float *y,
                                 const waste_tensor *t, const float *x,
-                                int out, int in, int scope, int min_scope)
+                                int out, int in, int scope, int min_scope,
+                                int kernel_mode)
 {
-    const int mode = scope >= min_scope ? m->cuda_kda_mode : 0;
+    const int mode = scope >= min_scope ? kernel_mode : 0;
     return cuda_q4_matvec_t(m, y, t, x, out, in, mode, 1);
 }
 
@@ -521,7 +522,8 @@ static int dense_matvec_t(waste_model *m, float *y, const waste_tensor *t,
                           const float *x, int out, int in, int min_scope)
 {
     return dense_matvec_scope_t(m, y, t, x, out, in,
-                                m->cuda_dense_scope, min_scope);
+                                m->cuda_dense_scope, min_scope,
+                                m->cuda_kda_mode);
 }
 
 int waste_model_cuda_k2_dense_compatible(const waste_model *m)
@@ -618,6 +620,8 @@ int waste_model_cuda_prefill_dense_compatible(const waste_model *m)
     return m && m->cuda_prefill_dense && !m->cuda_kda_failed &&
            m->cuda_kda_mode == 1 && m->cuda_dense_scope == 3 &&
            m->cuda_dense_preflight_scope == 3 &&
+           m->cuda_prefill_dense >= 1 && m->cuda_prefill_dense <= 2 &&
+           m->cuda_prefill_dense_preflight_mode == m->cuda_prefill_dense &&
            waste_model_cuda_glm47_flash_dense_compatible(m);
 }
 
@@ -814,6 +818,47 @@ static int cuda_dense_preflight(waste_model *m, int scope)
                              m->cuda_kda_mode))
         goto fail;
     m->cuda_dense_preflight_scope = scope;
+    return 0;
+
+fail:
+    m->cuda_kda_failed = 1;
+    m->cuda_kda_effective = 0;
+    m->cuda_dense_effective = 0;
+    m->cuda_vq_effective = 0;
+    m->cuda_kda_fallbacks++;
+    return -1;
+}
+
+/* Prefill may select the CPU/NEON-ordered Q4 kernel without changing the
+ * model-wide mode 1 selector required by CUDA VQ. Scope preflight above has
+ * already validated every dense tensor. Mode 2 gets its own real MLA launch
+ * here so the exact fallback cannot enter a prompt on configuration alone. */
+static int cuda_prefill_dense_preflight(waste_model *m, int mode)
+{
+    m->cuda_prefill_dense_preflight_mode = 0;
+    if (!mode) return 0;
+    if (mode < 1 || mode > 2 || m->cuda_kda_mode != 1 ||
+        m->cuda_dense_scope != 3 || m->cuda_dense_preflight_scope != 3 ||
+        !waste_model_cuda_glm47_flash_dense_compatible(m)) {
+        fprintf(stderr,
+                "waste: CUDA prefill dense mode requires global KDA mode 1, "
+                "preflighted dense scope 3, and exact GLM-4.7-Flash geometry\n");
+        goto fail;
+    }
+    if (mode == 2) {
+        const waste_config *c = &m->cfg;
+        const waste_tensor *q_a = waste_find(m, tname(
+            "%smodel.layers.0.self_attn.q_a_proj.weight", c->prefix));
+        if (!q_a || !q_a->q || q_a->bits != 4 || q_a->group != 128 ||
+            q_a->ndim != 2 ||
+            waste_cuda_q4_matvec(m, m->tmp, q_a, m->x,
+                                 q_a->shape[0], q_a->shape[1], 2)) {
+            fprintf(stderr,
+                    "waste: CUDA prefill dense mode-2 preflight failed\n");
+            goto fail;
+        }
+    }
+    m->cuda_prefill_dense_preflight_mode = mode;
     return 0;
 
 fail:
@@ -1703,7 +1748,7 @@ int waste_model_load(waste_model *m, const char *dir, int kv_cap,
         e = getenv("WASTE_CUDA_PREFILL_VQ");
         int prefill_vq = e ? atoi(e) != 0 : 0;
         e = getenv("WASTE_CUDA_PREFILL_DENSE");
-        int prefill_dense = e ? atoi(e) != 0 : 0;
+        int prefill_dense = e ? atoi(e) : 0;
         const char *backend = getenv("WASTE_BACKEND");
         if (backend && !strcmp(backend, "cpu")) {
             mode = 0;
@@ -1719,6 +1764,11 @@ int waste_model_load(waste_model *m, const char *dir, int kv_cap,
         if (scope > 3) scope = 3;
         if (vq_mode < 0) vq_mode = 0;
         if (vq_mode > 2) vq_mode = 2;
+        if (prefill_dense < 0 || prefill_dense > 2) {
+            fprintf(stderr,
+                    "waste: WASTE_CUDA_PREFILL_DENSE must be 0, 1 or 2\n");
+            return -1;
+        }
         if (vq_group != 1 && vq_group != 2 && vq_group != 4 &&
             vq_group != 8 && vq_group != 16) {
             fprintf(stderr,
@@ -2190,6 +2240,8 @@ int waste_model_load(waste_model *m, const char *dir, int kv_cap,
         return -1;
     if (m->cuda_dense_scope &&
         cuda_dense_preflight(m, m->cuda_dense_scope)) return -1;
+    if (m->cuda_prefill_dense &&
+        cuda_prefill_dense_preflight(m, m->cuda_prefill_dense)) return -1;
     if (m->cuda_vq_mode &&
         cuda_vq_preflight(m, m->cuda_vq_mode)) return -1;
     if (m->cuda_prefill_vq &&
@@ -2204,7 +2256,8 @@ int waste_model_load(waste_model *m, const char *dir, int kv_cap,
         fprintf(stderr,
                 "waste: WASTE_CUDA_PREFILL_DENSE requires CUDA KDA mode 1, "
                 "dense scope 3 with completed preflight, and exact "
-                "GLM-4.7-Flash geometry\n");
+                "GLM-4.7-Flash geometry; value 1 is the fast diagnostic "
+                "and value 2 is CPU/NEON-ordered\n");
         return -1;
     }
     if (m->cuda_vq_mode && xpar_on)
@@ -3342,7 +3395,7 @@ static void mla_head_range(int lo, int hi, void *ap)
 }
 
 static int mla_layer(waste_model *m, int L, const float *in, float *out,
-                     int pos, int cuda_scope)
+                     int pos, int cuda_scope, int cuda_mode)
 {
     const waste_config *c = &m->cfg;
     const int nh = c->n_heads, qd = c->qk_nope + c->qk_rope, vh = c->v_head;
@@ -3355,21 +3408,22 @@ static int mla_layer(waste_model *m, int L, const float *in, float *out,
         float *qa = o + (size_t)nh * vh;
         if (dense_matvec_scope_t(m, qa, waste_find(m, tname(
                 "%smodel.layers.%d.self_attn.q_a_proj.weight", c->prefix, L)),
-                in, c->q_lora, hid, cuda_scope, 2)) return -1;
+                in, c->q_lora, hid, cuda_scope, 2, cuda_mode)) return -1;
         waste_rmsnorm(qa, qa, waste_find(m, tname("%smodel.layers.%d.self_attn.q_a_layernorm.weight",
                                             c->prefix, L))->data, c->q_lora,
                      c->mla_rms_norm_eps);
         if (dense_matvec_scope_t(m, q, waste_find(m, tname(
                 "%smodel.layers.%d.self_attn.q_b_proj.weight", c->prefix, L)),
-                qa, nh * qd, c->q_lora, cuda_scope, 2)) return -1;
+                qa, nh * qd, c->q_lora, cuda_scope, 2, cuda_mode)) return -1;
     } else {
         if (dense_matvec_scope_t(m, q, waste_find(m, tname(
                 "%smodel.layers.%d.self_attn.q_proj.weight", c->prefix, L)),
-                in, nh * qd, hid, cuda_scope, 2)) return -1;
+                in, nh * qd, hid, cuda_scope, 2, cuda_mode)) return -1;
     }
     if (dense_matvec_scope_t(m, ckv, waste_find(m, tname(
             "%smodel.layers.%d.self_attn.kv_a_proj_with_mqa.weight", c->prefix, L)),
-            in, c->kv_lora + c->qk_rope, hid, cuda_scope, 2)) return -1;
+            in, c->kv_lora + c->qk_rope, hid, cuda_scope, 2,
+            cuda_mode)) return -1;
     waste_rmsnorm(ckv, ckv, T(m, "%smodel.layers.%d.self_attn.kv_a_layernorm.weight", c->prefix, L),
             c->kv_lora, c->mla_rms_norm_eps);
     /* Rotate before caching, not after: the cached entry is reused by every
@@ -3416,12 +3470,12 @@ static int mla_layer(waste_model *m, int L, const float *in, float *out,
         float *g = o + (size_t)nh * vh + (c->q_lora ? c->q_lora : 0);
         if (dense_matvec_scope_t(m, g, waste_find(m, tname(
                 "%smodel.layers.%d.self_attn.g_proj.weight", c->prefix, L)),
-                in, nh * vh, hid, cuda_scope, 2)) return -1;
+                in, nh * vh, hid, cuda_scope, 2, cuda_mode)) return -1;
         for (int i = 0; i < nh * vh; i++) o[i] *= 1.0f / (1.0f + expf(-g[i]));
     }
     if (dense_matvec_scope_t(m, out, waste_find(m, tname(
             "%smodel.layers.%d.self_attn.o_proj.weight", c->prefix, L)),
-            o, hid, nh * vh, cuda_scope, 2)) return -1;
+            o, hid, nh * vh, cuda_scope, 2, cuda_mode)) return -1;
     return 0;
 }
 
@@ -4344,6 +4398,7 @@ int waste_model_set_cuda_kda(waste_model *m, int mode)
     if (mode && backend && !strcmp(backend, "cpu")) return -1;
     if (!mode && (m->cuda_dense_scope || m->cuda_vq_mode)) return -1;
     if (m->cuda_vq_mode && mode != 1) return -1;
+    if (m->cuda_prefill_dense && mode != 1) return -1;
     if (mode && m->cuda_kda_failed) return -1;
     m->cuda_kda_mode = mode;
     m->cuda_kda_effective = 0;
@@ -4381,19 +4436,25 @@ int waste_model_set_cuda_dense(waste_model *m, int scope)
 {
     if (!m || scope < 0 || scope > 3) return -1;
 #if defined(WASTE_ENABLE_CUDA)
+    const int clear_prefill_dense = m->cuda_prefill_dense && scope == 0;
     const char *backend = getenv("WASTE_BACKEND");
     if (scope && backend && !strcmp(backend, "cpu")) return -1;
     if (scope && (!m->cuda_kda_mode || m->cuda_kda_failed)) return -1;
+    if (m->cuda_prefill_dense && scope != 0 && scope != 3) return -1;
     if (m->cuda_vq_mode && scope != 2 &&
         !(scope == 3 &&
           (waste_model_cuda_k2_vq3r_compatible(m) ||
            waste_model_cuda_glm47_flash_vq3r_compatible(m)))) return -1;
     m->cuda_dense_scope = scope;
     m->cuda_dense_preflight_scope = 0;
+    if (clear_prefill_dense) m->cuda_prefill_dense = 0;
+    m->cuda_prefill_dense_preflight_mode = 0;
     m->cuda_dense_effective = 0;
     m->cuda_dense_calls = 0;
     if (!m->cuda_kda_failed) m->cuda_kda_fallbacks = 0;
     if (scope && cuda_dense_preflight(m, scope)) return -1;
+    if (m->cuda_prefill_dense &&
+        cuda_prefill_dense_preflight(m, m->cuda_prefill_dense)) return -1;
     return 0;
 #else
     m->cuda_dense_scope = 0;
@@ -5285,7 +5346,10 @@ const float *waste_model_prefill(waste_model *m, const int *tokens, int n,
         ((m->cuda_kda_mode || m->cuda_dense_scope || m->cuda_vq_mode) &&
          m->cuda_kda_failed)) return NULL;
     if (n <= 0) return m->logits;
-    if (n == 1) return waste_model_step(m, tokens[0], pos0, NULL);
+    /* A one-token tail still belongs to the prefill contract. In particular,
+     * mode 2 must not fall through to decode's global mode-1 dense selector. */
+    if (n == 1 && !m->cuda_prefill_dense && !m->cuda_prefill_vq)
+        return waste_model_step(m, tokens[0], pos0, NULL);
     dump_pos0 = pos0;
     if (n > WASTE_CHUNK_MAX) n = WASTE_CHUNK_MAX;
     /* mla_layer writes one latent per position with no bound of its own,
@@ -5385,7 +5449,8 @@ const float *waste_model_prefill(waste_model *m, const int *tokens, int n,
             else if (mla_layer(
                     m, L, m->cnorm + (size_t)t * hid,
                     m->cresid + (size_t)t * hid, pos0 + t,
-                    m->cuda_prefill_dense ? m->cuda_dense_scope : 0)) {
+                    m->cuda_prefill_dense ? m->cuda_dense_scope : 0,
+                    m->cuda_prefill_dense)) {
                 attention_failed = 1;
                 break;
             }
@@ -5561,7 +5626,8 @@ const float *waste_model_step(waste_model *m, int token, int pos, int *routed)
         else {
             PROF_START(P_MLA);
             const int failed = mla_layer(m, L, norm, resid, pos,
-                                         m->cuda_dense_scope);
+                                         m->cuda_dense_scope,
+                                         m->cuda_kda_mode);
             PROF_END(P_MLA);
             if (failed) break;
         }
