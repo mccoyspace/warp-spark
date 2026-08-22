@@ -346,7 +346,44 @@ def normalise_cfg(cfg):
     for canon, hf in CONFIG_FLAG_ALIASES:
         if canon not in out and out.get(hf):
             out[canon] = True
+
+    # GLM generation configs name every terminal turn marker. Keep the set
+    # for generation while also publishing one scalar primary EOS for older
+    # readers (and for the tokenizer's single waste_tok_eos slot).
+    eos = out.get("eos_token_id")
+    if isinstance(eos, list):
+        if not eos or any(not isinstance(i, int) or i < 0 for i in eos):
+            raise ValueError("eos_token_id must be a non-empty list of token ids")
+        out["eos_token_ids"] = list(eos)
+        out["eos_token_id"] = eos[0]
+
+    if out.get("model_type") == "glm4_moe_lite":
+        # The GLM-Lite implementation uses the class default (1e-6) for the
+        # two MLA low-rank norms, independently of rms_norm_eps (1e-5 in the
+        # released Flash config). Making that implicit code default explicit
+        # prevents a plausible-but-wrong reuse of the layer-norm epsilon.
+        out.setdefault("mla_rms_norm_eps", 1e-6)
+        # Transformers defaults this family to interleaved RoPE even though
+        # the release config omits the key. WARP's MLA rotation uses that
+        # layout; a future explicit false is preserved for a fail-closed load.
+        out.setdefault("rope_interleave", True)
     return out
+
+
+def source_layer_index(name):
+    """HF decoder-layer index in a source tensor name, or ``None``.
+
+    The optional language-model prefix on K3 means startswith is insufficient;
+    anchoring on ``model.layers`` also avoids a vision tower's layer numbers.
+    """
+    match = re.search(r"(?:^|\.)model\.layers\.(\d+)\.", name)
+    return int(match.group(1)) if match else None
+
+
+def is_source_only_layer(name, n_layers):
+    """True for appended MTP/next-token layers outside the base decoder."""
+    layer = source_layer_index(name)
+    return layer is not None and layer >= n_layers
 
 
 def moe_layout(st, prefix, layer):
@@ -714,6 +751,7 @@ class ShardDebt:
     """
 
     TRUNK = ("trunk",)
+    DROP = ("source-only",)
 
     @staticmethod
     def name(who):
@@ -735,7 +773,7 @@ class ShardDebt:
         except OSError:
             return set()
 
-    def __init__(self, weight_map, src):
+    def __init__(self, weight_map, src, n_layers=None):
         self.src = src
         self.ledger_path = os.path.join(src, ".reclaimed")
         self.owed = {}            # shard -> consumers that have not finished
@@ -745,14 +783,14 @@ class ShardDebt:
             # one can give back, and counting it would report a saving twice.
             if not os.path.exists(os.path.join(src, shard)):
                 continue
-            who = self.consumer(name)
+            who = self.consumer(name, n_layers)
             self.owed.setdefault(shard, set()).add(who)
             self.held_by.setdefault(who, set()).add(shard)
         self.freed = 0
         self.released = []
 
     @staticmethod
-    def consumer(name):
+    def consumer(name, n_layers=None):
         """The one part of this script that reads `name`.
 
         The trunk pass takes everything that is not an expert. mxfp4 stores a
@@ -763,6 +801,8 @@ class ShardDebt:
         for suffix in ("_packed", "_scale"):
             if base.endswith(suffix):
                 base = base[:-len(suffix)]
+        if n_layers is not None and is_source_only_layer(base, n_layers):
+            return ShardDebt.DROP
         if ".experts." not in base:
             return ShardDebt.TRUNK
         parts = base.split(".")
@@ -930,7 +970,7 @@ def convert_layer(job):
 
 
 
-def build_trunk(args, sr, st, existing, manifest_path):
+def build_trunk(args, sr, st, existing, manifest_path, n_layers):
     """Write trunk.bin.tmp and return its index, or None if the run must stop.
 
     A function rather than a stretch of main() because --reclaim has to run
@@ -972,7 +1012,9 @@ def build_trunk(args, sr, st, existing, manifest_path):
         # interval.
         with open(trunk_tmp, "wb") as tf:
             for name in sorted(sr.names()):
-                if ".experts." in name or name.endswith(("_packed", "_scale")):
+                if (is_source_only_layer(name, n_layers) or
+                        ".experts." in name or
+                        name.endswith(("_packed", "_scale"))):
                     continue
                 if not st.have(name):
                     continue                  # shard not downloaded yet
@@ -1090,6 +1132,7 @@ def main():
         cfg = {**cfg["text_config"], "_outer": {k: v for k, v in cfg.items()
                                                 if k != "text_config"}}
         prefix = "language_model."
+    n_layers = cfg["num_hidden_layers"]
     st = ST(args.src)
     sr = ShardReader(args.src)
     dev = torch.device(args.device)
@@ -1140,14 +1183,14 @@ def main():
         # shards are already gone. Say which flag makes that a run rather
         # than a truncated container.
         if gone and not args.skip_trunk and any(
-                ShardDebt.consumer(name) == ShardDebt.TRUNK
+                ShardDebt.consumer(name, n_layers) == ShardDebt.TRUNK
                 and fn in gone for name, fn in st.wm.items()):
             print(f"--reclaim already consumed the shards the trunk is built "
                   f"from; rerun with --skip-trunk to keep the trunk "
                   f"{os.path.join(args.out, 'manifest.json')} publishes",
                   file=sys.stderr)
             return 1
-        debt = ShardDebt(st.wm, args.src)
+        debt = ShardDebt(st.wm, args.src, n_layers)
         n_shards, held = debt.still_owed()
         print(f"reclaim={args.reclaim}: {n_shards} shards, "
               f"{human(held)} of staging to give back"
@@ -1156,11 +1199,12 @@ def main():
             print("  a reclaimed shard is gone: tools/verify_container.py "
                   "cannot check this container against its source afterwards, "
                   "so prove the recipe on a smaller model first.")
+        reclaim(debt, args.reclaim, ShardDebt.DROP,
+                "source-only appended layer(s)")
     print(f"device={dev}  stages={args.stages}  entries={args.entries}  "
           f"index_bits={args.index_bits} "
           f"({args.stages * args.index_bits / VEC_DIM:.2f} b/w)")
 
-    n_layers = cfg["num_hidden_layers"]
     n_exp = cfg.get("num_experts") or cfg.get("n_routed_experts")
     print(f"prefix {prefix!r}  layers {n_layers}  experts {n_exp}")
     first_dense = cfg.get("first_k_dense_replace", 0)
@@ -1262,7 +1306,7 @@ def main():
         # writes trunk.bin.tmp either way and the published trunk.bin is
         # still only replaced together with the manifest, so nothing about
         # what this run can survive changes — only the order.
-        tindex = build_trunk(args, sr, st, existing, manifest_path)
+        tindex = build_trunk(args, sr, st, existing, manifest_path, n_layers)
         if tindex is None:
             return 1
         reclaim(debt, args.reclaim, ShardDebt.TRUNK, "trunk")
@@ -1502,7 +1546,7 @@ def main():
     # --reclaim has already run this, before the experts, so that the shards
     # holding non-expert tensors become deletable at all.
     if tindex is None:
-        tindex = build_trunk(args, sr, st, existing, manifest_path)
+        tindex = build_trunk(args, sr, st, existing, manifest_path, n_layers)
         if tindex is None:
             return 1
     trunk_path = os.path.join(args.out, "trunk.bin")
@@ -1541,6 +1585,15 @@ def main():
         "layers": manifest_layers,
         "trunk": tindex,
     }
+    source_only_layers = sorted({
+        layer for name in sr.names()
+        if (layer := source_layer_index(name)) is not None and
+        layer >= n_layers
+    })
+    if source_only_layers:
+        manifest["source_ignored_layers"] = source_only_layers
+        print("source: omitted appended non-base layer(s) " +
+              ", ".join(map(str, source_only_layers)))
     # A manifest that lists fewer expert layers than the one it replaces
     # publishes a container the engine will refuse to open, and the banks it
     # drops are still on disk taking up room. Never intended; say so.
