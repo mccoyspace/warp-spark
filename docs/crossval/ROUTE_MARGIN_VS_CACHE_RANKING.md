@@ -106,15 +106,29 @@ interesting to measure.
 
 ## What we can contribute
 
-Your `LEARNED.md` closes by noting this project has no NVIDIA hardware and no CI
-path for the non-synthetic suite on any platform. We have vehicles you do not:
+To be precise about whose constraint is whose: the "no NVIDIA hardware, no way to
+regress-check a numerical contract" line in `LEARNED.md` is **upstream's**
+(Marco Bambini, `bc08fe7`), inherited here by merge. It is not a statement about
+this fork, which plainly has GB10/GN100 hardware and has published extensive
+measurements on it. We misread that on our first pass and corrected it.
 
-- **Windows and x86-64 CPU-only**, where we can run the portable and server
-  suites and report pass/fail/skip with full provenance;
+The real gap it describes is a *maintenance* boundary: upstream cannot
+regression-test a backend it cannot run, which is exactly the out-of-tree
+position agreed on issue #11.
+
+What we offer is therefore complementary platform coverage, not hardware you
+lack:
+
+- **Windows and x86-64 CPU-only** runs of the portable and server suites, with
+  full provenance (OS, compiler, CPU, source SHA, exact commands,
+  pass/fail/skip, raw logs, synthetic vs real-model labelled);
 - **a prefill-balanced margin capture** on that path, with raw rows and route
   hashes rather than summary quantiles.
 
-We are not asking you to merge anything. Offered as validation capacity against
-whichever branch is most useful — `pr/server-prefix-cache` and
-`pr/in-memory-state-snapshots` look like the ones where an independent platform
-would say the most.
+That coverage is useful precisely because it is the platform neither you nor
+upstream is measuring, and because a portability regression is the kind of thing
+an ARM/CUDA vehicle cannot see.
+
+We are not asking you to merge anything. Offered against whichever branch is
+most useful — `pr/server-prefix-cache` and `pr/in-memory-state-snapshots` look
+like the ones where an independent platform would say the most.
