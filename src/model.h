@@ -247,6 +247,8 @@ int waste_model_cuda_k2_dense_compatible(const waste_model *m);
 int waste_model_cuda_k2_vq3r_compatible(const waste_model *m);
 int waste_model_cuda_glm47_flash_dense_compatible(const waste_model *m);
 int waste_model_cuda_glm47_flash_vq3r_compatible(const waste_model *m);
+int waste_model_cuda_vq_dense_scope_compatible(const waste_model *m,
+                                                int scope);
 
 /* Everything the load needs that is not in the container. These are
  * parameters rather than fields set beforehand because the first thing

@@ -92,6 +92,7 @@ static waste_model glm47_flash(void)
     changed.field = (value);                                                \
     CHECK(waste_model_cuda_k2_dense_compatible(&changed));                  \
     CHECK(!waste_model_cuda_k2_vq3r_compatible(&changed));                  \
+    CHECK(!waste_model_cuda_vq_dense_scope_compatible(&changed, 3));        \
 } while (0)
 
 #define REJECT_FLASH_DENSE(field, value) do {                               \
@@ -105,6 +106,7 @@ static waste_model glm47_flash(void)
     changed.field = (value);                                                \
     CHECK(waste_model_cuda_glm47_flash_dense_compatible(&changed));         \
     CHECK(!waste_model_cuda_glm47_flash_vq3r_compatible(&changed));         \
+    CHECK(!waste_model_cuda_vq_dense_scope_compatible(&changed, 3));        \
 } while (0)
 
 int main(void)
@@ -116,12 +118,17 @@ int main(void)
     CHECK(waste_model_cuda_k2_dense_compatible(&exact));
     CHECK(waste_model_cuda_k2_vq3r_compatible(&exact));
     CHECK(!waste_model_cuda_glm47_flash_dense_compatible(&exact));
+    CHECK(waste_model_cuda_vq_dense_scope_compatible(&exact, 2));
+    CHECK(waste_model_cuda_vq_dense_scope_compatible(&exact, 3));
+    CHECK(!waste_model_cuda_vq_dense_scope_compatible(&exact, 1));
+    CHECK(!waste_model_cuda_vq_dense_scope_compatible(NULL, 2));
 
     waste_model changed = k2();
     strcpy(changed.cfg.arch, "KimiK3ForConditionalGeneration");
     CHECK(!waste_model_cuda_k2_dense_compatible(&changed));
     changed = k2(); changed.cfg.kda_layer[17] = 1;
     CHECK(!waste_model_cuda_k2_dense_compatible(&changed));
+    CHECK(!waste_model_cuda_vq_dense_scope_compatible(&changed, 3));
 
     REJECT_DENSE(cfg.n_layers, 60);
     REJECT_DENSE(cfg.hidden, 7169);
@@ -153,12 +160,15 @@ int main(void)
     CHECK(waste_model_cuda_glm47_flash_dense_compatible(&exact));
     CHECK(waste_model_cuda_glm47_flash_vq3r_compatible(&exact));
     CHECK(!waste_model_cuda_k2_dense_compatible(&exact));
+    CHECK(waste_model_cuda_vq_dense_scope_compatible(&exact, 2));
+    CHECK(waste_model_cuda_vq_dense_scope_compatible(&exact, 3));
 
     changed = glm47_flash();
     strcpy(changed.cfg.arch, "DeepseekV3ForCausalLM");
     CHECK(!waste_model_cuda_glm47_flash_dense_compatible(&changed));
     changed = glm47_flash(); changed.cfg.kda_layer[17] = 1;
     CHECK(!waste_model_cuda_glm47_flash_dense_compatible(&changed));
+    CHECK(!waste_model_cuda_vq_dense_scope_compatible(&changed, 3));
 
     REJECT_FLASH_DENSE(cfg.n_layers, 46);
     REJECT_FLASH_DENSE(cfg.hidden, 2049);

@@ -587,6 +587,16 @@ int waste_model_cuda_glm47_flash_vq3r_compatible(const waste_model *m)
            m->expert_m[2] % (int)WASTE_VQ_INDEX_BLOCK == 0;
 }
 
+int waste_model_cuda_vq_dense_scope_compatible(const waste_model *m,
+                                                int scope)
+{
+    if (!m) return 0;
+    return scope == 2 ||
+        (scope == 3 &&
+         (waste_model_cuda_k2_vq3r_compatible(m) ||
+          waste_model_cuda_glm47_flash_vq3r_compatible(m)));
+}
+
 #if defined(WASTE_ENABLE_CUDA)
 static int cuda_kda_tensor_ok(waste_model *m, int layer, const char *projection,
                               const waste_tensor **first)
@@ -771,8 +781,8 @@ static int cuda_vq_preflight(waste_model *m, int mode)
     const int glm47_flash_geometry =
         waste_model_cuda_glm47_flash_vq3r_compatible(m);
     const int qualified_all_mla = k2_geometry || glm47_flash_geometry;
-    const int dense_scope_ok = m->cuda_dense_scope == 2 ||
-        (qualified_all_mla && m->cuda_dense_scope == 3);
+    const int dense_scope_ok = waste_model_cuda_vq_dense_scope_compatible(
+        m, m->cuda_dense_scope);
     if (mode < 1 || mode > 2 || m->cuda_kda_mode != 1 ||
         !dense_scope_ok) {
         fprintf(stderr,
@@ -4331,7 +4341,9 @@ int waste_model_set_cuda_vq(waste_model *m, int mode)
 #if defined(WASTE_ENABLE_CUDA)
     const char *backend = getenv("WASTE_BACKEND");
     if (mode && backend && !strcmp(backend, "cpu")) return -1;
-    if (mode && (m->cuda_kda_mode != 1 || m->cuda_dense_scope != 2 ||
+    if (mode && (m->cuda_kda_mode != 1 ||
+                 !waste_model_cuda_vq_dense_scope_compatible(
+                     m, m->cuda_dense_scope) ||
                  m->cuda_kda_failed))
         return -1;
     if (mode == 1 && m->cuda_vq_group != 1) return -1;
