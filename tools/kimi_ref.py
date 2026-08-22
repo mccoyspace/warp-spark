@@ -79,7 +79,8 @@ class Container:
     def __init__(self, path, device="cpu"):
         self.path = path
         self.dev = device
-        self.man = json.load(open(os.path.join(path, "manifest.json")))
+        with open(os.path.join(path, "manifest.json")) as inp:
+            self.man = json.load(inp)
         self.cfg = self.man["config"]
         self.prefix = self.man.get("tensor_prefix", "")
         self.stages = self.man["expert_quant"]["stages"]
@@ -92,7 +93,8 @@ class Container:
             self.banks[int(L)] = (f, meta)
 
     def _load_codebooks(self):
-        data = open(os.path.join(self.path, "codebooks.bin"), "rb").read()
+        with open(os.path.join(self.path, "codebooks.bin"), "rb") as inp:
+            data = inp.read()
         rec = 16 + CB_ENTRIES * VEC_DIM * 2
         self.books = []
         for off in range(0, len(data), rec):
@@ -107,7 +109,8 @@ class Container:
         2 GB trunk, impossible for K3's 31 GB (it would want ~124 GB). The
         blob stays as read and each tensor is materialized the first time
         it is asked for, with a bounded cache of the big ones."""
-        self._blob = open(os.path.join(self.path, "trunk.bin"), "rb").read()
+        with open(os.path.join(self.path, "trunk.bin"), "rb") as inp:
+            self._blob = inp.read()
         self._meta = {e["name"]: e for e in self.man["trunk"]}
         self.t = _LazyTrunk(self)
 
