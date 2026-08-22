@@ -172,6 +172,10 @@ class DeepseekRef:
         self.c, self.t, self.cfg = c, c.t, c.cfg
         self.p = c.prefix
         self.eps = self.cfg["rms_norm_eps"]
+        # GLM-4.7-Flash's two MLA low-rank norms keep their module default
+        # 1e-6 even though the decoder RMSNorm epsilon is 1e-5.  The
+        # converter records that source-code default explicitly.
+        self.mla_eps = self.cfg.get("mla_rms_norm_eps", self.eps)
         self.n_layers = self.cfg["num_hidden_layers"]
         self.first_dense = self.cfg.get("first_k_dense_replace", 0)
         self.use_rope = rope
@@ -196,13 +200,14 @@ class DeepseekRef:
         vh, qd = cfg["v_head_dim"], self.qk_n + self.qk_r
         if cfg.get("q_lora_rank"):
             qa = rms_norm(x @ self.t[p + "q_a_proj.weight"].T,
-                          self.t[p + "q_a_layernorm.weight"], self.eps)
+                          self.t[p + "q_a_layernorm.weight"], self.mla_eps)
             q = (qa @ self.t[p + "q_b_proj.weight"].T).view(T, nh, qd)
         else:
             q = (x @ self.t[p + "q_proj.weight"].T).view(T, nh, qd)
         ckv = x @ self.t[p + "kv_a_proj_with_mqa.weight"].T
         kpass, krot = ckv.split([cfg["kv_lora_rank"], qk_r], dim=-1)
-        kpass = rms_norm(kpass, self.t[p + "kv_a_layernorm.weight"], self.eps)
+        kpass = rms_norm(kpass, self.t[p + "kv_a_layernorm.weight"],
+                         self.mla_eps)
         kb = (kpass @ self.t[p + "kv_b_proj.weight"].T).view(T, nh, qk_n + vh)
         knope, val = kb.split([qk_n, vh], dim=-1)
 
