@@ -129,29 +129,34 @@ startup the server asks for the richer format first and falls back:
 1. **XTML**, if the container's tokenizer carries `<|open|>`, `<|sep|>`,
    `<|close|>` and `<|end_of_msg|>` as single tokens. Channels, tools,
    images — everything below in this document.
-2. **The container's own `chat.json`**, otherwise. The same four
-   prefix/suffix strings `waste chat` reads, so a container is addressed
-   identically over HTTP and on the command line, and a hand-edited
-   `chat.json` is honoured by both. Kimi-Linear is served this way.
+2. **The container's own `chat.json`**, otherwise. Role prefix/suffix
+   strings are the legacy subset; stateless HTTP additionally understands
+   an optional one-time `preamble`, explicit `stop` token list, and narrow
+   per-role whitespace normalization through `strip_roles`.
+   Kimi-Linear uses the legacy subset and GLM-4.7-Flash uses the extension.
 
 ```
 chat     from ~/models/kimi-linear.waste/chat.json — plain conversation only,
          no tools, no reasoning channel, no images
+
+chat     from a GLM-4.7-Flash container — exact plain no-thinking histories,
+         including [gMASK]<sop> and all three released terminal token ids
 ```
 
-Plain means plain: system / user / assistant turns, blocking and streaming,
-with the stop token taken from the template's assistant suffix rather than
-guessed. Everything four strings cannot express is refused with a 400 that
+Plain means plain: system / user / assistant turns, blocking and streaming.
+Legacy files take one stop token from the assistant suffix; extended files
+name their complete token list independently. Everything this schema cannot
+express is refused with a 400 that
 names the field — `tools`, `reasoning_effort`, an image part, a tool result
 turn. None of it is silently dropped; a server that ignores
 `reasoning_effort` reports a different amount of reasoning than it did.
 
-`chat.json` is validated more strictly here than by the CLI's reader, which
-has a person watching and an interrupt key. Serving needs an `open`, a
-`user` turn, and an assistant suffix containing a control token — without
-the last one every reply runs to `max_tokens` and reports `finish_reason:
-"length"`, which reads as a broken model rather than a broken template. And
-every `<|…|>` in the file is resolved against the real vocabulary: markup
+`chat.json` is validated more strictly here than the legacy CLI subset.
+Serving needs an `open`, a `user` turn, and either an explicit non-empty stop
+list or an assistant suffix containing a control token — without one every
+reply runs to `max_tokens` and reports `finish_reason: "length"`, which reads
+as a broken model rather than a broken template. Every control marker in the
+file is resolved against the real vocabulary: markup
 the tokenizer does not have encodes as ordinary text, so the model would
 read its own turn structure as prose and answer anyway, plausibly and
 wrongly. That check is the reason this path is safe at all, and it is the

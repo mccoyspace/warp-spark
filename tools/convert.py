@@ -1429,30 +1429,33 @@ def main():
         print(f"chat template: copied ({len(tpl)} bytes)")
 
     # ---- chat.json -------------------------------------------------------
-    # The declarative format the CLI reads. Neither Kimi release ships a
-    # template, so there is nothing to convert from — but for the models we
-    # have transcribed from the reference encoder, examples/ holds one, and
-    # a container that has to be finished by hand is a container that will
-    # be used unfinished. Copied from examples/ rather than embedded here,
-    # so there is one copy of each template and not two that drift.
+    # The declarative format the server reads (and the stateful CLI reads for
+    # its legacy subset). Neither Kimi release ships a template, so there is
+    # nothing to convert from — but for the models we have transcribed from
+    # the reference encoder, examples/ holds one, and a container that has to
+    # be finished by hand is a container that will be used unfinished. GLM's
+    # plain no-thinking subset is transcribed from its released Jinja. Copied
+    # from examples/ rather than embedded here, so there is one copy of each
+    # template and not two that drift.
     #
     # Only for an architecture we actually have: for anything else the CLI
     # keeps saying so and falling back, which is better than a guessed
     # format that produces plausible wrong answers. And never over an
     # existing file — a hand-edited chat.json outranks the shipped one.
     #
-    # The two Kimi releases use disjoint markup — K3's XTML brackets versus
-    # Kimi-Linear's <|im_*|> — so the map is per architecture and never a
-    # default. Installing the wrong one is not a visible failure: the markers
-    # are absent from the tokenizer, so they encode as ordinary text and the
-    # model reads its own turn structure as prose. That is what the marker
-    # check below refuses, and it also catches a release that renames them.
+    # These releases use disjoint markup, so the map is per architecture and
+    # never a default. Installing the wrong one is not a visible failure: the
+    # markers are absent from the tokenizer, so they encode as ordinary text
+    # and the model reads its own turn structure as prose. That is what the
+    # marker check below refuses, and it also catches a renamed release.
     _tmpl_for = {"kimi-k3": "chat-k3.json",
-                 "kimi-linear": "chat-kimi-linear.json"}
+                 "kimi-linear": "chat-kimi-linear.json",
+                 "glm47-flash": "chat-glm47-flash.json"}
     _hf0 = ((cfg.get("_outer", {}).get("architectures")
              or cfg.get("architectures") or [""]))[0]
     _arch0 = ("kimi-k3" if "KimiK3" in _hf0 else
-              "kimi-linear" if "KimiLinear" in _hf0 else "")
+              "kimi-linear" if "KimiLinear" in _hf0 else
+              "glm47-flash" if "Glm4MoeLite" in _hf0 else "")
     _dst = os.path.join(args.out, "chat.json")
     _name = _tmpl_for.get(_arch0)
     if _name and not os.path.exists(_dst):
@@ -1467,7 +1470,8 @@ def main():
             # no evidence would be worse than the old unconditional copy.
             _absent = sorted({
                 m for m in re.findall(
-                    r"<\|[^|>]*\|>",
+                    r"<\|[^|>]*\|>|\[[A-Za-z]+MASK\]|"
+                    r"</?[A-Za-z][A-Za-z0-9_]*>",
                     io.open(_src_tmpl, encoding="utf-8").read())
                 if m not in special_texts}) if special_texts else []
             if _absent:
@@ -1477,7 +1481,7 @@ def main():
                       f"back to raw continuation)")
             else:
                 atomic_copyfile(_src_tmpl, _dst)
-                print(f"chat.json: {_name} — `waste chat` will use it")
+                print(f"chat.json: {_name} — conversation metadata installed")
     elif os.path.exists(_dst):
         print("chat.json: already present, left alone")
     elif _arch0:

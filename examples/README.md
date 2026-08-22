@@ -202,16 +202,26 @@ strings:
 cp examples/chat.json ~/models/some-model.waste/chat.json
 ```
 
-Every field is optional. Each role is a `[prefix, suffix]` pair, and
-`open` is what is appended after the last user turn to hand the floor to
-the model:
+Each role is a `[prefix, suffix]` pair, and `open` is what is appended after
+the last user turn to hand the floor to the model. The HTTP formatter also
+accepts an optional one-time `preamble`, an explicit `stop` token list, and
+`strip_roles` for templates that normalize selected historical turns:
 
 ```json
-{"system":    ["<prefix>", "<suffix>"],
+{"preamble":  "<once before the first turn>",
+ "system":    ["<prefix>", "<suffix>"],
  "user":      ["<prefix>", "<suffix>"],
  "assistant": ["<prefix>", "<suffix>"],
- "open":      "<what starts the model's turn>"}
+ "strip_roles":["assistant"],
+ "open":      "<what starts the model's turn>",
+ "stop":      ["<token that ends generation>"]}
 ```
+
+Legacy files may omit `stop`; serving then derives one control token from
+the assistant suffix, preserving the original format exactly. The stateful
+`waste run` and `waste chat` commands currently refuse the extended fields
+instead of silently ignoring them; use `waste serve` for such a container,
+or `--raw` only when raw continuation is intentional.
 
 `\n` and `\t` are the escapes the reader understands. Whatever markup you
 put in these strings has to exist in the tokenizer as a *single* token, or
@@ -254,6 +264,20 @@ tokenizer has no XTML markers is chatted with through its `chat.json`.
 Plain conversation only — no tools, no reasoning channel, no images, each
 refused with a 400 naming the field rather than dropped. See
 [SERVE.md](../docs/SERVE.md), "serve/chatfmt.py".
+
+## chat-glm47-flash.json — GLM-4.7-Flash plain no-thinking
+
+[chat-glm47-flash.json](chat-glm47-flash.json) is the exact plain,
+no-thinking subset of GLM-4.7-Flash's released Jinja template. The converter
+installs it for `Glm4MoeLiteForCausalLM` containers. It emits the one-time
+`[gMASK]<sop>` preamble, prefixes turns with GLM's role tokens, opens an
+answer with `<|assistant|></think>`, and stops on any of the three EOS/turn
+tokens named by the release. Prior assistant text is stripped exactly as the
+Jinja does; user and system text is not.
+
+The deliberately narrow scope is ordinary system, user, and prior assistant
+text over stateless HTTP. Tools and thinking remain refused by name; the
+Jinja template's structured branches have not been approximated.
 
 ## chat-k3.json — Kimi K3
 

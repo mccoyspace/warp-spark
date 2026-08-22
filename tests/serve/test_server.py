@@ -38,8 +38,9 @@ from serve.engine import EngineError, WASTE_E_IO            # noqa: E402
 from serve.prefix_cache import CONTROLLER_OVERHEAD_BYTES    # noqa: E402
 from serve.qos import QosError, QosLease                     # noqa: E402
 from serve.server import serve                              # noqa: E402
-from tests.serve.fake_engine import (FakeEngine, LINEAR_MARKERS,  # noqa: E402
-                                     reply_plain, reply_tool_call)
+from tests.serve.fake_engine import (FakeEngine, GLM_MARKERS,    # noqa: E402
+                                     LINEAR_MARKERS, reply_plain,
+                                     reply_tool_call)
 
 
 class ServerTestCase(unittest.TestCase):
@@ -1384,6 +1385,31 @@ class TestChatFromChatJson(ServerTestCase):
                                  {"model": "test-model", "prompt": "start"})
         self.assertEqual(status, 200)
         self.assertEqual(body["choices"][0]["text"], "continued")
+
+
+class TestGlmChatFromChatJson(ServerTestCase):
+    """The server passes every explicit GLM terminal token to the engine."""
+
+    def setUp(self):
+        self.dir = tempfile.mkdtemp(prefix="serve-glm-chatjson-")
+        self.addCleanup(shutil.rmtree, self.dir, True)
+        shutil.copyfile(REPO / "examples" / "chat-glm47-flash.json",
+                        Path(self.dir) / "chat.json")
+        self.engine_kwargs = {"no_markers": True, "model_path": self.dir,
+                              "markers": dict(GLM_MARKERS)}
+        super().setUp()
+
+    def test_preamble_and_all_stops_reach_the_engine(self):
+        self.engine.reply = "ok<|user|>ignored"
+        status, body = self.chat(reasoning_effort="none")
+        self.assertEqual(status, 200)
+        self.assertEqual(body["choices"][0]["message"]["content"], "ok")
+        self.assertEqual(self.engine.calls[-1]["stop_tokens"],
+                         [154820, 154827, 154829])
+        prompt = self.engine.prompts[-1]
+        controls = [token for token in prompt if token in GLM_MARKERS]
+        self.assertEqual(controls,
+                         [154822, 154824, 154827, 154828, 154842])
 
 
 class TestAuth(ServerTestCase):

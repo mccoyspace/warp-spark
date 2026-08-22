@@ -26,6 +26,7 @@ one would. Everything deciding *which* chat.json is convert.py's own.
 import io
 import json
 import os
+import re
 import shutil
 import sys
 import tempfile
@@ -42,6 +43,12 @@ import test_convert_resume as H          # noqa: E402  — installs the stubs
 K3_MARKERS = ["<|open|>", "<|sep|>", "<|close|>", "<|end_of_msg|>"]
 KL_MARKERS = ["<|im_system|>", "<|im_user|>", "<|im_assistant|>",
               "<|im_middle|>", "<|im_end|>"]
+GLM_MARKERS = ["[gMASK]", "<sop>", "<|system|>", "<|user|>",
+               "<|assistant|>", "</think>", "<|endoftext|>",
+               "<|observation|>"]
+# Intentionally broader than convert.py's accepted spellings, so a new
+# bracketed control cannot disappear from both implementation and test.
+CONTROL_RE = re.compile(r"<[^>]+>|\[[A-Za-z]+MASK\]")
 
 fails = 0
 
@@ -61,14 +68,10 @@ def shipped(name):
 def uses_only(name, markers):
     """True if every <|…|> in the template is one the release carries.
 
-    Deliberately not the regex convert.py uses — deleting the known
-    markers and looking for a leftover `<|` is the same question asked a
-    different way, so a bug in one does not hide in the other.
+    Kept as a test-side expression rather than importing converter state:
+    the release marker set remains independent ground truth.
     """
-    text = shipped(name)
-    for m in markers:
-        text = text.replace(m, "")
-    return "<|" not in text
+    return set(CONTROL_RE.findall(shipped(name))).issubset(markers)
 
 
 def build(tmp, name, arch, markers, preexisting=None):
@@ -103,6 +106,8 @@ def main():
            "chat-k3.json uses only markup K3 carries")
         ck(uses_only("chat-kimi-linear.json", KL_MARKERS),
            "chat-kimi-linear.json uses only markup Kimi-Linear carries")
+        ck(uses_only("chat-glm47-flash.json", GLM_MARKERS),
+           "chat-glm47-flash.json uses only markup GLM-4.7-Flash carries")
 
         print("each architecture gets its own")
         ck(build(tmp, "kl", "KimiLinearForCausalLM", KL_MARKERS)
@@ -111,10 +116,16 @@ def main():
         ck(build(tmp, "k3", "KimiK3ForCausalLM", K3_MARKERS)
            == shipped("chat-k3.json"),
            "KimiK3 installs chat-k3.json verbatim")
+        ck(build(tmp, "glm", "Glm4MoeLiteForCausalLM", GLM_MARKERS)
+           == shipped("chat-glm47-flash.json"),
+           "Glm4MoeLite installs chat-glm47-flash.json verbatim")
 
         print("and never one the tokenizer cannot spell")
         ck(build(tmp, "cross", "KimiLinearForCausalLM", K3_MARKERS) is None,
            "a release without <|im_*|> gets no chat.json rather than a mute one")
+        ck(build(tmp, "glm-cross", "Glm4MoeLiteForCausalLM", KL_MARKERS)
+           is None,
+           "a release without GLM preamble tokens gets no chat.json")
 
         print("the cases that must not change")
         ck(build(tmp, "notok", "KimiLinearForCausalLM", None)

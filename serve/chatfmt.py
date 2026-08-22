@@ -9,10 +9,11 @@ container whose tokenizer has no XTML markers got a 400 on
 /v1/chat/completions and nothing else. Kimi-Linear is such a container, and
 it is not exotic — it is the second model this engine ships numbers for.
 
-The format such a container *does* carry is `chat.json`, the four
-prefix/suffix strings `waste chat` has always read. This file serves from
-the same file, so a container is addressed the same way over HTTP as it is
-on the command line, and a hand-edited chat.json is honoured by both.
+The format such a container *does* carry is `chat.json`: role
+prefix/suffix strings, an optional one-time preamble, an assistant opening,
+and optional explicit stop tokens.  The last two additions are deliberately
+small.  They are enough to express GLM's plain no-thinking template without
+embedding a Jinja interpreter in the server.
 
 What that buys, and what it does not:
 
@@ -52,9 +53,11 @@ from typing import Any, Optional
 from .regions import Delta
 from .xtml import Segment
 
-# The markup that has to exist in the tokenizer. Anything of this shape in
+# The markup that has to exist in the tokenizer. GLM uses three spellings:
+# <|role|>, [gMASK]/[sMASK], and <sop>/</think>. Anything of these shapes in
 # chat.json is checked against the container before the format is used.
-_MARKER_RE = re.compile(r"<\|[^|>]*\|>")
+_MARKER_RE = re.compile(
+    r"<\|[^|>]*\|>|\[[A-Za-z]+MASK\]|</?[A-Za-z][A-Za-z0-9_]*>")
 
 # `developer` is OpenAI's newer spelling of a system turn; chat.json has no
 # separate slot for it, and neither does any model that reads this format.
@@ -92,13 +95,25 @@ class ChatFormat:
 
     roles: dict[str, tuple[str, str]]
     opening: str
-    stop_marker: str
-    stop_id: int
+    stop_markers: tuple[str, ...]
+    stop_ids: tuple[int, ...]
+    preamble: str = ""
+    strip_roles: frozenset[str] = frozenset()
+
+    @property
+    def stop_marker(self) -> str:
+        """Primary stop marker, kept for callers of the original schema."""
+        return self.stop_markers[0]
+
+    @property
+    def stop_id(self) -> int:
+        """Primary stop id, kept for callers of the original schema."""
+        return self.stop_ids[0]
 
     @property
     def markers(self) -> dict[int, str]:
-        """The parser's marker table: what ends the assistant's turn."""
-        return {self.stop_id: self.stop_marker}
+        """The parser's marker table: everything that ends a reply."""
+        return dict(zip(self.stop_ids, self.stop_markers))
 
     # ---- loading --------------------------------------------------------
 
@@ -147,24 +162,55 @@ class ChatFormat:
                 'chat.json has no "user" turn, so a request cannot be put '
                 'to the model')
 
-        # The stop marker. Without one every reply runs to max_tokens and
-        # then reports finish_reason "length", which reads as a broken
-        # model rather than a broken template.
-        suffix = roles.get("assistant", ("", ""))[1]
-        found = _MARKER_RE.search(suffix)
-        if found is None:
+        preamble = raw.get("preamble", "")
+        if not isinstance(preamble, str):
+            raise ChatFormatError('chat.json "preamble" must be a string')
+
+        raw_strip_roles = raw.get("strip_roles", [])
+        if (not isinstance(raw_strip_roles, list)
+                or not all(isinstance(role, str) and role in _ROLES
+                           for role in raw_strip_roles)):
             raise ChatFormatError(
-                'chat.json\'s "assistant" suffix carries no control token, '
-                'so nothing would end a generated turn')
-        stop_marker = found.group(0)
+                'chat.json "strip_roles" must be an array containing only '
+                f'{list(_ROLES)}')
+        if len(set(raw_strip_roles)) != len(raw_strip_roles):
+            raise ChatFormatError(
+                'chat.json "strip_roles" must not repeat a role')
+        strip_roles = frozenset(raw_strip_roles)
+
+        # Legacy templates derive their one stop from the assistant suffix.
+        # New templates may name a list independently: GLM ends a reply on
+        # any of three role/EOS tokens and has an empty assistant suffix.
+        explicit_stops = raw.get("stop")
+        if explicit_stops is None:
+            suffix = roles.get("assistant", ("", ""))[1]
+            found = _MARKER_RE.search(suffix)
+            if found is None:
+                raise ChatFormatError(
+                    'chat.json has no explicit "stop" list, and its '
+                    '"assistant" suffix carries no control token, so '
+                    'nothing would end a generated turn')
+            stop_markers = (found.group(0),)
+        else:
+            if (not isinstance(explicit_stops, list) or not explicit_stops
+                    or not all(isinstance(x, str) and x
+                               for x in explicit_stops)):
+                raise ChatFormatError(
+                    'chat.json "stop" must be a non-empty array of strings')
+            if len(set(explicit_stops)) != len(explicit_stops):
+                raise ChatFormatError(
+                    'chat.json "stop" must not repeat a token')
+            stop_markers = tuple(explicit_stops)
 
         # Every marker in the file, against the real vocabulary. This is
         # the check the whole file exists to make: markup the tokenizer
         # does not have encodes as ordinary text, and the model then reads
         # its own turn structure as prose and answers anyway.
         ids: dict[str, int] = {}
-        for text in sorted({m for s in _strings(roles, opening)
-                            for m in _MARKER_RE.findall(s)}):
+        controls = {m for s in _strings(roles, opening, preamble)
+                    for m in _MARKER_RE.findall(s)}
+        controls.update(stop_markers)
+        for text in sorted(controls):
             got = engine.tokenize(text, markup=True)
             if len(got) != 1:
                 raise ChatFormatError(
@@ -173,8 +219,14 @@ class ChatFormat:
                     f"chat format disagree")
             ids[text] = got[0]
 
-        return cls(roles=roles, opening=opening, stop_marker=stop_marker,
-                   stop_id=ids[stop_marker])
+        stop_ids = tuple(ids[text] for text in stop_markers)
+        if len(set(stop_ids)) != len(stop_ids):
+            raise ChatFormatError(
+                'chat.json "stop" maps two strings to the same token id')
+
+        return cls(roles=roles, opening=opening,
+                   stop_markers=stop_markers, stop_ids=stop_ids,
+                   preamble=preamble, strip_roles=strip_roles)
 
     # ---- rendering ------------------------------------------------------
 
@@ -220,6 +272,8 @@ class ChatFormat:
         if semantic_anchor_end is not None:
             semantic_anchor_end.clear()
         segments: list[Segment] = []
+        if self.preamble:
+            segments.append(Segment(self.preamble, markup=True))
         for i, message in enumerate(messages):
             role = message.get("role")
             role = _ROLE_ALIASES.get(role, role)
@@ -235,8 +289,16 @@ class ChatFormat:
                     f'container\'s chat.json does not describe one',
                     param=f"messages[{i}].role")
             prefix, suffix = pair
+            content = message.get("content")
+            if role in self.strip_roles:
+                if not isinstance(content, str):
+                    raise ChatFormatError(
+                        f'messages[{i}] is a "{role}" turn whose content '
+                        f'must be a string because chat.json trims that role',
+                        param=f"messages[{i}].content")
+                content = content.strip()
             segments.append(Segment(prefix, markup=True))
-            segments.extend(_content_segments(message.get("content"), i))
+            segments.extend(_content_segments(content, i))
             segments.append(Segment(suffix, markup=True))
             if semantic_anchor_end is not None:
                 semantic_anchor_end[:] = [len(segments)]
@@ -246,8 +308,9 @@ class ChatFormat:
         return segments
 
 
-def _strings(roles: dict[str, tuple[str, str]], opening: str) -> list[str]:
-    return [s for pair in roles.values() for s in pair] + [opening]
+def _strings(roles: dict[str, tuple[str, str]], opening: str,
+             preamble: str) -> list[str]:
+    return [s for pair in roles.values() for s in pair] + [opening, preamble]
 
 
 def _content_segments(content: Any, index: int) -> list[Segment]:

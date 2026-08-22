@@ -457,6 +457,13 @@ static int load_chatfmt(const char *model, chatfmt *f)
     const size_t n = fread(buf, 1, sizeof buf - 1, fp);
     fclose(fp);
     buf[n] = 0;
+    /* The HTTP formatter understands the extended preamble, token-stop and
+     * role-normalization schema used by GLM.  This stateful CLI does not:
+     * silently ignoring any field produces a plausible answer to the wrong
+     * prompt. -1 is fail-closed; --raw remains an explicit escape. */
+    if (strstr(buf, "\"preamble\"") || strstr(buf, "\"stop\"") ||
+            strstr(buf, "\"strip_roles\""))
+        return -1;
     jstr_field(buf, "\"system\"", 0, f->sys_p, sizeof f->sys_p);
     jstr_field(buf, "\"system\"", 1, f->sys_s, sizeof f->sys_s);
     jstr_field(buf, "\"user\"", 0, f->usr_p, sizeof f->usr_p);
@@ -478,6 +485,15 @@ static int load_chatfmt(const char *model, chatfmt *f)
     }
     f->have = f->usr_p[0] || f->asst_p[0] || f->open[0];
     return f->have;
+}
+
+static int extended_chatfmt_error(const char *model)
+{
+    fprintf(stderr, "%s/chat.json uses extended preamble/stop/strip_roles, "
+            "which the stateful `waste run`/`waste chat` formatter does not "
+            "implement; use `waste serve` /v1/chat/completions, or pass "
+            "--raw to request raw continuation explicitly\n", model);
+    return 2;
 }
 
 /* ---- commands ----------------------------------------------------------- */
@@ -865,7 +881,13 @@ static int cmd_run(int argc, char **argv)
      * the model actually sees. */
     chatfmt fmt;
     int r;
-    if (!o.raw && load_chatfmt(o.pos[0], &fmt)) {
+    const int chat_format = o.raw ? 0 : load_chatfmt(o.pos[0], &fmt);
+    if (chat_format < 0) {
+        waste_close(c);
+        free(prompt);
+        return extended_chatfmt_error(o.pos[0]);
+    }
+    if (chat_format > 0) {
         char head[MEDIA_HEAD_CAP];
         head[0] = 0;
         if (o.n_image) {
@@ -914,7 +936,11 @@ static int cmd_chat(int argc, char **argv)
     show_chosen_budget(c, &o);
 
     chatfmt fmt;
-    const int templated = !o.raw && load_chatfmt(o.pos[0], &fmt);
+    const int templated = o.raw ? 0 : load_chatfmt(o.pos[0], &fmt);
+    if (templated < 0) {
+        waste_close(c);
+        return extended_chatfmt_error(o.pos[0]);
+    }
     printf("%s\n", waste_build_info());
     if (templated)
         printf("chat format from %s/chat.json\n", o.pos[0]);

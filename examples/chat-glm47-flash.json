@@ -1,0 +1,9 @@
+{
+ "preamble": "[gMASK]<sop>",
+ "system": ["<|system|>", ""],
+ "user": ["<|user|>", ""],
+ "assistant": ["<|assistant|></think>", ""],
+ "strip_roles": ["assistant"],
+ "open": "<|assistant|></think>",
+ "stop": ["<|endoftext|>", "<|user|>", "<|observation|>"]
+}

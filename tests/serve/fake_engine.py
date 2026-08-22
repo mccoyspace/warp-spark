@@ -37,6 +37,14 @@ LINEAR_MARKERS = {11: "<|im_system|>", 12: "<|im_user|>",
                   13: "<|im_assistant|>", 14: "<|im_middle|>",
                   15: "<|im_end|>"}
 
+# GLM-4.7-Flash's released tokenizer ids. These include the preamble and
+# no-thinking close, not just role boundaries: all are emitted in markup
+# mode by examples/chat-glm47-flash.json.
+GLM_MARKERS = {154820: "<|endoftext|>", 154822: "[gMASK]",
+               154824: "<sop>", 154826: "<|system|>",
+               154827: "<|user|>", 154828: "<|assistant|>",
+               154829: "<|observation|>", 154842: "</think>"}
+
 # Ordinary text starts here, so no piece of content can collide with a
 # marker id — the same separation the real container gets from its
 # reserved block.

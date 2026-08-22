@@ -188,7 +188,7 @@ class ChatServer(ThreadingHTTPServer):
                 self.markers = fmt.markers
                 self.chat_format = fmt
                 self.chat_error = None
-                self.stop_tokens = [fmt.stop_id]
+                self.stop_tokens = list(fmt.stop_ids)
                 # No think markup in such a container, so the channel does
                 # not exist to default on. A request that asks for it is
                 # refused by the renderer rather than answered without it.

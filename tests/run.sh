@@ -94,6 +94,34 @@ else
     head -20 "$TMP/lock.log"
 fi
 
+# GLM's stateless HTTP format has a one-time preamble and several token-id
+# stops. The stateful C commands do not implement those fields yet: they must
+# refuse rather than silently send a different prompt. --raw is the explicit
+# bypass for callers who really do want continuation.
+if [ -d "$LOCK_MODEL" ]; then
+    cp examples/chat-glm47-flash.json "$LOCK_MODEL/chat.json"
+    out=$(./waste run "$LOCK_MODEL" x --budget 64M -n 1 2>&1)
+    rc=$?
+    if [ "$rc" -ne 0 ] && printf '%s' "$out" |
+            grep -q "extended preamble/stop/strip_roles"; then
+        ok "stateful CLI refuses extended chat.json instead of ignoring it"
+    else
+        no "stateful CLI did not fail closed on extended chat.json"
+    fi
+    raw=$(./waste run "$LOCK_MODEL" x --raw --budget 64M -n 1 --quiet 2>&1)
+    raw_rc=$?
+    if ! printf '%s' "$raw" | grep -q "extended preamble/stop/strip_roles" &&
+            { [ "$raw_rc" -eq 0 ] ||
+              printf '%s' "$raw" | grep -q "tokenize: unsupported"; }; then
+        ok "--raw explicitly bypasses the extended chat formatter"
+    else
+        no "--raw did not bypass the extended chat formatter"
+    fi
+    rm -f "$LOCK_MODEL/chat.json"
+else
+    sk "extended chat.json CLI refusal" "no synthetic container"
+fi
+
 # ---------------------------------------------------------------- unit ----
 head_ "kernels vs the reference implementations"
 
