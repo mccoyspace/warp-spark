@@ -42,6 +42,7 @@ the runs after.
 """
 
 import argparse
+import base64
 import io
 import json
 import os
@@ -85,6 +86,175 @@ def atomic_text(path, value):
         out.flush()
         os.fsync(out.fileno())
     os.replace(tmp, path)
+
+
+# Hugging Face's ByteLevel pre-tokenizer maps every byte onto a printable
+# Unicode code point before the BPE sees it.  tokenizer.json stores vocab keys
+# in that mapped alphabet; WARP's rank file stores the original bytes.  This is
+# the inverse of tokenizers' GPT-2 byte-to-unicode table.
+def _bytelevel_inverse():
+    bs = (list(range(ord("!"), ord("~") + 1)) +
+          list(range(ord("¡"), ord("¬") + 1)) +
+          list(range(ord("®"), ord("ÿ") + 1)))
+    cs = list(bs)
+    n = 0
+    for b in range(256):
+        if b not in bs:
+            bs.append(b)
+            cs.append(256 + n)
+            n += 1
+    return {chr(c): b for b, c in zip(bs, cs)}
+
+
+# The C tokenizer implements this pre-token split.  Accepting a tokenizer.json
+# with a different split would produce a valid-looking rank file and silently
+# different prompts, so this converter is deliberately narrow.
+_HF_BYTELEVEL_PATTERN = (
+    r"(?i:'s|'t|'re|'ve|'m|'ll|'d)|[^\r\n\p{L}\p{N}]?\p{L}+|"
+    r"\p{N}{1,3}| ?[^\s\p{L}\p{N}]+[\r\n]*|\s*[\r\n]+|"
+    r"\s+(?!\S)|\s+"
+)
+
+
+def _hf_bytelevel_bpe(doc):
+    """Return ``(vocab_by_id, added_tokens)`` for the one HF tokenizer.json
+    shape WARP can translate exactly, or raise instead of guessing.
+
+    The merge list is not copied: WARP/tiktoken derives merge priority from
+    the token ids in the rank file.  The differential check covers that
+    equivalence for the release used to qualify this path.
+    """
+    model = doc.get("model") or {}
+    pre = doc.get("pre_tokenizer") or {}
+    parts = pre.get("pretokenizers") or []
+    split = parts[0] if len(parts) == 2 else {}
+    bytelevel = parts[1] if len(parts) == 2 else {}
+    pattern = (split.get("pattern") or {}).get("Regex")
+    decoder = doc.get("decoder") or {}
+
+    supported = (
+        doc.get("normalizer") is None and
+        model.get("type") == "BPE" and
+        model.get("dropout") is None and
+        model.get("unk_token") is None and
+        model.get("continuing_subword_prefix") is None and
+        model.get("end_of_word_suffix") is None and
+        model.get("byte_fallback") is False and
+        model.get("ignore_merges") is True and
+        pre.get("type") == "Sequence" and len(parts) == 2 and
+        split.get("type") == "Split" and pattern == _HF_BYTELEVEL_PATTERN and
+        split.get("behavior") == "Isolated" and
+        split.get("invert") is False and
+        bytelevel.get("type") == "ByteLevel" and
+        bytelevel.get("add_prefix_space") is False and
+        bytelevel.get("use_regex") is False and
+        decoder.get("type") == "ByteLevel"
+    )
+    if not supported:
+        raise ValueError(
+            "tokenizer.json is not the qualified byte-level BPE shape; "
+            "refusing to emit a tokenizer.model that may tokenize differently")
+
+    vocab = model.get("vocab")
+    if not isinstance(vocab, dict) or not vocab:
+        raise ValueError("tokenizer.json BPE vocabulary is empty")
+    ids = sorted(vocab.values())
+    if (any(not isinstance(i, int) for i in ids) or
+            ids != list(range(len(ids)))):
+        raise ValueError("tokenizer.json BPE ids must be dense from zero")
+
+    inv = _bytelevel_inverse()
+    by_id = [None] * len(ids)
+    decoded = set()
+    for text, token_id in vocab.items():
+        if not isinstance(text, str) or not text:
+            raise ValueError("tokenizer.json contains an empty BPE token")
+        try:
+            raw = bytes(inv[c] for c in text)
+        except KeyError as exc:
+            raise ValueError(
+                f"tokenizer.json token contains non-ByteLevel character "
+                f"U+{ord(exc.args[0]):04X}") from None
+        if raw in decoded:
+            raise ValueError("tokenizer.json maps two ids to the same bytes")
+        decoded.add(raw)
+        by_id[token_id] = raw
+
+    added = []
+    for ent in doc.get("added_tokens") or []:
+        token_id, text = ent.get("id"), ent.get("content")
+        if (not isinstance(token_id, int) or token_id < len(by_id) or
+                not isinstance(text, str) or not text):
+            raise ValueError("tokenizer.json has a malformed added token")
+        added.append((token_id, text))
+    if len({i for i, _ in added}) != len(added):
+        raise ValueError("tokenizer.json repeats an added-token id")
+    return by_id, sorted(added)
+
+
+def convert_tokenizer_json(src, dst):
+    """Translate a qualified HF ByteLevel BPE into WARP's rank file.
+
+    Returns the added tokens so a release without tokenizer_config.json can
+    still publish specials.json.  ``dst`` is replaced atomically.
+    """
+    with io.open(src, encoding="utf-8") as inp:
+        by_id, added = _hf_bytelevel_bpe(json.load(inp))
+    tmp = dst + ".tmp"
+    try:
+        with open(tmp, "wb") as out:
+            for token_id, raw in enumerate(by_id):
+                out.write(base64.b64encode(raw))
+                out.write(f" {token_id}\n".encode("ascii"))
+            out.flush()
+            os.fsync(out.fileno())
+        os.replace(tmp, dst)
+    except Exception:
+        try:
+            os.remove(tmp)
+        except FileNotFoundError:
+            pass
+        raise
+    return added
+
+
+def install_tokenizer(src_dir, out_dir):
+    """Install the tokenizer sidecars and return their special-token text.
+
+    Published tiktoken/tokenizer.model files keep precedence. tokenizer.json
+    is a fallback for releases such as GLM, not a reinterpretation of models
+    whose native rank file already works.
+    """
+    cfg_specials = []
+    p_cfg = os.path.join(src_dir, "tokenizer_config.json")
+    if os.path.exists(p_cfg):
+        dec = json.load(open(p_cfg)).get("added_tokens_decoder", {})
+        cfg_specials = sorted(
+            ((int(i), v["content"]) for i, v in dec.items()),
+            key=lambda x: x[0])
+
+    copied = False
+    for name in ("tiktoken.model", "tokenizer.model"):
+        src_tok = os.path.join(src_dir, name)
+        if os.path.exists(src_tok):
+            atomic_copyfile(src_tok, os.path.join(out_dir, "tokenizer.model"))
+            print(f"tokenizer: copied {name}")
+            copied = True
+            break
+
+    json_specials = []
+    p_json = os.path.join(src_dir, "tokenizer.json")
+    if not copied and os.path.exists(p_json):
+        json_specials = convert_tokenizer_json(
+            p_json, os.path.join(out_dir, "tokenizer.model"))
+        print("tokenizer: converted tokenizer.json byte-level BPE")
+
+    specials = cfg_specials or json_specials
+    if specials:
+        atomic_json(os.path.join(out_dir, "specials.json"),
+                    [{"id": i, "text": t} for i, t in specials])
+        print(f"special tokens: {len(specials)} written")
+    return {t for _, t in specials}
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from mxfp4 import ST, unblock_scale                             # noqa: E402
@@ -1187,30 +1357,11 @@ def main():
         print("codebooks: all layers cached, keeping existing codebooks.bin")
 
 
-    # ---- tokenizer: copy it in so the container is self-contained -------
-    for name in ("tiktoken.model", "tokenizer.model"):
-        src_tok = os.path.join(args.src, name)
-        if os.path.exists(src_tok):
-            atomic_copyfile(src_tok, os.path.join(args.out, "tokenizer.model"))
-            print(f"tokenizer: copied {name}")
-            break
-
-    # ---- special tokens --------------------------------------------------
-    # tiktoken's rank file holds only ordinary merges; the markup tokens live
-    # in tokenizer_config.json. Without them the engine splits <|open|> into
-    # six ordinary tokens, which silently destroys any chat template and the
-    # media markers an image would be wrapped in.
-    p_cfg = os.path.join(args.src, "tokenizer_config.json")
-    special_texts = set()
-    if os.path.exists(p_cfg):
-        dec = json.load(open(p_cfg)).get("added_tokens_decoder", {})
-        specials = sorted(((int(i), v["content"]) for i, v in dec.items()),
-                          key=lambda x: x[0])
-        if specials:
-            atomic_json(os.path.join(args.out, "specials.json"),
-                        [{"id": i, "text": t} for i, t in specials])
-            special_texts = {t for _, t in specials}
-            print(f"special tokens: {len(specials)} written")
+    # ---- tokenizer + special tokens --------------------------------------
+    # Native rank files keep precedence. Releases that ship only an HF
+    # tokenizer.json get the one qualified ByteLevel-BPE shape translated to
+    # the same rank file the C tokenizer already understands.
+    special_texts = install_tokenizer(args.src, args.out)
 
     # ---- chat template ---------------------------------------------------
     # HF keeps it either as a field in tokenizer_config.json or, more

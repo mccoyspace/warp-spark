@@ -1492,6 +1492,17 @@ else
     printf '%s\n' "$out" | grep -E "FAIL|Error|Traceback" | head -5
 fi
 
+# GLM ships tokenizer.json rather than a tiktoken rank file.  Only its exact
+# ByteLevel-BPE shape is translated; native rank files must keep precedence,
+# and an unsupported tokenizer must fail before publishing a partial file.
+if ! command -v python3 >/dev/null 2>&1; then
+    sk "tokenizer.json conversion" "python3 not installed"
+elif python3 -m unittest -q tests.test_convert_tokenizer_json >/dev/null 2>&1; then
+    ok "qualified tokenizer.json converts atomically and native ranks win"
+else
+    no "tokenizer.json conversion"
+fi
+
 # ---------------------------------------------------------------- serve ----
 head_ "serve (OpenAI-compatible server)"
 
