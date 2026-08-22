@@ -16,11 +16,12 @@
 > [upstream issue #11](https://github.com/sqliteai/warp/issues/11).
 > `tools/spark_cuda_serve.sh` is the qualified single-user GN100 server path.
 >
-> **Latest quarantined experiment:** strict CUDA VQ4P coverage is complete on
-> Kimi-Linear. In a direct matched GB10 run, VQ3R remained slightly faster
-> (12.731 versus 12.326 tok/s with Q0), so this is compatibility coverage rather
-> than a K3-profile change. See the
-> [VQ4P report](https://github.com/mccoyspace/warp-spark/blob/exp/cuda-vq4p-gb10/docs/GPU_VQ4P_GB10.md).
+> **Latest quarantined experiment:** Kimi K2 CUDA dense and VQ3R support is
+> complete for an exact, fail-closed model fingerprint. The selected GB10
+> profile averaged **2.748 tok/s**, reached **3.001 tok/s**, and was **2.25x**
+> the matched CPU fallback. Greedy tokens and ordered routes were unchanged in
+> 195 causal comparisons, and a 4,608-token resident soak completed without
+> swap I/O or memory growth. See the [K2 GB10 report](docs/K2_GB10.md).
 
 This fork follows the WARP project name. Upstream intentionally retains the
 `waste` executable, C API names, environment variables, and `.waste` container
@@ -133,11 +134,13 @@ dims are the only positional signal there is. A container built before this was
 not degraded, it was unordered — it could not tell which turn of a conversation
 came first.
 
-No throughput figures here, because nobody on this project has a K2 container.
-What has been measured, by [@fab2s](https://github.com/fab2s) who contributed
-both changes: a `Kimi-K2-Instruct` conversion — 61 layers, 384 experts top-8,
-VQ3R, a 354 GB expert set and a 6.9 GB trunk — opens and reports 1.03 T
-parameters total, 31.69 B active per token; and the rotary arithmetic agrees to
+The GB10 lab fork has now converted and qualified Kimi-K2-Instruct. Its
+experimental CUDA profile averages 2.748 tok/s versus a 1.223 tok/s CPU
+fallback; see [docs/K2_GB10.md](docs/K2_GB10.md). Earlier conversion work by
+[@fab2s](https://github.com/fab2s), who contributed both DeepSeek-family
+changes, established the same shape: 61 layers, 384 experts top-8, VQ3R, about
+1.03 T parameters total and 31.69 B active per token. The rotary arithmetic
+agrees to
 0.000023% relative L2 with an oracle whose YaRN helpers are taken verbatim from
 the DeepSeek release's own `modeling_deepseek.py`.
 
