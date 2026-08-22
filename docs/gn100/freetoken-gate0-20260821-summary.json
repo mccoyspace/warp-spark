@@ -1,0 +1,127 @@
+{
+  "schema": "warp.spark.freetoken_gate0.v1",
+  "date": "2026-08-21",
+  "machine": "gn100-77bd / NVIDIA DGX Spark-class GB10",
+  "status": "full_layer_stream_rejected_at_gate0",
+  "source": {
+    "base_revision": "4bba3d37ce29bb7415a437ddd03e5754f4a26204",
+    "tested_tree_content_sha256": "e48b35b044459f83cd3f1c555ff7b77a0a66ebe324ce492c4fce83327527b52a",
+    "model_c_sha256": "a9313ce1f541d302bf37be9939cfd0bfe469570f28efe0e862bb065dc1f14053",
+    "prefix_cache_py_sha256": "90e132a7c0e572fb3a64905357d2ddee60200e3f996dfb85bd8d48f2fe04e2b8",
+    "prefill_trace_py_sha256": "3d9fa27b0c47f34e64d64c8ab9b59c3426ca491156b3c5dc6ad3b22c7190627e"
+  },
+  "model": {
+    "name": "k3",
+    "layers": 93,
+    "moe_layers": 92,
+    "experts_per_layer": 896,
+    "manifest_sha256": "da3232925d8eeaf0df07ee45743f6467c7eecbc4c0e2513899028e788a1a07f2"
+  },
+  "profile": {
+    "build": "make -j8 WASTE_NATIVE=1 WASTE_ENABLE_CUDA=1 all test",
+    "cli_budget_bytes": 93024636928,
+    "server_budget_bytes": 95172120576,
+    "expert_cache_bytes": 62075813472,
+    "cpu_set": "5-9,15-19",
+    "threads": 10,
+    "direct_io": true,
+    "io_threads": 2,
+    "io_depth": 2,
+    "lookahead": 0,
+    "q8": 1,
+    "sdot": 0,
+    "i8mm": 0,
+    "cuda_kda": 1,
+    "cuda_dense": 2,
+    "cuda_vq": 2,
+    "cuda_vq_group": 1,
+    "xpar": 0,
+    "pm_qos_latency_us": 0
+  },
+  "semantic_anchor_real_k3": {
+    "prefix_reservation_bytes": 2147483648,
+    "entry_limit": 4,
+    "requests": [
+      {
+        "label": "cold_75_tokens",
+        "elapsed_seconds": 213.040,
+        "physical_read_bytes": 366087163904,
+        "status": "miss",
+        "anchor_cached_tokens": 64
+      },
+      {
+        "label": "paris_branch_161_tokens",
+        "elapsed_seconds": 273.238,
+        "physical_read_bytes": 508852117504,
+        "status": "hit",
+        "restored_tokens": 64,
+        "anchor_cached_tokens": 128
+      },
+      {
+        "label": "edited_at_token_109",
+        "prompt_tokens": 162,
+        "elapsed_seconds": 274.785,
+        "physical_read_bytes": 512189353984,
+        "status": "hit",
+        "restored_tokens": 64,
+        "anchor_cached_tokens": 128
+      }
+    ],
+    "final_cache": {
+      "entries": 3,
+      "anchor_entries": 3,
+      "anchor_hits": 2,
+      "anchor_admissions": 3,
+      "bytes_used": 1412379360,
+      "evictions": 0,
+      "admission_rejects": 0,
+      "restore_failures": 0,
+      "snapshot_failures": 0,
+      "allocation_failures": 0
+    }
+  },
+  "prefill_trace": {
+    "raw_user_tokens": 64,
+    "runtime_chunk_tokens": [64, 21],
+    "trace_sha256": "84c442ec33a6cb8c1525d3715d36ffb7d866c603b6e5836ef5a3c3d01fdfcf0f",
+    "trace_bytes": 86214,
+    "summary_sha256": "7348f14ea9b4b27fc4f9fb33e02c6148e818cd942c5400ac781fc6de72d1dbc5",
+    "qos_status_sha256": "0370300627c8c51327b061a27ed01a7d78296b051de8eaab1c3e39f5eea07b8c",
+    "qos_fd_closed": true,
+    "child_returncode": 0,
+    "complete_64_token_chunk": {
+      "rows": 93,
+      "expert_density_mean": 0.3511136451956522,
+      "expert_density_p95": 0.458705357,
+      "cache_hit_rate": 0.055868431054140896,
+      "physical_read_bytes": 339027779584,
+      "logical_demand_bytes": 359089549312,
+      "full_layer_stream_bytes": 1022716018688,
+      "full_to_physical_ratio": 3.016614213569494,
+      "optimistic_cache_credit_bytes": 62075813472,
+      "optimistic_stream_lower_bound_bytes": 960640205216,
+      "optimistic_lower_bound_to_physical_ratio": 2.833514723763174,
+      "layer_seconds": 179.83978459,
+      "attention_seconds": 97.67648793,
+      "feed_forward_seconds": 81.427708632,
+      "expert_acquire_seconds": 3.608397331
+    },
+    "tail_21_token_chunk": {
+      "rows": 93,
+      "expert_density_mean": 0.16816284936956521,
+      "expert_density_p95": 0.213169643,
+      "physical_read_bytes": 155010359296,
+      "logical_demand_bytes": 171982839808,
+      "full_layer_stream_bytes": 1022716018688,
+      "full_to_physical_ratio": 6.59772690891628,
+      "layer_seconds": 60.366960708
+    }
+  },
+  "decision": {
+    "implement_full_layer_loader": false,
+    "failed_gate": "projected full-layer physical traffic must not exceed 1.75x product control",
+    "observed_literal_ratio": 3.016614213569494,
+    "optimistic_cache_credit_ratio": 2.833514723763174,
+    "qualified_profile_changed": false
+  }
+}

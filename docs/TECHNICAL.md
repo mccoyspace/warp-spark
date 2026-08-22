@@ -153,6 +153,10 @@ The same idea was implemented and removed from chunked prefill. A 64-token
 chunk touches roughly 550 distinct experts per layer, evicts speculative
 records before using them, and increased reads by 6.9% without improving wall
 time. The detailed record is in [LEARNED.md](LEARNED.md), sections 34–39.
+The more aggressive complete-layer alternative is therefore gated by the
+instrument-first preregistration in
+[FULL_LAYER_PREFILL_EXPERIMENT.md](FULL_LAYER_PREFILL_EXPERIMENT.md), not an
+assumed follow-on optimization.
 
 ## The failed 3-bit trunk
 

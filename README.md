@@ -278,7 +278,9 @@ Useful references:
 - [docs/BACKENDS.md](docs/BACKENDS.md): CPU, SIMD, and Metal backends;
 - [docs/KDA.md](docs/KDA.md): Kimi Delta Attention;
 - [docs/GATES.md](docs/GATES.md): correctness and performance gates;
-- [docs/RESEARCH.md](docs/RESEARCH.md): current research directions.
+- [docs/RESEARCH.md](docs/RESEARCH.md): current research directions;
+- [docs/PREFIX_CACHE.md](docs/PREFIX_CACHE.md): exact root, head, and semantic-anchor snapshots;
+- [docs/FULL_LAYER_PREFILL_EXPERIMENT.md](docs/FULL_LAYER_PREFILL_EXPERIMENT.md): preregistered GB10 full-layer prefill experiment;
 - [docs/TECHNICAL.md](docs/TECHNICAL.md): detailed measurements and technical experiments.
 
 ## License
