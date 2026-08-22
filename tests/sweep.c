@@ -729,7 +729,7 @@ int main(int argc, char **argv)
                  decode_cuda_mode != 1 || cuda_fallbacks != 0 ||
                  cuda_calls != expected_kda_calls ||
                  dense_effective != decode_dense_scope ||
-                 decode_dense_scope != 2 ||
+                 !vq_dense_ok ||
                  dense_calls != expected_dense_calls ||
                  vq_effective != decode_vq_mode ||
                  decode_vq_mode != value ||
@@ -747,7 +747,7 @@ int main(int argc, char **argv)
                         " launches=%" PRIu64 "/%" PRIu64
                         " syncs=%" PRIu64 "/%" PRIu64
                         ", fallbacks=%" PRIu64 "\n",
-                        value, cuda_effective, decode_cuda_mode,
+                        value, cuda_effective, expected_kda_effective,
                         cuda_calls, expected_kda_calls,
                         dense_effective, decode_dense_scope,
                         dense_calls, expected_dense_calls,
