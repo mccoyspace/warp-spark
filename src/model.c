@@ -87,6 +87,17 @@ static double pnow(void)
 #define PROF_END(b)   do { if (prof_on) { pthread_mutex_lock(&prof_mu); \
     waste_prof[b] += pnow() - _t##b; waste_prof_n[b]++; \
     pthread_mutex_unlock(&prof_mu); } } while (0)
+/* The prefill trace needs the same read_expert wall interval as P_EDEQ.
+ * Share its two existing gates so an unset trace adds no inner-loop branch. */
+#define PROF_ACC_START(b, acc) \
+    const int _on##b = prof_on || (acc); \
+    double _t##b = _on##b ? pnow() : 0
+#define PROF_ACC_END(b, acc) do { if (_on##b) { \
+    if (acc) *(acc) += pnow() - _t##b; \
+    if (prof_on) { pthread_mutex_lock(&prof_mu); \
+        waste_prof[b] += pnow() - _t##b; waste_prof_n[b]++; \
+        pthread_mutex_unlock(&prof_mu); } \
+    } } while (0)
 
 static char *slurp(const char *path, size_t *len)
 {
@@ -202,6 +213,7 @@ static int sdot_on = 0;    /* 1 = also quantize activations (SDOT path)  */
 static int i8mm_on = 0;    /* SMMLA batched matmul; costs activation int8 */
 static const char *dump_route = NULL;  /* WASTE_DUMP_ROUTE, see moe_layer */
 static const char *dump_route_margin = NULL; /* WASTE_DUMP_ROUTE_MARGIN */
+static const char *dump_prefill = NULL; /* WASTE_DUMP_PREFILL, JSONL */
 /* Absolute position of the first token of the pass being routed. The dump
  * names each row by the token it belongs to rather than leaving a reader
  * to infer it from where the layer index wraps — which is a heuristic
@@ -232,6 +244,7 @@ static void model_opts_init(void)
      * times a token and getenv is not free. */
     dump_route = getenv("WASTE_DUMP_ROUTE");
     dump_route_margin = getenv("WASTE_DUMP_ROUTE_MARGIN");
+    dump_prefill = getenv("WASTE_DUMP_PREFILL");
     /* How many of the next layer's experts to fetch on the router's guess.
      * The layer boundary holds about six reads and the prediction's
      * precision falls off past there, so that is the default. 0 is off. */
@@ -4699,7 +4712,8 @@ static int prefill_alloc(waste_model *m, int T)
  * are per layer), so they are built once per token and reused across every
  * expert that token routes to.
  */
-static void moe_chunk(waste_model *m, int L, const float *in, float *out, int nT)
+static int moe_chunk(waste_model *m, int L, const float *in, float *out,
+                     int nT, double *expert_acquire_s)
 {
     const waste_config *c = &m->cfg;
     const int E = c->n_experts, K = c->top_k, hid = c->hidden;
@@ -4797,9 +4811,9 @@ static void moe_chunk(waste_model *m, int L, const float *in, float *out, int nT
     for (int u = w; u < w + wn; u++) {
         const int e = used_ids[u];
 
-        PROF_START(P_EDEQ);
+        PROF_ACC_START(P_EDEQ, expert_acquire_s);
         const uint8_t *rec = read_expert(m, L, e);
-        PROF_END(P_EDEQ);
+        PROF_ACC_END(P_EDEQ, expert_acquire_s);
         if (!rec) goto chunk_lost;       /* see moe_layer: the chunk is lost */
         const waste_expert_hdr *h = (const waste_expert_hdr *)rec;
         const uint16_t *s16 = (const uint16_t *)(rec + h->chan_corr_off);
@@ -4883,6 +4897,73 @@ chunk_lost:
                  "%smodel.layers.%d.block_sparse_moe.shared_experts.down_proj.weight",
                  c->prefix, L)), sa, hid, si, nT);
     for (int i = 0; i < nT * hid; i++) out[i] += sh[i];
+    return n_used;
+}
+
+static pthread_mutex_t dump_prefill_mu = PTHREAD_MUTEX_INITIALIZER;
+
+typedef struct {
+    int pos0, tokens, layer, is_moe, experts_unique, ok;
+    uint64_t cache_hits, cache_misses, physical_bytes_read;
+    double layer_s, attention_s, feed_forward_s, expert_acquire_s;
+} prefill_layer_trace;
+
+/* One JSON object per completed prefill layer. Rows are buffered until every
+ * layer finishes, so trace-file latency cannot distort the next layer's
+ * timing. The environment gate keeps waste_stats as a small stable aggregate
+ * ABI; these rows are campaign evidence rather than product counters. */
+static void dump_prefill_rows(const waste_model *m,
+                              const prefill_layer_trace *rows, int n_rows)
+{
+    if (!dump_prefill || !*dump_prefill || n_rows <= 0) return;
+    pthread_mutex_lock(&dump_prefill_mu);
+    FILE *f = fopen(dump_prefill, "a");
+    if (f) {
+        for (int i = 0; i < n_rows; i++) {
+            const prefill_layer_trace *r = rows + i;
+            const long long record_bytes = r->is_moe
+                ? (long long)m->bank[r->layer].rec_bytes : 0;
+            const unsigned long long logical = r->is_moe
+                ? (unsigned long long)r->experts_unique *
+                  (unsigned long long)record_bytes : 0;
+            const unsigned long long full_bank = r->is_moe
+                ? (unsigned long long)m->cfg.n_experts *
+                  (unsigned long long)record_bytes : 0;
+            fprintf(f,
+                "{\"schema\":\"waste-prefill-v1\",\"pos\":%d,"
+                "\"tokens\":%d,\"layer\":%d,\"moe\":%s,"
+                "\"experts_total\":%d,\"selected_pairs\":%d,"
+                "\"experts_unique\":%d,\"expert_density\":%.9g,"
+                "\"expert_record_bytes\":%lld,"
+                "\"logical_expert_bytes\":%llu,"
+                "\"full_bank_bytes\":%llu,"
+                "\"cache_hits\":%llu,\"cache_misses\":%llu,"
+                "\"physical_bytes_read\":%llu,"
+                "\"layer_ms\":%.6f,\"attention_ms\":%.6f,"
+                "\"feed_forward_ms\":%.6f,\"moe_ms\":%.6f,"
+                "\"expert_acquire_ms\":%.6f,"
+                "\"ok\":%s}\n",
+                r->pos0, r->tokens, r->layer,
+                r->is_moe ? "true" : "false",
+                r->is_moe ? m->cfg.n_experts : 0,
+                r->is_moe ? r->tokens * m->cfg.top_k : 0,
+                r->experts_unique,
+                r->is_moe && m->cfg.n_experts
+                    ? (double)r->experts_unique /
+                      (double)m->cfg.n_experts : 0.0,
+                record_bytes, logical, full_bank,
+                (unsigned long long)r->cache_hits,
+                (unsigned long long)r->cache_misses,
+                (unsigned long long)r->physical_bytes_read,
+                r->layer_s * 1000.0, r->attention_s * 1000.0,
+                r->feed_forward_s * 1000.0,
+                r->is_moe ? r->feed_forward_s * 1000.0 : 0.0,
+                r->expert_acquire_s * 1000.0,
+                r->ok ? "true" : "false");
+        }
+        fclose(f);
+    }
+    pthread_mutex_unlock(&dump_prefill_mu);
 }
 
 /* Prefill a chunk. KDA and MLA still walk the tokens in order — the
@@ -4945,12 +5026,31 @@ const float *waste_model_prefill(waste_model *m, const int *tokens, int n,
     const int ares_on = c->attn_res_block > 0;
     int nb = 0;
     int ps_live = 0;
+    /* Diagnostic-only storage is absent from the qualified path. An unlikely
+     * allocation failure merely suppresses this trace, like an fopen failure
+     * in dump_prefill_rows; inference itself remains exact and available. */
+    const int trace_requested = dump_prefill && *dump_prefill;
+    prefill_layer_trace *trace_rows = trace_requested
+        ? (prefill_layer_trace *)malloc(
+            (size_t)c->n_layers * sizeof *trace_rows)
+        : NULL;
+    prefill_layer_trace *trace_next = trace_rows;
+    int n_trace_rows = 0;
 
     for (int L = 0; L < c->n_layers; L++) {
         /* A record already failed: stop instead of streaming the rest of
          * the layers from a container that has been shown to be wrong.
          * On K3 that is gigabytes of pointless reads per token. */
         if (m->read_error) break;
+        prefill_layer_trace *r = trace_next;
+        if (r) {
+            *r = (prefill_layer_trace) {
+                .cache_hits = m->cache.hits,
+                .cache_misses = m->cache.misses,
+                .physical_bytes_read = m->cache.bytes_read,
+                .layer_s = pnow()
+            };
+        }
         if (ares_on) {
             memcpy(m->cprefix, m->cx, (size_t)n * hid * sizeof(float));
             ps_live = 1;
@@ -4978,6 +5078,7 @@ const float *waste_model_prefill(waste_model *m, const int *tokens, int n,
             waste_rmsnorm(m->cnorm + (size_t)t * hid, m->cx + (size_t)t * hid, iln, hid, c->eps);
 
         /* attention: per token, but on the batched norm buffer */
+        if (r) r->attention_s = pnow();
         for (int t = 0; t < n; t++) {
             if (c->kda_layer[L])
                 (void)kda_layer(m, L, m->cnorm + (size_t)t * hid,
@@ -4985,6 +5086,7 @@ const float *waste_model_prefill(waste_model *m, const int *tokens, int n,
             else (void)mla_layer(m, L, m->cnorm + (size_t)t * hid,
                                  m->cresid + (size_t)t * hid, pos0 + t, 0);
         }
+        if (r) r->attention_s = pnow() - r->attention_s;
 
         if (ares_on) {
             if (ps_live) for (int i = 0; i < n * hid; i++) m->cprefix[i] += m->cresid[i];
@@ -5004,9 +5106,15 @@ const float *waste_model_prefill(waste_model *m, const int *tokens, int n,
         for (int t = 0; t < n; t++)
             waste_rmsnorm(m->cnorm + (size_t)t * hid, m->cx + (size_t)t * hid, pln, hid, c->eps);
 
-        if (waste_find(m, tname("%smodel.layers.%d.block_sparse_moe.gate.weight", c->prefix, L))) {
+        const int is_moe = waste_find(m, tname(
+            "%smodel.layers.%d.block_sparse_moe.gate.weight",
+            c->prefix, L)) != NULL;
+        int n_used = 0;
+        if (r) r->feed_forward_s = pnow();
+        if (is_moe) {
             PROF_START(P_ROUTE);
-            moe_chunk(m, L, m->cnorm, m->cresid, n);
+            n_used = moe_chunk(m, L, m->cnorm, m->cresid, n,
+                               r ? &r->expert_acquire_s : NULL);
             PROF_END(P_ROUTE);
         } else {
             const int inter = c->dense_inter;
@@ -5018,6 +5126,7 @@ const float *waste_model_prefill(waste_model *m, const int *tokens, int n,
                                    : silu(a[i]) * b[i];
             waste_matmul_t(m, m->cresid, waste_find(m, tname("%smodel.layers.%d.mlp.down_proj.weight", c->prefix, L)), a, hid, inter, n);
         }
+        if (r) r->feed_forward_s = pnow() - r->feed_forward_s;
 
         if (ares_on) {
             for (int i = 0; i < n * hid; i++) m->cprefix[i] += m->cresid[i];
@@ -5025,6 +5134,25 @@ const float *waste_model_prefill(waste_model *m, const int *tokens, int n,
         } else {
             for (int i = 0; i < n * hid; i++) m->cx[i] += m->cresid[i];
         }
+        if (r) {
+            r->pos0 = pos0;
+            r->tokens = n;
+            r->layer = L;
+            r->is_moe = is_moe;
+            r->experts_unique = n_used;
+            r->ok = !m->read_error;
+            r->cache_hits = m->cache.hits - r->cache_hits;
+            r->cache_misses = m->cache.misses - r->cache_misses;
+            r->physical_bytes_read =
+                m->cache.bytes_read - r->physical_bytes_read;
+            r->layer_s = pnow() - r->layer_s;
+            trace_next++;
+            n_trace_rows++;
+        }
+    }
+    if (trace_rows) {
+        dump_prefill_rows(m, trace_rows, n_trace_rows);
+        free(trace_rows);
     }
 
     /* hand the chunk's block-residual history to the per-token path: decode

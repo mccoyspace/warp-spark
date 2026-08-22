@@ -288,6 +288,26 @@ version that shipped keeps the decode-style LUT arithmetic and reorganizes
 not the expert, so they are built once per token and reused across every
 expert that token routes to.
 
+For prefill scheduling experiments, `WASTE_DUMP_PREFILL=path` appends one
+`waste-prefill-v1` JSON object per completed layer of every multi-token chunk.
+The opt-in rows report chunk position/length, exact distinct-expert union and
+density, record/logical/full-bank bytes, layer-local cache deltas, and
+wall/attention/feed-forward/expert-acquire time. The union is the one
+`moe_chunk` already computes for execution, not a second routing pass. Rows are
+buffered until the layer loop completes so trace-file writes do not contaminate
+subsequent layer timers. The default path allocates no trace buffer and
+performs no trace clock calls or file I/O.
+
+```bash
+WASTE_DUMP_PREFILL=prefill.jsonl waste bench MODEL
+python3 tools/prefill_trace.py prefill.jsonl
+python3 tools/prefill_trace.py --json prefill.jsonl > prefill-summary.json
+```
+
+Trace runs establish mechanism and freeze an experimental threshold; matched
+performance arms should run without tracing. Single-token tail chunks use the
+ordinary decode path and therefore emit no prefill-layer row.
+
 ## Session state
 
 `waste_state_save` / `waste_state_load` persist the whole session: KDA

@@ -529,6 +529,39 @@ PY
     else no "chunked prefill diverges"
     fi
 
+    PREFILL_TRACE="$TMP/prefill-layer.jsonl"
+    rm -f "$PREFILL_TRACE"
+    WASTE_CHUNK=1 WASTE_DUMP_PREFILL="$PREFILL_TRACE" \
+        ./test_forward "$MODEL" "$IDS" "$TMP/prefill-trace.bin" 0 \
+        >/dev/null 2>&1
+    if cmp -s "$TMP/chunk.bin" "$TMP/prefill-trace.bin" &&
+       python3 tools/prefill_trace.py --json "$PREFILL_TRACE" \
+           > "$TMP/prefill-layer-summary.json" 2>/dev/null &&
+       python3 tools/prefill_trace.py --json \
+           "$PREFILL_TRACE" "$PREFILL_TRACE" \
+           > "$TMP/prefill-layer-summary-repeated.json" 2>/dev/null &&
+       python3 - "$TMP/prefill-layer-summary.json" <<'PY' &&
+import json, sys
+s = json.load(open(sys.argv[1]))
+assert s["rows"] > 0 and s["chunks"] > 0 and s["moe_rows"] > 0
+assert s["failed_rows"] == 0
+d = s["expert_density"]
+assert 0 < d["min"] <= d["mean"] <= d["max"] <= 1
+assert s["bytes"]["logical_demand"] > 0
+assert s["bytes"]["full_layer_stream"] >= s["bytes"]["logical_demand"]
+assert s["timing_ms"]["layers_total"] >= 0
+PY
+       python3 - "$TMP/prefill-layer-summary.json" \
+           "$TMP/prefill-layer-summary-repeated.json" <<'PY'
+import json, sys
+one, two = (json.load(open(path)) for path in sys.argv[1:])
+assert two["rows"] == 2 * one["rows"]
+assert two["chunks"] == 2 * one["chunks"]
+PY
+    then ok "prefill layer trace is parseable and bit-identical"
+    else no "prefill layer trace"
+    fi
+
     # WASTE_Q8=0 makes the entire trunk resident as f32 — 8x a 4-bit one, so
     # K3's 26 GiB trunk asks for ~210 GB and no host runs this. Say so
     # instead of reporting the refusal as a divergence.
