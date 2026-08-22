@@ -123,6 +123,12 @@ int main(void)
     CHECK(!waste_model_cuda_vq_dense_scope_compatible(&exact, 1));
     CHECK(!waste_model_cuda_vq_dense_scope_compatible(NULL, 2));
 
+    /* K2 is qualified for decode but never for this GLM-only pilot. */
+    exact.cuda_prefill_vq = 1;
+    exact.cuda_vq_mode = 2;
+    exact.cuda_vq_preflight_modes = 1 << 2;
+    CHECK(!waste_model_cuda_prefill_vq_compatible(&exact));
+
     waste_model changed = k2();
     strcpy(changed.cfg.arch, "KimiK3ForConditionalGeneration");
     CHECK(!waste_model_cuda_k2_dense_compatible(&changed));
@@ -162,6 +168,32 @@ int main(void)
     CHECK(!waste_model_cuda_k2_dense_compatible(&exact));
     CHECK(waste_model_cuda_vq_dense_scope_compatible(&exact, 2));
     CHECK(waste_model_cuda_vq_dense_scope_compatible(&exact, 3));
+    exact.cuda_vq_mode = 2;
+    exact.cuda_vq_preflight_modes = 1 << 2;
+    CHECK(!waste_model_cuda_prefill_vq_compatible(&exact));
+    exact.cuda_prefill_vq = 1;
+    CHECK(waste_model_cuda_prefill_vq_compatible(&exact));
+    exact.cuda_vq_mode = 1;
+    CHECK(!waste_model_cuda_prefill_vq_compatible(&exact));
+    exact.cuda_vq_mode = 2;
+    exact.cuda_vq_preflight_modes = 0;
+    CHECK(!waste_model_cuda_prefill_vq_compatible(&exact));
+
+    {
+        const int src_ids[] = { 51, 3, 29, 11 };
+        const float src_weights[] = { 0.51f, 0.03f, 0.29f, 0.11f };
+        int ids[4] = { 0 };
+        float weights[4] = { 0 };
+        CHECK(!waste_model_sort_route_copy(
+            src_ids, src_weights, 4, ids, weights));
+        CHECK(ids[0] == 3 && ids[1] == 11 &&
+              ids[2] == 29 && ids[3] == 51);
+        CHECK(weights[0] == 0.03f && weights[1] == 0.11f &&
+              weights[2] == 0.29f && weights[3] == 0.51f);
+        CHECK(src_ids[0] == 51 && src_weights[0] == 0.51f);
+        CHECK(waste_model_sort_route_copy(
+            src_ids, src_weights, 65, ids, weights) == -1);
+    }
 
     changed = glm47_flash();
     strcpy(changed.cfg.arch, "DeepseekV3ForCausalLM");

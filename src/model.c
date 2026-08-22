@@ -450,9 +450,9 @@ static void matvec_t(waste_model *m, float *y, const waste_tensor *t,
     }
 }
 
-/* One sticky failure domain covers every decode CUDA projection. A token may
- * already have advanced KDA, convolution, MLA-cache, or block-residual state,
- * so no CUDA arm is allowed to fall back halfway through it. */
+/* One sticky failure domain covers every CUDA projection. A token or prefill
+ * chunk may already have advanced KDA, convolution, MLA-cache, or
+ * block-residual state, so no CUDA arm may fall back halfway through it. */
 #if defined(WASTE_ENABLE_CUDA)
 static int cuda_projection_failed(waste_model *m, const char *scope)
 {
@@ -595,6 +595,47 @@ int waste_model_cuda_vq_dense_scope_compatible(const waste_model *m,
         (scope == 3 &&
          (waste_model_cuda_k2_vq3r_compatible(m) ||
           waste_model_cuda_glm47_flash_vq3r_compatible(m)));
+}
+
+/* The chunk-prefill pilot deliberately has a smaller allowlist than decode.
+ * It reuses the qualified mode-2 VQ primitive, but only GLM-4.7-Flash is the
+ * vehicle for this experiment. Requiring the completed runtime preflight as
+ * well as the static geometry keeps a directly mutated model struct from
+ * entering an untested path. */
+int waste_model_cuda_prefill_vq_compatible(const waste_model *m)
+{
+    return m && m->cuda_prefill_vq && m->cuda_vq_mode == 2 &&
+           (m->cuda_vq_preflight_modes & (1 << 2)) &&
+           waste_model_cuda_glm47_flash_vq3r_compatible(m);
+}
+
+/* Preserve the CPU chunk contract without disturbing the router-owned
+ * arrays (and therefore its trace): the CUDA pilot accumulates each token's
+ * expert outputs in ascending expert-id order, exactly as moe_chunk's
+ * expert-major loop does. */
+int waste_model_sort_route_copy(const int *src_ids, const float *src_weights,
+                                int n, int *dst_ids, float *dst_weights)
+{
+    if (!src_ids || !src_weights || !dst_ids || !dst_weights ||
+        n < 0 || n > WASTE_PF_MAX)
+        return -1;
+    for (int i = 0; i < n; i++) {
+        dst_ids[i] = src_ids[i];
+        dst_weights[i] = src_weights[i];
+    }
+    for (int i = 1; i < n; i++) {
+        const int id = dst_ids[i];
+        const float weight = dst_weights[i];
+        int j = i;
+        while (j > 0 && dst_ids[j - 1] > id) {
+            dst_ids[j] = dst_ids[j - 1];
+            dst_weights[j] = dst_weights[j - 1];
+            j--;
+        }
+        dst_ids[j] = id;
+        dst_weights[j] = weight;
+    }
+    return 0;
 }
 
 #if defined(WASTE_ENABLE_CUDA)
@@ -1645,12 +1686,15 @@ int waste_model_load(waste_model *m, const char *dir, int kv_cap,
         int vq_mode = e ? atoi(e) : 0;
         e = getenv("WASTE_CUDA_VQ_GROUP");
         int vq_group = e ? atoi(e) : 1;
+        e = getenv("WASTE_CUDA_PREFILL_VQ");
+        int prefill_vq = e ? atoi(e) != 0 : 0;
         const char *backend = getenv("WASTE_BACKEND");
         if (backend && !strcmp(backend, "cpu")) {
             mode = 0;
             scope = 0;
             vq_mode = 0;
             vq_group = 1;
+            prefill_vq = 0;
         }
         if (mode < 0) mode = 0;
         if (mode > 2) mode = 2;
@@ -1673,6 +1717,7 @@ int waste_model_load(waste_model *m, const char *dir, int kv_cap,
         m->cuda_dense_scope = scope;
         m->cuda_vq_mode = vq_mode;
         m->cuda_vq_group = vq_group;
+        m->cuda_prefill_vq = prefill_vq;
     }
 #endif
     m->kv_cap = kv_cap;
@@ -2129,6 +2174,13 @@ int waste_model_load(waste_model *m, const char *dir, int kv_cap,
         cuda_dense_preflight(m, m->cuda_dense_scope)) return -1;
     if (m->cuda_vq_mode &&
         cuda_vq_preflight(m, m->cuda_vq_mode)) return -1;
+    if (m->cuda_prefill_vq &&
+        !waste_model_cuda_prefill_vq_compatible(m)) {
+        fprintf(stderr,
+                "waste: WASTE_CUDA_PREFILL_VQ requires CUDA VQ mode 2, "
+                "completed preflight, and exact GLM-4.7-Flash VQ3R geometry\n");
+        return -1;
+    }
     if (m->cuda_vq_mode && xpar_on)
         fprintf(stderr,
                 "waste: WASTE_XPAR ignored while CUDA VQ owns routed-expert "
@@ -3486,12 +3538,14 @@ static void release_expert_holds(waste_model *m, waste_ecache_hold *hold,
 
 /* Queue several already-validated mode-2 expert kernels between stream
  * synchronizations. This changes only scheduling: SiTU and the final expert
- * sum remain the original CPU loops, and that sum consumes j in router order.
- * Explicit cache holds keep every pageable record pointer valid until CUDA
- * has drained the group. */
+ * sum remain the original CPU loops, and that sum consumes j in caller order
+ * (router order for decode, ascending expert id for chunk prefill). Explicit
+ * cache holds keep every pageable record pointer valid until CUDA drains the
+ * group. */
 static int moe_vq_grouped(waste_model *m, int L, const int *idx,
                           const float *weight, int K, const float *xin,
-                          float *ysum, int lat, int inter)
+                          float *ysum, int lat, int inter,
+                          double *expert_acquire_s)
 {
     const waste_config *c = &m->cfg;
     const int group = m->cuda_vq_group;
@@ -3508,9 +3562,9 @@ static int moe_vq_grouped(waste_model *m, int L, const int *idx,
             hold[s] = (waste_ecache_hold)WASTE_ECACHE_HOLD_INIT;
 
         for (int s = 0; s < count; s++) {
-            PROF_START(P_EDEQ);
+            PROF_ACC_START(P_EDEQ, expert_acquire_s);
             rec[s] = read_expert_hold(m, L, idx[j0 + s], &hold[s]);
-            PROF_END(P_EDEQ);
+            PROF_ACC_END(P_EDEQ, expert_acquire_s);
             if (!rec[s]) {
                 const int cuda_failed = waste_cuda_vq_group_drain(m);
                 release_expert_holds(m, hold, count);
@@ -3798,7 +3852,7 @@ static int moe_layer(waste_model *m, int L, const float *in, float *out, int *ro
     int routed_grouped = 0;
 #if defined(WASTE_ENABLE_CUDA)
     if (m->cuda_vq_mode == 2 && m->cuda_vq_group > 1) {
-        if (moe_vq_grouped(m, L, idx, w, K, xin, ysum, lat, inter))
+        if (moe_vq_grouped(m, L, idx, w, K, xin, ysum, lat, inter, NULL))
             return -1;
         routed_grouped = 1;
     }
@@ -4960,6 +5014,58 @@ static int moe_chunk(waste_model *m, int L, const float *in, float *out,
         for (int i = 0; i < nT * K; i++)
             if (route[i] == e) { used_ids[n_used++] = e; break; }
 
+#if defined(WASTE_ENABLE_CUDA)
+    if (m->cuda_prefill_vq) {
+        if (!waste_model_cuda_prefill_vq_compatible(m))
+            return cuda_projection_failed(m, "prefill VQ guard");
+        if (m->cache.n_slots < n_used) {
+            fprintf(stderr,
+                    "waste: CUDA prefill VQ needs %d cache slots for this "
+                    "layer's unique expert set (have %d)\n",
+                    n_used, m->cache.n_slots);
+            return cuda_projection_failed(m, "prefill VQ cache guard");
+        }
+
+        /* Retain the chunk path's unique ascending physical schedule. Each
+         * hint window is consumed before the next replaces it. Within a
+         * window, a record's first token access incurs the physical read and
+         * all later token accesses are cache hits on the qualified full-cache
+         * profile. Arithmetic is per token through the existing exact mode-2
+         * primitive; filtering sorted copies by ascending windows preserves
+         * the CPU chunk's fp32 accumulation order across all K experts. */
+        for (int u0 = 0; u0 < n_used; u0 += WASTE_PF_MAX) {
+            const int un = n_used - u0 < WASTE_PF_MAX
+                         ? n_used - u0 : WASTE_PF_MAX;
+            const int lo = used_ids[u0];
+            const int hi = used_ids[u0 + un - 1];
+            waste_ecache_hint(&m->cache, L, used_ids + u0, un);
+            for (int t = 0; t < nT; t++) {
+                int sorted_ids[WASTE_PF_MAX];
+                float sorted_weights[WASTE_PF_MAX];
+                if (waste_model_sort_route_copy(
+                        route + (size_t)t * K, rw + (size_t)t * K, K,
+                        sorted_ids, sorted_weights))
+                    return cuda_projection_failed(m, "prefill VQ route sort");
+                int nk = 0;
+                for (int j = 0; j < K; j++) {
+                    const int id = sorted_ids[j];
+                    if (id < lo || id > hi) continue;
+                    sorted_ids[nk] = id;
+                    sorted_weights[nk] = sorted_weights[j];
+                    nk++;
+                }
+                if (nk && moe_vq_grouped(
+                        m, L, sorted_ids, sorted_weights, nk,
+                        xin + (size_t)t * lat,
+                        ysum + (size_t)t * lat, lat, inter,
+                        expert_acquire_s))
+                    return -1;          /* sticky CUDA/read error; no fallback */
+            }
+        }
+        goto chunk_experts_done;
+    }
+#endif
+
     for (int w = 0; w < n_used; w += WASTE_PF_MAX) {
     const int wn = n_used - w < WASTE_PF_MAX ? n_used - w : WASTE_PF_MAX;
     waste_ecache_hint(&m->cache, L, used_ids + w, wn);
@@ -5020,6 +5126,9 @@ static int moe_chunk(waste_model *m, int L, const float *in, float *out,
     }
     }
 chunk_lost:
+#if defined(WASTE_ENABLE_CUDA)
+chunk_experts_done:
+#endif
 
     if (c->latent_dim) {
         if (c->latent_norm) {
@@ -5271,6 +5380,7 @@ const float *waste_model_prefill(waste_model *m, const int *tokens, int n,
             n_used = moe_chunk(m, L, m->cnorm, m->cresid, n,
                                r ? &r->expert_acquire_s : NULL);
             PROF_END(P_ROUTE);
+            if (n_used < 0) break;
         } else {
             const int inter = c->dense_inter;
             float *a = m->cff, *b = a + (size_t)n * inter;
@@ -5309,6 +5419,10 @@ const float *waste_model_prefill(waste_model *m, const int *tokens, int n,
         dump_prefill_rows(m, trace_rows, n_trace_rows);
         free(trace_rows);
     }
+    if (m->read_error || m->cuda_kda_state_dirty ||
+        ((m->cuda_kda_mode || m->cuda_dense_scope || m->cuda_vq_mode) &&
+         m->cuda_kda_failed))
+        return NULL;
 
     /* hand the chunk's block-residual history to the per-token path: decode
      * continues from the last token's row */
