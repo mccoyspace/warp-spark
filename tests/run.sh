@@ -1527,8 +1527,9 @@ if ! command -v python3 >/dev/null 2>&1; then
     sk "GLM converter metadata" "python3 not installed"
 elif python3 -m unittest -q \
         tests.test_convert_tokenizer_json tests.test_convert_glm \
+        tests.test_glm53_release \
         >/dev/null 2>&1; then
-    ok "GLM tokenizer, EOS and source-layer boundaries convert safely"
+    ok "GLM tokenizer, EOS, source boundaries and GLM-5.3 intake gate"
 else
     no "GLM converter metadata"
 fi
