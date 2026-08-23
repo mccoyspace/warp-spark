@@ -1,9 +1,10 @@
 # Full GLM-4.7 on NVIDIA GB10
 
-This note records a sanitized first experimental qualification of the full
-`zai-org/GLM-4.7` model on a 128 GiB NVIDIA GB10 system. It is a CPU-only
-bring-up result, not an upstream-supported model or performance claim. Raw
-prompts, completions, captures, and machine paths are intentionally excluded.
+This note records a sanitized experimental qualification of the full
+`zai-org/GLM-4.7` model on a 128 GiB NVIDIA GB10 system, from the initial CPU
+bring-up through narrowly gated coherent-memory CUDA pilots. It is not an
+upstream-supported model or a general performance claim. Raw prompts,
+completions, captures, and machine paths are intentionally excluded.
 
 The source checkpoint was pinned to Hugging Face revision
 [`602d01ef`](https://huggingface.co/zai-org/GLM-4.7/tree/602d01efcdd332c5238ca4bcede555defbe83eb7).
@@ -97,7 +98,48 @@ Reducing routing from top-8 to top-6 or top-4 also produced 1.38-1.40 tok/s on
 CPU, but changed the generated path. Those settings are retained only as
 unqualified approximate-profile candidates; neither is the default.
 
-After CUDA FFN/VQ promotion, standard GQA accounts for roughly 64% of the
-remaining decode time. Offloading only its Q/K/V/O projections is therefore
-the next bounded experiment. These short rows remain qualification evidence,
-not sustained or quality-benchmark claims.
+After CUDA FFN/VQ promotion, standard GQA accounted for roughly 64% of the
+remaining decode time. This motivated one further bounded pilot: move only
+its Q/K/V/O projections through the already qualified CUDA Q4 kernel.
+
+## CUDA GQA projection qualification
+
+The new arm, qualified at code commit `83add64`, is default-off and restricted
+to the exact full-GLM geometry and the qualified KDA-1, dense-3,
+VQ-2/group-1 base. Bias, per-head Q/K RMSNorm, half-split partial RoPE, fp32
+K/V state, score/value attention, routing, expert accumulation, and prompt
+prefill remain on the CPU. All 368 projection tensors are checked before
+decode, both matrix orientations receive a real preflight launch, and any
+CUDA failure stops the request without a CPU fallback.
+
+An interleaved control/test/test/control development run produced:
+
+| Arm | Repeat 1 | Repeat 2 | Mean effective rate |
+| --- | ---: | ---: | ---: |
+| CUDA FFN + VQ3R control | 4.694486 s, 1.704127 tok/s | 4.698418 s, 1.702701 tok/s | 1.703414 tok/s |
+| + CUDA GQA projections | 2.223362 s, 3.598155 tok/s | 2.217875 s, 3.607056 tok/s | 3.602606 tok/s |
+
+The projection arm was 2.115x the control's mean throughput. In a separately
+profiled pair, effective rate moved from 1.699467 to 3.627511 tok/s while the
+standard-GQA phase fell from 2.967868618 to 0.483058310 seconds, an 83.72%
+reduction. The candidate repeats were byte-identical. Against the controls,
+all greedy tokens, argmaxes, top-10 sets, and ordered routes were unchanged;
+maximum and mean absolute logit error were `9.5367e-6` and `6.5221e-7`.
+This passed the strict numerical contract, but the candidate logits were not
+bit-exact to the control.
+
+A different 16-token route pattern provided the held-out bracket:
+
+| Arm | Repeat 1 | Repeat 2 |
+| --- | ---: | ---: |
+| Control | 12.062276 s, 1.326449 tok/s | 12.224253 s, 1.308873 tok/s |
+| GQA projection candidate | 7.078026 s, 2.260517 tok/s | 7.077308 s, 2.260747 tok/s |
+
+The candidate was approximately 1.716x the bracketed control mean. Every arm
+read 52,160,634,880 expert bytes; all 11,392 routed selections were unchanged,
+and maximum absolute logit error was `1.04904e-5`. No swap I/O occurred.
+
+The arithmetic smoke still returned exactly `323` and stopped on the expected
+secondary EOS, now at 2.54 tok/s. A short studio-oriented check generated 70
+coherent tokens in 27.82 seconds (2.52 tok/s). These are short qualification
+rows on one host, not sustained-throughput or broad quality benchmarks.
