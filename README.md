@@ -283,6 +283,7 @@ Useful references:
 - [docs/GATES.md](docs/GATES.md): correctness and performance gates;
 - [docs/RESEARCH.md](docs/RESEARCH.md): current research directions;
 - [docs/PREFIX_CACHE.md](docs/PREFIX_CACHE.md): exact root, head, and semantic-anchor snapshots;
+- [docs/K3_PREFILL_GB10.md](docs/K3_PREFILL_GB10.md): K3 CUDA chunk-prefill qualification on GB10;
 - [docs/FULL_LAYER_PREFILL_EXPERIMENT.md](docs/FULL_LAYER_PREFILL_EXPERIMENT.md): preregistered GB10 full-layer prefill experiment;
 - [docs/TECHNICAL.md](docs/TECHNICAL.md): detailed measurements and technical experiments.
 
