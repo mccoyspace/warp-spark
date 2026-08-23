@@ -337,6 +337,8 @@ CONFIG_ALIASES = (
 CONFIG_FLAG_ALIASES = (("moe_renormalize", "norm_topk_prob"),)
 
 GLM47_FULL_ARCH = "Glm4MoeForCausalLM"
+GLM52_ARCH = "GlmMoeDsaForCausalLM"
+GLM52_DENSE_CONTEXT = 2048
 
 
 def hf_architecture(cfg):
@@ -350,6 +352,12 @@ def is_glm47_full(cfg):
     """True only for the official full GLM-4.7 causal-LM architecture."""
     return (hf_architecture(cfg) == GLM47_FULL_ARCH and
             cfg.get("model_type") == "glm4_moe")
+
+
+def is_glm52(cfg):
+    """True only for the official GLM-5.x DSA causal-LM architecture."""
+    return (hf_architecture(cfg) == GLM52_ARCH and
+            cfg.get("model_type") == "glm_moe_dsa")
 
 
 def chat_profile(cfg):
@@ -391,6 +399,34 @@ def normalise_cfg(cfg):
         # the release config omits the key. WARP's MLA rotation uses that
         # layout; a future explicit false is preserved for a fail-closed load.
         out.setdefault("rope_interleave", True)
+    elif is_glm52(out):
+        # The reference implementation constructs both low-rank RMSNorms
+        # without passing the model-wide epsilon, so their class default is
+        # 1e-6. GLM-5 also uses adjacent-pair/interleaved RoPE in its MLA
+        # path. Make both inherited code defaults part of the container.
+        out.setdefault("mla_rms_norm_eps", 1e-6)
+        out.setdefault("rope_interleave", True)
+        out.setdefault("topk_method", "noaux_tc")
+        out.setdefault("moe_router_activation_func", "sigmoid")
+        rope = out.get("rope_parameters") or {}
+        if rope.get("rope_type", "default") != "default":
+            raise ValueError("GLM-5.2 v0 supports only default rope_parameters")
+        if "rope_theta" not in rope:
+            raise ValueError("GLM-5.2 rope_parameters.rope_theta is required")
+        # The C runtime's existing MLA contract uses the legacy flat spelling.
+        # Copy, do not infer: the release intentionally uses 8,000,000 rather
+        # than the generic 10,000 default.
+        out["rope_theta"] = rope["rope_theta"]
+
+        # At S <= index_topk (2048 in the qualified release), DSA selects
+        # every causal key, so ordinary dense MLA is the exact attention
+        # contract and the indexer has no effect on logits. This explicit
+        # bound prevents a caller from silently crossing into sparse DSA,
+        # which the first WARP implementation deliberately does not claim.
+        out["source_max_position_embeddings"] = out.get(
+            "max_position_embeddings")
+        out["dsa_dense_context_limit"] = GLM52_DENSE_CONTEXT
+        out["max_position_embeddings"] = GLM52_DENSE_CONTEXT
     elif is_glm47_full(out):
         # The released config omits these because its reference class
         # hardcodes the sigmoid/no-auxiliary-loss router. WARP names the
@@ -411,18 +447,26 @@ def unsupported_source_features(cfg):
     accidentally treating it as a 93rd base layer. Keep that decision in the
     manifest: an ignored layer number alone does not explain why it vanished.
     """
-    if not is_glm47_full(cfg):
+    if not (is_glm47_full(cfg) or is_glm52(cfg)):
         return []
     count = cfg.get("num_nextn_predict_layers", 0) or 0
     if not isinstance(count, int) or count < 0:
         raise ValueError("num_nextn_predict_layers must be a non-negative integer")
-    if not count:
-        return []
-    base = cfg["num_hidden_layers"]
-    return [{"name": "multi_token_prediction",
-             "source_layers": list(range(base, base + count)),
-             "action": "omitted",
-             "reason": "unsupported"}]
+    features = []
+    if is_glm52(cfg):
+        features.append({
+            "name": "deepseek_sparse_attention_indexer",
+            "action": "dense_equivalent",
+            "context_limit": GLM52_DENSE_CONTEXT,
+            "reason": "index_topk covers the complete causal history",
+        })
+    if count:
+        base = cfg["num_hidden_layers"]
+        features.append({"name": "multi_token_prediction",
+                         "source_layers": list(range(base, base + count)),
+                         "action": "omitted",
+                         "reason": "unsupported"})
+    return features
 
 
 def source_layer_index(name):
@@ -439,6 +483,13 @@ def is_source_only_layer(name, n_layers):
     """True for appended MTP/next-token layers outside the base decoder."""
     layer = source_layer_index(name)
     return layer is not None and layer >= n_layers
+
+
+def is_omitted_source_tensor(name, cfg, n_layers):
+    """True when a source tensor is intentionally absent from the container."""
+    if is_source_only_layer(name, n_layers):
+        return True
+    return is_glm52(cfg) and ".self_attn.indexer." in name
 
 
 def moe_layout(st, prefix, layer):
@@ -707,6 +758,197 @@ def validate_glm47_full_source(cfg, source, prefix=""):
         shown = "; ".join(errors[:12])
         more = f"; ... {len(errors) - 12} more" if len(errors) > 12 else ""
         raise ValueError("GLM-4.7 full source contract failed: " + shown + more)
+
+
+def validate_glm52_source(cfg, source, prefix=""):
+    """Fail closed on the pinned GLM-5.2 FP8 checkpoint geometry.
+
+    The first runtime deliberately replaces DSA with dense MLA only through
+    ``index_topk`` tokens, but conversion still binds itself to the complete
+    published source shape. Matrix storage may be either BF16 or FP8 e4m3;
+    FP8 is accepted only with the matching 128x128 inverse-scale grid.
+    """
+    arch = hf_architecture(cfg)
+    model_type = cfg.get("model_type")
+    claims = arch == GLM52_ARCH or model_type == "glm_moe_dsa"
+    if not claims:
+        return
+
+    errors = []
+    if arch != GLM52_ARCH:
+        errors.append(f"architectures[0]={arch!r}, expected {GLM52_ARCH!r}")
+    if model_type != "glm_moe_dsa":
+        errors.append("model_type must be 'glm_moe_dsa'")
+
+    expected = {
+        "num_hidden_layers": 78,
+        "hidden_size": 6144,
+        "vocab_size": 154880,
+        "n_routed_experts": 256,
+        "num_experts_per_tok": 8,
+        "n_shared_experts": 1,
+        "first_k_dense_replace": 3,
+        "intermediate_size": 12288,
+        "moe_intermediate_size": 2048,
+        "num_attention_heads": 64,
+        "num_key_value_heads": 64,
+        "q_lora_rank": 2048,
+        "kv_lora_rank": 512,
+        "qk_nope_head_dim": 192,
+        "qk_rope_head_dim": 64,
+        "v_head_dim": 256,
+        "index_topk": GLM52_DENSE_CONTEXT,
+        "index_head_dim": 128,
+        "index_n_heads": 32,
+        "index_topk_freq": 4,
+        "index_skip_topk_offset": 3,
+        "max_position_embeddings": 1048576,
+        "rms_norm_eps": 1e-5,
+        "hidden_act": "silu",
+        "routed_scaling_factor": 2.5,
+        "topk_method": "noaux_tc",
+        "scoring_func": "sigmoid",
+        "norm_topk_prob": True,
+        "n_group": 1,
+        "topk_group": 1,
+        "attention_bias": False,
+        "tie_word_embeddings": False,
+    }
+    for key, want in expected.items():
+        got = (cfg.get("source_max_position_embeddings")
+               if key == "max_position_embeddings" and
+               "source_max_position_embeddings" in cfg else cfg.get(key))
+        if isinstance(want, float):
+            matches = (isinstance(got, (int, float)) and
+                       abs(float(got) - want) <= max(1e-12, abs(want) * 1e-9))
+        elif isinstance(want, bool):
+            matches = got is want
+        else:
+            matches = got == want
+        if not matches:
+            errors.append(f"{key}={got!r}, expected {want!r}")
+
+    dense_sparse = ["dense"] * 3 + ["sparse"] * 75
+    if cfg.get("mlp_layer_types") != dense_sparse:
+        errors.append("mlp_layer_types must be 3 dense then 75 sparse")
+    expected_indexers = [
+        "full" if i < 3 or (i - 2) % 4 == 0 else "shared"
+        for i in range(78)
+    ]
+    if cfg.get("indexer_types") != expected_indexers:
+        errors.append("indexer_types does not match the qualified IndexShare schedule")
+    rope = cfg.get("rope_parameters") or {}
+    if rope.get("rope_type") != "default" or rope.get("rope_theta") != 8000000:
+        errors.append("rope_parameters must be default RoPE at theta 8000000")
+    quant = cfg.get("quantization_config") or {}
+    if (quant.get("quant_method") != "fp8" or quant.get("fmt") != "e4m3" or
+            quant.get("activation_scheme") != "dynamic" or
+            quant.get("weight_block_size") != [128, 128]):
+        errors.append("quantization_config must be dynamic e4m3 FP8 with 128x128 blocks")
+
+    n_mtp = cfg.get("num_nextn_predict_layers", 0) or 0
+    if n_mtp != 1:
+        errors.append("num_nextn_predict_layers must be 1")
+    names = set(source.names())
+    source_only = sorted({
+        layer for name in names
+        if (layer := source_layer_index(name)) is not None and layer >= 78
+    })
+    if source_only != [78]:
+        errors.append(f"appended source layers are {source_only}, expected [78]")
+
+    def require(name, shape, dtype="BF16"):
+        if name not in names:
+            errors.append(f"missing {name}")
+            return
+        try:
+            meta = source.tensor_meta(name)
+        except (KeyError, OSError, ValueError) as exc:
+            errors.append(f"cannot read header for {name}: {exc}")
+            return
+        if meta.get("reclaimed"):
+            return
+        if tuple(meta.get("shape", ())) != tuple(shape):
+            errors.append(f"{name} shape {tuple(meta.get('shape', ()))}, expected {tuple(shape)}")
+        if meta.get("dtype") != dtype:
+            errors.append(f"{name} dtype {meta.get('dtype')!r}, expected {dtype}")
+
+    def require_weight(name, shape):
+        if name not in names:
+            errors.append(f"missing {name}")
+            return
+        try:
+            meta = source.tensor_meta(name)
+        except (KeyError, OSError, ValueError) as exc:
+            errors.append(f"cannot read header for {name}: {exc}")
+            return
+        if meta.get("reclaimed"):
+            return
+        got_shape = tuple(meta.get("shape", ()))
+        if got_shape != tuple(shape):
+            errors.append(f"{name} shape {got_shape}, expected {tuple(shape)}")
+        scale = name + "_scale_inv"
+        if scale in names:
+            if meta.get("dtype") != "F8_E4M3":
+                errors.append(f"{name} with block scales must be F8_E4M3")
+            sm = source.tensor_meta(scale)
+            want_scale = tuple((int(d) + 127) // 128 for d in shape)
+            if (not sm.get("reclaimed") and
+                    (tuple(sm.get("shape", ())) != want_scale or
+                     sm.get("dtype") != "F32")):
+                errors.append(f"{scale} must be F32 {want_scale}")
+        elif meta.get("dtype") not in ("BF16", "F32"):
+            errors.append(f"{name} without block scales must be BF16 or F32")
+
+    p = prefix + "model."
+    H, qa, kv, qr = 6144, 2048, 512, 64
+    qd, vh, heads = 192 + qr, 256, 64
+    require_weight(p + "embed_tokens.weight", (154880, H))
+    require(p + "norm.weight", (H,))
+    require_weight(prefix + "lm_head.weight", (154880, H))
+
+    for layer in range(78):
+        base = f"{p}layers.{layer}."
+        require(base + "input_layernorm.weight", (H,))
+        require(base + "post_attention_layernorm.weight", (H,))
+        attn = base + "self_attn."
+        require_weight(attn + "q_a_proj.weight", (qa, H))
+        require(attn + "q_a_layernorm.weight", (qa,))
+        require_weight(attn + "q_b_proj.weight", (heads * qd, qa))
+        require_weight(attn + "kv_a_proj_with_mqa.weight", (kv + qr, H))
+        require(attn + "kv_a_layernorm.weight", (kv,))
+        require_weight(attn + "kv_b_proj.weight", (heads * (192 + vh), kv))
+        require_weight(attn + "o_proj.weight", (H, heads * vh))
+
+        if expected_indexers[layer] == "full":
+            indexer = attn + "indexer."
+            require_weight(indexer + "wq_b.weight", (32 * 128, qa))
+            require_weight(indexer + "wk.weight", (128, H))
+            require(indexer + "k_norm.weight", (128,))
+            require(indexer + "k_norm.bias", (128,))
+            require_weight(indexer + "weights_proj.weight", (32, H))
+
+        mlp = base + "mlp."
+        if layer < 3:
+            require_weight(mlp + "gate_proj.weight", (12288, H))
+            require_weight(mlp + "up_proj.weight", (12288, H))
+            require_weight(mlp + "down_proj.weight", (H, 12288))
+        else:
+            require_weight(mlp + "gate.weight", (256, H))
+            require(mlp + "gate.e_score_correction_bias", (256,), "F32")
+            require_weight(mlp + "shared_experts.gate_proj.weight", (2048, H))
+            require_weight(mlp + "shared_experts.up_proj.weight", (2048, H))
+            require_weight(mlp + "shared_experts.down_proj.weight", (H, 2048))
+            for expert in range(256):
+                ep = mlp + f"experts.{expert}."
+                require_weight(ep + "gate_proj.weight", (2048, H))
+                require_weight(ep + "up_proj.weight", (2048, H))
+                require_weight(ep + "down_proj.weight", (H, 2048))
+
+    if errors:
+        shown = "; ".join(errors[:12])
+        more = f"; ... {len(errors) - 12} more" if len(errors) > 12 else ""
+        raise ValueError("GLM-5.2 source contract failed: " + shown + more)
 
 
 # ------------------------------------------------------------ quantizers --
@@ -1212,7 +1454,7 @@ def convert_layer(job):
 
 
 
-def build_trunk(args, sr, st, existing, manifest_path, n_layers):
+def build_trunk(args, sr, st, existing, manifest_path, n_layers, cfg):
     """Write trunk.bin.tmp and return its index, or None if the run must stop.
 
     A function rather than a stretch of main() because --reclaim has to run
@@ -1254,9 +1496,9 @@ def build_trunk(args, sr, st, existing, manifest_path, n_layers):
         # interval.
         with open(trunk_tmp, "wb") as tf:
             for name in sorted(sr.names()):
-                if (is_source_only_layer(name, n_layers) or
+                if (is_omitted_source_tensor(name, cfg, n_layers) or
                         ".experts." in name or
-                        name.endswith(("_packed", "_scale"))):
+                        name.endswith(("_packed", "_scale", "_scale_inv"))):
                     continue
                 if not st.have(name):
                     continue                  # shard not downloaded yet
@@ -1385,6 +1627,7 @@ def main():
     # expensive work or published any container files.
     try:
         validate_glm47_full_source(cfg, sr, prefix)
+        validate_glm52_source(cfg, sr, prefix)
         source_unsupported = unsupported_source_features(cfg)
     except ValueError as exc:
         print(str(exc), file=sys.stderr)
@@ -1559,7 +1802,8 @@ def main():
         # writes trunk.bin.tmp either way and the published trunk.bin is
         # still only replaced together with the manifest, so nothing about
         # what this run can survive changes — only the order.
-        tindex = build_trunk(args, sr, st, existing, manifest_path, n_layers)
+        tindex = build_trunk(args, sr, st, existing, manifest_path, n_layers,
+                             cfg)
         if tindex is None:
             return 1
         reclaim(debt, args.reclaim, ShardDebt.TRUNK, "trunk")
@@ -1799,7 +2043,8 @@ def main():
     # --reclaim has already run this, before the experts, so that the shards
     # holding non-expert tensors become deletable at all.
     if tindex is None:
-        tindex = build_trunk(args, sr, st, existing, manifest_path, n_layers)
+        tindex = build_trunk(args, sr, st, existing, manifest_path, n_layers,
+                             cfg)
         if tindex is None:
             return 1
     trunk_path = os.path.join(args.out, "trunk.bin")
@@ -1848,8 +2093,13 @@ def main():
               ", ".join(map(str, source_only_layers)))
     if source_unsupported:
         manifest["unsupported_features"] = source_unsupported
-        print("source: multi-token prediction is unsupported; appended "
-              "MTP layer omitted")
+        for feature in source_unsupported:
+            if feature["name"] == "deepseek_sparse_attention_indexer":
+                print("source: DSA indexer omitted; dense MLA is exact only "
+                      f"through {feature['context_limit']} context tokens")
+            elif feature["name"] == "multi_token_prediction":
+                print("source: multi-token prediction is unsupported; "
+                      "appended MTP layer omitted")
     # A manifest that lists fewer expert layers than the one it replaces
     # publishes a container the engine will refuse to open, and the banks it
     # drops are still on disk taking up room. Never intended; say so.

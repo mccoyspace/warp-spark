@@ -1626,7 +1626,8 @@ static int validate_text_tensors(waste_model *m)
             const int lat = c->latent_dim ? c->latent_dim : hid;
             const int shared = c->moe_inter * (c->n_shared ? c->n_shared : 1);
             REQUIRE_MATRIX(tname("%smodel.layers.%d.block_sparse_moe.gate.weight", c->prefix, L), c->n_experts, hid);
-            if (c->attention_kind == WASTE_ATTN_GQA)
+            if (c->attention_kind == WASTE_ATTN_GQA ||
+                !strcmp(c->arch, "GlmMoeDsaForCausalLM"))
                 REQUIRE_VECTOR(tname("%smodel.layers.%d.block_sparse_moe.gate.e_score_correction_bias",
                                      c->prefix, L), c->n_experts);
             REQUIRE_MATRIX(tname("%smodel.layers.%d.block_sparse_moe.shared_experts.gate_proj.weight", c->prefix, L), shared, hid);
@@ -1678,6 +1679,8 @@ static int cfg_sane(const waste_config *c)
     if (c->eps <= 0.0f || !(c->eps < 1.0f)) return 0;      /* also catches NaN */
     if (c->mla_rms_norm_eps <= 0.0f ||
         !(c->mla_rms_norm_eps < 1.0f)) return 0;
+    if (c->dsa_dense_context_limit < 0 ||
+        c->dsa_dense_context_limit > (1 << 24)) return 0;
     /* MoE is optional, but if there are experts the routing has to make
      * sense: top_k above the pool overruns the per-token index array. */
     if (c->n_experts < 0 || c->n_experts > (1 << 20)) return 0;
@@ -1757,7 +1760,8 @@ static void rope_init(waste_config *c, const js_doc *d, int cfg)
     c->rope_interleave = interleave_default;
     if (interleave >= 0 && js_typeof(d, interleave) != JS_BOOL) {
         if (!strcmp(c->arch, "Glm4MoeLiteForCausalLM") ||
-            !strcmp(c->arch, "Glm4MoeForCausalLM")) {
+            !strcmp(c->arch, "Glm4MoeForCausalLM") ||
+            !strcmp(c->arch, "GlmMoeDsaForCausalLM")) {
             snprintf(c->rope_err, sizeof c->rope_err,
                      "GLM-4.7 rope_interleave is not true or false");
             return;
@@ -1768,9 +1772,10 @@ static void rope_init(waste_config *c, const js_doc *d, int cfg)
     /* Flash's MLA path implements only its adjacent-pair layout. Full GLM's
      * standard-GQA path has a separate half-split primitive below. */
     if (!c->rope_interleave &&
-        !strcmp(c->arch, "Glm4MoeLiteForCausalLM")) {
+        (!strcmp(c->arch, "Glm4MoeLiteForCausalLM") ||
+         !strcmp(c->arch, "GlmMoeDsaForCausalLM"))) {
         snprintf(c->rope_err, sizeof c->rope_err,
-                 "GLM-4.7-Flash rope_interleave=false is not implemented");
+                 "%s rope_interleave=false is not implemented", c->arch);
         return;
     }
     /* By value, not by presence: a container carrying "mla_use_nope": false
@@ -1966,7 +1971,8 @@ static void attention_init(waste_config *c, const js_doc *d, int cfg)
     if (!strcmp(c->arch, "KimiLinearForCausalLM") ||
         !strcmp(c->arch, "KimiK3ForConditionalGeneration") ||
         !strcmp(c->arch, "DeepseekV3ForCausalLM") ||
-        !strcmp(c->arch, "Glm4MoeLiteForCausalLM")) {
+        !strcmp(c->arch, "Glm4MoeLiteForCausalLM") ||
+        !strcmp(c->arch, "GlmMoeDsaForCausalLM")) {
         c->attention_kind = WASTE_ATTN_LATENT;
         return;
     }
@@ -2008,6 +2014,8 @@ static void cfg_from_json(waste_config *c, const js_doc *d, int cfg)
     c->qk_nope = (int)js_int(d, js_get(d, cfg, "qk_nope_head_dim"), 0);
     c->qk_rope = (int)js_int(d, js_get(d, cfg, "qk_rope_head_dim"), 0);
     c->v_head = (int)js_int(d, js_get(d, cfg, "v_head_dim"), 0);
+    c->dsa_dense_context_limit = (int)js_int(
+        d, js_get(d, cfg, "dsa_dense_context_limit"), 0);
     c->eps = (float)js_num(d, js_get(d, cfg, "rms_norm_eps"), 1e-5);
     c->mla_rms_norm_eps = (float)js_num(
         d, js_get(d, cfg, "mla_rms_norm_eps"), c->eps);
@@ -2241,6 +2249,15 @@ int waste_model_load(waste_model *m, const char *dir, int kv_cap,
                 snprintf(m->cfg.prefix, sizeof m->cfg.prefix, "language_model.");
         }
         cfg_from_json(&m->cfg, &d, cfg);
+    }
+    if (m->cfg.dsa_dense_context_limit > 0 &&
+        kv_cap > m->cfg.dsa_dense_context_limit) {
+        fprintf(stderr,
+                "waste: %s dense-attention qualification is limited to %d "
+                "context tokens (requested %d); sparse DSA is not implemented\n",
+                m->cfg.arch, m->cfg.dsa_dense_context_limit, kv_cap);
+        js_free(&d); free(src);
+        return -2;
     }
     if (m->cfg.attention_err[0]) {
         fprintf(stderr, "waste: %s\n", m->cfg.attention_err);

@@ -55,6 +55,9 @@ typedef struct {
 #define WASTE_ATTN_LATENT 1
 #define WASTE_ATTN_GQA    2
     int attention_kind;
+    /* GLM-5.x v0 runs exact dense MLA only while DSA's top-k covers the
+     * whole causal history. Zero means no architecture-specific bound. */
+    int dsa_dense_context_limit;
     int n_kv_heads, head_dim;
     int qkv_bias, qk_norm;
     int router_n_group, router_topk_group;

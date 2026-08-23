@@ -147,6 +147,51 @@ GLM47_CFG = {
     "num_nextn_predict_layers": 1,
 }
 
+# A shape-scaled GLM-5.2 bounded qualification container. Its attention is
+# ordinary latent MLA because DSA top-k covers this fixture's entire context;
+# the explicit limit is the behavior under test, not a claim of sparse DSA.
+GLM52_CFG = {
+    "model_type": "glm_moe_dsa",
+    "architectures": ["GlmMoeDsaForCausalLM"],
+    "hidden_size": 128,
+    "num_hidden_layers": 4,
+    "first_k_dense_replace": 3,
+    "intermediate_size": 256,
+    "moe_intermediate_size": 64,
+    "n_routed_experts": 8,
+    "num_experts": 8,
+    "num_experts_per_tok": 2,
+    "num_experts_per_token": 2,
+    "n_shared_experts": 1,
+    "num_shared_experts": 1,
+    "norm_topk_prob": True,
+    "moe_renormalize": True,
+    "topk_method": "noaux_tc",
+    "moe_router_activation_func": "sigmoid",
+    "routed_scaling_factor": 2.5,
+    "n_group": 1,
+    "topk_group": 1,
+    "hidden_act": "silu",
+    "num_attention_heads": 4,
+    "num_key_value_heads": 4,
+    "q_lora_rank": 64,
+    "kv_lora_rank": 32,
+    "qk_nope_head_dim": 16,
+    "qk_rope_head_dim": 8,
+    "v_head_dim": 16,
+    "mla_rms_norm_eps": 1e-6,
+    "rms_norm_eps": 1e-5,
+    "rope_interleave": True,
+    "rope_theta": 8000000,
+    "dsa_dense_context_limit": 8,
+    "max_position_embeddings": 8,
+    "vocab_size": 256,
+    "tie_word_embeddings": False,
+    "bos_token_id": 1,
+    "eos_token_id": 2,
+    "eos_token_ids": [2, 3, 4],
+}
+
 
 def f32(vals):
     return struct.pack("<%df" % len(vals), *vals)
@@ -335,6 +380,9 @@ def main():
                     help="a tiny full GLM-4.7: standard GQA with QKV bias, "
                          "Q/K norm, partial half-split RoPE, three dense "
                          "layers and one separate-expert MoE layer")
+    ap.add_argument("--glm52", action="store_true",
+                    help="a tiny GLM-5.2 dense-equivalent MLA container with "
+                         "an explicit eight-token DSA context bound")
     ap.add_argument("--qk-rope", type=int, metavar="N",
                     help="override qk_rope_head_dim. With --rope, a slice "
                          "wider than the build's WASTE_MAX_ROPE_HALF pair "
@@ -360,12 +408,13 @@ def main():
                          "at 1.0. Unequal mscales put a ratio on cos/sin that "
                          "the engine does not apply, so it refuses instead")
     args = ap.parse_args()
-    if args.rope and args.glm47_full:
-        ap.error("--rope and --glm47-full are mutually exclusive")
+    if sum((args.rope, args.glm47_full, args.glm52)) > 1:
+        ap.error("--rope, --glm47-full and --glm52 are mutually exclusive")
     rng = random.Random(args.seed)
     os.makedirs(args.out, exist_ok=True)
 
-    cfg = dict(GLM47_CFG if args.glm47_full else CFG)
+    cfg = dict(GLM52_CFG if args.glm52 else
+               GLM47_CFG if args.glm47_full else CFG)
     if args.rope:
         # Dropping linear_attn_config is what makes every layer MLA, so the
         # rotation is exercised at depth rather than in the one full-attention
@@ -448,7 +497,13 @@ def main():
             t.f32(a + "o_norm.weight", [D_KDA])
         else:
             a = p + "self_attn."
-            t.quant(a + "q_proj.weight", [nh * qd, hid])
+            if cfg.get("q_lora_rank"):
+                ql = cfg["q_lora_rank"]
+                t.quant(a + "q_a_proj.weight", [ql, hid])
+                t.f32(a + "q_a_layernorm.weight", [ql])
+                t.quant(a + "q_b_proj.weight", [nh * qd, ql])
+            else:
+                t.quant(a + "q_proj.weight", [nh * qd, hid])
             t.quant(a + "kv_a_proj_with_mqa.weight", [kvl + rope, hid])
             t.f32(a + "kv_a_layernorm.weight", [kvl])
             t.quant(a + "kv_b_proj.weight", [nh * (cfg["qk_nope_head_dim"] + vh), kvl])
@@ -506,7 +561,7 @@ def main():
 
     manifest = {
         "format_version": 0,
-        "arch": (cfg["architectures"][0] if args.glm47_full
+        "arch": (cfg["architectures"][0] if (args.glm47_full or args.glm52)
                  else cfg["model_type"]),
         "tensor_prefix": args.prefix,
         "config": cfg,

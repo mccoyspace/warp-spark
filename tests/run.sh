@@ -1534,6 +1534,22 @@ else
     no "GLM converter metadata"
 fi
 
+# GLM-5.2's first runtime contract is intentionally exact and small: DSA
+# top-2048 covers the whole causal history, so dense MLA is equivalent only
+# inside that bound. The tiny fixture uses eight to make both sides cheap.
+GLM52="$TMP/glm52.waste"
+if ! python3 tools/make_test_container.py --glm52 "$GLM52" >/dev/null 2>&1; then
+    sk "GLM-5.2 dense-equivalent context guard" "container not built"
+elif WASTE_TEST_CTX=8 WASTE_TEST_RESET_REPLAY=1 \
+        ./test_forward "$GLM52" 3,7,11,5 "$TMP/glm52.bin" 1 \
+        >/dev/null 2>&1 &&
+     ! WASTE_TEST_CTX=9 ./test_forward "$GLM52" 3,7 \
+        >/dev/null 2>&1; then
+    ok "GLM-5.2 runs/replays within the dense-equivalent bound and refuses above it"
+else
+    no "GLM-5.2 dense-equivalent context guard"
+fi
+
 # Flash names three terminal turn markers.  A valid bounded set must load;
 # malformed sets must fail with a format error before generation.  Scalar-only
 # Kimi manifests keep the old tokenizer path and are exercised everywhere else

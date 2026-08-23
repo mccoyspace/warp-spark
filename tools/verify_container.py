@@ -32,9 +32,11 @@ KINDS = (("gate", "w1"), ("up", "w3"), ("down", "w2"))
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from mxfp4 import ST                                              # noqa: E402
-from convert import (ShardReader, is_source_only_layer, moe_layout,
+from convert import (ShardReader, is_omitted_source_tensor,
+                     is_source_only_layer, moe_layout,
                      source_layer_index, unsupported_source_features,
-                     validate_glm47_full_source)                  # noqa: E402
+                     validate_glm47_full_source,
+                     validate_glm52_source)                       # noqa: E402
 
 
 def load_codebooks(path):
@@ -103,6 +105,8 @@ def main():
     cfg = man["config"]
     validate_glm47_full_source(cfg, source_index,
                                man.get("tensor_prefix", ""))
+    validate_glm52_source(cfg, source_index,
+                          man.get("tensor_prefix", ""))
     n_layers = cfg["num_hidden_layers"]
     source_only = sorted({
         layer for name in source_index.names()
@@ -120,8 +124,9 @@ def main():
                   if int(layer) >= n_layers]
     assert not bad_layers, f"source-only layers published as expert banks: {bad_layers}"
     bad_trunk = [entry["name"] for entry in man["trunk"]
-                 if is_source_only_layer(entry["name"], n_layers)]
-    assert not bad_trunk, f"source-only tensors published in trunk: {bad_trunk[:3]}"
+                 if is_omitted_source_tensor(entry["name"], cfg, n_layers)]
+    assert not bad_trunk, (
+        f"source-only/omitted tensors published in trunk: {bad_trunk[:3]}")
 
     stages = man["expert_quant"]["stages"]
     books = load_codebooks(os.path.join(args.container, "codebooks.bin"))

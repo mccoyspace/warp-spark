@@ -139,6 +139,46 @@ class HeaderFixture:
 
 
 class GlmConversionBoundaryTest(unittest.TestCase):
+    def test_glm52_dense_equivalent_contract_is_explicit_and_bounded(self):
+        source_cfg = {
+            "architectures": ["GlmMoeDsaForCausalLM"],
+            "model_type": "glm_moe_dsa",
+            "max_position_embeddings": 1048576,
+            "norm_topk_prob": True,
+            "eos_token_id": [154820, 154827, 154829],
+            "rope_interleave": True,
+            "rope_parameters": {
+                "rope_type": "default", "rope_theta": 8000000,
+            },
+        }
+        cfg = CONVERT.normalise_cfg(source_cfg)
+        self.assertEqual(cfg["source_max_position_embeddings"], 1048576)
+        self.assertEqual(cfg["max_position_embeddings"], 2048)
+        self.assertEqual(cfg["dsa_dense_context_limit"], 2048)
+        self.assertEqual(cfg["rope_theta"], 8000000)
+        self.assertEqual(cfg["mla_rms_norm_eps"], 1e-6)
+        self.assertEqual(cfg["eos_token_ids"], [154820, 154827, 154829])
+        self.assertIs(cfg["moe_renormalize"], True)
+        self.assertTrue(CONVERT.is_omitted_source_tensor(
+            "model.layers.6.self_attn.indexer.wk.weight", source_cfg, 78))
+        self.assertFalse(CONVERT.is_omitted_source_tensor(
+            "model.layers.6.self_attn.kv_b_proj.weight", source_cfg, 78))
+        features = CONVERT.unsupported_source_features(
+            dict(source_cfg, num_hidden_layers=78,
+                 num_nextn_predict_layers=1))
+        self.assertEqual(features[0]["name"],
+                         "deepseek_sparse_attention_indexer")
+        self.assertEqual(features[0]["action"], "dense_equivalent")
+        self.assertEqual(features[1]["source_layers"], [78])
+
+    def test_glm52_nondefault_rope_fails_closed(self):
+        with self.assertRaisesRegex(ValueError, "default rope_parameters"):
+            CONVERT.normalise_cfg({
+                "architectures": ["GlmMoeDsaForCausalLM"],
+                "model_type": "glm_moe_dsa",
+                "rope_parameters": {"rope_type": "yarn", "rope_theta": 1},
+            })
+
     def test_glm_lite_implicit_contract_is_made_explicit(self):
         cfg = CONVERT.normalise_cfg({
             "model_type": "glm4_moe_lite",
