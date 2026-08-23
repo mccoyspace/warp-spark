@@ -92,6 +92,7 @@ static waste_model k3(void)
     m.cfg.vocab = 163840;
     m.cfg.n_experts = 896;
     m.cfg.top_k = 16;
+    m.manifest_top_k = 16;
     m.cfg.moe_inter = 3072;
     m.cfg.dense_inter = 33792;
     m.cfg.n_shared = 2;
@@ -242,6 +243,8 @@ int main(void)
     {
         waste_model exact_k3 = k3();
         CHECK(!waste_model_cuda_k3_dense_compatible(NULL));
+        CHECK(!waste_model_k3_routing_compatible(NULL));
+        CHECK(waste_model_k3_routing_compatible(&exact_k3));
         CHECK(waste_model_cuda_k3_dense_compatible(&exact_k3));
         CHECK(waste_model_cuda_k3_vq3r_compatible(&exact_k3));
         CHECK(waste_model_cuda_vq_dense_scope_compatible(&exact_k3, 2));
@@ -284,6 +287,50 @@ int main(void)
         exact_k3 = k3(); strcpy(exact_k3.cfg.arch, "KimiLinearForCausalLM");
         CHECK(!waste_model_cuda_k3_dense_compatible(&exact_k3));
         exact_k3 = k3(); strcpy(exact_k3.cfg.prefix, "");
+        CHECK(!waste_model_cuda_k3_dense_compatible(&exact_k3));
+
+        /* Approximate K3 routing is accepted only with trained top-16
+         * provenance and an explicit startup selector matching cfg.top_k. */
+        for (int i = 0; i < 2; i++) {
+            const int top_k = i ? 8 : 12;
+            exact_k3 = k3();
+            exact_k3.cfg.top_k = top_k;
+            exact_k3.k3_approx_top_k = top_k;
+            CHECK(waste_model_k3_routing_compatible(&exact_k3));
+            CHECK(waste_model_cuda_k3_dense_compatible(&exact_k3));
+            CHECK(waste_model_cuda_k3_vq3r_compatible(&exact_k3));
+            exact_k3.cuda_prefill_vq = 1;
+            exact_k3.cuda_vq_mode = 2;
+            exact_k3.cuda_vq_preflight_modes = 1 << 2;
+            CHECK(waste_model_cuda_prefill_vq_compatible(&exact_k3));
+            exact_k3.cuda_kda_mode = 1;
+            exact_k3.cuda_dense_scope = 2;
+            exact_k3.cuda_dense_preflight_scope = 2;
+            exact_k3.cuda_prefill_dense = 1;
+            exact_k3.cuda_prefill_dense_preflight_mode = 1;
+            CHECK(waste_model_cuda_prefill_dense_compatible(&exact_k3));
+        }
+        exact_k3 = k3(); exact_k3.cfg.top_k = 8;
+        CHECK(!waste_model_k3_routing_compatible(&exact_k3));
+        exact_k3 = k3(); exact_k3.k3_approx_top_k = 8;
+        CHECK(!waste_model_k3_routing_compatible(&exact_k3));
+        exact_k3 = k3(); exact_k3.cfg.top_k = 8;
+        exact_k3.k3_approx_top_k = 12;
+        CHECK(!waste_model_k3_routing_compatible(&exact_k3));
+        for (int top_k = 4; top_k <= 17; top_k += top_k == 4 ? 11 : 2) {
+            exact_k3 = k3();
+            exact_k3.cfg.top_k = top_k;
+            exact_k3.k3_approx_top_k = top_k;
+            CHECK(!waste_model_k3_routing_compatible(&exact_k3));
+            CHECK(!waste_model_cuda_k3_dense_compatible(&exact_k3));
+        }
+        exact_k3 = k3(); exact_k3.manifest_top_k = 12;
+        exact_k3.cfg.top_k = 12;
+        CHECK(!waste_model_k3_routing_compatible(&exact_k3));
+        CHECK(!waste_model_cuda_k3_dense_compatible(&exact_k3));
+        exact_k3 = k3(); exact_k3.manifest_top_k = 8;
+        exact_k3.cfg.top_k = 8;
+        CHECK(!waste_model_k3_routing_compatible(&exact_k3));
         CHECK(!waste_model_cuda_k3_dense_compatible(&exact_k3));
     }
 

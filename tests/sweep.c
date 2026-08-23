@@ -379,6 +379,14 @@ int main(int argc, char **argv)
         return 1;
     }
     const int top_k0 = m.cfg.top_k;
+    if (is_topk &&
+        !strcmp(m.cfg.arch, "KimiK3ForConditionalGeneration")) {
+        fprintf(stderr,
+                "K3 top-k is startup-only; run separate processes with "
+                "WASTE_K3_APPROX_TOP_K=12 or 8\n");
+        waste_model_free(&m);
+        return 2;
+    }
     if (!m.direct_io) {
         fprintf(stderr, "direct I/O fell back on at least one expert bank\n");
         waste_model_free(&m);

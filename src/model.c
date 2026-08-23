@@ -557,17 +557,17 @@ int waste_model_cuda_k2_vq3r_compatible(const waste_model *m)
            m->expert_m[2] % (int)WASTE_VQ_INDEX_BLOCK == 0;
 }
 
-/* Exact text-side K3 geometry used by the measured scope-2 CUDA profile.
- * The KDA pattern matters as much as the headline dimensions: prefill mode 1
- * sends every KDA projection through the decode-qualified Q4 kernel. */
-int waste_model_cuda_k3_dense_compatible(const waste_model *m)
+/* Exact text-side K3 geometry used by the measured scope-2 CUDA profile,
+ * excluding the effective router width. The KDA pattern matters as much as
+ * the headline dimensions: prefill mode 1 sends every KDA projection through
+ * the decode-qualified Q4 kernel. */
+static int k3_config_geometry_compatible(const waste_config *c)
 {
-    if (!m) return 0;
-    const waste_config *c = &m->cfg;
+    if (!c) return 0;
     if (strcmp(c->arch, "KimiK3ForConditionalGeneration") ||
         strcmp(c->prefix, "language_model.") ||
         c->n_layers != 93 || c->hidden != 7168 || c->vocab != 163840 ||
-        c->n_experts != 896 || c->top_k != 16 ||
+        c->n_experts != 896 ||
         c->moe_inter != 3072 || c->dense_inter != 33792 ||
         c->n_shared != 2 || c->first_dense != 1 ||
         c->n_heads != 96 || c->kv_lora != 512 || c->q_lora != 1536 ||
@@ -575,15 +575,39 @@ int waste_model_cuda_k3_dense_compatible(const waste_model *m)
         c->latent_dim != 3584 || !c->latent_norm ||
         c->kda_heads != 96 || c->kda_dim != 128 || c->conv_k != 4 ||
         !c->full_rank_gate || c->attn_res_block != 12 ||
-        !c->mla_output_gate || !c->mla_nope || !c->act_situ ||
-        m->expert_m[0] != 3072 || m->expert_m[1] != 3072 ||
-        m->expert_m[2] != 3584 || m->expert_n[0] != 3584 ||
-        m->expert_n[1] != 3584 || m->expert_n[2] != 3072)
+        !c->mla_output_gate || !c->mla_nope || !c->act_situ)
         return 0;
     for (int L = 0; L < c->n_layers; L++) {
         const int expected_kda = L < 92 && L % 4 != 3;
         if (!!c->kda_layer[L] != expected_kda) return 0;
     }
+    return 1;
+}
+
+/* K3's manifest value is immutable provenance, while cfg.top_k is the
+ * effective runtime width. Exact mode follows the manifest. Approximate mode
+ * is deliberately narrow and self-identifying so a test or caller cannot
+ * obtain an unqualified CUDA path by changing cfg.top_k after preflight. */
+int waste_model_k3_routing_compatible(const waste_model *m)
+{
+    if (!m || strcmp(m->cfg.arch, "KimiK3ForConditionalGeneration") ||
+        m->manifest_top_k != 16)
+        return 0;
+    if (!m->k3_approx_top_k)
+        return m->cfg.top_k == 16;
+    return (m->k3_approx_top_k == 12 || m->k3_approx_top_k == 8) &&
+           m->cfg.top_k == m->k3_approx_top_k;
+}
+
+int waste_model_cuda_k3_dense_compatible(const waste_model *m)
+{
+    if (!m || !k3_config_geometry_compatible(&m->cfg) ||
+        m->manifest_top_k != 16 ||
+        !waste_model_k3_routing_compatible(m) ||
+        m->expert_m[0] != 3072 || m->expert_m[1] != 3072 ||
+        m->expert_m[2] != 3584 || m->expert_n[0] != 3584 ||
+        m->expert_n[1] != 3584 || m->expert_n[2] != 3072)
+        return 0;
     return 1;
 }
 
@@ -956,7 +980,8 @@ static int cuda_vq_preflight(waste_model *m, int mode)
         (!k3_geometry && !qualified_all_mla) ||
         !m->codebooksT || m->n_books < 9) {
         fprintf(stderr,
-                "waste: CUDA VQ requires K3 VQ3R 3584/3072 top-16 or "
+                "waste: CUDA VQ requires K3 VQ3R 3584/3072 trained top-16 "
+                "with effective top-16, top-12 or top-8, or "
                 "allowlisted K2 7168/2048 top-8 or GLM-4.7-Flash "
                 "2048/1536 top-4 VQ3R geometry\n");
         goto fail;
@@ -1782,12 +1807,26 @@ int waste_model_load(waste_model *m, const char *dir, int kv_cap,
     static const waste_load_opts defaults = { .direct_io = 1 };
     if (!opt) opt = &defaults;
     const size_t cache_bytes = opt->cache_bytes;
+    int requested_k3_top_k = 0;
     memset(m, 0, sizeof *m);
     pthread_mutex_init(&m->fetch_mu, NULL);
     m->trunk_fd = -1;
     for (int L = 0; L < WASTE_MAX_LAYERS; L++) m->bank[L].fd = -1;
     m->want_vision = opt->want_vision;
     m->want_direct = opt->direct_io;
+    {
+        const char *e = getenv("WASTE_K3_APPROX_TOP_K");
+        if (e) {
+            if (!strcmp(e, "0")) requested_k3_top_k = 0;
+            else if (!strcmp(e, "12")) requested_k3_top_k = 12;
+            else if (!strcmp(e, "8")) requested_k3_top_k = 8;
+            else {
+                fprintf(stderr,
+                        "waste: WASTE_K3_APPROX_TOP_K must be 0, 12 or 8\n");
+                return -1;
+            }
+        }
+    }
     pthread_once(&model_opts_once, model_opts_init);
 #if defined(WASTE_ENABLE_CUDA)
     {
@@ -1914,6 +1953,16 @@ int waste_model_load(waste_model *m, const char *dir, int kv_cap,
                         "(%d layers, hidden %d, vocab %d, %d experts top-%d)\n",
                 m->cfg.n_layers, m->cfg.hidden, m->cfg.vocab,
                 m->cfg.n_experts, m->cfg.top_k);
+        js_free(&d); free(src);
+        return -2;                        /* -> WASTE_E_FORMAT */
+    }
+    m->manifest_top_k = m->cfg.top_k;
+    if (requested_k3_top_k &&
+        (m->manifest_top_k != 16 ||
+         !k3_config_geometry_compatible(&m->cfg))) {
+        fprintf(stderr,
+                "waste: WASTE_K3_APPROX_TOP_K requires the exact released "
+                "K3 trained top-16 geometry\n");
         js_free(&d); free(src);
         return -2;                        /* -> WASTE_E_FORMAT */
     }
@@ -2126,6 +2175,21 @@ int waste_model_load(waste_model *m, const char *dir, int kv_cap,
     free(src);
 
     if (!validate_text_tensors(m)) return -2;      /* -> WASTE_E_FORMAT */
+
+    if (requested_k3_top_k) {
+        m->k3_approx_top_k = requested_k3_top_k;
+        m->cfg.top_k = requested_k3_top_k;
+        if (!waste_model_cuda_k3_dense_compatible(m)) {
+            fprintf(stderr,
+                    "waste: K3 approximate routing failed the exact "
+                    "post-load geometry gate\n");
+            return -2;                    /* -> WASTE_E_FORMAT */
+        }
+        fprintf(stderr,
+                "waste: experimental K3 approximate routing top-%d "
+                "(container trained top-16); output may differ\n",
+                requested_k3_top_k);
+    }
 
     /* state + scratch */
     const int H = c->kda_heads, D = c->kda_dim, C = H * D;
@@ -5400,6 +5464,13 @@ const float *waste_model_prefill(waste_model *m, const int *tokens, int n,
 {
     const waste_config *c = &m->cfg;
     const int hid = c->hidden;
+    if (!strcmp(c->arch, "KimiK3ForConditionalGeneration") &&
+        !waste_model_k3_routing_compatible(m)) {
+        fprintf(stderr,
+                "waste: K3 routing configuration changed after load; "
+                "refusing prefill\n");
+        return NULL;
+    }
     if (m->cuda_kda_state_dirty ||
         ((m->cuda_kda_mode || m->cuda_dense_scope || m->cuda_vq_mode) &&
          m->cuda_kda_failed)) return NULL;
@@ -5629,6 +5700,13 @@ const float *waste_model_step(waste_model *m, int token, int pos, int *routed)
     dump_pos0 = pos;
     const waste_config *c = &m->cfg;
     const int hid = c->hidden;
+    if (!strcmp(c->arch, "KimiK3ForConditionalGeneration") &&
+        !waste_model_k3_routing_compatible(m)) {
+        fprintf(stderr,
+                "waste: K3 routing configuration changed after load; "
+                "refusing decode\n");
+        return NULL;
+    }
     if (m->cuda_kda_state_dirty ||
         ((m->cuda_kda_mode || m->cuda_dense_scope || m->cuda_vq_mode) &&
          m->cuda_kda_failed)) return NULL;

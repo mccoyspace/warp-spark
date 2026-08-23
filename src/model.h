@@ -124,6 +124,12 @@ typedef struct {
 
 typedef struct {
     waste_config cfg;
+    /* Routing provenance is kept outside cfg because cfg.top_k is the
+     * effective runtime width. K3 is trained top-16; the only supported
+     * approximations are explicit startup-time reductions to top-12/top-8.
+     * Keeping both values makes accidental post-load mutation fail closed. */
+    int manifest_top_k;
+    int k3_approx_top_k;             /* 0 = manifest-exact; otherwise 12/8 */
     waste_vision_cfg vcfg;
     int  want_vision;                /* load the tower's 434 MB of weights */
     /* Image embeddings for the prefill about to run: one row per merged
@@ -251,6 +257,7 @@ typedef struct {
  * Dense covers the qualified Q4 projection shape; VQ adds expert format. */
 int waste_model_cuda_k2_dense_compatible(const waste_model *m);
 int waste_model_cuda_k2_vq3r_compatible(const waste_model *m);
+int waste_model_k3_routing_compatible(const waste_model *m);
 int waste_model_cuda_k3_dense_compatible(const waste_model *m);
 int waste_model_cuda_k3_vq3r_compatible(const waste_model *m);
 int waste_model_cuda_glm47_flash_dense_compatible(const waste_model *m);
