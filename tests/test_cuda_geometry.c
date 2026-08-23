@@ -123,11 +123,30 @@ int main(void)
     CHECK(!waste_model_cuda_vq_dense_scope_compatible(&exact, 1));
     CHECK(!waste_model_cuda_vq_dense_scope_compatible(NULL, 2));
 
-    /* K2 is qualified for decode but never for this GLM-only pilot. */
+    /* K2 enters the prefill pilot only after its exact decode preflight. */
     exact.cuda_prefill_vq = 1;
     exact.cuda_vq_mode = 2;
     exact.cuda_vq_preflight_modes = 1 << 2;
+    CHECK(waste_model_cuda_prefill_vq_compatible(&exact));
+    exact.cuda_vq_preflight_modes = 0;
     CHECK(!waste_model_cuda_prefill_vq_compatible(&exact));
+    exact.cuda_vq_preflight_modes = 1 << 2;
+
+    {
+        waste_model dense = k2();
+        dense.cuda_kda_mode = 1;
+        dense.cuda_dense_scope = 3;
+        dense.cuda_dense_preflight_scope = 3;
+        dense.cuda_prefill_dense = 1;
+        dense.cuda_prefill_dense_preflight_mode = 1;
+        CHECK(waste_model_cuda_prefill_dense_compatible(&dense));
+        dense.cuda_prefill_dense = 2;
+        CHECK(!waste_model_cuda_prefill_dense_compatible(&dense));
+        dense.cuda_prefill_dense_preflight_mode = 2;
+        CHECK(waste_model_cuda_prefill_dense_compatible(&dense));
+        dense.cfg.hidden++;
+        CHECK(!waste_model_cuda_prefill_dense_compatible(&dense));
+    }
 
     waste_model changed = k2();
     strcpy(changed.cfg.arch, "KimiK3ForConditionalGeneration");
@@ -209,12 +228,6 @@ int main(void)
         dense.cuda_kda_failed = 1;
         CHECK(!waste_model_cuda_prefill_dense_compatible(&dense));
 
-        dense = k2();
-        dense.cuda_prefill_dense = 1;
-        dense.cuda_kda_mode = 1;
-        dense.cuda_dense_scope = 3;
-        dense.cuda_dense_preflight_scope = 3;
-        CHECK(!waste_model_cuda_prefill_dense_compatible(&dense));
     }
 
     {

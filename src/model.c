@@ -600,20 +600,21 @@ int waste_model_cuda_vq_dense_scope_compatible(const waste_model *m,
 }
 
 /* The chunk-prefill pilot deliberately has a smaller allowlist than decode.
- * It reuses the qualified mode-2 VQ primitive, but only GLM-4.7-Flash is the
- * vehicle for this experiment. Requiring the completed runtime preflight as
- * well as the static geometry keeps a directly mutated model struct from
- * entering an untested path. */
+ * It reuses the qualified mode-2 VQ primitive only on the all-MLA K2 and
+ * GLM-4.7-Flash geometries selected as real-model vehicles. Requiring the
+ * completed runtime preflight as well as the static geometry keeps a directly
+ * mutated model struct from entering an untested path. */
 int waste_model_cuda_prefill_vq_compatible(const waste_model *m)
 {
     return m && m->cuda_prefill_vq && m->cuda_vq_mode == 2 &&
            (m->cuda_vq_preflight_modes & (1 << 2)) &&
-           waste_model_cuda_glm47_flash_vq3r_compatible(m);
+           (waste_model_cuda_k2_vq3r_compatible(m) ||
+            waste_model_cuda_glm47_flash_vq3r_compatible(m));
 }
 
-/* Keep this pilot on the already-qualified GLM Flash dense profile. Scope 3
+/* Keep this pilot on the already-qualified all-MLA dense profiles. Scope 3
  * and KDA mode 1 are intentional rather than minimum bounds: they name the
- * measured decode configuration, while the recorded preflight scope proves
+ * measured decode configurations, while the recorded preflight scope proves
  * that every required Q4 tensor and one real launch passed before prefill. */
 int waste_model_cuda_prefill_dense_compatible(const waste_model *m)
 {
@@ -622,7 +623,8 @@ int waste_model_cuda_prefill_dense_compatible(const waste_model *m)
            m->cuda_dense_preflight_scope == 3 &&
            m->cuda_prefill_dense >= 1 && m->cuda_prefill_dense <= 2 &&
            m->cuda_prefill_dense_preflight_mode == m->cuda_prefill_dense &&
-           waste_model_cuda_glm47_flash_dense_compatible(m);
+           (waste_model_cuda_k2_dense_compatible(m) ||
+            waste_model_cuda_glm47_flash_dense_compatible(m));
 }
 
 /* Preserve the CPU chunk contract without disturbing the router-owned
@@ -839,10 +841,11 @@ static int cuda_prefill_dense_preflight(waste_model *m, int mode)
     if (!mode) return 0;
     if (mode < 1 || mode > 2 || m->cuda_kda_mode != 1 ||
         m->cuda_dense_scope != 3 || m->cuda_dense_preflight_scope != 3 ||
-        !waste_model_cuda_glm47_flash_dense_compatible(m)) {
+        !(waste_model_cuda_k2_dense_compatible(m) ||
+          waste_model_cuda_glm47_flash_dense_compatible(m))) {
         fprintf(stderr,
                 "waste: CUDA prefill dense mode requires global KDA mode 1, "
-                "preflighted dense scope 3, and exact GLM-4.7-Flash geometry\n");
+                "preflighted dense scope 3, and a qualified all-MLA geometry\n");
         goto fail;
     }
     if (mode == 2) {
