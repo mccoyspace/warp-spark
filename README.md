@@ -16,12 +16,23 @@
 > [upstream issue #11](https://github.com/sqliteai/warp/issues/11).
 > `tools/spark_cuda_serve.sh` is the qualified single-user GN100 server path.
 >
-> **Latest quarantined experiment:** Kimi K2 CUDA dense and VQ3R support is
+> **Kimi K2 quarantined experiment:** Kimi K2 CUDA dense and VQ3R support is
 > complete for an exact, fail-closed model fingerprint. The selected GB10
 > profile averaged **2.748 tok/s**, reached **3.001 tok/s**, and was **2.25x**
 > the matched CPU fallback. Greedy tokens and ordered routes were unchanged in
 > 195 causal comparisons, and a 4,608-token resident soak completed without
 > swap I/O or memory growth. See the [K2 GB10 report](docs/K2_GB10.md).
+>
+> **Latest approximate K3 experiment:** A startup-only, fail-closed top-8
+> routing profile averaged **1.213 decode tok/s** and **0.515 full-request
+> tok/s** across four frozen studio-task families, respectively 55.5% and
+> 45.3% above matched trained-top-16 controls. All registered prompt, route,
+> behavior, and private comparative-review gates passed, but this small sample
+> is not a general quality-equivalence claim. A grouped CUDA scheduler halved
+> synchronization count while preserving the captured logits, tokens, and
+> routes byte-for-byte, yet reduced decode by 0.70%, so group one remains
+> selected and no new pipeline code is proposed.
+> See the [practical K3 decode report](docs/K3_DECODE_PRACTICAL_GB10.md).
 
 This fork follows the WARP project name. Upstream intentionally retains the
 `waste` executable, C API names, environment variables, and `.waste` container
@@ -79,9 +90,9 @@ Most of that requirement is the 27.28 GB resident trunk rather than the cache. S
 
 The last two rows are the failure mode worth knowing about: the hit rate keeps climbing and the bytes read keep falling while throughput drops eightfold. The engine is inside its budget and the machine is not, so a cache hit becomes a page fault. Giving the process more memory is not always faster.
 
-Decoding with fewer experts per token is a knob rather than a rebuild:
-`num_experts_per_token` in the container manifest. K3 ships at 16. Measured
-on this machine, one load with the arms interleaved:
+An earlier exploratory sweep changed `num_experts_per_token` in the container
+manifest rather than rebuilding weights. K3 ships at 16. Measured on this
+machine, one load with the arms interleaved:
 
 | experts/token | decode | KL from top-16 | working set |
 |---:|---:|---:|---:|
@@ -94,8 +105,11 @@ Top-8 is 1.49x for a divergence twice that of a quantization this project
 rejects elsewhere, and it reproduces top-16's greedy continuation on the
 prompts tested. Top-4 does not: its next-token distribution still looks
 close, and it stops following the prompt within a few tokens — which is why
-the gate here is a continuation and not a KL. This is a quality trade and
-the default stays 16.
+the gate here is a continuation and not a KL. This was a quality trade and the
+default remained 16 at this exploratory stage. The later fail-closed top-8
+qualification linked above adds held-out studio-task gates and a startup-only
+selector: public clean installs still default to trained top-16, while the
+private studio harness may deliberately select the qualified top-8 profile.
 
 Storage is the main constraint. A cold K3 token reads about 17 GB of experts. The internal SSD sustains 12.78 GB/s; a tested USB enclosure managed 0.94 GB/s. Put the converted container on internal NVMe storage.
 
@@ -284,6 +298,7 @@ Useful references:
 - [docs/RESEARCH.md](docs/RESEARCH.md): current research directions;
 - [docs/PREFIX_CACHE.md](docs/PREFIX_CACHE.md): exact root, head, and semantic-anchor snapshots;
 - [docs/K3_PREFILL_GB10.md](docs/K3_PREFILL_GB10.md): K3 CUDA chunk-prefill qualification on GB10;
+- [docs/K3_DECODE_PRACTICAL_GB10.md](docs/K3_DECODE_PRACTICAL_GB10.md): fail-closed approximate K3 routing and practical studio qualification on GB10;
 - [docs/FULL_LAYER_PREFILL_EXPERIMENT.md](docs/FULL_LAYER_PREFILL_EXPERIMENT.md): preregistered GB10 full-layer prefill experiment;
 - [docs/TECHNICAL.md](docs/TECHNICAL.md): detailed measurements and technical experiments.
 
