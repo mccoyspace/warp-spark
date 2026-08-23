@@ -54,10 +54,10 @@ the secondary EOS marker `<|user|>`. It generated three tokens in 5.52 seconds
 (0.54 tok/s), with 1,819 expert hits and 317 misses (85% hit rate). This tests
 basic semantic execution and stopping only; it is not a quality evaluation.
 
-## Current scope
+## Initial qualification scope
 
-- The full model currently uses WARP's CPU implementation of standard grouped
-  query attention. CUDA was not used or qualified for this result.
+- The initial result used WARP's CPU implementation of standard grouped query
+  attention. CUDA was not used in that first qualification row.
 - Standard-GQA state snapshots are not implemented, so snapshot export/import
   is unavailable for this model.
 - The checkpoint's optional MTP layer was omitted and is unsupported.
@@ -65,3 +65,39 @@ basic semantic execution and stopping only; it is not a quality evaluation.
   contract and fail closed outside that experimental scope.
 - Source weights remain retained. Nothing here is an upstream support or
   performance claim.
+
+## First optimization pass
+
+A subsequent experimental pass kept the exact full-model architecture while
+testing the same software controls used on the Kimi profiles. On one fixed
+eight-token development row, the original CPU setup produced 0.587 tok/s.
+The useful CPU changes were:
+
+- a child-scoped Linux PM-QoS Q0 request;
+- reducing the expert cache from 59,340 to 18,809 MiB; and
+- using nine compute threads inside the same ten-CPU mask.
+
+Together those changes reached 1.26 tok/s with identical tokens, logits, and
+routes. Lookahead, additional reader concurrency, deeper I/O queues, and
+expert-parallel execution did not improve the row and remain disabled.
+
+The existing coherent-memory CUDA Q4 and VQ3R kernels were then admitted only
+for the exact full-GLM geometry. Standard-GQA attention and prompt prefill
+remain on the CPU. CUDA dense FFN work improved the matched row from 1.27 to
+1.37 tok/s; adding VQ3R reached 1.70 tok/s. The complete CUDA arm preserved
+all routed expert selections and top-10 logits, with a maximum logit delta of
+1.43e-5 against CPU in the held-out check.
+
+A separate 16-token route pattern measured 1.105 tok/s for the bracketed CPU
+control and 1.311 tok/s for CUDA, an 18.6% improvement. It read substantially
+more expert data and is the more conservative generalization result. The raw
+arithmetic smoke continued to return `323` and stop correctly, at 1.47 tok/s.
+
+Reducing routing from top-8 to top-6 or top-4 also produced 1.38-1.40 tok/s on
+CPU, but changed the generated path. Those settings are retained only as
+unqualified approximate-profile candidates; neither is the default.
+
+After CUDA FFN/VQ promotion, standard GQA accounts for roughly 64% of the
+remaining decode time. Offloading only its Q/K/V/O projections is therefore
+the next bounded experiment. These short rows remain qualification evidence,
+not sustained or quality-benchmark claims.
