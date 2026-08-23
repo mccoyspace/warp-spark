@@ -24,6 +24,8 @@
 #   tools/fetch_weights.sh                    # start or resume
 #   tools/fetch_weights.sh --check            # verify what is on disk, no fetch
 #   tools/fetch_weights.sh --repo moonshotai/Kimi-Linear --dest /data/kl
+#   tools/fetch_weights.sh --repo zai-org/GLM-5.2-FP8 --revision <commit> \
+#       --dest /data/glm52
 #
 # Set HF_TOKEN for a gated repo. Safe to run repeatedly and safe to kill:
 # the next run picks up where it stopped, mid-shard.
@@ -31,6 +33,7 @@
 set -uo pipefail
 
 REPO="${REPO:-moonshotai/Kimi-K3}"
+REVISION="${REVISION:-main}"
 DEST="${DEST:-/Volumes/WasteDisk/k3}"
 JOBS="${JOBS:-3}"
 MAX_RETRY="${MAX_RETRY:-8}"
@@ -43,6 +46,7 @@ CHECK_ONLY=0
 while [ $# -gt 0 ]; do
     case "$1" in
         --repo) REPO="$2"; shift 2 ;;
+        --revision) REVISION="$2"; shift 2 ;;
         --dest) DEST="$2"; shift 2 ;;
         --jobs) JOBS="$2"; shift 2 ;;
         --dry-run) DRY=1; shift ;;
@@ -53,9 +57,15 @@ while [ $# -gt 0 ]; do
 done
 
 API="https://huggingface.co/api/models/${REPO}"
-RAW="https://huggingface.co/${REPO}/resolve/main"
+if [ "$REVISION" = main ]; then
+    API_REV="$API"
+else
+    API_REV="$API/revision/$REVISION"
+fi
+RAW="https://huggingface.co/${REPO}/resolve/${REVISION}"
 STATE="$DEST/.download-state"
 LOG="$DEST/download.log"
+PROVENANCE="$DEST/.download-provenance"
 
 # GNU and BSD disagree on how to ask a file its size, and this script has to
 # run on the laptop that converts and on a Linux box that only fetches.
@@ -88,7 +98,7 @@ hcurl() {
 echo "repo:  $REPO"
 echo "dest:  $DEST"
 
-code=$(hcurl -s -o /dev/null -w '%{http_code}' --max-time 30 "$API")
+code=$(hcurl -s -o /dev/null -w '%{http_code}' --max-time 30 "$API_REV")
 if [ "$code" != "200" ]; then
     echo "!! repo not reachable (HTTP $code)."
     echo "   HuggingFace answers 401 both for a missing repo and for a gated"
@@ -100,6 +110,26 @@ fi
 
 mkdir -p "$DEST" || exit 1
 touch "$STATE"
+
+# A resumable directory is bound to one immutable source.  Mixing a prior
+# partial download with a different revision can otherwise produce a complete
+# looking checkpoint whose index and shards came from different commits.
+resolved=$(hcurl -sfL --max-time 60 "$API_REV" 2>/dev/null | python3 -c '
+import json, sys
+print(json.load(sys.stdin).get("sha", ""))
+' 2>/dev/null)
+[ "${#resolved}" = 40 ] || {
+    echo "!! repository API did not return an immutable revision" >&2
+    exit 1
+}
+expected=$(printf 'repo=%s\nrevision=%s\n' "$REPO" "$resolved")
+if [ -s "$PROVENANCE" ] && [ "$(cat "$PROVENANCE")" != "$expected" ]; then
+    echo "!! destination belongs to a different source:" >&2
+    cat "$PROVENANCE" >&2
+    echo "   requested repo=$REPO revision=$resolved" >&2
+    exit 1
+fi
+printf '%s' "$expected" > "$PROVENANCE"
 
 log() { printf '%s  %s\n' "$(date '+%Y-%m-%d %H:%M:%S')" "$*" | tee -a "$LOG"; }
 
@@ -185,7 +215,7 @@ if [ "$DRY" = 0 ] && [ "$CHECK_ONLY" = 0 ]; then
     # missed preprocessor_config.json, so the image normalization was the
     # CLIP convention for a day when the release states mean = std = 0.5.
     # A whitelist cannot report what it never knew to ask for.
-    SMALL=$(hcurl -sfL --max-time 60 "$API" 2>/dev/null | python3 -c '
+    SMALL=$(hcurl -sfL --max-time 60 "$API_REV" 2>/dev/null | python3 -c '
 import json, sys
 try:
     d = json.load(sys.stdin)
@@ -271,7 +301,7 @@ while read -r f; do
     fi
 done < "$DEST/.shards"
 
-log "repo $REPO -> $DEST  (stat: $STAT_MODE)"
+log "repo $REPO@$resolved -> $DEST  (stat: $STAT_MODE)"
 python3 - "$TOTAL_BYTES" "$have_bytes" "$(free_kb)" "$TOTAL" "$have" <<'PY'
 import sys
 tot, got, availkb, n, nhave = (int(x) for x in sys.argv[1:6])
