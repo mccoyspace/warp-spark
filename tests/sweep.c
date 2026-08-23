@@ -400,8 +400,14 @@ int main(int argc, char **argv)
     }
     lo.cache_bytes = (size_t)cache_mb << 20;
     lo.direct_io = 1;
+    const char *ctxe = getenv("WASTE_TEST_CTX");
+    const int ctx_cap = ctxe ? atoi(ctxe) : 4096;
+    if (ctx_cap <= 0) {
+        fprintf(stderr, "WASTE_TEST_CTX must be positive\n");
+        return 2;
+    }
     double t0 = now();
-    if (waste_model_load(&m, argv[1], 4096, &lo)) {
+    if (waste_model_load(&m, argv[1], ctx_cap, &lo)) {
         fprintf(stderr, "load failed\n");
         return 1;
     }
