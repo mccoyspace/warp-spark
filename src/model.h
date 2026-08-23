@@ -223,10 +223,11 @@ typedef struct {
      * dense and mode-2 VQ primitives. The context is opaque so a normal build
      * has no CUDA headers or runtime dependency. KDA mode 0 is
      * CPU, 1 is the fast reduction, and 2 uses a four-lane/group reduction;
-     * on allowlisted all-MLA models it selects that Q4 kernel while KDA
-     * effective mode/calls correctly remain zero. Dense scope is cumulative: 0
-     * KDA-only, 1 shared+latent MoE, 2 ordinary MLA projections too, 3 the
-     * non-MoE dense FFN too. */
+     * on allowlisted zero-KDA models it selects that Q4 kernel while KDA
+     * effective mode/calls correctly remain zero. Dense scope is cumulative:
+     * 0 KDA-only, 1 shared+latent MoE, 2 ordinary MLA projections too, 3 the
+     * non-MoE dense FFN too. Standard GQA attention is never implied by scope
+     * 2: the full-GLM pilot leaves every attention projection on the CPU. */
     void    *cuda_kda_ctx;
     int      cuda_kda_mode, cuda_kda_effective, cuda_kda_failed;
     int      cuda_dense_scope, cuda_dense_effective;
@@ -266,12 +267,19 @@ typedef struct {
 } waste_model;
 
 /* Internal accelerator allowlists. These are deliberately model-free so the
- * exact all-MLA geometry gates can be tested without model weights or a CUDA
- * host. Dense covers only the Q4 trunk shape; VQ adds the expert format. */
+ * exact model geometry gates can be tested without model weights or a CUDA
+ * host. Dense covers only its named Q4 trunk targets; VQ adds expert format. */
 int waste_model_cuda_k2_dense_compatible(const waste_model *m);
 int waste_model_cuda_k2_vq3r_compatible(const waste_model *m);
 int waste_model_cuda_glm47_flash_dense_compatible(const waste_model *m);
 int waste_model_cuda_glm47_flash_vq3r_compatible(const waste_model *m);
+int waste_model_cuda_glm47_full_dense_compatible(const waste_model *m);
+int waste_model_cuda_glm47_full_vq3r_compatible(const waste_model *m);
+int waste_model_cuda_glm47_full_profile_compatible(const waste_model *m,
+                                                    int kda_mode,
+                                                    int dense_scope,
+                                                    int vq_mode,
+                                                    int vq_group);
 int waste_model_cuda_vq_dense_scope_compatible(const waste_model *m,
                                                 int scope);
 int waste_model_cuda_prefill_vq_compatible(const waste_model *m);

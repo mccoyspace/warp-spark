@@ -147,9 +147,9 @@ else
 fi
 
 if ./test_cuda_geometry 2>/dev/null | grep -q "^CUDA GEOMETRY OK"; then
-    ok "K2/GLM-4.7-Flash CUDA allowlists accept exact all-MLA/VQ3R geometry"
+    ok "CUDA allowlists accept exact K2/GLM-Flash/full-GLM decode geometry"
 else
-    no "K2/GLM-4.7-Flash CUDA geometry allowlists"
+    no "K2/GLM-Flash/full-GLM CUDA geometry allowlists"
 fi
 
 SWEEP_MODEL="$TMP/sweep-test.waste"

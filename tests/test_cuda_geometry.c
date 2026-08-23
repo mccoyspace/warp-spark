@@ -112,6 +112,35 @@ static waste_model glm47_full_gqa(void)
     return m;
 }
 
+static waste_model glm47_full_cuda(void)
+{
+    waste_model m = glm47_full_gqa();
+    m.cfg.n_layers = 92;
+    m.cfg.hidden = 5120;
+    m.cfg.n_experts = 160;
+    m.cfg.top_k = 8;
+    m.cfg.moe_inter = 1536;
+    m.cfg.dense_inter = 12288;
+    m.cfg.n_shared = 1;
+    m.cfg.first_dense = 3;
+    m.cfg.n_heads = 96;
+    m.cfg.n_kv_heads = 8;
+    m.cfg.head_dim = 128;
+    m.cfg.qk_nope = 64;
+    m.cfg.qk_rope = 64;
+    m.cfg.v_head = 128;
+    m.expert_m[0] = m.expert_m[1] = 1536;
+    m.expert_m[2] = 5120;
+    m.expert_n[0] = m.expert_n[1] = 5120;
+    m.expert_n[2] = 1536;
+    m.index_bits = 8;
+    m.stages = 3;
+    m.vec_dim = 8;
+    m.cb_entries = 256;
+    m.index_block = WASTE_VQ_INDEX_BLOCK;
+    return m;
+}
+
 #define REJECT_DENSE(field, value) do {                                     \
     waste_model changed = k2();                                             \
     changed.field = (value);                                                \
@@ -140,12 +169,28 @@ static waste_model glm47_full_gqa(void)
     CHECK(!waste_model_cuda_vq_dense_scope_compatible(&changed, 3));        \
 } while (0)
 
+#define REJECT_FULL_DENSE(field, value) do {                                \
+    waste_model changed = glm47_full_cuda();                                \
+    changed.field = (value);                                                \
+    CHECK(!waste_model_cuda_glm47_full_dense_compatible(&changed));         \
+} while (0)
+
+#define REJECT_FULL_VQ(field, value) do {                                   \
+    waste_model changed = glm47_full_cuda();                                \
+    changed.field = (value);                                                \
+    CHECK(waste_model_cuda_glm47_full_dense_compatible(&changed));          \
+    CHECK(!waste_model_cuda_glm47_full_vq3r_compatible(&changed));          \
+    CHECK(!waste_model_cuda_vq_dense_scope_compatible(&changed, 2));        \
+    CHECK(!waste_model_cuda_vq_dense_scope_compatible(&changed, 3));        \
+} while (0)
+
 int main(void)
 {
     waste_model exact = k2();
     CHECK(WASTE_VQ_INDEX_BLOCK == 64);
     CHECK(!waste_model_cuda_k2_dense_compatible(NULL));
     CHECK(!waste_model_cuda_glm47_flash_dense_compatible(NULL));
+    CHECK(!waste_model_cuda_glm47_full_dense_compatible(NULL));
     CHECK(waste_model_cuda_k2_dense_compatible(&exact));
     CHECK(waste_model_cuda_k2_vq3r_compatible(&exact));
     CHECK(!waste_model_cuda_glm47_flash_dense_compatible(&exact));
@@ -202,6 +247,53 @@ int main(void)
         size_t state_bytes = 0;
         gqa = glm47_full_gqa();
         CHECK(waste_model_state_size(&gqa, 0, &state_bytes) == -1);
+    }
+
+    {
+        waste_model full = glm47_full_cuda();
+        CHECK(waste_model_glm47_gqa_compatible(&full));
+        CHECK(waste_model_cuda_glm47_full_dense_compatible(&full));
+        CHECK(waste_model_cuda_glm47_full_vq3r_compatible(&full));
+        CHECK(!waste_model_cuda_k2_dense_compatible(&full));
+        CHECK(!waste_model_cuda_glm47_flash_dense_compatible(&full));
+        CHECK(!waste_model_cuda_vq_dense_scope_compatible(&full, 1));
+        CHECK(!waste_model_cuda_vq_dense_scope_compatible(&full, 2));
+        CHECK(waste_model_cuda_vq_dense_scope_compatible(&full, 3));
+        CHECK(waste_model_cuda_glm47_full_profile_compatible(
+            &full, 1, 3, 0, 1));
+        CHECK(waste_model_cuda_glm47_full_profile_compatible(
+            &full, 1, 3, 2, 1));
+        CHECK(!waste_model_cuda_glm47_full_profile_compatible(
+            &full, 2, 3, 2, 1));
+        CHECK(!waste_model_cuda_glm47_full_profile_compatible(
+            &full, 1, 2, 2, 1));
+        CHECK(!waste_model_cuda_glm47_full_profile_compatible(
+            &full, 1, 3, 1, 1));
+        CHECK(!waste_model_cuda_glm47_full_profile_compatible(
+            &full, 1, 3, 2, 2));
+
+        /* Decode reuse must not widen either GLM-Flash prefill pilot. */
+        full.cuda_kda_mode = 1;
+        full.cuda_dense_scope = 3;
+        full.cuda_dense_preflight_scope = 3;
+        full.cuda_prefill_dense = 1;
+        full.cuda_prefill_dense_preflight_mode = 1;
+        full.cuda_vq_mode = 2;
+        full.cuda_vq_preflight_modes = 1 << 2;
+        full.cuda_prefill_vq = 1;
+        CHECK(!waste_model_cuda_prefill_dense_compatible(&full));
+        CHECK(!waste_model_cuda_prefill_vq_compatible(&full));
+
+        /* Official release: 89 MoE and 3 dense layers. Scope 3 launches
+         * three shared/dense FFN projections per layer; GQA stays CPU. */
+        const int moe_layers = full.cfg.n_layers - full.cfg.first_dense;
+        CHECK(moe_layers == 89);
+        CHECK(3 * moe_layers + 3 * full.cfg.first_dense == 276);
+        CHECK(moe_layers * full.cfg.top_k == 712);
+        CHECK(3 * moe_layers * full.cfg.top_k == 2136);
+        CHECK(moe_layers * (2 + full.cfg.top_k) == 890);
+        CHECK(moe_layers * (1 + 3 * full.cfg.top_k) == 2225);
+        CHECK(2 * moe_layers * full.cfg.top_k == 1424);
     }
 
     /* K2 is qualified for decode but never for this GLM-only pilot. */
@@ -351,6 +443,45 @@ int main(void)
     REJECT_FLASH_VQ(vec_dim, 4);
     REJECT_FLASH_VQ(cb_entries, 64);
     REJECT_FLASH_VQ(index_block, 32);
+
+    changed = glm47_full_cuda();
+    strcpy(changed.cfg.arch, "Glm4MoeLiteForCausalLM");
+    CHECK(!waste_model_cuda_glm47_full_dense_compatible(&changed));
+    changed = glm47_full_cuda(); changed.cfg.kda_layer[17] = 1;
+    CHECK(!waste_model_cuda_glm47_full_dense_compatible(&changed));
+    CHECK(!waste_model_cuda_vq_dense_scope_compatible(&changed, 3));
+
+    REJECT_FULL_DENSE(cfg.n_layers, 91);
+    REJECT_FULL_DENSE(cfg.hidden, 5121);
+    REJECT_FULL_DENSE(cfg.n_experts, 64);
+    REJECT_FULL_DENSE(cfg.top_k, 4);
+    REJECT_FULL_DENSE(cfg.moe_inter, 2048);
+    REJECT_FULL_DENSE(cfg.dense_inter, 10240);
+    REJECT_FULL_DENSE(cfg.n_shared, 2);
+    REJECT_FULL_DENSE(cfg.first_dense, 1);
+    REJECT_FULL_DENSE(cfg.n_heads, 64);
+    REJECT_FULL_DENSE(cfg.n_kv_heads, 4);
+    REJECT_FULL_DENSE(cfg.head_dim, 64);
+    REJECT_FULL_DENSE(cfg.qk_nope, 32);
+    REJECT_FULL_DENSE(cfg.qk_rope, 32);
+    REJECT_FULL_DENSE(cfg.v_head, 64);
+    REJECT_FULL_DENSE(cfg.partial_rotary_factor, 0.25f);
+    REJECT_FULL_DENSE(cfg.qkv_bias, 0);
+    REJECT_FULL_DENSE(cfg.qk_norm, 0);
+    REJECT_FULL_DENSE(cfg.router_n_group, 2);
+    REJECT_FULL_DENSE(cfg.routed_scale, 1.0f);
+    REJECT_FULL_DENSE(expert_m[0], 1472);
+    REJECT_FULL_DENSE(expert_m[1], 1472);
+    REJECT_FULL_DENSE(expert_m[2], 5056);
+    REJECT_FULL_DENSE(expert_n[0], 5056);
+    REJECT_FULL_DENSE(expert_n[1], 5056);
+    REJECT_FULL_DENSE(expert_n[2], 1472);
+
+    REJECT_FULL_VQ(index_bits, 6);
+    REJECT_FULL_VQ(stages, 2);
+    REJECT_FULL_VQ(vec_dim, 4);
+    REJECT_FULL_VQ(cb_entries, 64);
+    REJECT_FULL_VQ(index_block, 32);
 
     if (bad) return 1;
     puts("CUDA GEOMETRY OK");

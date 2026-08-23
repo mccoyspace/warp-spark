@@ -115,6 +115,11 @@ static uint64_t cuda_dense_call_target(const waste_model *m, int scope,
     if (scope >= 2) {
         for (int layer = 0; layer < m->cfg.n_layers; layer++) {
             if (m->cfg.kda_layer[layer]) continue;
+            /* Scope 2 owns MLA projections only. The full-GLM allowlist
+             * leaves q/k/v/o standard-GQA projections on CPU, so counting
+             * three imaginary launches per layer would make the acceptance
+             * harness reject the exact implementation it is meant to gate. */
+            if (m->cfg.attention_kind == WASTE_ATTN_GQA) continue;
             calls += m->cfg.q_lora ? 2 : 1;    /* q_a/q_b or q */
             calls += 2;                         /* kv_a and o */
             if (m->cfg.mla_output_gate) calls++;
@@ -399,7 +404,7 @@ int main(int argc, char **argv)
     if (is_cuda && cuda_call_target(&m, 1) == 0) {
         fprintf(stderr,
                 "cuda KDA sweep requires KDA layers; use cuda_dense for "
-                "qualified all-MLA models\n");
+                "qualified zero-KDA models\n");
         waste_model_free(&m);
         return 1;
     }
@@ -409,7 +414,7 @@ int main(int argc, char **argv)
     if (is_vq && (waste_model_get_cuda_kda(&m) != 1 || !vq_dense_ok)) {
         fprintf(stderr,
                 "cuda_vq sweep requires WASTE_CUDA_KDA=1 and "
-                "WASTE_CUDA_DENSE=2 (or 3 on qualified all-MLA geometry)\n");
+                "WASTE_CUDA_DENSE=2 (or 3 on qualified geometry)\n");
         waste_model_free(&m);
         return 1;
     }
