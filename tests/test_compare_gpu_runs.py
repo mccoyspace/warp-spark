@@ -206,6 +206,67 @@ class CompareGpuRunsTest(unittest.TestCase):
         }
         return control, candidate
 
+    @staticmethod
+    def gqa_arms():
+        # The exact full-GLM allowlist fixes the per-token dense work at 276
+        # FFN calls plus 368 q/k/v/o calls.  This fixture has two decode rows.
+        decode_steps = 2
+        ffn_dense = 276 * decode_steps
+        gqa_calls = 368 * decode_steps
+        # The tiny capture itself has four routed layer executions and eight
+        # experts, so these VQ2/group1 counters are independently derivable.
+        layer_runs, experts = 4, 8
+        base = {
+            "key": "cuda_gqa_proj",
+            "fallbacks": 0,
+            "kda_mode": 1,
+            "kda_effective": 0,
+            "kda_calls": 0,
+            "kda_expected_calls": 0,
+            "dense_scope": 3,
+            "dense_effective": 3,
+            "vq_mode": 2,
+            "vq_effective": 2,
+            "vq_group": 1,
+            "vq_experts": experts,
+            "vq_expected_experts": experts,
+            "vq_applies": 3 * experts,
+            "vq_expected_applies": 3 * experts,
+            "vq_lut_builds": experts + 2 * layer_runs,
+            "vq_expected_lut_builds": experts + 2 * layer_runs,
+            "vq_launches": 3 * experts + layer_runs,
+            "vq_expected_launches": 3 * experts + layer_runs,
+            "vq_syncs": 2 * experts,
+            "vq_expected_syncs": 2 * experts,
+        }
+        control = {
+            **base,
+            "value": 0,
+            "effective": 0,
+            "calls": 0,
+            "expected_calls": 0,
+            "dense_calls": ffn_dense,
+            "dense_expected_calls": ffn_dense,
+            "gqa_proj": 0,
+            "gqa_proj_effective": 0,
+            "gqa_proj_calls": 0,
+            "gqa_proj_expected_calls": 0,
+        }
+        candidate = {
+            **base,
+            "value": 1,
+            "effective": 1,
+            "calls": gqa_calls,
+            "expected_calls": gqa_calls,
+            "dense_calls": ffn_dense + gqa_calls,
+            "dense_expected_calls": ffn_dense + gqa_calls,
+            "gqa_proj": 1,
+            "gqa_proj_effective": 1,
+            "gqa_proj_calls": gqa_calls,
+            "gqa_proj_expected_calls": gqa_calls,
+        }
+        return control, candidate
+
     def test_self_compare_is_exact(self):
         result = self.compare()
         self.assertEqual(result["causally_compared_steps"], 3)
@@ -419,6 +480,31 @@ class CompareGpuRunsTest(unittest.TestCase):
         })
         with self.assertRaises(COMPARE.CaptureError):
             self.compare(cpu_arm=control, gpu_arm=candidate)
+
+    def test_gqa_projection_retains_full_profile_and_exact_counters(self):
+        control, candidate = self.gqa_arms()
+        result = self.compare(cpu_arm=control, gpu_arm=candidate)
+        self.assertEqual(result["arms"]["cpu"]["dense_calls"], 552)
+        self.assertEqual(result["arms"]["gpu"]["gqa_proj_calls"], 736)
+        self.assertEqual(result["arms"]["gpu"]["dense_calls"], 1288)
+        self.assertEqual(result["arms"]["gpu"]["vq_launches"], 28)
+
+    def test_gqa_projection_rejects_self_consistent_wrong_work(self):
+        control, candidate = self.gqa_arms()
+        mutations = (
+            {"gqa_proj_calls": 735, "gqa_proj_expected_calls": 735,
+             "calls": 735, "expected_calls": 735,
+             "dense_calls": 1287, "dense_expected_calls": 1287},
+            {"dense_calls": 1287, "dense_expected_calls": 1287},
+            {"vq_launches": 27, "vq_expected_launches": 27},
+            {"fallbacks": 1},
+        )
+        for mutation in mutations:
+            with self.subTest(mutation=mutation):
+                bad = copy.deepcopy(candidate)
+                bad.update(mutation)
+                with self.assertRaises(COMPARE.CaptureError):
+                    self.compare(cpu_arm=control, gpu_arm=bad)
 
     def test_missing_arm_metadata_is_rejected(self):
         with self.assertRaises(COMPARE.CaptureError):

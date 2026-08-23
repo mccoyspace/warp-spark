@@ -1013,7 +1013,8 @@ static waste_status read_error_report(waste_ctx *c)
      * would send someone to re-download 900 GB over a full context. */
     if (waste_model_ctx_full(&c->m)) return ctx_full_report(c);
     if (c->m.cuda_kda_state_dirty ||
-        ((c->m.cuda_kda_mode || c->m.cuda_dense_scope) &&
+        ((c->m.cuda_kda_mode || c->m.cuda_dense_scope ||
+          c->m.cuda_gqa_proj || c->m.cuda_vq_mode) &&
          c->m.cuda_kda_failed)) {
         snprintf(c->detail, sizeof c->detail,
                  "CUDA decode projection failed; reset and reload the model "
@@ -1053,8 +1054,7 @@ waste_status waste_eval(waste_ctx *c, const int32_t *tokens, size_t n,
     for (size_t i = 0; i < n; ) {
         int k = (int)(n - i);
         if (k > cmax) k = cmax;
-        lg = (k > 1) ? waste_model_prefill(&c->m, tokens + i, k, c->pos)
-                     : waste_model_step(&c->m, tokens[i], c->pos, NULL);
+        lg = waste_model_prefill(&c->m, tokens + i, k, c->pos);
         c->pos += k;
         i += (size_t)k;
         if (!lg) break;
@@ -1198,8 +1198,7 @@ waste_status waste_generate(waste_ctx *c, const int32_t *prompt, size_t n,
         while (i < n) {
             int k = (int)(n - i);
             if (k > cmax) k = cmax;
-            lg = (k > 1) ? waste_model_prefill(&c->m, prompt + i, k, c->pos)
-                         : waste_model_step(&c->m, prompt[i], c->pos, NULL);
+            lg = waste_model_prefill(&c->m, prompt + i, k, c->pos);
             c->pos += k;
             i += (size_t)k;
             if (!lg) break;

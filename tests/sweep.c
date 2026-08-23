@@ -36,6 +36,8 @@
  *   WASTE_CUDA_KDA=1 sweep CONTAINER ids,.. n_gen cuda_dense=0,1,2,3 [repeat]
  *   WASTE_CUDA_KDA=1 WASTE_CUDA_DENSE=2 \
  *     sweep CONTAINER ids,.. n_gen cuda_vq=0,1,2 [repeat]
+ *   WASTE_CUDA_KDA=1 WASTE_CUDA_DENSE=3 WASTE_CUDA_VQ=2 \
+ *     sweep CONTAINER ids,.. n_gen cuda_gqa_proj=0,1 [repeat]
  * K2 is all MLA, so WASTE_CUDA_KDA selects the Q4 kernel for its dense arm
  * but executes and reports zero KDA calls.
  *
@@ -137,6 +139,13 @@ static uint64_t cuda_dense_call_target(const waste_model *m, int scope,
     return calls * (uint64_t)n_gen;
 }
 
+static uint64_t cuda_gqa_proj_call_target(const waste_model *m, int enabled,
+                                          int n_gen)
+{
+    if (!enabled || m->cfg.attention_kind != WASTE_ATTN_GQA) return 0;
+    return (uint64_t)m->cfg.n_layers * UINT64_C(4) * (uint64_t)n_gen;
+}
+
 typedef struct {
     uint64_t experts;
     uint64_t applies;
@@ -214,26 +223,32 @@ static int write_capture(const char *dir, const char *key, int value, int rep,
         return -1;
     }
     const int dense_arm = !strcmp(key, "cuda_dense");
+    const int gqa_arm = !strcmp(key, "cuda_gqa_proj");
     const int vq_arm = !strcmp(key, "cuda_vq");
     const cuda_vq_target vq_expected = cuda_vq_targets(
         m, waste_model_get_cuda_vq(m), n_gen);
     const int effective = vq_arm ? waste_model_cuda_vq_effective(m)
+                        : gqa_arm ? waste_model_cuda_gqa_proj_effective(m)
                         : dense_arm ? waste_model_cuda_dense_effective(m)
                                     : waste_model_cuda_kda_effective(m);
     /* For the additive v1 schema's generic call fields, a VQ call is an
      * actual CUDA launch.  The explicit semantic counters below remain the
      * authoritative breakdown. */
     const uint64_t calls = vq_arm ? waste_model_cuda_vq_launches(m)
+                         : gqa_arm ? waste_model_cuda_gqa_proj_calls(m)
                          : dense_arm ? waste_model_cuda_dense_calls(m)
                                      : waste_model_cuda_kda_calls(m);
     const uint64_t expected = vq_arm
         ? vq_expected.launches
+        : gqa_arm ? cuda_gqa_proj_call_target(m, value, n_gen)
         : dense_arm ? cuda_dense_call_target(m, value, n_gen)
                     : (value ? cuda_call_target(m, n_gen) : UINT64_C(0));
     const uint64_t kda_expected = waste_model_get_cuda_kda(m)
         ? cuda_call_target(m, n_gen) : UINT64_C(0);
+    const uint64_t gqa_expected = cuda_gqa_proj_call_target(
+        m, waste_model_get_cuda_gqa_proj(m), n_gen);
     const uint64_t dense_expected = cuda_dense_call_target(
-        m, waste_model_get_cuda_dense(m), n_gen);
+        m, waste_model_get_cuda_dense(m), n_gen) + gqa_expected;
     fprintf(json,
             "{\n  \"schema\": \"waste.gpu_capture.v1\",\n"
             "  \"dtype\": \"float32-le\",\n"
@@ -248,6 +263,9 @@ static int write_capture(const char *dir, const char *key, int value, int rep,
             ", \"dense_scope\": %d, \"dense_effective\": %d"
             ", \"dense_calls\": %" PRIu64
             ", \"dense_expected_calls\": %" PRIu64
+            ", \"gqa_proj\": %d, \"gqa_proj_effective\": %d"
+            ", \"gqa_proj_calls\": %" PRIu64
+            ", \"gqa_proj_expected_calls\": %" PRIu64
             ", \"vq_mode\": %d, \"vq_effective\": %d"
             ", \"vq_group\": %d"
             ", \"vq_experts\": %" PRIu64
@@ -271,6 +289,9 @@ static int write_capture(const char *dir, const char *key, int value, int rep,
             waste_model_get_cuda_dense(m),
             waste_model_cuda_dense_effective(m),
             waste_model_cuda_dense_calls(m), dense_expected,
+            waste_model_get_cuda_gqa_proj(m),
+            waste_model_cuda_gqa_proj_effective(m),
+            waste_model_cuda_gqa_proj_calls(m), gqa_expected,
             waste_model_get_cuda_vq(m), waste_model_cuda_vq_effective(m),
             waste_model_get_cuda_vq_group(m),
             waste_model_cuda_vq_experts(m), vq_expected.experts,
@@ -322,7 +343,7 @@ int main(int argc, char **argv)
         fprintf(stderr,
                 "usage: %s CONTAINER ids,.. n_gen KEY=v1,v2,.. [repeat]\n"
                 "  KEY is lookahead, iodepth, cache (MB), topk, cuda, "
-                "cuda_dense, or cuda_vq\n", argv[0]);
+                "cuda_dense, cuda_gqa_proj, or cuda_vq\n", argv[0]);
         return 2;
     }
     int ids[MAX_IDS], n = 0;
@@ -355,9 +376,10 @@ int main(int argc, char **argv)
     const int is_topk = !strcmp(key, "topk");
     const int is_cuda = !strcmp(key, "cuda");
     const int is_dense = !strcmp(key, "cuda_dense");
+    const int is_gqa = !strcmp(key, "cuda_gqa_proj");
     const int is_vq = !strcmp(key, "cuda_vq");
     if (!is_look && !is_depth && !is_cache && !is_topk && !is_cuda &&
-        !is_dense && !is_vq) {
+        !is_dense && !is_gqa && !is_vq) {
         fprintf(stderr, "unknown key %s\n", key);
         return 2;
     }
@@ -367,7 +389,7 @@ int main(int argc, char **argv)
     memset(&lo, 0, sizeof lo);
     const char *cmb = getenv("WASTE_CACHE_MB");
     const unsigned long long cache_mb = cmb ? strtoull(cmb, NULL, 10) : 0;
-    if ((is_look || is_depth || is_cuda || is_dense || is_vq) &&
+    if ((is_look || is_depth || is_cuda || is_dense || is_gqa || is_vq) &&
         cache_mb == 0) {
         fprintf(stderr, "WASTE_CACHE_MB must be positive for %s sweeps\n", key);
         return 2;
@@ -389,7 +411,7 @@ int main(int argc, char **argv)
         waste_model_free(&m);
         return 1;
     }
-    if ((is_look || is_depth || is_cuda || is_dense || is_vq) &&
+    if ((is_look || is_depth || is_cuda || is_dense || is_gqa || is_vq) &&
         waste_ecache_io_threads(&m.cache) == 0) {
         fprintf(stderr, "%s sweep has no effective reader threads\n", key);
         waste_model_free(&m);
@@ -398,6 +420,16 @@ int main(int argc, char **argv)
     if (is_dense && !waste_model_get_cuda_kda(&m)) {
         fprintf(stderr,
                 "cuda_dense sweep requires WASTE_CUDA_KDA=1 or 2\n");
+        waste_model_free(&m);
+        return 1;
+    }
+    if (is_gqa &&
+        !waste_model_cuda_glm47_full_gqa_profile_compatible(
+            &m, waste_model_get_cuda_kda(&m),
+            waste_model_get_cuda_dense(&m), 1)) {
+        fprintf(stderr,
+                "cuda_gqa_proj sweep requires exact full GLM-4.7, "
+                "WASTE_CUDA_KDA=1, and WASTE_CUDA_DENSE=3\n");
         waste_model_free(&m);
         return 1;
     }
@@ -467,10 +499,11 @@ int main(int argc, char **argv)
      * and it does — a grouped sweep charges the drift to the last arm and
      * an interleaved one spreads it across all of them. */
     printf("%10s %4s %7s %3s %3s %3s %4s %7s %6s %10s %11s %9s %9s %8s %14s "
-           "%18s %18s %18s %4s %7s %4s %9s %9s %9s %9s %9s\n",
+           "%18s %18s %18s %4s %7s %4s %7s %4s %9s %9s %9s %9s %9s\n",
            key, "rep", "slots", "io", "qd", "eff", "fall", "calls", "warm",
            "seconds", "tok/s", "hits", "misses", "hit", "bytes",
            "token_hash", "logit_hash", "route_hash", "deff", "dcalls",
+           "geff", "gcalls",
            "veff", "vexperts", "vapplies", "vluts", "vlaunch", "vsync");
     const uint64_t expected_cuda_calls = is_cuda
         ? cuda_call_target(&m, n_gen) : UINT64_C(0);
@@ -511,6 +544,17 @@ int main(int argc, char **argv)
                     fprintf(stderr,
                             "cuda_dense=%d is unavailable for this build/model\n",
                             requested);
+                    waste_model_free(&m);
+                    return 1;
+                }
+                value = requested;
+            } else if (is_gqa) {
+                const int requested = value;
+                if (waste_model_set_cuda_gqa_proj(&m, requested) ||
+                    waste_model_get_cuda_gqa_proj(&m) != requested) {
+                    fprintf(stderr,
+                            "cuda_gqa_proj=%d is unavailable for this "
+                            "build/model\n", requested);
                     waste_model_free(&m);
                     return 1;
                 }
@@ -562,10 +606,12 @@ int main(int argc, char **argv)
              * call target and both arms begin from the same prompt state. */
             const int decode_cuda_mode = m.cuda_kda_mode;
             const int decode_dense_scope = m.cuda_dense_scope;
+            const int decode_gqa_proj = m.cuda_gqa_proj;
             const int decode_vq_mode = m.cuda_vq_mode;
-            if (is_cuda || is_dense || is_vq) {
+            if (is_cuda || is_dense || is_gqa || is_vq) {
                 m.cuda_kda_mode = 0;
                 m.cuda_dense_scope = 0;
+                m.cuda_gqa_proj = 0;
                 m.cuda_vq_mode = 0;
             }
             const float *lg = NULL;
@@ -573,14 +619,14 @@ int main(int argc, char **argv)
                 int k = n - done;
                 const int cmax = waste_model_chunk_max(&m);
                 if (k > cmax) k = cmax;
-                lg = (k > 1) ? waste_model_prefill(&m, ids + done, k, done)
-                             : waste_model_step(&m, ids[done], done, NULL);
+                lg = waste_model_prefill(&m, ids + done, k, done);
                 if (!lg) break;
                 done += k;
             }
-            if (is_cuda || is_dense || is_vq) {
+            if (is_cuda || is_dense || is_gqa || is_vq) {
                 m.cuda_kda_mode = decode_cuda_mode;
                 m.cuda_dense_scope = decode_dense_scope;
+                m.cuda_gqa_proj = decode_gqa_proj;
                 m.cuda_vq_mode = decode_vq_mode;
             }
             if (!lg) {
@@ -646,6 +692,9 @@ int main(int argc, char **argv)
             const uint64_t cuda_calls = waste_model_cuda_kda_calls(&m);
             const int dense_effective = waste_model_cuda_dense_effective(&m);
             const uint64_t dense_calls = waste_model_cuda_dense_calls(&m);
+            const int gqa_effective =
+                waste_model_cuda_gqa_proj_effective(&m);
+            const uint64_t gqa_calls = waste_model_cuda_gqa_proj_calls(&m);
             const int vq_effective = waste_model_cuda_vq_effective(&m);
             const uint64_t vq_experts = waste_model_cuda_vq_experts(&m);
             const uint64_t vq_applies = waste_model_cuda_vq_applies(&m);
@@ -657,15 +706,17 @@ int main(int argc, char **argv)
                 ? cuda_call_target(&m, n_gen) : UINT64_C(0);
             const int expected_kda_effective = expected_kda_calls
                 ? decode_cuda_mode : 0;
+            const uint64_t expected_gqa_calls = cuda_gqa_proj_call_target(
+                &m, decode_gqa_proj, n_gen);
             const uint64_t expected_dense_calls = cuda_dense_call_target(
-                &m, decode_dense_scope, n_gen);
+                &m, decode_dense_scope, n_gen) + expected_gqa_calls;
             const cuda_vq_target expected_vq = cuda_vq_targets(
                 &m, decode_vq_mode, n_gen);
             printf("%10d %4d %7d %3d %3d %3d %4" PRIu64 " %7" PRIu64
                    " %6d %10.6f %11.6f %9" PRIu64
                    " %9" PRIu64 " %7.2f%% %14" PRIu64 " 0x%016" PRIx64
                    " 0x%016" PRIx64 " 0x%016" PRIx64 " %4d %7" PRIu64
-                   " %4d %9" PRIu64 " %9" PRIu64 " %9" PRIu64
+                   " %4d %7" PRIu64 " %4d %9" PRIu64 " %9" PRIu64 " %9" PRIu64
                    " %9" PRIu64 " %9" PRIu64 "\n",
                    value, r + 1, m.cache.n_slots,
                    waste_ecache_io_threads(&m.cache),
@@ -674,7 +725,8 @@ int main(int argc, char **argv)
                    dt, n_gen / dt,
                    h, mi, 100.0 * (double)h / (double)(h + mi ? h + mi : 1),
                    bytes, token_hash, logit_hash, route_hash,
-                   dense_effective, dense_calls, vq_effective, vq_experts,
+                   dense_effective, dense_calls, gqa_effective, gqa_calls,
+                   vq_effective, vq_experts,
                    vq_applies, vq_lut_builds, vq_launches, vq_syncs);
             if (profile) {
                 printf("profile %s=%d rep=%d", key, value, r + 1);
@@ -727,23 +779,24 @@ int main(int argc, char **argv)
                 waste_model_free(&m);
                 return 1;
             }
-            if (is_vq &&
+            if (is_gqa &&
                 (cuda_effective != expected_kda_effective ||
-                 decode_cuda_mode != 1 || cuda_fallbacks != 0 ||
-                 cuda_calls != expected_kda_calls ||
+                 cuda_fallbacks != 0 || cuda_calls != expected_kda_calls ||
                  dense_effective != decode_dense_scope ||
-                 !vq_dense_ok ||
                  dense_calls != expected_dense_calls ||
+                 decode_gqa_proj != value || gqa_effective != value ||
+                 gqa_calls != expected_gqa_calls ||
                  vq_effective != decode_vq_mode ||
-                 decode_vq_mode != value ||
                  vq_experts != expected_vq.experts ||
                  vq_applies != expected_vq.applies ||
                  vq_lut_builds != expected_vq.lut_builds ||
                  vq_launches != expected_vq.launches ||
                  vq_syncs != expected_vq.syncs)) {
                 fprintf(stderr,
-                        "cuda_vq=%d acceptance failed: kda=%d/%d calls=%" PRIu64
-                        "/%" PRIu64 ", dense=%d/%d calls=%" PRIu64 "/%" PRIu64
+                        "cuda_gqa_proj=%d acceptance failed: kda=%d/%d "
+                        "calls=%" PRIu64 "/%" PRIu64
+                        ", dense=%d/%d calls=%" PRIu64 "/%" PRIu64
+                        ", gqa=%d/%d calls=%" PRIu64 "/%" PRIu64
                         ", vq=%d/%d experts=%" PRIu64 "/%" PRIu64
                         " applies=%" PRIu64 "/%" PRIu64
                         " luts=%" PRIu64 "/%" PRIu64
@@ -754,6 +807,51 @@ int main(int argc, char **argv)
                         cuda_calls, expected_kda_calls,
                         dense_effective, decode_dense_scope,
                         dense_calls, expected_dense_calls,
+                        gqa_effective, decode_gqa_proj,
+                        gqa_calls, expected_gqa_calls,
+                        vq_effective, decode_vq_mode,
+                        vq_experts, expected_vq.experts,
+                        vq_applies, expected_vq.applies,
+                        vq_lut_builds, expected_vq.lut_builds,
+                        vq_launches, expected_vq.launches,
+                        vq_syncs, expected_vq.syncs, cuda_fallbacks);
+                free(capture_logits); free(capture_inputs);
+                free(capture_routes);
+                waste_model_free(&m);
+                return 1;
+            }
+            if (is_vq &&
+                (cuda_effective != expected_kda_effective ||
+                 decode_cuda_mode != 1 || cuda_fallbacks != 0 ||
+                 cuda_calls != expected_kda_calls ||
+                 dense_effective != decode_dense_scope ||
+                 !vq_dense_ok ||
+                 dense_calls != expected_dense_calls ||
+                 gqa_effective != decode_gqa_proj ||
+                 gqa_calls != expected_gqa_calls ||
+                 vq_effective != decode_vq_mode ||
+                 decode_vq_mode != value ||
+                 vq_experts != expected_vq.experts ||
+                 vq_applies != expected_vq.applies ||
+                 vq_lut_builds != expected_vq.lut_builds ||
+                 vq_launches != expected_vq.launches ||
+                 vq_syncs != expected_vq.syncs)) {
+                fprintf(stderr,
+                        "cuda_vq=%d acceptance failed: kda=%d/%d calls=%" PRIu64
+                        "/%" PRIu64 ", dense=%d/%d calls=%" PRIu64 "/%" PRIu64
+                        ", gqa=%d/%d calls=%" PRIu64 "/%" PRIu64
+                        ", vq=%d/%d experts=%" PRIu64 "/%" PRIu64
+                        " applies=%" PRIu64 "/%" PRIu64
+                        " luts=%" PRIu64 "/%" PRIu64
+                        " launches=%" PRIu64 "/%" PRIu64
+                        " syncs=%" PRIu64 "/%" PRIu64
+                        ", fallbacks=%" PRIu64 "\n",
+                        value, cuda_effective, expected_kda_effective,
+                        cuda_calls, expected_kda_calls,
+                        dense_effective, decode_dense_scope,
+                        dense_calls, expected_dense_calls,
+                        gqa_effective, decode_gqa_proj,
+                        gqa_calls, expected_gqa_calls,
                         vq_effective, decode_vq_mode,
                         vq_experts, expected_vq.experts,
                         vq_applies, expected_vq.applies,

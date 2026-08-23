@@ -271,11 +271,25 @@ int main(void)
             &full, 1, 3, 1, 1));
         CHECK(!waste_model_cuda_glm47_full_profile_compatible(
             &full, 1, 3, 2, 2));
+        CHECK(waste_model_cuda_glm47_full_gqa_profile_compatible(
+            &full, 1, 3, 1));
+        CHECK(!waste_model_cuda_glm47_full_gqa_profile_compatible(
+            &full, 1, 3, 0));
+        CHECK(!waste_model_cuda_glm47_full_gqa_profile_compatible(
+            &full, 2, 3, 1));
+        CHECK(!waste_model_cuda_glm47_full_gqa_profile_compatible(
+            &full, 1, 2, 1));
+        CHECK(!waste_model_cuda_glm47_full_gqa_profile_compatible(
+            &full, 1, 3, 2));
+        CHECK(!waste_model_cuda_glm47_full_gqa_profile_compatible(
+            &exact, 1, 3, 1));
 
         /* Decode reuse must not widen either GLM-Flash prefill pilot. */
         full.cuda_kda_mode = 1;
         full.cuda_dense_scope = 3;
         full.cuda_dense_preflight_scope = 3;
+        full.cuda_gqa_proj = 1;
+        full.cuda_gqa_proj_preflight = 1;
         full.cuda_prefill_dense = 1;
         full.cuda_prefill_dense_preflight_mode = 1;
         full.cuda_vq_mode = 2;
@@ -285,10 +299,15 @@ int main(void)
         CHECK(!waste_model_cuda_prefill_vq_compatible(&full));
 
         /* Official release: 89 MoE and 3 dense layers. Scope 3 launches
-         * three shared/dense FFN projections per layer; GQA stays CPU. */
+         * three shared/dense FFN projections per layer. The separate GQA
+         * bit adds q/k/v/o per layer while attention arithmetic stays CPU. */
         const int moe_layers = full.cfg.n_layers - full.cfg.first_dense;
+        const int ffn_calls = 3 * moe_layers + 3 * full.cfg.first_dense;
+        const int gqa_calls = 4 * full.cfg.n_layers;
         CHECK(moe_layers == 89);
-        CHECK(3 * moe_layers + 3 * full.cfg.first_dense == 276);
+        CHECK(ffn_calls == 276);
+        CHECK(gqa_calls == 368);
+        CHECK(ffn_calls + gqa_calls == 644);
         CHECK(moe_layers * full.cfg.top_k == 712);
         CHECK(3 * moe_layers * full.cfg.top_k == 2136);
         CHECK(moe_layers * (2 + full.cfg.top_k) == 890);

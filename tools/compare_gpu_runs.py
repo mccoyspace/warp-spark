@@ -104,6 +104,10 @@ class Arm:
     dense_effective: int | None = None
     dense_calls: int | None = None
     dense_expected_calls: int | None = None
+    gqa_proj: int | None = None
+    gqa_proj_effective: int | None = None
+    gqa_proj_calls: int | None = None
+    gqa_proj_expected_calls: int | None = None
     vq_mode: int | None = None
     vq_effective: int | None = None
     vq_group: int = 1
@@ -286,6 +290,16 @@ def load_capture(path: str) -> Capture:
             dense_expected_calls=_optional_arm_integer(
                 raw_arm, "dense_expected_calls", path
             ),
+            gqa_proj=_optional_arm_integer(raw_arm, "gqa_proj", path),
+            gqa_proj_effective=_optional_arm_integer(
+                raw_arm, "gqa_proj_effective", path
+            ),
+            gqa_proj_calls=_optional_arm_integer(
+                raw_arm, "gqa_proj_calls", path
+            ),
+            gqa_proj_expected_calls=_optional_arm_integer(
+                raw_arm, "gqa_proj_expected_calls", path
+            ),
             vq_mode=_optional_arm_integer(raw_arm, "vq_mode", path),
             vq_effective=_optional_arm_integer(raw_arm, "vq_effective", path),
             vq_group=(1 if raw_arm.get("vq_group") is None else _integer(
@@ -318,7 +332,8 @@ def load_capture(path: str) -> Capture:
     raw_steps = raw.get("steps")
     if not isinstance(raw_steps, list) or not raw_steps:
         raise CaptureError(f"{path}: steps must be a non-empty list")
-    if (arm is not None and arm.key in ("cuda", "cuda_dense", "cuda_vq") and
+    cuda_keys = ("cuda", "cuda_dense", "cuda_gqa_proj", "cuda_vq")
+    if (arm is not None and arm.key in cuda_keys and
             len(raw_steps) < 2):
         raise CaptureError(f"{path}: CUDA capture must contain a decode step")
     steps = []
@@ -364,7 +379,7 @@ def load_capture(path: str) -> Capture:
             if len(set(ids)) != len(ids):
                 raise CaptureError(f"{rwhere}.experts contains duplicate ids")
             routes.append(RouteRow(layer, ids))
-        if (arm is not None and arm.key in ("cuda", "cuda_dense", "cuda_vq") and
+        if (arm is not None and arm.key in cuda_keys and
                 expected_index > 0 and not routes):
             raise CaptureError(f"{where}.routes must contain decode route rows")
         steps.append(Step(index, position, input_token, tuple(routes)))
@@ -396,6 +411,10 @@ def _arm_dict(arm: Arm) -> dict[str, Any]:
         "dense_effective": arm.dense_effective,
         "dense_calls": arm.dense_calls,
         "dense_expected_calls": arm.dense_expected_calls,
+        "gqa_proj": arm.gqa_proj,
+        "gqa_proj_effective": arm.gqa_proj_effective,
+        "gqa_proj_calls": arm.gqa_proj_calls,
+        "gqa_proj_expected_calls": arm.gqa_proj_expected_calls,
         "vq_mode": arm.vq_mode,
         "vq_effective": arm.vq_effective,
         "vq_group": arm.vq_group,
@@ -448,6 +467,88 @@ def _validate_cuda_arms(cpu: Capture, gpu: Capture) -> dict[str, Any] | None:
         raise CaptureError(
             f"captures have different arm keys: {cpu.arm.key!r} vs {gpu.arm.key!r}"
         )
+    if cpu.arm.key == "cuda_gqa_proj":
+        counter_names = ("experts", "applies", "lut_builds", "launches", "syncs")
+        decode_steps = len(gpu.steps) - 1
+        if decode_steps <= 0 or len(cpu.steps) != len(gpu.steps):
+            raise CaptureError("CUDA GQA captures require matched decode steps")
+        # The selector is allowed only for the exact 92-layer full GLM-4.7
+        # profile: four attention projections and three FFN projections per
+        # layer (three dense layers plus 89 shared experts).
+        expected_gqa = 4 * 92 * decode_steps
+        expected_ffn_dense = 3 * 92 * decode_steps
+        for label, capture in (("control", cpu), ("candidate", gpu)):
+            arm = capture.arm
+            assert arm is not None
+            if (not _valid_kda_base(arm, (1,)) or
+                    arm.kda_expected_calls != 0):
+                raise CaptureError(
+                    f"CUDA GQA {label} has invalid zero-call KDA/Q4=1 base"
+                )
+            if (arm.dense_scope != 3 or arm.dense_effective != 3 or
+                    arm.dense_calls is None or
+                    arm.dense_expected_calls is None or
+                    arm.dense_calls != arm.dense_expected_calls):
+                raise CaptureError(
+                    f"CUDA GQA {label} has invalid dense=3 metadata"
+                )
+            if (arm.gqa_proj is None or arm.gqa_proj_effective is None or
+                    arm.gqa_proj_calls is None or
+                    arm.gqa_proj_expected_calls is None or
+                    arm.gqa_proj_calls != arm.gqa_proj_expected_calls or
+                    arm.value != arm.gqa_proj or
+                    arm.effective != arm.gqa_proj_effective or
+                    arm.calls != arm.gqa_proj_calls or
+                    arm.expected_calls != arm.gqa_proj_expected_calls):
+                raise CaptureError(
+                    f"CUDA GQA {label} generic and projection metadata disagree"
+                )
+            if (arm.fallbacks != 0 or arm.vq_mode != 2 or
+                    arm.vq_effective != 2 or arm.vq_group != 1):
+                raise CaptureError(
+                    f"CUDA GQA {label} requires fail-free VQ2/group1 base"
+                )
+            layer_runs, experts = _vq_route_work(capture)
+            expected_vq = {
+                "experts": experts,
+                "applies": 3 * experts,
+                "lut_builds": experts + 2 * layer_runs,
+                "launches": 3 * experts + layer_runs,
+                "syncs": 2 * experts,
+            }
+            if layer_runs == 0:
+                raise CaptureError(f"CUDA GQA {label} has no routed workload")
+            for counter in counter_names:
+                actual = getattr(arm, f"vq_{counter}")
+                declared = getattr(arm, f"vq_expected_{counter}")
+                required = expected_vq[counter]
+                if actual != required or declared != required:
+                    raise CaptureError(
+                        f"CUDA GQA {label} VQ {counter}={actual}/{declared}; "
+                        f"route rows require {required}"
+                    )
+        if (cpu.arm.value != 0 or cpu.arm.effective != 0 or
+                cpu.arm.gqa_proj != 0 or cpu.arm.gqa_proj_effective != 0 or
+                cpu.arm.gqa_proj_calls != 0 or
+                cpu.arm.gqa_proj_expected_calls != 0 or
+                cpu.arm.dense_calls != expected_ffn_dense):
+            raise CaptureError(
+                "CUDA GQA control must execute only the full-GLM FFN base"
+            )
+        if (gpu.arm.value != 1 or gpu.arm.effective != 1 or
+                gpu.arm.gqa_proj != 1 or gpu.arm.gqa_proj_effective != 1 or
+                gpu.arm.gqa_proj_calls != expected_gqa or
+                gpu.arm.gqa_proj_expected_calls != expected_gqa or
+                gpu.arm.dense_calls != expected_ffn_dense + expected_gqa):
+            raise CaptureError(
+                "CUDA GQA candidate must execute 368 projection calls per "
+                "decode token and report them in the dense aggregate"
+            )
+        for name in counter_names:
+            if getattr(cpu.arm, f"vq_{name}") != getattr(gpu.arm, f"vq_{name}"):
+                raise CaptureError("CUDA GQA captures changed the VQ workload")
+        return {"cpu": _arm_dict(cpu.arm), "gpu": _arm_dict(gpu.arm)}
+
     if cpu.arm.key == "cuda_vq":
         counter_names = ("experts", "applies", "lut_builds", "launches", "syncs")
         for label, arm in (("control", cpu.arm), ("candidate", gpu.arm)):

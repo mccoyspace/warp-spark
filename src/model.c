@@ -461,6 +461,7 @@ static int cuda_projection_failed(waste_model *m, const char *scope)
     m->cuda_kda_state_dirty = 1;
     m->cuda_kda_effective = 0;
     m->cuda_dense_effective = 0;
+    m->cuda_gqa_proj_effective = 0;
     m->cuda_vq_effective = 0;
     m->cuda_kda_fallbacks++;
     return -1;
@@ -636,6 +637,18 @@ int waste_model_cuda_glm47_full_profile_compatible(const waste_model *m,
     if (!vq_mode) return 1;                 /* matched dense-only control */
     return vq_mode == 2 && vq_group == 1 &&
            waste_model_cuda_glm47_full_vq3r_compatible(m);
+}
+
+/* Projection-only standard-GQA pilot. The ordinary dense scope deliberately
+ * does not acquire a new meaning: this separate bit names q/k/v/o, and only
+ * the exact full-GLM FFN profile may compose with it. */
+int waste_model_cuda_glm47_full_gqa_profile_compatible(const waste_model *m,
+                                                        int kda_mode,
+                                                        int dense_scope,
+                                                        int gqa_proj)
+{
+    return gqa_proj == 1 && kda_mode == 1 && dense_scope == 3 &&
+           waste_model_cuda_glm47_full_dense_compatible(m);
 }
 
 int waste_model_cuda_vq_dense_scope_compatible(const waste_model *m,
@@ -822,6 +835,7 @@ fail:
     m->cuda_kda_failed = 1;
     m->cuda_kda_effective = 0;
     m->cuda_dense_effective = 0;
+    m->cuda_gqa_proj_effective = 0;
     m->cuda_vq_effective = 0;
     m->cuda_kda_fallbacks++;
     return -1;
@@ -932,6 +946,60 @@ fail:
     m->cuda_kda_failed = 1;
     m->cuda_kda_effective = 0;
     m->cuda_dense_effective = 0;
+    m->cuda_gqa_proj_effective = 0;
+    m->cuda_vq_effective = 0;
+    m->cuda_kda_fallbacks++;
+    return -1;
+}
+
+/* Validate all 368 standard-GQA projection tensors and execute both Q4
+ * matrix orientations before the first token. Biases, Q/K normalization,
+ * partial RoPE,
+ * cache updates, score/value attention, and routing remain in gqa_layer on
+ * the CPU; this proof owns only q/k/v/o matvec dispatch. */
+static int cuda_gqa_proj_preflight(waste_model *m, int enabled)
+{
+    m->cuda_gqa_proj_preflight = 0;
+    if (!enabled) return 0;
+    if (m->cuda_dense_preflight_scope != 3 ||
+        !waste_model_cuda_glm47_full_gqa_profile_compatible(
+            m, m->cuda_kda_mode, m->cuda_dense_scope, enabled)) {
+        fprintf(stderr,
+                "waste: full GLM-4.7 CUDA GQA projections require KDA mode "
+                "1, preflighted dense scope 3, and exact full-model "
+                "geometry\n");
+        goto fail;
+    }
+    const waste_config *c = &m->cfg;
+    const waste_tensor *first = NULL;
+    const waste_tensor *first_o = NULL;
+    static const char *projection[] = { "q", "k", "v", "o" };
+    for (int L = 0; L < c->n_layers; L++) {
+        for (size_t i = 0; i < sizeof projection / sizeof projection[0]; i++) {
+            const char *name = tname(
+                "%smodel.layers.%d.self_attn.%s_proj.weight",
+                c->prefix, L, projection[i]);
+            if (cuda_dense_tensor_ok(m, name, &first))
+                goto fail;
+            if (!first_o && i == 3) first_o = waste_find(m, name);
+        }
+    }
+    /* Exercise both matrix orientations before any K/V state can change:
+     * q expands H -> Q*D, while o contracts Q*D -> H.  The q output is a
+     * correctly sized scratch input for the o launch. */
+    if (!first || !first_o || waste_cuda_q4_matvec(
+            m, m->tmp, first, m->x, first->shape[0], first->shape[1], 1) ||
+        waste_cuda_q4_matvec(m, m->tmp + first_o->shape[1], first_o, m->tmp,
+                            first_o->shape[0], first_o->shape[1], 1))
+        goto fail;
+    m->cuda_gqa_proj_preflight = 1;
+    return 0;
+
+fail:
+    m->cuda_kda_failed = 1;
+    m->cuda_kda_effective = 0;
+    m->cuda_dense_effective = 0;
+    m->cuda_gqa_proj_effective = 0;
     m->cuda_vq_effective = 0;
     m->cuda_kda_fallbacks++;
     return -1;
@@ -973,6 +1041,7 @@ fail:
     m->cuda_kda_failed = 1;
     m->cuda_kda_effective = 0;
     m->cuda_dense_effective = 0;
+    m->cuda_gqa_proj_effective = 0;
     m->cuda_vq_effective = 0;
     m->cuda_kda_fallbacks++;
     return -1;
@@ -1134,6 +1203,7 @@ fail:
     m->cuda_kda_failed = 1;
     m->cuda_kda_effective = 0;
     m->cuda_dense_effective = 0;
+    m->cuda_gqa_proj_effective = 0;
     m->cuda_vq_effective = 0;
     m->cuda_kda_fallbacks++;
     return -1;
@@ -2018,6 +2088,8 @@ int waste_model_load(waste_model *m, const char *dir, int kv_cap,
         int mode = e ? atoi(e) : 0;
         e = getenv("WASTE_CUDA_DENSE");
         int scope = e ? atoi(e) : 0;
+        e = getenv("WASTE_CUDA_GQA_PROJ");
+        int gqa_proj = e ? atoi(e) : 0;
         e = getenv("WASTE_CUDA_VQ");
         int vq_mode = e ? atoi(e) : 0;
         e = getenv("WASTE_CUDA_VQ_GROUP");
@@ -2030,6 +2102,7 @@ int waste_model_load(waste_model *m, const char *dir, int kv_cap,
         if (backend && !strcmp(backend, "cpu")) {
             mode = 0;
             scope = 0;
+            gqa_proj = 0;
             vq_mode = 0;
             vq_group = 1;
             prefill_vq = 0;
@@ -2039,6 +2112,10 @@ int waste_model_load(waste_model *m, const char *dir, int kv_cap,
         if (mode > 2) mode = 2;
         if (scope < 0) scope = 0;
         if (scope > 3) scope = 3;
+        if (gqa_proj < 0 || gqa_proj > 1) {
+            fprintf(stderr, "waste: WASTE_CUDA_GQA_PROJ must be 0 or 1\n");
+            return -1;
+        }
         if (vq_mode < 0) vq_mode = 0;
         if (vq_mode > 2) vq_mode = 2;
         if (prefill_dense < 0 || prefill_dense > 2) {
@@ -2059,6 +2136,7 @@ int waste_model_load(waste_model *m, const char *dir, int kv_cap,
         }
         m->cuda_kda_mode = mode;
         m->cuda_dense_scope = scope;
+        m->cuda_gqa_proj = gqa_proj;
         m->cuda_vq_mode = vq_mode;
         m->cuda_vq_group = vq_group;
         m->cuda_prefill_vq = prefill_vq;
@@ -2543,6 +2621,8 @@ int waste_model_load(waste_model *m, const char *dir, int kv_cap,
         return -1;
     if (m->cuda_dense_scope &&
         cuda_dense_preflight(m, m->cuda_dense_scope)) return -1;
+    if (m->cuda_gqa_proj &&
+        cuda_gqa_proj_preflight(m, m->cuda_gqa_proj)) return -1;
     if (m->cuda_prefill_dense &&
         cuda_prefill_dense_preflight(m, m->cuda_prefill_dense)) return -1;
     if (m->cuda_vq_mode &&
@@ -3702,6 +3782,32 @@ static void gqa_head_range(int lo, int hi, void *ap)
     }
 }
 
+static int gqa_projection_t(waste_model *m, float *y,
+                            const waste_tensor *t, const float *x,
+                            int out, int in)
+{
+#if defined(WASTE_ENABLE_CUDA)
+    if (m->cuda_gqa_proj &&
+        (!m->cuda_gqa_proj_preflight || m->cuda_kda_mode != 1 ||
+         m->cuda_dense_scope != 3 ||
+         m->cuda_dense_preflight_scope != 3))
+        return cuda_projection_failed(m, "GQA projection guard");
+    const int mode = m->cuda_gqa_proj ? 1 : 0;
+#else
+    const int mode = 0;
+#endif
+    if (dense_matvec_scope_t(m, y, t, x, out, in,
+                             mode, 1, mode))
+        return -1;
+#if defined(WASTE_ENABLE_CUDA)
+    if (mode) {
+        m->cuda_gqa_proj_effective = 1;
+        m->cuda_gqa_proj_calls++;
+    }
+#endif
+    return 0;
+}
+
 /* CPU-correct standard grouped-query attention for full GLM-4.7.  This is
  * intentionally the plain representation first: separate q/k/v projections,
  * fp32 caches, and one causal head loop.  There is no MLA absorption or CUDA
@@ -3725,9 +3831,10 @@ static int gqa_layer(waste_model *m, int L, const float *in, float *out,
         "%smodel.layers.%d.self_attn.k_proj.weight", c->prefix, L));
     const waste_tensor *vw = waste_find(m, tname(
         "%smodel.layers.%d.self_attn.v_proj.weight", c->prefix, L));
-    matvec_t(m, q, qw, in, qrows, c->hidden);
-    matvec_t(m, k, kw, in, kvrows, c->hidden);
-    matvec_t(m, v, vw, in, kvrows, c->hidden);
+    if (gqa_projection_t(m, q, qw, in, qrows, c->hidden) ||
+        gqa_projection_t(m, k, kw, in, kvrows, c->hidden) ||
+        gqa_projection_t(m, v, vw, in, kvrows, c->hidden))
+        return -1;
 
     const float *qb = T(m, "%smodel.layers.%d.self_attn.q_proj.bias",
                         c->prefix, L);
@@ -3773,10 +3880,9 @@ static int gqa_layer(waste_model *m, int L, const float *in, float *out,
         .scale = 1.0f / sqrtf((float)D),
     };
     waste_parallel_for(c->n_heads, 1, gqa_head_range, &a);
-    matvec_t(m, out, waste_find(m, tname(
+    return gqa_projection_t(m, out, waste_find(m, tname(
         "%smodel.layers.%d.self_attn.o_proj.weight", c->prefix, L)),
         o, c->hidden, qrows);
-    return 0;
 }
 
 typedef struct {
@@ -4814,9 +4920,11 @@ void waste_model_reset(waste_model *m)
      * CUDA. CPU mode can still be selected for a reset model. */
     m->cuda_kda_effective = 0;
     m->cuda_dense_effective = 0;
+    m->cuda_gqa_proj_effective = 0;
     m->cuda_vq_effective = 0;
     m->cuda_kda_calls = 0;
     m->cuda_dense_calls = 0;
+    m->cuda_gqa_proj_calls = 0;
     m->cuda_vq_experts = 0;
     m->cuda_vq_applies = 0;
     m->cuda_vq_lut_builds = 0;
@@ -4844,8 +4952,11 @@ int waste_model_set_cuda_kda(waste_model *m, int mode)
 #if defined(WASTE_ENABLE_CUDA)
     const char *backend = getenv("WASTE_BACKEND");
     if (mode && backend && !strcmp(backend, "cpu")) return -1;
-    if (!mode && (m->cuda_dense_scope || m->cuda_vq_mode)) return -1;
+    if (!mode &&
+        (m->cuda_dense_scope || m->cuda_gqa_proj || m->cuda_vq_mode))
+        return -1;
     if (m->cuda_vq_mode && mode != 1) return -1;
+    if (m->cuda_gqa_proj && mode != 1) return -1;
     if (m->cuda_prefill_dense && mode != 1) return -1;
     if (mode && m->cuda_kda_failed) return -1;
     m->cuda_kda_mode = mode;
@@ -4889,16 +5000,22 @@ int waste_model_set_cuda_dense(waste_model *m, int scope)
     if (scope && backend && !strcmp(backend, "cpu")) return -1;
     if (scope && (!m->cuda_kda_mode || m->cuda_kda_failed)) return -1;
     if (m->cuda_prefill_dense && scope != 0 && scope != 3) return -1;
+    if (m->cuda_gqa_proj && scope != 3) return -1;
     if (m->cuda_vq_mode &&
         !waste_model_cuda_vq_dense_scope_compatible(m, scope)) return -1;
     m->cuda_dense_scope = scope;
     m->cuda_dense_preflight_scope = 0;
+    m->cuda_gqa_proj_preflight = 0;
     if (clear_prefill_dense) m->cuda_prefill_dense = 0;
     m->cuda_prefill_dense_preflight_mode = 0;
     m->cuda_dense_effective = 0;
     m->cuda_dense_calls = 0;
+    m->cuda_gqa_proj_effective = 0;
+    m->cuda_gqa_proj_calls = 0;
     if (!m->cuda_kda_failed) m->cuda_kda_fallbacks = 0;
     if (scope && cuda_dense_preflight(m, scope)) return -1;
+    if (m->cuda_gqa_proj &&
+        cuda_gqa_proj_preflight(m, m->cuda_gqa_proj)) return -1;
     if (m->cuda_prefill_dense &&
         cuda_prefill_dense_preflight(m, m->cuda_prefill_dense)) return -1;
     return 0;
@@ -4921,6 +5038,48 @@ int waste_model_cuda_dense_effective(const waste_model *m)
 uint64_t waste_model_cuda_dense_calls(const waste_model *m)
 {
     return m ? m->cuda_dense_calls : 0;
+}
+
+int waste_model_set_cuda_gqa_proj(waste_model *m, int enabled)
+{
+    if (!m || enabled < 0 || enabled > 1) return -1;
+#if defined(WASTE_ENABLE_CUDA)
+    const char *backend = getenv("WASTE_BACKEND");
+    if (enabled && backend && !strcmp(backend, "cpu")) return -1;
+    if (enabled && (m->cuda_kda_failed ||
+        !waste_model_cuda_glm47_full_gqa_profile_compatible(
+            m, m->cuda_kda_mode, m->cuda_dense_scope, enabled)))
+        return -1;
+    m->cuda_gqa_proj = enabled;
+    m->cuda_gqa_proj_preflight = 0;
+    m->cuda_gqa_proj_effective = 0;
+    m->cuda_gqa_proj_calls = 0;
+    /* GQA projection calls are a strict subset of the aggregate dense
+     * counter, so changing this selector starts both views together. */
+    m->cuda_dense_effective = 0;
+    m->cuda_dense_calls = 0;
+    if (!m->cuda_kda_failed) m->cuda_kda_fallbacks = 0;
+    if (enabled && cuda_gqa_proj_preflight(m, enabled)) return -1;
+    return 0;
+#else
+    m->cuda_gqa_proj = 0;
+    return enabled ? -1 : 0;
+#endif
+}
+
+int waste_model_get_cuda_gqa_proj(const waste_model *m)
+{
+    return m ? m->cuda_gqa_proj : 0;
+}
+
+int waste_model_cuda_gqa_proj_effective(const waste_model *m)
+{
+    return m ? m->cuda_gqa_proj_effective : 0;
+}
+
+uint64_t waste_model_cuda_gqa_proj_calls(const waste_model *m)
+{
+    return m ? m->cuda_gqa_proj_calls : 0;
 }
 
 int waste_model_set_cuda_vq(waste_model *m, int mode)
@@ -5791,11 +5950,13 @@ const float *waste_model_prefill(waste_model *m, const int *tokens, int n,
     const waste_config *c = &m->cfg;
     const int hid = c->hidden;
     if (m->cuda_kda_state_dirty ||
-        ((m->cuda_kda_mode || m->cuda_dense_scope || m->cuda_vq_mode) &&
+        ((m->cuda_kda_mode || m->cuda_dense_scope || m->cuda_gqa_proj ||
+          m->cuda_vq_mode) &&
          m->cuda_kda_failed)) return NULL;
     if (n <= 0) return m->logits;
     const int gqa_decode_cuda = c->attention_kind == WASTE_ATTN_GQA &&
-        (m->cuda_kda_mode || m->cuda_dense_scope || m->cuda_vq_mode);
+        (m->cuda_kda_mode || m->cuda_dense_scope || m->cuda_gqa_proj ||
+         m->cuda_vq_mode);
     /* A one-token tail still belongs to the prefill contract. In particular,
      * mode 2 must not fall through to decode's global mode-1 dense selector.
      * Standard GQA also stays in this function when a decode-only CUDA arm is
@@ -5821,10 +5982,12 @@ const float *waste_model_prefill(waste_model *m, const int *tokens, int n,
     if (c->attention_kind == WASTE_ATTN_GQA) {
         const int decode_cuda_mode = m->cuda_kda_mode;
         const int decode_dense_scope = m->cuda_dense_scope;
+        const int decode_gqa_proj = m->cuda_gqa_proj;
         const int decode_vq_mode = m->cuda_vq_mode;
         if (gqa_decode_cuda) {
             m->cuda_kda_mode = 0;
             m->cuda_dense_scope = 0;
+            m->cuda_gqa_proj = 0;
             m->cuda_vq_mode = 0;
         }
         const float *logits = NULL;
@@ -5835,6 +5998,7 @@ const float *waste_model_prefill(waste_model *m, const int *tokens, int n,
         if (gqa_decode_cuda) {
             m->cuda_kda_mode = decode_cuda_mode;
             m->cuda_dense_scope = decode_dense_scope;
+            m->cuda_gqa_proj = decode_gqa_proj;
             m->cuda_vq_mode = decode_vq_mode;
         }
         return logits;
@@ -6006,7 +6170,8 @@ const float *waste_model_prefill(waste_model *m, const int *tokens, int n,
         free(trace_rows);
     }
     if (m->read_error || m->cuda_kda_state_dirty ||
-        ((m->cuda_kda_mode || m->cuda_dense_scope || m->cuda_vq_mode) &&
+        ((m->cuda_kda_mode || m->cuda_dense_scope || m->cuda_gqa_proj ||
+          m->cuda_vq_mode) &&
          m->cuda_kda_failed))
         return NULL;
 
@@ -6042,7 +6207,8 @@ const float *waste_model_step(waste_model *m, int token, int pos, int *routed)
     const waste_config *c = &m->cfg;
     const int hid = c->hidden;
     if (m->cuda_kda_state_dirty ||
-        ((m->cuda_kda_mode || m->cuda_dense_scope || m->cuda_vq_mode) &&
+        ((m->cuda_kda_mode || m->cuda_dense_scope || m->cuda_gqa_proj ||
+          m->cuda_vq_mode) &&
          m->cuda_kda_failed)) return NULL;
     {   /* see waste_model_prefill */
         const int cm = waste_model_ctx_max(m);
@@ -6073,7 +6239,8 @@ const float *waste_model_step(waste_model *m, int token, int pos, int *routed)
 
     for (int L = 0; L < c->n_layers; L++) {
         if (m->read_error ||
-            ((m->cuda_kda_mode || m->cuda_dense_scope || m->cuda_vq_mode) &&
+            ((m->cuda_kda_mode || m->cuda_dense_scope || m->cuda_gqa_proj ||
+              m->cuda_vq_mode) &&
              m->cuda_kda_failed))
             break;                       /* see waste_model_prefill */
         char b[128];
@@ -6161,7 +6328,8 @@ const float *waste_model_step(waste_model *m, int token, int pos, int *routed)
             if (df) { fwrite(m->x, sizeof(float), (size_t)hid, df); fclose(df); }
         }
     }
-    if ((m->cuda_kda_mode || m->cuda_dense_scope || m->cuda_vq_mode) &&
+    if ((m->cuda_kda_mode || m->cuda_dense_scope || m->cuda_gqa_proj ||
+         m->cuda_vq_mode) &&
         m->cuda_kda_failed) {
         free(resid);
         free(norm);
@@ -6182,7 +6350,8 @@ const float *waste_model_step(waste_model *m, int token, int pos, int *routed)
     free(resid);
     free(norm);
     return (m->read_error ||
-            ((m->cuda_kda_mode || m->cuda_dense_scope || m->cuda_vq_mode) &&
+            ((m->cuda_kda_mode || m->cuda_dense_scope || m->cuda_gqa_proj ||
+              m->cuda_vq_mode) &&
              m->cuda_kda_failed))
          ? NULL : m->logits;
 }

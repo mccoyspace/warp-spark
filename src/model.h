@@ -227,11 +227,14 @@ typedef struct {
      * effective mode/calls correctly remain zero. Dense scope is cumulative:
      * 0 KDA-only, 1 shared+latent MoE, 2 ordinary MLA projections too, 3 the
      * non-MoE dense FFN too. Standard GQA attention is never implied by scope
-     * 2: the full-GLM pilot leaves every attention projection on the CPU. */
+     * 2. Its separate gqa_proj bit moves only full GLM q/k/v/o projections;
+     * normalization, RoPE, cache and attention arithmetic remain on CPU. */
     void    *cuda_kda_ctx;
     int      cuda_kda_mode, cuda_kda_effective, cuda_kda_failed;
     int      cuda_dense_scope, cuda_dense_effective;
     int      cuda_dense_preflight_scope;
+    int      cuda_gqa_proj, cuda_gqa_proj_effective;
+    int      cuda_gqa_proj_preflight;
     int      cuda_vq_mode, cuda_vq_effective, cuda_vq_preflight_modes;
     int      cuda_vq_group;          /* experts between mode-2 stream syncs */
     int      cuda_prefill_vq;        /* opt-in GLM Flash chunk VQ3R pilot   */
@@ -239,6 +242,7 @@ typedef struct {
     int      cuda_prefill_dense_preflight_mode;
     int      cuda_kda_state_dirty;
     uint64_t cuda_kda_fallbacks, cuda_kda_calls, cuda_dense_calls;
+    uint64_t cuda_gqa_proj_calls;
     uint64_t cuda_vq_experts, cuda_vq_applies, cuda_vq_lut_builds;
     uint64_t cuda_vq_launches, cuda_vq_syncs;
     int      trunk_fd;              /* stays open for the on-disk tensors  */
@@ -280,6 +284,10 @@ int waste_model_cuda_glm47_full_profile_compatible(const waste_model *m,
                                                     int dense_scope,
                                                     int vq_mode,
                                                     int vq_group);
+int waste_model_cuda_glm47_full_gqa_profile_compatible(const waste_model *m,
+                                                        int kda_mode,
+                                                        int dense_scope,
+                                                        int gqa_proj);
 int waste_model_cuda_vq_dense_scope_compatible(const waste_model *m,
                                                 int scope);
 int waste_model_cuda_prefill_vq_compatible(const waste_model *m);
@@ -342,6 +350,10 @@ int         waste_model_set_cuda_dense(waste_model *m, int scope);
 int         waste_model_get_cuda_dense(const waste_model *m);
 int         waste_model_cuda_dense_effective(const waste_model *m);
 uint64_t    waste_model_cuda_dense_calls(const waste_model *m);
+int         waste_model_set_cuda_gqa_proj(waste_model *m, int enabled);
+int         waste_model_get_cuda_gqa_proj(const waste_model *m);
+int         waste_model_cuda_gqa_proj_effective(const waste_model *m);
+uint64_t    waste_model_cuda_gqa_proj_calls(const waste_model *m);
 int         waste_model_set_cuda_vq(waste_model *m, int mode);
 int         waste_model_get_cuda_vq(const waste_model *m);
 int         waste_model_get_cuda_vq_group(const waste_model *m);
