@@ -143,3 +143,26 @@ The arithmetic smoke still returned exactly `323` and stopped on the expected
 secondary EOS, now at 2.54 tok/s. A short studio-oriented check generated 70
 coherent tokens in 27.82 seconds (2.52 tok/s). These are short qualification
 rows on one host, not sustained-throughput or broad quality benchmarks.
+
+## Fused VQ pipeline experiment
+
+A final default-off experiment kept each expert's VQ gate/up result on the
+GPU, applied SiLU and the down projection there, and synchronized only the
+final down vector. Experimental commit `85e011f` was tested and then reverted
+by `0aa550b` after it missed the performance gate.
+
+The interleaved mode-2/mode-3/mode-3/mode-2 development run produced:
+
+| Arm | Repeat 1 | Repeat 2 | Mean effective rate |
+| --- | ---: | ---: | ---: |
+| Existing VQ mode 2 | 2.218469 s, 3.606090 tok/s | 2.210495 s, 3.619099 tok/s | 3.6125945 tok/s |
+| Fused VQ mode 3 | 2.191513 s, 3.650445 tok/s | 2.224014 s, 3.597099 tok/s | 3.623772 tok/s |
+
+The measured gain was 0.309%, below the registered gate. Expert traffic was
+identical at 7,147,479,040 bytes. Greedy tokens, top-10 logits, and ordered
+routes were unchanged; maximum absolute logit difference was `6.6757e-6`.
+Semantic counters were exact. Synchronizations fell from 11,392 to 5,696,
+while launches rose from 17,800 to 23,496. The profiled VQ phase P7 was
+effectively unchanged (`1.077652455` versus `1.079494174` seconds), showing
+that removing this host handoff did not remove the dominant work. No held-out
+run was performed for the rejected candidate.
