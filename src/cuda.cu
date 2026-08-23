@@ -6,9 +6,11 @@
  * create a second weight cache outside the engine's memory budget.
  *
  * Selected decode-only KDA and dense projections call the Q4 operation
- * directly. The VQ arm is separately opt-in and keeps the router, SiTU and
- * expert reduction on the CPU. Prefill, absorbed MLA kv_b and the Q8 head
- * remain on the qualified CPU too.
+ * directly. The VQ arm is separately opt-in. Modes 1 and 2 keep activation
+ * and expert reduction on the CPU; the exact-full-GLM-only mode 3 keeps its
+ * SiLU pipeline on device but still returns one expert at a time for the
+ * original CPU router-order reduction. Prefill, absorbed MLA kv_b and the Q8
+ * head remain on the qualified CPU too.
  */
 
 #include "model.h"
@@ -56,6 +58,7 @@ typedef struct {
     int vq_group_phase, vq_group_count;
     int vq_group_rows, vq_group_cols;
     int vq_group_pair_prepared, vq_group_failed;
+    int vq_fused_pair_prepared, vq_fused_cb_base, vq_fused_cols;
     int vq_ready;
 } waste_cuda_kda;
 
@@ -239,6 +242,19 @@ __global__ static void vq_apply_one(float *y, const uint8_t *idx,
     y[row] = __fmul_rn(acc, q4_half(scale[row]));
 }
 
+/* Full GLM uses ordinary SiLU rather than SiTU. Mode 3 keeps the pair apply
+ * in vq_y, folds gate and up in place, then feeds the gate half directly to
+ * the down-LUT builder. -fmad=false keeps this a bounded arithmetic change
+ * rather than silently fusing the multiply into another operation. */
+__global__ static void vq_silu_mul(float *gate_up, int rows)
+{
+    const int row = (int)(blockIdx.x * blockDim.x + threadIdx.x);
+    if (row >= rows) return;
+    const float gate = gate_up[row];
+    const float up = gate_up[rows + row];
+    gate_up[row] = (gate / (1.0f + expf(-gate))) * up;
+}
+
 static void cuda_problem(const char *where, cudaError_t status)
 {
     fprintf(stderr, "waste: CUDA KDA %s: %s\n", where,
@@ -269,6 +285,7 @@ static int cuda_vq_group_abort(waste_cuda_kda *ctx, const char *where,
     if (ctx) {
         cuda_vq_group_reset(ctx);
         ctx->vq_group_pair_prepared = 0;
+        ctx->vq_fused_pair_prepared = 0;
         ctx->vq_group_failed = 1;
     }
     return -1;
@@ -416,6 +433,9 @@ static void cuda_vq_release(waste_cuda_kda *ctx)
     ctx->vq_group_down_y_slot_values = 0;
     cuda_vq_group_reset(ctx);
     ctx->vq_group_pair_prepared = 0;
+    ctx->vq_fused_pair_prepared = 0;
+    ctx->vq_fused_cb_base = 0;
+    ctx->vq_fused_cols = 0;
     ctx->vq_group_failed = 0;
     for (int i = 0; i < 3; i++) {
         if (ctx->vq_lut[i]) cudaFree(ctx->vq_lut[i]);
@@ -529,11 +549,12 @@ extern "C" int waste_cuda_vq_prepare_pair(waste_model *m, int mode,
                                             int cb_base, int cols)
 {
     waste_cuda_kda *ctx = m ? (waste_cuda_kda *)m->cuda_kda_ctx : NULL;
-    if (!ctx || !ctx->vq_ready || (mode != 1 && mode != 2) ||
+    if (!ctx || !ctx->vq_ready || (mode != 1 && mode != 2 && mode != 3) ||
         ctx->vq_group_failed || ctx->vq_group_phase != VQ_GROUP_IDLE ||
         cols < 1 || cols % VQ_VEC_DIM || (size_t)cols > ctx->capacity)
         return -1;
     ctx->vq_group_pair_prepared = 0;
+    ctx->vq_fused_pair_prepared = 0;
     const size_t values =
         (size_t)(cols / VQ_VEC_DIM) * VQ_STAGES * VQ_ENTRIES;
     if (values > ctx->vq_lut_values[0] || values > ctx->vq_lut_values[1])
@@ -571,6 +592,11 @@ extern "C" int waste_cuda_vq_prepare_pair(waste_model *m, int mode,
         return -1;
     }
     if (mode == 2) ctx->vq_group_pair_prepared = 1;
+    if (mode == 3) {
+        ctx->vq_fused_pair_prepared = 1;
+        ctx->vq_fused_cb_base = cb_base;
+        ctx->vq_fused_cols = cols;
+    }
     return 0;
 }
 
@@ -606,6 +632,77 @@ extern "C" int waste_cuda_vq_apply_pair(waste_model *m,
     memcpy(gate_y, ctx->host_y, (size_t)rows * sizeof(float));
     memcpy(up_y, ctx->host_y + rows, (size_t)rows * sizeof(float));
     ctx->vq_group_pair_prepared = 0;
+    return 0;
+}
+
+/* Mode 3: pair apply -> SiLU(gate)*up -> down LUT -> down apply, with one
+ * final vector copied to the CPU. The expert record remains a coherent host
+ * pointer, so the caller must hold its cache slot until this function has
+ * synchronized (or drained on error). */
+extern "C" int waste_cuda_vq_fused_expert(
+    waste_model *m, int mode, float *y, const uint8_t *gate_idx,
+    const uint8_t *up_idx, const uint8_t *down_idx,
+    const uint16_t *scale, int cb_base, int inter, int lat)
+{
+    waste_cuda_kda *ctx = m ? (waste_cuda_kda *)m->cuda_kda_ctx : NULL;
+    if (!ctx || !ctx->vq_ready || mode != 3 || !y || !gate_idx || !up_idx ||
+        !down_idx || !scale || ctx->vq_group_failed ||
+        ctx->vq_group_phase != VQ_GROUP_IDLE ||
+        !ctx->vq_fused_pair_prepared ||
+        ctx->vq_fused_cb_base != cb_base || ctx->vq_fused_cols != lat ||
+        m->cuda_dense_preflight_scope != 3 ||
+        !m->cuda_gqa_proj_preflight || m->cfg.act_situ ||
+        !waste_model_cuda_glm47_full_vq_fused_compatible(
+            m, m->cuda_kda_mode, m->cuda_dense_scope,
+            m->cuda_gqa_proj, m->cuda_vq_mode, m->cuda_vq_group) ||
+        inter != m->cfg.moe_inter || lat != m->cfg.hidden ||
+        inter < 1 || lat < 1 || inter % VQ_INDEX_BLOCK ||
+        lat % VQ_INDEX_BLOCK || inter % VQ_VEC_DIM || lat % VQ_VEC_DIM ||
+        (size_t)(2 * inter) > ctx->vq_y_capacity ||
+        (size_t)lat > ctx->vq_y_capacity)
+        return -1;
+
+    const size_t down_values =
+        (size_t)(inter / VQ_VEC_DIM) * VQ_STAGES * VQ_ENTRIES;
+    if (down_values != ctx->vq_lut_values[2] ||
+        cb_base < 0 || cb_base + 3 * VQ_STAGES > m->n_books)
+        return -1;
+
+    vq_apply_pair<<<inter / VQ_INDEX_BLOCK, 2 * VQ_INDEX_BLOCK,
+                    0, ctx->stream>>>(
+        ctx->vq_y, gate_idx, up_idx, scale,
+        ctx->vq_lut[0], ctx->vq_lut[1], inter, lat / VQ_VEC_DIM);
+    cudaError_t status = cudaGetLastError();
+    if (status == cudaSuccess) {
+        vq_silu_mul<<<(inter + VQ_BUILD_THREADS - 1) / VQ_BUILD_THREADS,
+                       VQ_BUILD_THREADS, 0, ctx->stream>>>(ctx->vq_y, inter);
+        status = cudaGetLastError();
+    }
+    if (status == cudaSuccess) {
+        const int total = (int)down_values;
+        vq_build_one<<<(total + VQ_BUILD_THREADS - 1) / VQ_BUILD_THREADS,
+                        VQ_BUILD_THREADS, 0, ctx->stream>>>(
+            ctx->vq_lut[2], ctx->vq_books, ctx->vq_y,
+            inter / VQ_VEC_DIM, cb_base + 2 * VQ_STAGES);
+        status = cudaGetLastError();
+    }
+    if (status == cudaSuccess) {
+        /* The LUT build has consumed the activation before stream order lets
+         * this overwrite vq_y with the final hidden-width vector. */
+        vq_apply_one<<<(lat + VQ_DOWN_THREADS - 1) / VQ_DOWN_THREADS,
+                        VQ_DOWN_THREADS, 0, ctx->stream>>>(
+            ctx->vq_y, down_idx, scale + 2 * inter, ctx->vq_lut[2],
+            lat, inter / VQ_VEC_DIM);
+        status = cudaGetLastError();
+    }
+    if (status == cudaSuccess)
+        status = cudaMemcpyAsync(ctx->host_y, ctx->vq_y,
+                                 (size_t)lat * sizeof(float),
+                                 cudaMemcpyDeviceToHost, ctx->stream);
+    if (status == cudaSuccess) status = cudaStreamSynchronize(ctx->stream);
+    if (status != cudaSuccess)
+        return cuda_vq_group_abort(ctx, "VQ fused expert", status);
+    memcpy(y, ctx->host_y, (size_t)lat * sizeof(float));
     return 0;
 }
 
@@ -782,6 +879,7 @@ extern "C" int waste_cuda_vq_group_drain(waste_model *m)
     const cudaError_t status = cudaStreamSynchronize(ctx->stream);
     cuda_vq_group_reset(ctx);
     ctx->vq_group_pair_prepared = 0;
+    ctx->vq_fused_pair_prepared = 0;
     if (status != cudaSuccess) {
         cuda_problem("VQ group drain", status);
         ctx->vq_group_failed = 1;

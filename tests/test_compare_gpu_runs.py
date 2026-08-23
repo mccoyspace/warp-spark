@@ -267,6 +267,64 @@ class CompareGpuRunsTest(unittest.TestCase):
         }
         return control, candidate
 
+    @staticmethod
+    def fused_vq_arms():
+        # Two decode steps, four routed layer rows and eight experts. Both
+        # arms keep the qualified 644-call/token full-GLM dense/GQA base.
+        layer_runs, experts = 4, 8
+        base = {
+            "key": "cuda_vq",
+            "fallbacks": 0,
+            "kda_mode": 1,
+            "kda_effective": 0,
+            "kda_calls": 0,
+            "kda_expected_calls": 0,
+            "dense_scope": 3,
+            "dense_effective": 3,
+            "dense_calls": 1288,
+            "dense_expected_calls": 1288,
+            "gqa_proj": 1,
+            "gqa_proj_effective": 1,
+            "gqa_proj_calls": 736,
+            "gqa_proj_expected_calls": 736,
+            "vq_group": 1,
+            "vq_experts": experts,
+            "vq_expected_experts": experts,
+            "vq_applies": 3 * experts,
+            "vq_expected_applies": 3 * experts,
+            "vq_lut_builds": experts + 2 * layer_runs,
+            "vq_expected_lut_builds": experts + 2 * layer_runs,
+        }
+        control_launches = 3 * experts + layer_runs
+        control = {
+            **base,
+            "value": 2,
+            "effective": 2,
+            "calls": control_launches,
+            "expected_calls": control_launches,
+            "vq_mode": 2,
+            "vq_effective": 2,
+            "vq_launches": control_launches,
+            "vq_expected_launches": control_launches,
+            "vq_syncs": 2 * experts,
+            "vq_expected_syncs": 2 * experts,
+        }
+        candidate_launches = 4 * experts + layer_runs
+        candidate = {
+            **base,
+            "value": 3,
+            "effective": 3,
+            "calls": candidate_launches,
+            "expected_calls": candidate_launches,
+            "vq_mode": 3,
+            "vq_effective": 3,
+            "vq_launches": candidate_launches,
+            "vq_expected_launches": candidate_launches,
+            "vq_syncs": experts,
+            "vq_expected_syncs": experts,
+        }
+        return control, candidate
+
     def test_self_compare_is_exact(self):
         result = self.compare()
         self.assertEqual(result["causally_compared_steps"], 3)
@@ -480,6 +538,37 @@ class CompareGpuRunsTest(unittest.TestCase):
         })
         with self.assertRaises(COMPARE.CaptureError):
             self.compare(cpu_arm=control, gpu_arm=candidate)
+
+    def test_vq_fused_accepts_exact_full_profile_and_route_counts(self):
+        control, candidate = self.fused_vq_arms()
+        result = self.compare(cpu_arm=control, gpu_arm=candidate)
+        self.assertEqual(result["arms"]["cpu"]["vq_mode"], 2)
+        self.assertEqual(result["arms"]["cpu"]["vq_launches"], 28)
+        self.assertEqual(result["arms"]["gpu"]["vq_mode"], 3)
+        self.assertEqual(result["arms"]["gpu"]["vq_launches"], 36)
+        self.assertEqual(result["arms"]["gpu"]["vq_syncs"], 8)
+
+    def test_vq_fused_rejects_wrong_base_or_self_consistent_counts(self):
+        control, candidate = self.fused_vq_arms()
+        mutations = (
+            {"gqa_proj": 0, "gqa_proj_effective": 0,
+             "gqa_proj_calls": 0, "gqa_proj_expected_calls": 0},
+            {"dense_calls": 552, "dense_expected_calls": 552},
+            {"vq_group": 2},
+            {"vq_launches": 35, "vq_expected_launches": 35,
+             "calls": 35, "expected_calls": 35},
+            {"vq_syncs": 16, "vq_expected_syncs": 16},
+        )
+        for mutation in mutations:
+            with self.subTest(mutation=mutation):
+                bad = copy.deepcopy(candidate)
+                bad.update(mutation)
+                with self.assertRaises(COMPARE.CaptureError):
+                    self.compare(cpu_arm=control, gpu_arm=bad)
+
+        zero_control, _ = self.vq_arms(2, zero_kda=True, dense_scope=3)
+        with self.assertRaises(COMPARE.CaptureError):
+            self.compare(cpu_arm=zero_control, gpu_arm=candidate)
 
     def test_gqa_projection_retains_full_profile_and_exact_counters(self):
         control, candidate = self.gqa_arms()

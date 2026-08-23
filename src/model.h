@@ -288,6 +288,12 @@ int waste_model_cuda_glm47_full_gqa_profile_compatible(const waste_model *m,
                                                         int kda_mode,
                                                         int dense_scope,
                                                         int gqa_proj);
+int waste_model_cuda_glm47_full_vq_fused_compatible(const waste_model *m,
+                                                     int kda_mode,
+                                                     int dense_scope,
+                                                     int gqa_proj,
+                                                     int vq_mode,
+                                                     int vq_group);
 int waste_model_cuda_vq_dense_scope_compatible(const waste_model *m,
                                                 int scope);
 int waste_model_cuda_prefill_vq_compatible(const waste_model *m);
