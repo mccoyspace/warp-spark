@@ -144,9 +144,65 @@ secondary EOS, now at 2.54 tok/s. A short studio-oriented check generated 70
 coherent tokens in 27.82 seconds (2.52 tok/s). These are short qualification
 rows on one host, not sustained-throughput or broad quality benchmarks.
 
+## Layer-major GQA chunk-prefill qualification
+
+Commit `ae4cb6d` adds a bounded, default-off prompt path for the full model.
+`WASTE_GQA_CHUNK_PREFILL=1` walks each standard-GQA layer through the prompt
+in strict causal token order, then reuses the existing chunk-wide dense-FFN
+and MoE machinery. On the qualified CUDA profile it must be paired with
+`WASTE_CUDA_PREFILL_VQ=1`; the exact full-GLM geometry, KDA-1/dense-3/GQA-1/
+VQ-2/group-1 selectors, and completed CUDA preflights are all required. Other
+CUDA combinations fail closed.
+
+The router, routing correction, fp32 K/V state, Q/K normalization, partial
+RoPE, score/value attention, and router-ordered decode accumulation retain
+their existing contracts. Prompt GQA projections use the qualified CUDA Q4
+path, routed prompt experts use the qualified CUDA VQ3R path, and the LM head
+is evaluated once for the completed prompt. A one-token tail uses the normal
+qualified step path rather than creating a degenerate chunk.
+
+The matched 34-token prompt bracket was:
+
+| Arm | Repeat 1 | Repeat 2 | Mean prompt time |
+| --- | ---: | ---: | ---: |
+| Token-major control | 33.31 s | 33.42 s | 33.365 s |
+| Layer-major CUDA candidate | 13.88 s | 13.80 s | 13.840 s |
+
+The candidate reduced prompt latency by 58.519% and was 2.41077x faster. Its
+prompt rate was 2.45-2.46 tok/s. Reported expert traffic fell from 110.69 GB
+and 13,403 misses to 66.22 GB and 8,018 misses. The candidate trace contained
+92 completed layer rows, including all 89 MoE layers and no failed rows; its
+prompt-only physical read count was 68,096,143,360 bytes.
+
+Profiling explains both halves of the gain. The standard-GQA phase fell from
+12.74-12.78 seconds to 2.15 seconds, while MoE fell from 20.09-20.15 seconds
+to 11.86-11.93 seconds. The candidate spent about 0.85 seconds in 276 batched
+matrix calls. Its prompt-plus-one-step counters were 13,156 aggregate dense
+calls, 12,880 GQA projection calls, 24,920 experts, 74,760 VQ applies, 36,338
+LUT builds, 80,469 launches, 49,840 synchronizations, and zero fallbacks.
+
+Each control repeated byte-for-byte, as did each candidate. Across arms,
+argmax and ordered top-10 logits were unchanged; maximum and mean absolute
+logit differences were `1.144409e-5` and `1.538187e-6`. All 3,115 routes had
+identical expert IDs after keying by position and layer, and the maximum
+router-weight difference was `1e-5`. The next eight generated tokens were
+also identical.
+
+Including those eight tokens, total time fell from 36.512 to 17.332 seconds,
+a 2.10662x full-request improvement. Subsequent decode steps averaged 0.40914
+seconds for the control and 0.43557 seconds for the candidate, a 6.46%
+regression, so the promotion is specifically a prompt/full-request result and
+not a decode-speed claim. The arithmetic smoke still returned exactly `323`
+and the expected EOS, and every arm recorded zero swap-I/O delta.
+
+The result passed the registered performance and numerical gates and is
+retained as the local experimental full-GLM prompt profile. The selector
+remains opt-in rather than default and does not imply upstream support or a
+general result for other models or hardware.
+
 ## Fused VQ pipeline experiment
 
-A final default-off experiment kept each expert's VQ gate/up result on the
+An earlier default-off experiment kept each expert's VQ gate/up result on the
 GPU, applied SiLU and the down projection there, and synchronized only the
 final down vector. Experimental commit `85e011f` was tested and then reverted
 by `0aa550b` after it missed the performance gate.
