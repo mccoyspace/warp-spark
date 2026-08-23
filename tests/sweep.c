@@ -36,9 +36,6 @@
  *   WASTE_CUDA_KDA=1 sweep CONTAINER ids,.. n_gen cuda_dense=0,1,2,3 [repeat]
  *   WASTE_CUDA_KDA=1 WASTE_CUDA_DENSE=2 \
  *     sweep CONTAINER ids,.. n_gen cuda_vq=0,1,2 [repeat]
- *   WASTE_CUDA_KDA=1 WASTE_CUDA_DENSE=3 WASTE_CUDA_GQA_PROJ=1 \
- *     WASTE_CUDA_VQ_GROUP=1 WASTE_CUDA_VQ=2 \
- *     sweep FULL_GLM_CONTAINER ids,.. n_gen cuda_vq=2,3 [repeat]
  *   WASTE_CUDA_KDA=1 WASTE_CUDA_DENSE=3 WASTE_CUDA_VQ=2 \
  *     sweep CONTAINER ids,.. n_gen cuda_gqa_proj=0,1 [repeat]
  * K2 is all MLA, so WASTE_CUDA_KDA selects the Q4 kernel for its dense arm
@@ -181,16 +178,11 @@ static cuda_vq_target cuda_vq_targets(const waste_model *m, int mode,
     const uint64_t layers = cuda_vq_moe_layer_count(m);
     target.experts = layers * (uint64_t)m->cfg.top_k * steps;
     target.applies = target.experts * UINT64_C(3); /* gate, up, down */
-    target.lut_builds = mode >= 2
+    target.lut_builds = mode == 2
         ? layers * UINT64_C(2) * steps + target.experts : UINT64_C(0);
     target.launches = mode == 1
         ? target.experts * UINT64_C(2)
-        : layers * steps + target.experts * (mode == 3
-            ? UINT64_C(4) : UINT64_C(3));
-    if (mode == 3) {
-        target.syncs = target.experts;
-        return target;
-    }
+        : layers * steps + target.experts * UINT64_C(3);
     const uint64_t group = mode == 2
         ? (uint64_t)waste_model_get_cuda_vq_group(m) : UINT64_C(1);
     const uint64_t groups_per_layer =

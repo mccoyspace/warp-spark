@@ -53,12 +53,6 @@ int  waste_cuda_vq_apply_down(waste_model *m, int mode, float *y,
                               const uint8_t *idx, const uint16_t *scale,
                               const float *x, const float *cpu_lut,
                               int cb_base, int rows, int cols);
-int  waste_cuda_vq_fused_expert(waste_model *m, int mode, float *y,
-                                const uint8_t *gate_idx,
-                                const uint8_t *up_idx,
-                                const uint8_t *down_idx,
-                                const uint16_t *scale, int cb_base,
-                                int inter, int lat);
 int  waste_cuda_vq_group_pair_enqueue(
         waste_model *m, int slot, const uint8_t *gate_idx,
         const uint8_t *up_idx, const uint16_t *scale, int rows, int cols);
@@ -657,22 +651,6 @@ int waste_model_cuda_glm47_full_gqa_profile_compatible(const waste_model *m,
            waste_model_cuda_glm47_full_dense_compatible(m);
 }
 
-/* Mode 3 is deliberately not another meaning of the general VQ selector.
- * It is one full-GLM experiment whose CPU/GPU split is part of the contract:
- * the qualified q/k/v/o arm must already be active, and expert grouping is
- * forbidden because each held record is completed and released in turn. */
-int waste_model_cuda_glm47_full_vq_fused_compatible(const waste_model *m,
-                                                     int kda_mode,
-                                                     int dense_scope,
-                                                     int gqa_proj,
-                                                     int vq_mode,
-                                                     int vq_group)
-{
-    return kda_mode == 1 && dense_scope == 3 && gqa_proj == 1 &&
-           vq_mode == 3 && vq_group == 1 &&
-           waste_model_cuda_glm47_full_vq3r_compatible(m);
-}
-
 int waste_model_cuda_vq_dense_scope_compatible(const waste_model *m,
                                                 int scope)
 {
@@ -1085,26 +1063,14 @@ static int cuda_vq_preflight(waste_model *m, int mode)
         k2_geometry || glm47_flash_geometry || glm47_full_geometry;
     const int dense_scope_ok = waste_model_cuda_vq_dense_scope_compatible(
         m, m->cuda_dense_scope);
-    if (mode < 1 || mode > 3 || m->cuda_kda_mode != 1 ||
+    if (mode < 1 || mode > 2 || m->cuda_kda_mode != 1 ||
         !dense_scope_ok) {
         fprintf(stderr,
                 "waste: CUDA VQ requires CUDA KDA mode 1 and dense scope 2 "
                 "(or scope 3 on qualified geometry)\n");
         goto fail;
     }
-    if (mode == 3 &&
-        (!waste_model_cuda_glm47_full_vq_fused_compatible(
-             m, m->cuda_kda_mode, m->cuda_dense_scope,
-             m->cuda_gqa_proj, mode, m->cuda_vq_group) ||
-         m->cuda_dense_preflight_scope != 3 ||
-         !m->cuda_gqa_proj_preflight || m->cache.n_slots < 1)) {
-        fprintf(stderr,
-                "waste: CUDA VQ mode 3 requires the exact full GLM-4.7 "
-                "KDA1/dense3/GQA1/VQ3/group1 profile, completed dense/GQA "
-                "preflights, and at least one expert-cache slot\n");
-        goto fail;
-    }
-    if (glm47_full_geometry && mode != 3 &&
+    if (glm47_full_geometry &&
         !waste_model_cuda_glm47_full_profile_compatible(
             m, m->cuda_kda_mode, m->cuda_dense_scope, mode,
             m->cuda_vq_group)) {
@@ -1187,18 +1153,9 @@ static int cuda_vq_preflight(waste_model *m, int mode)
                          NULL, NULL);
         }
         if (waste_cuda_vq_prepare_pair(
-                m, mode, m->x, gate_lut, up_lut, h->codebook_id, lat)) {
-            if (mode == 3) waste_cuda_vq_group_drain(m);
+                m, mode, m->x, gate_lut, up_lut, h->codebook_id, lat))
             goto fail;
-        }
-        if (mode == 3) {
-            if (waste_cuda_vq_fused_expert(
-                    m, mode, down, rec + h->gate_off, rec + h->up_off,
-                    rec + h->down_off, scale, h->codebook_id, inter, lat)) {
-                waste_cuda_vq_group_drain(m);
-                goto fail;
-            }
-        } else if (grouped) {
+        if (grouped) {
             if (waste_cuda_vq_group_pair_enqueue(
                     m, 0, rec + h->gate_off, rec + h->up_off,
                     scale, inter, lat) ||
@@ -1211,19 +1168,16 @@ static int cuda_vq_preflight(waste_model *m, int mode)
                        scale, inter, lat)) {
             goto fail;
         }
-        if (mode != 3)
-            for (int i = 0; i < inter; i++)
-                gate[i] = c->act_situ
-                    ? waste_situ_pair(gate[i], up[i], c->situ_beta,
-                                      c->situ_linear_beta)
-                    : (gate[i] / (1.0f + expf(-gate[i]))) * up[i];
+        for (int i = 0; i < inter; i++)
+            gate[i] = c->act_situ
+                ? waste_situ_pair(gate[i], up[i], c->situ_beta,
+                                  c->situ_linear_beta)
+                : (gate[i] / (1.0f + expf(-gate[i]))) * up[i];
         if (mode == 1)
             vq_build_lut(m, down_lut, h->codebook_id + 2 * m->stages,
                          gate, inter, m->stages, m->cb_entries, m->vec_dim,
                          NULL, NULL);
-        if (mode == 3) {
-            /* The fused path already produced and synchronized `down`. */
-        } else if (grouped) {
+        if (grouped) {
             if (waste_cuda_vq_group_down_enqueue(
                     m, 0, rec + h->down_off, scale + 2 * inter, gate,
                     h->codebook_id + 2 * m->stages, lat, inter) ||
@@ -1237,9 +1191,8 @@ static int cuda_vq_preflight(waste_model *m, int mode)
                        h->codebook_id + 2 * m->stages, lat, inter)) {
             goto fail;
         }
-        if (mode != 3)
-            for (int i = 0; i < inter; i++)
-                if (!isfinite(gate[i]) || !isfinite(up[i])) goto fail;
+        for (int i = 0; i < inter; i++)
+            if (!isfinite(gate[i]) || !isfinite(up[i])) goto fail;
         for (int i = 0; i < lat; i++)
             if (!isfinite(down[i])) goto fail;
     }
@@ -2163,10 +2116,8 @@ int waste_model_load(waste_model *m, const char *dir, int kv_cap,
             fprintf(stderr, "waste: WASTE_CUDA_GQA_PROJ must be 0 or 1\n");
             return -1;
         }
-        if (vq_mode < 0 || vq_mode > 3) {
-            fprintf(stderr, "waste: WASTE_CUDA_VQ must be 0, 1, 2 or 3\n");
-            return -1;
-        }
+        if (vq_mode < 0) vq_mode = 0;
+        if (vq_mode > 2) vq_mode = 2;
         if (prefill_dense < 0 || prefill_dense > 2) {
             fprintf(stderr,
                     "waste: WASTE_CUDA_PREFILL_DENSE must be 0, 1 or 2\n");
@@ -2178,7 +2129,7 @@ int waste_model_load(waste_model *m, const char *dir, int kv_cap,
                     "waste: WASTE_CUDA_VQ_GROUP must be 1, 2, 4, 8 or 16\n");
             return -1;
         }
-        if ((vq_mode == 1 || vq_mode == 3) && vq_group != 1) {
+        if (vq_mode == 1 && vq_group != 1) {
             fprintf(stderr,
                     "waste: grouped CUDA VQ currently requires mode 2\n");
             return -1;
@@ -2664,11 +2615,6 @@ int waste_model_load(waste_model *m, const char *dir, int kv_cap,
         fprintf(stderr,
                 "waste: grouped CUDA VQ needs at least %d expert-cache slots\n",
                 m->cuda_vq_group);
-        return -1;
-    }
-    if (m->cuda_vq_mode == 3 && m->cache.n_slots < 1) {
-        fprintf(stderr,
-                "waste: CUDA VQ mode 3 needs at least one expert-cache slot\n");
         return -1;
     }
     if (m->cuda_kda_mode && cuda_kda_preflight(m, m->cuda_kda_mode))
@@ -4355,77 +4301,6 @@ static int moe_vq_grouped(waste_model *m, int L, const int *idx,
     }
     return 0;
 }
-
-/* Exact-full-GLM mode 3 keeps one pageable expert record held through the
- * complete device pipeline and returns one synchronized down vector. The
- * router-order CPU fold is intentionally unchanged. */
-static int moe_vq_fused(waste_model *m, int L, const int *idx,
-                        const float *weight, int K, const float *xin,
-                        float *ysum, int lat, int inter)
-{
-    if (!waste_model_cuda_glm47_full_vq_fused_compatible(
-            m, m->cuda_kda_mode, m->cuda_dense_scope, m->cuda_gqa_proj,
-            m->cuda_vq_mode, m->cuda_vq_group) ||
-        !(m->cuda_vq_preflight_modes & (1 << 3)) ||
-        m->cuda_dense_preflight_scope != 3 ||
-        !m->cuda_gqa_proj_preflight || m->cache.n_slots < 1)
-        return cuda_projection_failed(m, "VQ fused guard");
-
-    int pair_ready = 0;
-    for (int j = 0; j < K; j++) {
-        waste_ecache_hold hold = WASTE_ECACHE_HOLD_INIT;
-        PROF_START(P_EDEQ);
-        const uint8_t *rec = read_expert_hold(m, L, idx[j], &hold);
-        PROF_END(P_EDEQ);
-        if (!rec) {
-            const int cuda_failed = waste_cuda_vq_group_drain(m);
-            waste_ecache_release_hold(&m->cache, &hold);
-            return cuda_failed
-                ? cuda_projection_failed(m, "VQ fused read drain") : -1;
-        }
-        const waste_expert_hdr *h = (const waste_expert_hdr *)rec;
-        if (h->fmt != WQ_VQ3R) {
-            waste_cuda_vq_group_drain(m);
-            waste_ecache_release_hold(&m->cache, &hold);
-            return cuda_projection_failed(m, "VQ3R fused record validation");
-        }
-        PROF_START(P_EMM);
-        if (!pair_ready) {
-            if (waste_cuda_vq_prepare_pair(
-                    m, 3, xin, NULL, NULL, h->codebook_id, lat)) {
-                waste_cuda_vq_group_drain(m);
-                waste_ecache_release_hold(&m->cache, &hold);
-                return cuda_projection_failed(m, "VQ fused prepare");
-            }
-            m->cuda_vq_lut_builds += 2;
-            m->cuda_vq_launches++;
-            pair_ready = 1;
-        }
-        const uint16_t *scale = (const uint16_t *)(
-            rec + h->chan_corr_off);
-        PROF_START(P_LUTA);
-        const int failed = waste_cuda_vq_fused_expert(
-            m, 3, m->e_gate, rec + h->gate_off, rec + h->up_off,
-            rec + h->down_off, scale, h->codebook_id, inter, lat);
-        PROF_END(P_LUTA);
-        if (failed) {
-            waste_cuda_vq_group_drain(m);
-            waste_ecache_release_hold(&m->cache, &hold);
-            return cuda_projection_failed(m, "VQ fused expert");
-        }
-        m->cuda_vq_lut_builds++;
-        m->cuda_vq_launches += 4;
-        m->cuda_vq_syncs++;
-        m->cuda_vq_experts++;
-        m->cuda_vq_applies += 3;
-        const float wj = weight[j];
-        for (int i = 0; i < lat; i++) ysum[i] += wj * m->e_gate[i];
-        PROF_END(P_EMM);
-        waste_ecache_release_hold(&m->cache, &hold);
-    }
-    m->cuda_vq_effective = 3;
-    return 0;
-}
 #endif
 
 static int moe_layer(waste_model *m, int L, const float *in, float *out, int *routed)
@@ -4605,11 +4480,7 @@ static int moe_layer(waste_model *m, int L, const float *in, float *out, int *ro
     int lut_ready = 0;
     int routed_grouped = 0;
 #if defined(WASTE_ENABLE_CUDA)
-    if (m->cuda_vq_mode == 3) {
-        if (moe_vq_fused(m, L, idx, w, K, xin, ysum, lat, inter))
-            return -1;
-        routed_grouped = 1;
-    } else if (m->cuda_vq_mode == 2 && m->cuda_vq_group > 1) {
+    if (m->cuda_vq_mode == 2 && m->cuda_vq_group > 1) {
         if (moe_vq_grouped(m, L, idx, w, K, xin, ysum, lat, inter, NULL))
             return -1;
         routed_grouped = 1;
@@ -5175,7 +5046,6 @@ int waste_model_set_cuda_gqa_proj(waste_model *m, int enabled)
 #if defined(WASTE_ENABLE_CUDA)
     const char *backend = getenv("WASTE_BACKEND");
     if (enabled && backend && !strcmp(backend, "cpu")) return -1;
-    if (m->cuda_vq_mode == 3 && enabled != 1) return -1;
     if (enabled && (m->cuda_kda_failed ||
         !waste_model_cuda_glm47_full_gqa_profile_compatible(
             m, m->cuda_kda_mode, m->cuda_dense_scope, enabled)))
@@ -5214,7 +5084,7 @@ uint64_t waste_model_cuda_gqa_proj_calls(const waste_model *m)
 
 int waste_model_set_cuda_vq(waste_model *m, int mode)
 {
-    if (!m || mode < 0 || mode > 3) return -1;
+    if (!m || mode < 0 || mode > 2) return -1;
 #if defined(WASTE_ENABLE_CUDA)
     const char *backend = getenv("WASTE_BACKEND");
     if (mode && backend && !strcmp(backend, "cpu")) return -1;
@@ -5223,16 +5093,9 @@ int waste_model_set_cuda_vq(waste_model *m, int mode)
                      m, m->cuda_dense_scope) ||
                  m->cuda_kda_failed))
         return -1;
-    if ((mode == 1 || mode == 3) && m->cuda_vq_group != 1) return -1;
+    if (mode == 1 && m->cuda_vq_group != 1) return -1;
     if (mode == 2 && m->cuda_vq_group > 1 &&
         m->cache.n_slots < m->cuda_vq_group) return -1;
-    if (mode == 3 &&
-        (!waste_model_cuda_glm47_full_vq_fused_compatible(
-             m, m->cuda_kda_mode, m->cuda_dense_scope,
-             m->cuda_gqa_proj, mode, m->cuda_vq_group) ||
-         m->cuda_dense_preflight_scope != 3 ||
-         !m->cuda_gqa_proj_preflight || m->cache.n_slots < 1))
-        return -1;
     m->cuda_vq_mode = mode;
     m->cuda_vq_effective = 0;
     m->cuda_vq_experts = 0;

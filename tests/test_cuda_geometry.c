@@ -283,20 +283,6 @@ int main(void)
             &full, 1, 3, 2));
         CHECK(!waste_model_cuda_glm47_full_gqa_profile_compatible(
             &exact, 1, 3, 1));
-        CHECK(waste_model_cuda_glm47_full_vq_fused_compatible(
-            &full, 1, 3, 1, 3, 1));
-        CHECK(!waste_model_cuda_glm47_full_vq_fused_compatible(
-            &full, 2, 3, 1, 3, 1));
-        CHECK(!waste_model_cuda_glm47_full_vq_fused_compatible(
-            &full, 1, 2, 1, 3, 1));
-        CHECK(!waste_model_cuda_glm47_full_vq_fused_compatible(
-            &full, 1, 3, 0, 3, 1));
-        CHECK(!waste_model_cuda_glm47_full_vq_fused_compatible(
-            &full, 1, 3, 1, 2, 1));
-        CHECK(!waste_model_cuda_glm47_full_vq_fused_compatible(
-            &full, 1, 3, 1, 3, 2));
-        CHECK(!waste_model_cuda_glm47_full_vq_fused_compatible(
-            &exact, 1, 3, 1, 3, 1));
 
         /* Decode reuse must not widen either GLM-Flash prefill pilot. */
         full.cuda_kda_mode = 1;
@@ -327,10 +313,6 @@ int main(void)
         CHECK(moe_layers * (2 + full.cfg.top_k) == 890);
         CHECK(moe_layers * (1 + 3 * full.cfg.top_k) == 2225);
         CHECK(2 * moe_layers * full.cfg.top_k == 1424);
-        /* Fused mode 3 adds one SiLU kernel per expert but cuts the two
-         * mode-2 handoff synchronizations to one final-vector sync. */
-        CHECK(moe_layers * (1 + 4 * full.cfg.top_k) == 2937);
-        CHECK(moe_layers * full.cfg.top_k == 712);
     }
 
     /* K2 is qualified for decode but never for this GLM-only pilot. */
