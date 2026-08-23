@@ -16,18 +16,28 @@ REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
 
 def load_convert():
+    missing = object()
+    old_torch = sys.modules.get("torch", missing)
+    old_mxfp4 = sys.modules.get("mxfp4", missing)
     torch = types.ModuleType("torch")
     torch.device = lambda value: value
     torch.backends = types.SimpleNamespace(
         mps=types.SimpleNamespace(is_available=lambda: False))
-    sys.modules.setdefault("torch", torch)
+    sys.modules["torch"] = torch
     mx = types.ModuleType("mxfp4")
     mx.ST = object
     mx.unblock_scale = lambda value, scale, block: value
-    sys.modules.setdefault("mxfp4", mx)
+    sys.modules["mxfp4"] = mx
     sys.path.insert(0, os.path.join(REPO, "tools"))
-    import convert
-    return convert
+    try:
+        import convert
+        return convert
+    finally:
+        for name, old in (("torch", old_torch), ("mxfp4", old_mxfp4)):
+            if old is missing:
+                sys.modules.pop(name, None)
+            else:
+                sys.modules[name] = old
 
 
 CONVERT = load_convert()
