@@ -283,6 +283,13 @@ int waste_model_cuda_glm47_flash_dense_compatible(const waste_model *m);
 int waste_model_cuda_glm47_flash_vq3r_compatible(const waste_model *m);
 int waste_model_cuda_glm47_full_dense_compatible(const waste_model *m);
 int waste_model_cuda_glm47_full_vq3r_compatible(const waste_model *m);
+int waste_model_cuda_glm52_dense_compatible(const waste_model *m);
+int waste_model_cuda_glm52_vq3r_compatible(const waste_model *m);
+int waste_model_cuda_glm52_profile_compatible(const waste_model *m,
+                                               int kda_mode,
+                                               int dense_scope,
+                                               int vq_mode,
+                                               int vq_group);
 int waste_model_cuda_glm47_full_profile_compatible(const waste_model *m,
                                                     int kda_mode,
                                                     int dense_scope,

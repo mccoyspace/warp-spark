@@ -621,6 +621,67 @@ int waste_model_cuda_glm47_full_vq3r_compatible(const waste_model *m)
            m->expert_m[2] % (int)WASTE_VQ_INDEX_BLOCK == 0;
 }
 
+/* Bounded GLM-5.2 runs ordinary dense MLA while the released DSA top-k
+ * covers the complete causal history.  The CUDA work below reuses only the
+ * already-qualified Q4 projection and VQ3R expert kernels; this exact gate
+ * prevents a later sparse-DSA or release-shape change from inheriting that
+ * qualification accidentally. */
+int waste_model_cuda_glm52_dense_compatible(const waste_model *m)
+{
+    if (!m) return 0;
+    const waste_config *c = &m->cfg;
+    if (strcmp(c->arch, "GlmMoeDsaForCausalLM") ||
+        strcmp(c->model_type, "glm_moe_dsa") ||
+        strcmp(c->hidden_act, "silu") ||
+        strcmp(c->topk_method, "noaux_tc") ||
+        strcmp(c->router_activation, "sigmoid") ||
+        c->attention_kind != WASTE_ATTN_LATENT ||
+        c->n_layers != 78 || c->hidden != 6144 ||
+        c->n_experts != 256 || c->top_k != 8 ||
+        c->moe_inter != 2048 || c->dense_inter != 12288 ||
+        c->n_shared != 1 || c->first_dense != 3 ||
+        c->n_heads != 64 || c->n_kv_heads != 64 ||
+        c->kv_lora != 512 || c->q_lora != 2048 ||
+        c->qk_nope != 192 || c->qk_rope != 64 || c->v_head != 256 ||
+        c->rope_interleave != 1 || c->mla_nope != 0 ||
+        c->dsa_dense_context_limit != 2048 ||
+        c->max_position_embeddings != 2048 ||
+        c->router_n_group != 1 || c->router_topk_group != 1 ||
+        !c->renorm || fabsf(c->routed_scale - 2.5f) > 1e-6f ||
+        c->latent_dim != 0 || c->kda_heads != 0 || c->kda_dim != 0 ||
+        m->expert_m[0] != 2048 || m->expert_m[1] != 2048 ||
+        m->expert_m[2] != 6144 || m->expert_n[0] != 6144 ||
+        m->expert_n[1] != 6144 || m->expert_n[2] != 2048)
+        return 0;
+    for (int L = 0; L < c->n_layers; L++)
+        if (c->kda_layer[L]) return 0;
+    return 1;
+}
+
+int waste_model_cuda_glm52_vq3r_compatible(const waste_model *m)
+{
+    return waste_model_cuda_glm52_dense_compatible(m) &&
+           m->index_bits == 8 && m->stages == 3 && m->vec_dim == 8 &&
+           m->cb_entries == 256 &&
+           m->index_block == WASTE_VQ_INDEX_BLOCK &&
+           m->expert_m[0] % (int)WASTE_VQ_INDEX_BLOCK == 0 &&
+           m->expert_m[2] % (int)WASTE_VQ_INDEX_BLOCK == 0;
+}
+
+int waste_model_cuda_glm52_profile_compatible(const waste_model *m,
+                                               int kda_mode,
+                                               int dense_scope,
+                                               int vq_mode,
+                                               int vq_group)
+{
+    if (!waste_model_cuda_glm52_dense_compatible(m) ||
+        kda_mode != 1 || dense_scope != 3)
+        return 0;
+    if (!vq_mode) return 1;
+    return vq_mode == 2 && vq_group == 1 &&
+           waste_model_cuda_glm52_vq3r_compatible(m);
+}
+
 /* The first hardware pilot deliberately qualifies one selector tuple, plus
  * its VQ-off control.  Disabled components remain valid so one-load sweeps
  * and orderly CUDA-to-CPU recovery can build/tear down the tuple in stages;
@@ -655,6 +716,8 @@ int waste_model_cuda_vq_dense_scope_compatible(const waste_model *m,
                                                 int scope)
 {
     if (!m) return 0;
+    if (waste_model_cuda_glm52_dense_compatible(m))
+        return scope == 3 && waste_model_cuda_glm52_vq3r_compatible(m);
     if (waste_model_cuda_glm47_full_dense_compatible(m))
         return scope == 3 &&
                waste_model_cuda_glm47_full_vq3r_compatible(m);
@@ -827,12 +890,14 @@ static int cuda_kda_preflight(waste_model *m, int mode)
         }
     }
     if (!first || !kda_layers) {
-        /* On the exact K2, GLM-4.7-Flash, and full-GLM geometries,
+        /* On the exact K2, GLM-4.7-Flash, full-GLM, and bounded GLM-5.2
+         * geometries,
          * WASTE_CUDA_KDA remains only the Q4 kernel selector for dense
          * projections and must execute zero KDA calls. Every other zero-KDA
          * model fails closed. Full GLM's standard-GQA attention is not moved
          * by accepting this otherwise-no-op base mode. */
         const int full_gqa = waste_model_cuda_glm47_full_dense_compatible(m);
+        const int glm52 = waste_model_cuda_glm52_dense_compatible(m);
         if (full_gqa && mode != 1) {
             fprintf(stderr,
                     "waste: full GLM-4.7 CUDA decode requires KDA selector "
@@ -840,7 +905,8 @@ static int cuda_kda_preflight(waste_model *m, int mode)
             goto fail;
         }
         if (waste_model_cuda_k2_dense_compatible(m) ||
-            waste_model_cuda_glm47_flash_dense_compatible(m) || full_gqa)
+            waste_model_cuda_glm47_flash_dense_compatible(m) || full_gqa ||
+            glm52)
             return 0;
         fprintf(stderr,
                 "waste: CUDA KDA requested for a model with no KDA layers\n");
@@ -880,6 +946,7 @@ static int cuda_dense_preflight(waste_model *m, int scope)
     int kda_layers = 0;
     for (int L = 0; L < c->n_layers; L++) kda_layers += !!c->kda_layer[L];
     const int full_gqa = waste_model_cuda_glm47_full_dense_compatible(m);
+    const int glm52 = waste_model_cuda_glm52_dense_compatible(m);
     if (full_gqa && !waste_model_cuda_glm47_full_profile_compatible(
                         m, m->cuda_kda_mode, scope, 0, 1)) {
         fprintf(stderr,
@@ -887,11 +954,20 @@ static int cuda_dense_preflight(waste_model *m, int scope)
                 "dense scope 3\n");
         goto fail;
     }
+    if (glm52 && !waste_model_cuda_glm52_profile_compatible(
+                     m, m->cuda_kda_mode, scope, 0, 1)) {
+        fprintf(stderr,
+                "waste: GLM-5.2 CUDA dense requires KDA mode 1 and "
+                "dense scope 3\n");
+        goto fail;
+    }
     if (!kda_layers && !waste_model_cuda_k2_dense_compatible(m) &&
-        !waste_model_cuda_glm47_flash_dense_compatible(m) && !full_gqa) {
+        !waste_model_cuda_glm47_flash_dense_compatible(m) && !full_gqa &&
+        !glm52) {
         fprintf(stderr,
                 "waste: CUDA dense zero-KDA path requires exact K2, "
-                "GLM-4.7-Flash, or full GLM-4.7 geometry\n");
+                "GLM-4.7-Flash, full GLM-4.7, or bounded GLM-5.2 "
+                "geometry\n");
         goto fail;
     }
     const waste_tensor *first = NULL;
@@ -1082,8 +1158,10 @@ static int cuda_vq_preflight(waste_model *m, int mode)
         waste_model_cuda_glm47_flash_vq3r_compatible(m);
     const int glm47_full_geometry =
         waste_model_cuda_glm47_full_vq3r_compatible(m);
+    const int glm52_geometry = waste_model_cuda_glm52_vq3r_compatible(m);
     const int qualified_decode_geometry =
-        k2_geometry || glm47_flash_geometry || glm47_full_geometry;
+        k2_geometry || glm47_flash_geometry || glm47_full_geometry ||
+        glm52_geometry;
     const int dense_scope_ok = waste_model_cuda_vq_dense_scope_compatible(
         m, m->cuda_dense_scope);
     if (mode < 1 || mode > 2 || m->cuda_kda_mode != 1 ||
@@ -1102,6 +1180,14 @@ static int cuda_vq_preflight(waste_model *m, int mode)
                 "scope 3, VQ mode 2, and VQ group 1\n");
         goto fail;
     }
+    if (glm52_geometry && !waste_model_cuda_glm52_profile_compatible(
+                              m, m->cuda_kda_mode, m->cuda_dense_scope,
+                              mode, m->cuda_vq_group)) {
+        fprintf(stderr,
+                "waste: GLM-5.2 CUDA VQ requires KDA mode 1, dense scope "
+                "3, VQ mode 2, and VQ group 1\n");
+        goto fail;
+    }
     if (m->index_bits != 8) {
         fprintf(stderr,
                 "waste: CUDA VQ is VQ3R-complete; VQ4P is rejected "
@@ -1117,7 +1203,7 @@ static int cuda_vq_preflight(waste_model *m, int mode)
                 "waste: CUDA VQ requires K3 VQ3R 3584/3072 top-16 or "
                 "allowlisted K2 7168/2048 top-8 or GLM-4.7-Flash "
                 "2048/1536 top-4 or full GLM-4.7 5120/1536 top-8 "
-                "VQ3R geometry\n");
+                "or GLM-5.2 6144/2048 top-8 VQ3R geometry\n");
         goto fail;
     }
     if (waste_cuda_vq_init(m)) {
