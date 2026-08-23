@@ -557,6 +557,46 @@ int waste_model_cuda_k2_vq3r_compatible(const waste_model *m)
            m->expert_m[2] % (int)WASTE_VQ_INDEX_BLOCK == 0;
 }
 
+/* Exact text-side K3 geometry used by the measured scope-2 CUDA profile.
+ * The KDA pattern matters as much as the headline dimensions: prefill mode 1
+ * sends every KDA projection through the decode-qualified Q4 kernel. */
+int waste_model_cuda_k3_dense_compatible(const waste_model *m)
+{
+    if (!m) return 0;
+    const waste_config *c = &m->cfg;
+    if (strcmp(c->arch, "KimiK3ForConditionalGeneration") ||
+        strcmp(c->prefix, "language_model.") ||
+        c->n_layers != 93 || c->hidden != 7168 || c->vocab != 163840 ||
+        c->n_experts != 896 || c->top_k != 16 ||
+        c->moe_inter != 3072 || c->dense_inter != 33792 ||
+        c->n_shared != 2 || c->first_dense != 1 ||
+        c->n_heads != 96 || c->kv_lora != 512 || c->q_lora != 1536 ||
+        c->qk_nope != 128 || c->qk_rope != 64 || c->v_head != 128 ||
+        c->latent_dim != 3584 || !c->latent_norm ||
+        c->kda_heads != 96 || c->kda_dim != 128 || c->conv_k != 4 ||
+        !c->full_rank_gate || c->attn_res_block != 12 ||
+        !c->mla_output_gate || !c->mla_nope || !c->act_situ ||
+        m->expert_m[0] != 3072 || m->expert_m[1] != 3072 ||
+        m->expert_m[2] != 3584 || m->expert_n[0] != 3584 ||
+        m->expert_n[1] != 3584 || m->expert_n[2] != 3072)
+        return 0;
+    for (int L = 0; L < c->n_layers; L++) {
+        const int expected_kda = L < 92 && L % 4 != 3;
+        if (!!c->kda_layer[L] != expected_kda) return 0;
+    }
+    return 1;
+}
+
+int waste_model_cuda_k3_vq3r_compatible(const waste_model *m)
+{
+    return waste_model_cuda_k3_dense_compatible(m) &&
+           m->index_bits == 8 && m->stages == 3 && m->vec_dim == 8 &&
+           m->cb_entries == 256 &&
+           m->index_block == WASTE_VQ_INDEX_BLOCK &&
+           m->expert_m[0] % (int)WASTE_VQ_INDEX_BLOCK == 0 &&
+           m->expert_m[2] % (int)WASTE_VQ_INDEX_BLOCK == 0;
+}
+
 int waste_model_cuda_glm47_flash_dense_compatible(const waste_model *m)
 {
     if (!m) return 0;
@@ -600,29 +640,35 @@ int waste_model_cuda_vq_dense_scope_compatible(const waste_model *m,
 }
 
 /* The chunk-prefill pilot deliberately has a smaller allowlist than decode.
- * It reuses the qualified mode-2 VQ primitive only on the all-MLA K2 and
- * GLM-4.7-Flash geometries selected as real-model vehicles. Requiring the
- * completed runtime preflight as well as the static geometry keeps a directly
- * mutated model struct from entering an untested path. */
+ * It reuses the qualified mode-2 VQ primitive only on exact measured model
+ * geometries. Requiring the completed runtime preflight as well as the static
+ * geometry keeps a directly mutated model struct from entering an untested
+ * path. */
 int waste_model_cuda_prefill_vq_compatible(const waste_model *m)
 {
     return m && m->cuda_prefill_vq && m->cuda_vq_mode == 2 &&
            (m->cuda_vq_preflight_modes & (1 << 2)) &&
-           (waste_model_cuda_k2_vq3r_compatible(m) ||
+           (waste_model_cuda_k3_vq3r_compatible(m) ||
+            waste_model_cuda_k2_vq3r_compatible(m) ||
             waste_model_cuda_glm47_flash_vq3r_compatible(m));
 }
 
-/* Keep this pilot on the already-qualified all-MLA dense profiles. Scope 3
- * and KDA mode 1 are intentional rather than minimum bounds: they name the
- * measured decode configurations, while the recorded preflight scope proves
- * that every required Q4 tensor and one real launch passed before prefill. */
+/* K2/GLM use their qualified all-MLA scope 3. K3 uses its qualified mixed
+ * KDA/MLA scope 2, and only the practical mode 1 path: mode 2 remains closed
+ * until its KDA and MLA arithmetic have a separate contract. */
 int waste_model_cuda_prefill_dense_compatible(const waste_model *m)
 {
-    return m && m->cuda_prefill_dense && !m->cuda_kda_failed &&
-           m->cuda_kda_mode == 1 && m->cuda_dense_scope == 3 &&
+    if (!m || !m->cuda_prefill_dense || m->cuda_kda_failed ||
+        m->cuda_kda_mode != 1 ||
+        m->cuda_prefill_dense_preflight_mode != m->cuda_prefill_dense)
+        return 0;
+    if (waste_model_cuda_k3_dense_compatible(m))
+        return m->cuda_prefill_dense == 1 &&
+               m->cuda_dense_scope == 2 &&
+               m->cuda_dense_preflight_scope == 2;
+    return m->cuda_dense_scope == 3 &&
            m->cuda_dense_preflight_scope == 3 &&
            m->cuda_prefill_dense >= 1 && m->cuda_prefill_dense <= 2 &&
-           m->cuda_prefill_dense_preflight_mode == m->cuda_prefill_dense &&
            (waste_model_cuda_k2_dense_compatible(m) ||
             waste_model_cuda_glm47_flash_dense_compatible(m));
 }
@@ -839,13 +885,19 @@ static int cuda_prefill_dense_preflight(waste_model *m, int mode)
 {
     m->cuda_prefill_dense_preflight_mode = 0;
     if (!mode) return 0;
+    const int k3_geometry = waste_model_cuda_k3_dense_compatible(m);
+    const int all_mla_geometry =
+        waste_model_cuda_k2_dense_compatible(m) ||
+        waste_model_cuda_glm47_flash_dense_compatible(m);
+    const int required_scope = k3_geometry ? 2 : 3;
     if (mode < 1 || mode > 2 || m->cuda_kda_mode != 1 ||
-        m->cuda_dense_scope != 3 || m->cuda_dense_preflight_scope != 3 ||
-        !(waste_model_cuda_k2_dense_compatible(m) ||
-          waste_model_cuda_glm47_flash_dense_compatible(m))) {
+        m->cuda_dense_scope != required_scope ||
+        m->cuda_dense_preflight_scope != required_scope ||
+        (!k3_geometry && !all_mla_geometry) || (k3_geometry && mode != 1)) {
         fprintf(stderr,
                 "waste: CUDA prefill dense mode requires global KDA mode 1, "
-                "preflighted dense scope 3, and a qualified all-MLA geometry\n");
+                "the qualified preflighted dense scope, and an exact K2, K3 "
+                "or GLM-4.7-Flash geometry (K3 supports mode 1 only)\n");
         goto fail;
     }
     if (mode == 2) {
@@ -899,8 +951,7 @@ static int cuda_vq_preflight(waste_model *m, int mode)
                 "pending its own correctness contract\n");
         goto fail;
     }
-    const int k3_geometry =
-        c->latent_dim == 3584 && c->moe_inter == 3072 && c->top_k == 16;
+    const int k3_geometry = waste_model_cuda_k3_vq3r_compatible(m);
     if (m->stages != 3 || m->vec_dim != 8 || m->cb_entries != 256 ||
         (!k3_geometry && !qualified_all_mla) ||
         !m->codebooksT || m->n_books < 9) {
@@ -2251,16 +2302,16 @@ int waste_model_load(waste_model *m, const char *dir, int kv_cap,
         !waste_model_cuda_prefill_vq_compatible(m)) {
         fprintf(stderr,
                 "waste: WASTE_CUDA_PREFILL_VQ requires CUDA VQ mode 2, "
-                "completed preflight, and exact GLM-4.7-Flash VQ3R geometry\n");
+                "completed preflight, and an exact qualified VQ3R geometry\n");
         return -1;
     }
     if (m->cuda_prefill_dense &&
         !waste_model_cuda_prefill_dense_compatible(m)) {
         fprintf(stderr,
                 "waste: WASTE_CUDA_PREFILL_DENSE requires CUDA KDA mode 1, "
-                "dense scope 3 with completed preflight, and exact "
-                "GLM-4.7-Flash geometry; value 1 is the fast diagnostic "
-                "and value 2 is CPU/NEON-ordered\n");
+                "the qualified dense scope with completed preflight, and an "
+                "exact K2, K3 or GLM-4.7-Flash geometry; K3 accepts the "
+                "practical value 1 only\n");
         return -1;
     }
     if (m->cuda_vq_mode && xpar_on)
@@ -4443,7 +4494,11 @@ int waste_model_set_cuda_dense(waste_model *m, int scope)
     const char *backend = getenv("WASTE_BACKEND");
     if (scope && backend && !strcmp(backend, "cpu")) return -1;
     if (scope && (!m->cuda_kda_mode || m->cuda_kda_failed)) return -1;
-    if (m->cuda_prefill_dense && scope != 0 && scope != 3) return -1;
+    if (m->cuda_prefill_dense && scope != 0 &&
+        !((scope == 2 && waste_model_cuda_k3_dense_compatible(m)) ||
+          (scope == 3 &&
+           (waste_model_cuda_k2_dense_compatible(m) ||
+            waste_model_cuda_glm47_flash_dense_compatible(m))))) return -1;
     if (m->cuda_vq_mode && scope != 2 &&
         !(scope == 3 &&
           (waste_model_cuda_k2_vq3r_compatible(m) ||
@@ -5364,6 +5419,11 @@ const float *waste_model_prefill(waste_model *m, const int *tokens, int n,
     }
     if (prefill_alloc(m, n)) return NULL;
 #if defined(WASTE_ENABLE_CUDA)
+    if (m->cuda_prefill_vq &&
+        !waste_model_cuda_prefill_vq_compatible(m)) {
+        cuda_projection_failed(m, "prefill VQ guard");
+        return NULL;
+    }
     if (m->cuda_prefill_dense &&
         !waste_model_cuda_prefill_dense_compatible(m)) {
         cuda_projection_failed(m, "prefill dense guard");
@@ -5446,10 +5506,15 @@ const float *waste_model_prefill(waste_model *m, const int *tokens, int n,
         if (r) r->attention_s = pnow();
         int attention_failed = 0;
         for (int t = 0; t < n; t++) {
-            if (c->kda_layer[L])
-                (void)kda_layer(m, L, m->cnorm + (size_t)t * hid,
-                                m->cresid + (size_t)t * hid, 0);
-            else if (mla_layer(
+            if (c->kda_layer[L]) {
+                if (kda_layer(
+                        m, L, m->cnorm + (size_t)t * hid,
+                        m->cresid + (size_t)t * hid,
+                        m->cuda_prefill_dense ? m->cuda_kda_mode : 0)) {
+                    attention_failed = 1;
+                    break;
+                }
+            } else if (mla_layer(
                     m, L, m->cnorm + (size_t)t * hid,
                     m->cresid + (size_t)t * hid, pos0 + t,
                     m->cuda_prefill_dense ? m->cuda_dense_scope : 0,

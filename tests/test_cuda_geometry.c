@@ -1,7 +1,7 @@
 /* SPDX-License-Identifier: Apache-2.0
  * Copyright 2026 SQLite Cloud, Inc.
  */
-/* Model-free tests for the exact all-MLA CUDA allowlists. */
+/* Model-free tests for the exact CUDA model allowlists. */
 
 #include <stdio.h>
 #include <string.h>
@@ -81,6 +81,51 @@ static waste_model glm47_flash(void)
     return m;
 }
 
+static waste_model k3(void)
+{
+    waste_model m;
+    memset(&m, 0, sizeof m);
+    strcpy(m.cfg.arch, "KimiK3ForConditionalGeneration");
+    strcpy(m.cfg.prefix, "language_model.");
+    m.cfg.n_layers = 93;
+    m.cfg.hidden = 7168;
+    m.cfg.vocab = 163840;
+    m.cfg.n_experts = 896;
+    m.cfg.top_k = 16;
+    m.cfg.moe_inter = 3072;
+    m.cfg.dense_inter = 33792;
+    m.cfg.n_shared = 2;
+    m.cfg.first_dense = 1;
+    m.cfg.n_heads = 96;
+    m.cfg.kv_lora = 512;
+    m.cfg.q_lora = 1536;
+    m.cfg.qk_nope = 128;
+    m.cfg.qk_rope = 64;
+    m.cfg.v_head = 128;
+    m.cfg.latent_dim = 3584;
+    m.cfg.latent_norm = 1;
+    m.cfg.kda_heads = 96;
+    m.cfg.kda_dim = 128;
+    m.cfg.conv_k = 4;
+    m.cfg.full_rank_gate = 1;
+    m.cfg.attn_res_block = 12;
+    m.cfg.mla_output_gate = 1;
+    m.cfg.mla_nope = 1;
+    m.cfg.act_situ = 1;
+    for (int L = 0; L < m.cfg.n_layers; L++)
+        m.cfg.kda_layer[L] = L < 92 && L % 4 != 3;
+    m.expert_m[0] = m.expert_m[1] = 3072;
+    m.expert_m[2] = 3584;
+    m.expert_n[0] = m.expert_n[1] = 3584;
+    m.expert_n[2] = 3072;
+    m.index_bits = 8;
+    m.stages = 3;
+    m.vec_dim = 8;
+    m.cb_entries = 256;
+    m.index_block = WASTE_VQ_INDEX_BLOCK;
+    return m;
+}
+
 #define REJECT_DENSE(field, value) do {                                     \
     waste_model changed = k2();                                             \
     changed.field = (value);                                                \
@@ -107,6 +152,19 @@ static waste_model glm47_flash(void)
     CHECK(waste_model_cuda_glm47_flash_dense_compatible(&changed));         \
     CHECK(!waste_model_cuda_glm47_flash_vq3r_compatible(&changed));         \
     CHECK(!waste_model_cuda_vq_dense_scope_compatible(&changed, 3));        \
+} while (0)
+
+#define REJECT_K3_DENSE(field, value) do {                                  \
+    waste_model changed = k3();                                             \
+    changed.field = (value);                                                \
+    CHECK(!waste_model_cuda_k3_dense_compatible(&changed));                 \
+} while (0)
+
+#define REJECT_K3_VQ(field, value) do {                                     \
+    waste_model changed = k3();                                             \
+    changed.field = (value);                                                \
+    CHECK(waste_model_cuda_k3_dense_compatible(&changed));                  \
+    CHECK(!waste_model_cuda_k3_vq3r_compatible(&changed));                  \
 } while (0)
 
 int main(void)
@@ -180,6 +238,89 @@ int main(void)
     REJECT_VQ(vec_dim, 4);
     REJECT_VQ(cb_entries, 64);
     REJECT_VQ(index_block, 32);
+
+    {
+        waste_model exact_k3 = k3();
+        CHECK(!waste_model_cuda_k3_dense_compatible(NULL));
+        CHECK(waste_model_cuda_k3_dense_compatible(&exact_k3));
+        CHECK(waste_model_cuda_k3_vq3r_compatible(&exact_k3));
+        CHECK(waste_model_cuda_vq_dense_scope_compatible(&exact_k3, 2));
+        CHECK(!waste_model_cuda_vq_dense_scope_compatible(&exact_k3, 3));
+
+        exact_k3.cuda_prefill_vq = 1;
+        exact_k3.cuda_vq_mode = 2;
+        exact_k3.cuda_vq_preflight_modes = 1 << 2;
+        CHECK(waste_model_cuda_prefill_vq_compatible(&exact_k3));
+        exact_k3.cuda_vq_preflight_modes = 0;
+        CHECK(!waste_model_cuda_prefill_vq_compatible(&exact_k3));
+        exact_k3.cuda_vq_preflight_modes = 1 << 2;
+
+        exact_k3.cuda_kda_mode = 1;
+        exact_k3.cuda_dense_scope = 2;
+        exact_k3.cuda_dense_preflight_scope = 2;
+        exact_k3.cuda_prefill_dense = 1;
+        exact_k3.cuda_prefill_dense_preflight_mode = 1;
+        CHECK(waste_model_cuda_prefill_dense_compatible(&exact_k3));
+        exact_k3.cuda_dense_scope = 3;
+        CHECK(!waste_model_cuda_prefill_dense_compatible(&exact_k3));
+        exact_k3.cuda_dense_scope = 2;
+        exact_k3.cuda_dense_preflight_scope = 3;
+        CHECK(!waste_model_cuda_prefill_dense_compatible(&exact_k3));
+        exact_k3.cuda_dense_preflight_scope = 2;
+        exact_k3.cuda_kda_mode = 2;
+        CHECK(!waste_model_cuda_prefill_dense_compatible(&exact_k3));
+        exact_k3.cuda_kda_mode = 1;
+        exact_k3.cuda_kda_failed = 1;
+        CHECK(!waste_model_cuda_prefill_dense_compatible(&exact_k3));
+        exact_k3.cuda_kda_failed = 0;
+        exact_k3.cuda_prefill_dense = 2;
+        exact_k3.cuda_prefill_dense_preflight_mode = 2;
+        CHECK(!waste_model_cuda_prefill_dense_compatible(&exact_k3));
+
+        exact_k3 = k3(); exact_k3.cfg.kda_layer[3] = 1;
+        CHECK(!waste_model_cuda_k3_dense_compatible(&exact_k3));
+        exact_k3 = k3(); exact_k3.cfg.kda_layer[90] = 0;
+        CHECK(!waste_model_cuda_k3_dense_compatible(&exact_k3));
+        exact_k3 = k3(); strcpy(exact_k3.cfg.arch, "KimiLinearForCausalLM");
+        CHECK(!waste_model_cuda_k3_dense_compatible(&exact_k3));
+        exact_k3 = k3(); strcpy(exact_k3.cfg.prefix, "");
+        CHECK(!waste_model_cuda_k3_dense_compatible(&exact_k3));
+    }
+
+    REJECT_K3_DENSE(cfg.n_layers, 92);
+    REJECT_K3_DENSE(cfg.hidden, 7169);
+    REJECT_K3_DENSE(cfg.vocab, 163839);
+    REJECT_K3_DENSE(cfg.n_experts, 895);
+    REJECT_K3_DENSE(cfg.top_k, 8);
+    REJECT_K3_DENSE(cfg.moe_inter, 2048);
+    REJECT_K3_DENSE(cfg.dense_inter, 33791);
+    REJECT_K3_DENSE(cfg.n_shared, 1);
+    REJECT_K3_DENSE(cfg.first_dense, 0);
+    REJECT_K3_DENSE(cfg.n_heads, 64);
+    REJECT_K3_DENSE(cfg.kv_lora, 256);
+    REJECT_K3_DENSE(cfg.q_lora, 0);
+    REJECT_K3_DENSE(cfg.qk_nope, 64);
+    REJECT_K3_DENSE(cfg.qk_rope, 128);
+    REJECT_K3_DENSE(cfg.v_head, 64);
+    REJECT_K3_DENSE(cfg.latent_dim, 0);
+    REJECT_K3_DENSE(cfg.latent_norm, 0);
+    REJECT_K3_DENSE(cfg.kda_heads, 64);
+    REJECT_K3_DENSE(cfg.kda_dim, 64);
+    REJECT_K3_DENSE(cfg.conv_k, 3);
+    REJECT_K3_DENSE(cfg.full_rank_gate, 0);
+    REJECT_K3_DENSE(cfg.attn_res_block, 0);
+    REJECT_K3_DENSE(cfg.mla_output_gate, 0);
+    REJECT_K3_DENSE(cfg.mla_nope, 0);
+    REJECT_K3_DENSE(cfg.act_situ, 0);
+    REJECT_K3_DENSE(expert_m[0], 3008);
+    REJECT_K3_DENSE(expert_m[2], 3520);
+    REJECT_K3_DENSE(expert_n[0], 3520);
+    REJECT_K3_DENSE(expert_n[2], 3008);
+    REJECT_K3_VQ(index_bits, 6);
+    REJECT_K3_VQ(stages, 4);
+    REJECT_K3_VQ(vec_dim, 4);
+    REJECT_K3_VQ(cb_entries, 64);
+    REJECT_K3_VQ(index_block, 32);
 
     exact = glm47_flash();
     CHECK(waste_model_cuda_glm47_flash_dense_compatible(&exact));

@@ -214,7 +214,7 @@ typedef struct {
     int      cuda_dense_preflight_scope;
     int      cuda_vq_mode, cuda_vq_effective, cuda_vq_preflight_modes;
     int      cuda_vq_group;          /* experts between mode-2 stream syncs */
-    int      cuda_prefill_vq;        /* opt-in all-MLA chunk VQ3R pilot     */
+    int      cuda_prefill_vq;        /* opt-in qualified chunk VQ3R pilot   */
     int      cuda_prefill_dense;     /* 1 fast diagnostic, 2 ordered-exact */
     int      cuda_prefill_dense_preflight_mode;
     int      cuda_kda_state_dirty;
@@ -247,10 +247,12 @@ typedef struct {
 } waste_model;
 
 /* Internal accelerator allowlists. These are deliberately model-free so the
- * exact all-MLA geometry gates can be tested without model weights or a CUDA
- * host. Dense covers only the Q4 trunk shape; VQ adds the expert format. */
+ * exact model geometry gates can be tested without weights or a CUDA host.
+ * Dense covers the qualified Q4 projection shape; VQ adds expert format. */
 int waste_model_cuda_k2_dense_compatible(const waste_model *m);
 int waste_model_cuda_k2_vq3r_compatible(const waste_model *m);
+int waste_model_cuda_k3_dense_compatible(const waste_model *m);
+int waste_model_cuda_k3_vq3r_compatible(const waste_model *m);
 int waste_model_cuda_glm47_flash_dense_compatible(const waste_model *m);
 int waste_model_cuda_glm47_flash_vq3r_compatible(const waste_model *m);
 int waste_model_cuda_vq_dense_scope_compatible(const waste_model *m,
