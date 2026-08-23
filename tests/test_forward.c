@@ -26,6 +26,28 @@ static double now(void)
     return t.tv_sec + t.tv_nsec / 1e9;
 }
 
+static const float *run_prompt(waste_model *m, const int *ids, int n,
+                               int chunked)
+{
+    const float *lg = NULL;
+    if (chunked) {
+        int done = 0;
+        while (done < n) {
+            int c = n - done;
+            if (c > waste_model_chunk_max(m)) c = waste_model_chunk_max(m);
+            lg = waste_model_prefill(m, ids + done, c, done);
+            if (!lg) break;
+            done += c;
+        }
+    } else {
+        for (int i = 0; i < n; i++) {
+            lg = waste_model_step(m, ids[i], i, NULL);
+            if (!lg) break;
+        }
+    }
+    return lg;
+}
+
 int main(int argc, char **argv)
 {
     if (argc < 3) {
@@ -58,17 +80,7 @@ int main(int argc, char **argv)
     const float *lg = NULL;
     const int chunked = getenv("WASTE_CHUNK") && atoi(getenv("WASTE_CHUNK")) != 0;
     t0 = now();
-    if (chunked) {
-        int done = 0;
-        while (done < n) {
-            int c = n - done;
-            if (c > waste_model_chunk_max(&m)) c = waste_model_chunk_max(&m);
-            lg = waste_model_prefill(&m, ids + done, c, done);
-            done += c;
-        }
-    } else {
-        for (int i = 0; i < n; i++) lg = waste_model_step(&m, ids[i], i, NULL);
-    }
+    lg = run_prompt(&m, ids, n, chunked);
     const double tp = now() - t0;
 
     /* NULL means an expert record did not survive the read: a short read,
@@ -82,6 +94,23 @@ int main(int argc, char **argv)
                 why ? why : "read failed");
         waste_model_free(&m);
         return 1;
+    }
+
+    if (getenv("WASTE_TEST_RESET_REPLAY")) {
+        const size_t logits_bytes = (size_t)m.cfg.vocab * sizeof(float);
+        float *first = (float *)malloc(logits_bytes);
+        if (!first) { waste_model_free(&m); return 1; }
+        memcpy(first, lg, logits_bytes);
+        waste_model_reset(&m);
+        lg = run_prompt(&m, ids, n, chunked);
+        if (!lg || memcmp(first, lg, logits_bytes)) {
+            fprintf(stderr, "reset replay changed final logits\n");
+            free(first);
+            waste_model_free(&m);
+            return 1;
+        }
+        free(first);
+        printf("reset replay exact\n");
     }
 
     int best = 0;
@@ -110,7 +139,7 @@ int main(int argc, char **argv)
         }
         best = 0;
         for (int v = 1; v < m.cfg.vocab; v++) if (lg[v] > lg[best]) best = v;
-        printf("  [%3d] %6d  (%.2fs, %llu expert reads)\n", i, best, now() - t0,
+        printf("  [%3d] %6d  (%.3fs, %llu expert reads)\n", i, best, now() - t0,
                (unsigned long long)m.expert_reads);
         cur = best;
     }
@@ -124,6 +153,10 @@ int main(int argc, char **argv)
            waste_model_get_cuda_dense(&m),
            waste_model_cuda_dense_effective(&m),
            (unsigned long long)waste_model_cuda_dense_calls(&m));
+    printf("cuda gqa proj: requested %d, effective %d, calls %llu\n",
+           waste_model_get_cuda_gqa_proj(&m),
+           waste_model_cuda_gqa_proj_effective(&m),
+           (unsigned long long)waste_model_cuda_gqa_proj_calls(&m));
     printf("cuda vq: requested %d, effective %d, group %d, experts %llu, applies %llu, "
            "lut builds %llu, launches %llu, syncs %llu\n",
            waste_model_get_cuda_vq(&m),
@@ -136,6 +169,7 @@ int main(int argc, char **argv)
            (unsigned long long)waste_model_cuda_vq_syncs(&m));
 
     extern double waste_prof[16];
+    extern uint64_t waste_prof_n[16];
     if (getenv("WASTE_PROFILE")) {
         /* indented names are sub-totals of the line above and are excluded
          * from `tot`, so the percentages add to 100 */
@@ -153,8 +187,10 @@ int main(int argc, char **argv)
         printf("\n-- profile (s, %d steps) --\n", n + n_gen);
         for (int i = 0; i < 16; i++)
             if (waste_prof[i] > 0)
-                printf("  %-14s %7.2f  %5.1f%%\n", names[i], waste_prof[i],
-                       100.0 * waste_prof[i] / tot);
+                printf("  %-14s %7.2f  %5.1f%%  n=%llu\n",
+                       names[i], waste_prof[i],
+                       100.0 * waste_prof[i] / tot,
+                       (unsigned long long)waste_prof_n[i]);
         printf("  %-14s %7.2f\n", "accounted", tot);
     }
     printf("\ncache: %llu hits / %llu misses = %.1f%% hit, %llu evictions, "

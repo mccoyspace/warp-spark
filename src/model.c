@@ -664,16 +664,39 @@ int waste_model_cuda_vq_dense_scope_compatible(const waste_model *m,
           waste_model_cuda_glm47_flash_vq3r_compatible(m)));
 }
 
-/* The chunk-prefill pilot deliberately has a smaller allowlist than decode.
- * It reuses the qualified mode-2 VQ primitive, but only GLM-4.7-Flash is the
- * vehicle for this experiment. Requiring the completed runtime preflight as
- * well as the static geometry keeps a directly mutated model struct from
- * entering an untested path. */
+/* CPU layer-major GQA is a semantic implementation rather than a release-
+ * shape optimization. This lets the tiny independent fixture exercise the
+ * real path without a test-only geometry escape hatch. */
+int waste_model_gqa_chunk_prefill_compatible(const waste_model *m)
+{
+    return m && m->gqa_chunk_prefill &&
+           waste_model_glm47_gqa_compatible(m);
+}
+
+/* CUDA composition is intentionally much narrower than the CPU algorithm:
+ * only the official full release and the complete qualified decode tuple may
+ * enter prefill. Dense/GQA/VQ proof bits make direct struct mutation fail
+ * before any K/V or residual state changes. */
+int waste_model_cuda_gqa_chunk_prefill_compatible(const waste_model *m)
+{
+    return waste_model_gqa_chunk_prefill_compatible(m) &&
+           m->cuda_prefill_vq && !m->cuda_kda_failed &&
+           m->cuda_kda_mode == 1 && m->cuda_dense_scope == 3 &&
+           m->cuda_dense_preflight_scope == 3 &&
+           m->cuda_gqa_proj == 1 && m->cuda_gqa_proj_preflight &&
+           m->cuda_vq_mode == 2 && m->cuda_vq_group == 1 &&
+           (m->cuda_vq_preflight_modes & (1 << 2)) &&
+           waste_model_cuda_glm47_full_vq3r_compatible(m);
+}
+
+/* The chunk-prefill VQ pilot remains exact-Flash-compatible as before, and
+ * now also admits only the exact full-GLM tuple proven above. */
 int waste_model_cuda_prefill_vq_compatible(const waste_model *m)
 {
     return m && m->cuda_prefill_vq && m->cuda_vq_mode == 2 &&
            (m->cuda_vq_preflight_modes & (1 << 2)) &&
-           waste_model_cuda_glm47_flash_vq3r_compatible(m);
+           (waste_model_cuda_glm47_flash_vq3r_compatible(m) ||
+            waste_model_cuda_gqa_chunk_prefill_compatible(m));
 }
 
 /* Keep this pilot on the already-qualified GLM Flash dense profile. Scope 3
@@ -2082,6 +2105,15 @@ int waste_model_load(waste_model *m, const char *dir, int kv_cap,
     m->want_vision = opt->want_vision;
     m->want_direct = opt->direct_io;
     pthread_once(&model_opts_once, model_opts_init);
+    {
+        const char *e = getenv("WASTE_GQA_CHUNK_PREFILL");
+        if (e && strcmp(e, "0") && strcmp(e, "1")) {
+            fprintf(stderr,
+                    "waste: WASTE_GQA_CHUNK_PREFILL must be 0 or 1\n");
+            return -1;
+        }
+        m->gqa_chunk_prefill = e && !strcmp(e, "1");
+    }
 #if defined(WASTE_ENABLE_CUDA)
     {
         const char *e = getenv("WASTE_CUDA_KDA");
@@ -2609,6 +2641,13 @@ int waste_model_load(waste_model *m, const char *dir, int kv_cap,
         } else if (!m->latcache[L]) return -1;
     }
     if (c->attn_res_block && !m->blockres) return -1;
+    if (m->gqa_chunk_prefill &&
+        !waste_model_gqa_chunk_prefill_compatible(m)) {
+        fprintf(stderr,
+                "waste: WASTE_GQA_CHUNK_PREFILL requires supported "
+                "standard-GQA GLM semantics\n");
+        return -1;
+    }
 #if defined(WASTE_ENABLE_CUDA)
     if (m->cuda_vq_mode == 2 && m->cuda_vq_group > 1 &&
         m->cache.n_slots < m->cuda_vq_group) {
@@ -2631,7 +2670,18 @@ int waste_model_load(waste_model *m, const char *dir, int kv_cap,
         !waste_model_cuda_prefill_vq_compatible(m)) {
         fprintf(stderr,
                 "waste: WASTE_CUDA_PREFILL_VQ requires CUDA VQ mode 2, "
-                "completed preflight, and exact GLM-4.7-Flash VQ3R geometry\n");
+                "completed preflight, and exact GLM-4.7-Flash geometry or "
+                "the exact full-GLM GQA chunk profile\n");
+        return -1;
+    }
+    if (m->gqa_chunk_prefill &&
+        (m->cuda_kda_mode || m->cuda_dense_scope || m->cuda_gqa_proj ||
+         m->cuda_vq_mode || m->cuda_prefill_vq) &&
+        !waste_model_cuda_gqa_chunk_prefill_compatible(m)) {
+        fprintf(stderr,
+                "waste: CUDA GQA chunk prefill requires exact full GLM-4.7 "
+                "with KDA1, dense3, GQA1, VQ2/group1, prefill VQ enabled, "
+                "and all CUDA preflights complete\n");
         return -1;
     }
     if (m->cuda_prefill_dense &&
@@ -5000,6 +5050,8 @@ int waste_model_set_cuda_dense(waste_model *m, int scope)
     if (scope && backend && !strcmp(backend, "cpu")) return -1;
     if (scope && (!m->cuda_kda_mode || m->cuda_kda_failed)) return -1;
     if (m->cuda_prefill_dense && scope != 0 && scope != 3) return -1;
+    if (m->gqa_chunk_prefill && m->cuda_prefill_vq && scope != 3)
+        return -1;
     if (m->cuda_gqa_proj && scope != 3) return -1;
     if (m->cuda_vq_mode &&
         !waste_model_cuda_vq_dense_scope_compatible(m, scope)) return -1;
@@ -5046,6 +5098,8 @@ int waste_model_set_cuda_gqa_proj(waste_model *m, int enabled)
 #if defined(WASTE_ENABLE_CUDA)
     const char *backend = getenv("WASTE_BACKEND");
     if (enabled && backend && !strcmp(backend, "cpu")) return -1;
+    if (m->gqa_chunk_prefill && m->cuda_prefill_vq && enabled != 1)
+        return -1;
     if (enabled && (m->cuda_kda_failed ||
         !waste_model_cuda_glm47_full_gqa_profile_compatible(
             m, m->cuda_kda_mode, m->cuda_dense_scope, enabled)))
@@ -5086,6 +5140,9 @@ int waste_model_set_cuda_vq(waste_model *m, int mode)
 {
     if (!m || mode < 0 || mode > 2) return -1;
 #if defined(WASTE_ENABLE_CUDA)
+    const int clear_prefill_vq = m->cuda_prefill_vq && mode == 0;
+    const int clear_gqa_chunk = m->gqa_chunk_prefill &&
+                                m->cuda_prefill_vq && mode == 0;
     const char *backend = getenv("WASTE_BACKEND");
     if (mode && backend && !strcmp(backend, "cpu")) return -1;
     if (mode && (m->cuda_kda_mode != 1 ||
@@ -5094,9 +5151,18 @@ int waste_model_set_cuda_vq(waste_model *m, int mode)
                  m->cuda_kda_failed))
         return -1;
     if (mode == 1 && m->cuda_vq_group != 1) return -1;
+    if (m->gqa_chunk_prefill && m->cuda_prefill_vq &&
+        mode != 0 && mode != 2)
+        return -1;
+    if (m->cuda_prefill_vq && mode != 0 && mode != 2) return -1;
     if (mode == 2 && m->cuda_vq_group > 1 &&
         m->cache.n_slots < m->cuda_vq_group) return -1;
     m->cuda_vq_mode = mode;
+    if (clear_prefill_vq) m->cuda_prefill_vq = 0;
+    /* Mode zero is the explicit atomic exit from the composite experiment.
+     * The remaining decode selectors can then be dismantled in their normal
+     * VQ -> GQA -> dense -> KDA order without leaving prefill poisoned. */
+    if (clear_gqa_chunk) m->gqa_chunk_prefill = 0;
     m->cuda_vq_effective = 0;
     m->cuda_vq_experts = 0;
     m->cuda_vq_applies = 0;
@@ -5644,7 +5710,8 @@ static int moe_chunk(waste_model *m, int L, const float *in, float *out,
             }
             idx[j] = best; w[j] = score[best];
         }
-        const char *attention = c->kda_layer[L] ? "KDA" : "MLA";
+        const char *attention = c->attention_kind == WASTE_ATTN_GQA ? "GQA" :
+                                c->kda_layer[L] ? "KDA" : "MLA";
         route_margin_row('P', dump_pos0 + t, L, attention,
                          in + (size_t)t * hid, hid,
                          sc, score, bias, E, idx, K);
@@ -5954,6 +6021,18 @@ const float *waste_model_prefill(waste_model *m, const int *tokens, int n,
           m->cuda_vq_mode) &&
          m->cuda_kda_failed)) return NULL;
     if (n <= 0) return m->logits;
+    if (m->gqa_chunk_prefill &&
+        !waste_model_gqa_chunk_prefill_compatible(m))
+        return NULL;
+#if defined(WASTE_ENABLE_CUDA)
+    if (m->gqa_chunk_prefill &&
+        (m->cuda_kda_mode || m->cuda_dense_scope || m->cuda_gqa_proj ||
+         m->cuda_vq_mode || m->cuda_prefill_vq) &&
+        !waste_model_cuda_gqa_chunk_prefill_compatible(m)) {
+        cuda_projection_failed(m, "GQA chunk prefill guard");
+        return NULL;
+    }
+#endif
     const int gqa_decode_cuda = c->attention_kind == WASTE_ATTN_GQA &&
         (m->cuda_kda_mode || m->cuda_dense_scope || m->cuda_gqa_proj ||
          m->cuda_vq_mode);
@@ -5961,8 +6040,8 @@ const float *waste_model_prefill(waste_model *m, const int *tokens, int n,
      * mode 2 must not fall through to decode's global mode-1 dense selector.
      * Standard GQA also stays in this function when a decode-only CUDA arm is
      * selected, so the arm can be masked for a one-token prompt as well. */
-    if (n == 1 && !m->cuda_prefill_dense && !m->cuda_prefill_vq &&
-        !gqa_decode_cuda)
+    if (n == 1 && !m->gqa_chunk_prefill && !m->cuda_prefill_dense &&
+        !m->cuda_prefill_vq && !gqa_decode_cuda)
         return waste_model_step(m, tokens[0], pos0, NULL);
     dump_pos0 = pos0;
     if (n > WASTE_CHUNK_MAX) n = WASTE_CHUNK_MAX;
@@ -5973,13 +6052,32 @@ const float *waste_model_prefill(waste_model *m, const int *tokens, int n,
         const int cm = waste_model_ctx_max(m);
         if (cm && (pos0 < 0 || pos0 > cm - n)) { m->ctx_full = 1; return NULL; }
     }
-    /* The first standard-GQA milestone is deliberately token-serial. It
-     * exercises exactly the CPU step and its fp32 K/V state instead of
-     * teaching the MLA chunk machinery a second attention representation.
-     * Full GLM's CUDA pilot is decode-only: temporarily mask its selectors
-     * for every prompt token, including a one-token final chunk, then restore
-     * them even when a CPU prompt step fails. */
-    if (c->attention_kind == WASTE_ATTN_GQA) {
+    /* Layer-major GQA assumes that every layer owns the same contiguous
+     * causal prefix. Refuse a stale, gapped, or partially failed state before
+     * allocating scratch or writing any new K/V row. */
+    if (m->gqa_chunk_prefill) {
+        for (int L = 0; L < c->n_layers; L++) {
+            if (m->n_kv[L] != pos0) {
+                fprintf(stderr,
+                        "waste: GQA chunk prefill K/V state mismatch at "
+                        "layer %d (have %d, need %d)\n",
+                        L, m->n_kv[L], pos0);
+                return NULL;
+            }
+        }
+    }
+    /* There is nothing to batch in a singleton tail. Keep it out of the
+     * prefill trace schema and use the already-qualified decode tuple rather
+     * than paying an unexpected CPU-only token. */
+    if (c->attention_kind == WASTE_ATTN_GQA &&
+        m->gqa_chunk_prefill && n == 1)
+        return waste_model_step(m, tokens[0], pos0, NULL);
+    /* Keep the established token-major GQA path as the no-flag control.
+     * Its CUDA profile is decode-only, so mask the selectors for every
+     * prompt token and restore them after success or failure. The opt-in
+     * layer-major path below instead calls gqa_layer in causal token order
+     * inside each layer and computes the LM head only once. */
+    if (c->attention_kind == WASTE_ATTN_GQA && !m->gqa_chunk_prefill) {
         const int decode_cuda_mode = m->cuda_kda_mode;
         const int decode_dense_scope = m->cuda_dense_scope;
         const int decode_gqa_proj = m->cuda_gqa_proj;
@@ -6042,6 +6140,7 @@ const float *waste_model_prefill(waste_model *m, const int *tokens, int n,
         : NULL;
     prefill_layer_trace *trace_next = trace_rows;
     int n_trace_rows = 0;
+    int prefill_failed = 0;
 
     for (int L = 0; L < c->n_layers; L++) {
         /* A record already failed: stop instead of streaming the rest of
@@ -6087,7 +6186,17 @@ const float *waste_model_prefill(waste_model *m, const int *tokens, int n,
         if (r) r->attention_s = pnow();
         int attention_failed = 0;
         for (int t = 0; t < n; t++) {
-            if (c->kda_layer[L])
+            if (c->attention_kind == WASTE_ATTN_GQA) {
+                PROF_START(P_MLA);
+                const int failed = gqa_layer(
+                    m, L, m->cnorm + (size_t)t * hid,
+                    m->cresid + (size_t)t * hid, pos0 + t);
+                PROF_END(P_MLA);
+                if (failed) {
+                    attention_failed = 1;
+                    break;
+                }
+            } else if (c->kda_layer[L])
                 (void)kda_layer(m, L, m->cnorm + (size_t)t * hid,
                                 m->cresid + (size_t)t * hid, 0);
             else if (mla_layer(
@@ -6099,8 +6208,14 @@ const float *waste_model_prefill(waste_model *m, const int *tokens, int n,
                 break;
             }
         }
+        if (c->attention_kind == WASTE_ATTN_GQA &&
+            m->n_kv[L] != pos0 + n)
+            attention_failed = 1;
         if (r) r->attention_s = pnow() - r->attention_s;
-        if (attention_failed) break;
+        if (attention_failed) {
+            prefill_failed = 1;
+            break;
+        }
 
         if (ares_on) {
             if (ps_live) for (int i = 0; i < n * hid; i++) m->cprefix[i] += m->cresid[i];
@@ -6130,7 +6245,10 @@ const float *waste_model_prefill(waste_model *m, const int *tokens, int n,
             n_used = moe_chunk(m, L, m->cnorm, m->cresid, n,
                                r ? &r->expert_acquire_s : NULL);
             PROF_END(P_ROUTE);
-            if (n_used < 0) break;
+            if (n_used < 0) {
+                prefill_failed = 1;
+                break;
+            }
         } else {
             const int inter = c->dense_inter;
             float *a = m->cff, *b = a + (size_t)n * inter;
@@ -6169,7 +6287,7 @@ const float *waste_model_prefill(waste_model *m, const int *tokens, int n,
         dump_prefill_rows(m, trace_rows, n_trace_rows);
         free(trace_rows);
     }
-    if (m->read_error || m->cuda_kda_state_dirty ||
+    if (prefill_failed || m->read_error || m->cuda_kda_state_dirty ||
         ((m->cuda_kda_mode || m->cuda_dense_scope || m->cuda_gqa_proj ||
           m->cuda_vq_mode) &&
          m->cuda_kda_failed))
@@ -6195,8 +6313,10 @@ const float *waste_model_prefill(waste_model *m, const int *tokens, int n,
     const float *fnw = waste_find(m, tname("%smodel.norm.weight", c->prefix))->data;
     float *last = m->cnorm;
     waste_rmsnorm(last, m->cx + (size_t)(n - 1) * hid, fnw, hid, c->eps);
+    PROF_START(P_HEAD);
     matvec_t(m, m->logits, waste_find(m, tname("%slm_head.weight", c->prefix)), last,
              c->vocab, hid);
+    PROF_END(P_HEAD);
     memcpy(m->x, m->cx + (size_t)(n - 1) * hid, (size_t)hid * sizeof(float));
     return m->read_error ? NULL : m->logits;
 }

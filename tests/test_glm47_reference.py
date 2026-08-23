@@ -61,6 +61,56 @@ class Glm47ReferenceTest(unittest.TestCase):
         with torch.no_grad():
             return Glm47Ref(self.container, **kwargs).forward(IDS)
 
+    def run_engine(self, label, *, chunked, gqa_chunk=None, reset=False,
+                   dump_routes=True, ids=IDS):
+        engine = os.path.join(REPO, "test_forward")
+        if not os.path.isfile(engine):
+            self.skipTest("make test_forward has not been run")
+        actual_path = os.path.join(self.tmp, label + ".bin")
+        route_path = os.path.join(self.tmp, label + ".routes")
+        env = dict(os.environ)
+        env.pop("WASTE_GQA_CHUNK_PREFILL", None)
+        env.update({
+            "WASTE_BACKEND": "cpu",
+            "WASTE_CHUNK": "1" if chunked else "0",
+            "WASTE_CUDA_KDA": "0",
+            "WASTE_CUDA_DENSE": "0",
+            "WASTE_CUDA_VQ": "0",
+            "WASTE_SDOT": "0",
+            "WASTE_I8MM": "0",
+        })
+        if gqa_chunk is not None:
+            env["WASTE_GQA_CHUNK_PREFILL"] = str(gqa_chunk)
+        if reset:
+            env["WASTE_TEST_RESET_REPLAY"] = "1"
+        if dump_routes:
+            env["WASTE_DUMP_ROUTE"] = route_path
+        else:
+            env.pop("WASTE_DUMP_ROUTE", None)
+        run = subprocess.run([
+            engine, self.container_path, ",".join(map(str, ids)),
+            actual_path, "0",
+        ], cwd=REPO, env=env, text=True, stdout=subprocess.PIPE,
+           stderr=subprocess.PIPE)
+        self.assertEqual(run.returncode, 0, run.stdout + run.stderr)
+        with open(actual_path, "rb") as inp:
+            raw = inp.read()
+        actual = torch.tensor(struct.unpack(f"<{len(raw) // 4}f", raw))
+        routes = {}
+        if dump_routes:
+            top_k = self.container.cfg["num_experts_per_token"]
+            with open(route_path) as inp:
+                for line in inp:
+                    fields = line.split()
+                    key = (int(fields[0]), int(fields[1]))
+                    self.assertNotIn(key, routes)
+                    routes[key] = {
+                        "experts": [int(v) for v in fields[2:2 + top_k]],
+                        "weights": [float(v) for v in
+                                    fields[2 + top_k:2 + 2 * top_k]],
+                    }
+        return raw, actual, routes, run
+
     def test_fixture_distinguishes_each_attention_obligation(self):
         canonical = self.logits[-1]
         variants = {
@@ -135,6 +185,66 @@ class Glm47ReferenceTest(unittest.TestCase):
             for actual_weight, expected_weight in zip(
                     actual_route["weights"], expected_route["weights"]):
                 self.assertAlmostEqual(actual_weight, expected_weight, places=4)
+
+    def test_layer_major_chunk_matches_sequential_contract(self):
+        seq_raw, seq, seq_routes, _ = self.run_engine(
+            "sequential", chunked=False)
+        chunk_raw, chunk, chunk_routes, _ = self.run_engine(
+            "layer-major", chunked=True, gqa_chunk=1)
+
+        self.assertEqual(int(seq.argmax()), int(chunk.argmax()))
+        self.assertEqual(
+            torch.topk(seq, 10).indices.tolist(),
+            torch.topk(chunk, 10).indices.tolist())
+        self.assertLess(float((seq - chunk).abs().max()), 1e-4)
+        self.assertEqual(seq_routes.keys(), chunk_routes.keys())
+        for key in seq_routes:
+            self.assertEqual(seq_routes[key]["experts"],
+                             chunk_routes[key]["experts"])
+            self.assertEqual(seq_routes[key]["weights"],
+                             chunk_routes[key]["weights"])
+
+        repeat_raw, _repeat, repeat_routes, _ = self.run_engine(
+            "layer-major-repeat", chunked=True, gqa_chunk=1)
+        self.assertEqual(chunk_raw, repeat_raw)
+        self.assertEqual(chunk_routes, repeat_routes)
+        self.assertNotEqual(seq_raw, chunk_raw,
+                            "fixture no longer exercises fold-order drift")
+
+    def test_layer_major_reset_replay_is_byte_exact(self):
+        _raw, _actual, _routes, run = self.run_engine(
+            "layer-major-reset", chunked=True, gqa_chunk=1,
+            reset=True, dump_routes=False)
+        self.assertIn("reset replay exact", run.stdout)
+
+    def test_layer_major_64_plus_1_tail_matches_sequential(self):
+        ids = (IDS * 10)[:65]
+        _seq_raw, seq, seq_routes, _ = self.run_engine(
+            "tail-sequential", chunked=False, ids=ids)
+        chunk_raw, chunk, chunk_routes, _ = self.run_engine(
+            "tail-layer-major", chunked=True, gqa_chunk=1, ids=ids)
+        self.assertEqual(int(seq.argmax()), int(chunk.argmax()))
+        self.assertEqual(torch.topk(seq, 10).indices.tolist(),
+                         torch.topk(chunk, 10).indices.tolist())
+        self.assertLess(float((seq - chunk).abs().max()), 1e-4)
+        self.assertEqual(seq_routes, chunk_routes)
+
+        replay_raw, _actual, _routes, run = self.run_engine(
+            "tail-layer-major-reset", chunked=True, gqa_chunk=1,
+            reset=True, dump_routes=False, ids=ids)
+        self.assertEqual(chunk_raw, replay_raw)
+        self.assertIn("reset replay exact", run.stdout)
+
+    def test_layer_major_env_rejects_non_boolean_value(self):
+        engine = os.path.join(REPO, "test_forward")
+        env = dict(os.environ, WASTE_BACKEND="cpu",
+                   WASTE_GQA_CHUNK_PREFILL="yes")
+        run = subprocess.run([
+            engine, self.container_path, ",".join(map(str, IDS)), "", "0",
+        ], cwd=REPO, env=env, text=True, stdout=subprocess.PIPE,
+           stderr=subprocess.PIPE)
+        self.assertNotEqual(run.returncode, 0)
+        self.assertIn("WASTE_GQA_CHUNK_PREFILL must be 0 or 1", run.stderr)
 
 
 if __name__ == "__main__":

@@ -240,6 +240,7 @@ typedef struct {
     int      cuda_prefill_vq;        /* opt-in GLM Flash chunk VQ3R pilot   */
     int      cuda_prefill_dense;     /* 1 fast diagnostic, 2 ordered-exact */
     int      cuda_prefill_dense_preflight_mode;
+    int      gqa_chunk_prefill;      /* semantic GLM GQA layer-major pilot */
     int      cuda_kda_state_dirty;
     uint64_t cuda_kda_fallbacks, cuda_kda_calls, cuda_dense_calls;
     uint64_t cuda_gqa_proj_calls;
@@ -292,6 +293,8 @@ int waste_model_cuda_vq_dense_scope_compatible(const waste_model *m,
                                                 int scope);
 int waste_model_cuda_prefill_vq_compatible(const waste_model *m);
 int waste_model_cuda_prefill_dense_compatible(const waste_model *m);
+int waste_model_gqa_chunk_prefill_compatible(const waste_model *m);
+int waste_model_cuda_gqa_chunk_prefill_compatible(const waste_model *m);
 /* Model-free semantic gate for the standard-GQA runtime.  Conversion owns
  * the exact released H/L/source contract; this gate owns the invariants the
  * forward pass actually interprets. */

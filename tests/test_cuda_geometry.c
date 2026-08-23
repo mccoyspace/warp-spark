@@ -203,8 +203,13 @@ int main(void)
         waste_model gqa = glm47_full_gqa();
         CHECK(!waste_model_glm47_gqa_compatible(NULL));
         CHECK(waste_model_glm47_gqa_compatible(&gqa));
+        CHECK(!waste_model_gqa_chunk_prefill_compatible(&gqa));
+        gqa.gqa_chunk_prefill = 1;
+        CHECK(waste_model_gqa_chunk_prefill_compatible(&gqa));
+        CHECK(!waste_model_cuda_gqa_chunk_prefill_compatible(&gqa));
         gqa.cfg.n_layers = WASTE_MAX_LAYERS + 1;
         CHECK(!waste_model_glm47_gqa_compatible(&gqa));
+        CHECK(!waste_model_gqa_chunk_prefill_compatible(&gqa));
         gqa = glm47_full_gqa();
         gqa.cfg.n_kv_heads = 5;
         CHECK(!waste_model_glm47_gqa_compatible(&gqa));
@@ -284,7 +289,8 @@ int main(void)
         CHECK(!waste_model_cuda_glm47_full_gqa_profile_compatible(
             &exact, 1, 3, 1));
 
-        /* Decode reuse must not widen either GLM-Flash prefill pilot. */
+        /* Full GQA prefill is admitted only by its own opt-in and the exact
+         * qualified tuple; the Flash dense pilot remains separate. */
         full.cuda_kda_mode = 1;
         full.cuda_dense_scope = 3;
         full.cuda_dense_preflight_scope = 3;
@@ -293,10 +299,35 @@ int main(void)
         full.cuda_prefill_dense = 1;
         full.cuda_prefill_dense_preflight_mode = 1;
         full.cuda_vq_mode = 2;
+        full.cuda_vq_group = 1;
         full.cuda_vq_preflight_modes = 1 << 2;
         full.cuda_prefill_vq = 1;
         CHECK(!waste_model_cuda_prefill_dense_compatible(&full));
         CHECK(!waste_model_cuda_prefill_vq_compatible(&full));
+        CHECK(!waste_model_gqa_chunk_prefill_compatible(&full));
+        CHECK(!waste_model_cuda_gqa_chunk_prefill_compatible(&full));
+        full.gqa_chunk_prefill = 1;
+        CHECK(waste_model_gqa_chunk_prefill_compatible(&full));
+        CHECK(waste_model_cuda_gqa_chunk_prefill_compatible(&full));
+        CHECK(waste_model_cuda_prefill_vq_compatible(&full));
+
+#define REJECT_GQA_CHUNK(field, value) do {                                 \
+            waste_model changed = full;                                    \
+            changed.field = (value);                                       \
+            CHECK(!waste_model_cuda_gqa_chunk_prefill_compatible(&changed)); \
+        } while (0)
+        REJECT_GQA_CHUNK(cuda_kda_mode, 2);
+        REJECT_GQA_CHUNK(cuda_dense_scope, 2);
+        REJECT_GQA_CHUNK(cuda_dense_preflight_scope, 0);
+        REJECT_GQA_CHUNK(cuda_gqa_proj, 0);
+        REJECT_GQA_CHUNK(cuda_gqa_proj_preflight, 0);
+        REJECT_GQA_CHUNK(cuda_vq_mode, 1);
+        REJECT_GQA_CHUNK(cuda_vq_group, 2);
+        REJECT_GQA_CHUNK(cuda_vq_preflight_modes, 0);
+        REJECT_GQA_CHUNK(cuda_prefill_vq, 0);
+        REJECT_GQA_CHUNK(cuda_kda_failed, 1);
+        REJECT_GQA_CHUNK(cfg.hidden, 5121);
+#undef REJECT_GQA_CHUNK
 
         /* Official release: 89 MoE and 3 dense layers. Scope 3 launches
          * three shared/dense FFN projections per layer. The separate GQA
@@ -313,6 +344,21 @@ int main(void)
         CHECK(moe_layers * (2 + full.cfg.top_k) == 890);
         CHECK(moe_layers * (1 + 3 * full.cfg.top_k) == 2225);
         CHECK(2 * moe_layers * full.cfg.top_k == 1424);
+        /* A 34-token prompt plus one measured decode step. */
+        CHECK(35 * gqa_calls == 12880);
+        CHECK(35 * gqa_calls + ffn_calls == 13156);
+        CHECK(35 * moe_layers * full.cfg.top_k == 24920);
+        CHECK(35 * 3 * moe_layers * full.cfg.top_k == 74760);
+        CHECK(35 * 2 * moe_layers * full.cfg.top_k == 49840);
+        CHECK(35 * moe_layers == 3115);
+        /* Chunk prefill may split one token's eight routes across several
+         * 64-unique-expert windows. Each nonempty token/window pair prepares
+         * gate+up once, so LUT/launch totals are route-dependent. These are
+         * strict floors; hardware gates also check
+         *   prepare = (lut_builds - experts) / 2
+         *   launches = 3 * experts + prepare. */
+        CHECK(24920 + 2 * 3115 == 31150);
+        CHECK(74760 + 3115 == 77875);
     }
 
     /* K2 is qualified for decode but never for this GLM-only pilot. */
