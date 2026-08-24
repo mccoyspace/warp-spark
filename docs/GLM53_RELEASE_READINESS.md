@@ -7,11 +7,13 @@ but the public weights have not been released.
 
 ## What is ready
 
-- Spark has about 1.6 TB free. The retained GLM-4.7 conversions occupy about
-  139 GB; their large source shards have already been removed.
-- The full-GLM experimental branch and its CUDA/prefill qualifications are
-  committed. They are useful implementation evidence, not a compatible
-  GLM-5 execution path.
+- Spark has about 1.3 TiB free after the GLM-5.2 source shards were removed.
+  The source-backed GLM-5.2 VQ3R container occupies about 264 GiB; retained
+  GLM-4.7 conversions occupy about 139 GB.
+- A bounded GLM-5.2 execution path is now qualified through 2,048 context
+  tokens, including exact release-shape gates and coherent-memory CUDA
+  dense/VQ decode. It is a concrete base for comparison, not evidence that a
+  future GLM-5.3 checkpoint is compatible without re-running every gate.
 - Normal Qwen vLLM and Comfy workloads remain available. They should be
   stopped only for the eventual conversion/qualification window.
 - `tools/check_glm53_release.py` can inspect the release without fetching a
