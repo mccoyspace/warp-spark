@@ -282,6 +282,7 @@ Useful references:
 - [docs/KDA.md](docs/KDA.md): Kimi Delta Attention;
 - [docs/GATES.md](docs/GATES.md): correctness and performance gates;
 - [docs/RESEARCH.md](docs/RESEARCH.md): current research directions;
+- [docs/SPARK_MODEL_CAPACITY.md](docs/SPARK_MODEL_CAPACITY.md): installed Spark model and capacity map;
 - [docs/GLM52_GB10.md](docs/GLM52_GB10.md): bounded GLM-5.2 qualification on GB10;
 - [docs/PREFIX_CACHE.md](docs/PREFIX_CACHE.md): exact root, head, and semantic-anchor snapshots;
 - [docs/FULL_LAYER_PREFILL_EXPERIMENT.md](docs/FULL_LAYER_PREFILL_EXPERIMENT.md): preregistered GB10 full-layer prefill experiment;
