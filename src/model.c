@@ -2054,11 +2054,36 @@ static void attention_init(waste_config *c, const js_doc *d, int cfg)
         return;
     }
 
+    if (!strcmp(c->arch, "GlmMoeDsaForCausalLM")) {
+        /* These fields do not change the bounded dense-MLA arithmetic, but
+         * they are part of the exact released GLM-5.2 contract used by the
+         * CUDA allowlist.  Parse them rather than weakening that gate: a
+         * future release with different routing or head geometry must still
+         * fail closed. */
+        c->attention_kind = WASTE_ATTN_LATENT;
+        c->n_kv_heads = (int)js_int(
+            d, js_get(d, cfg, "num_key_value_heads"), 0);
+        c->max_position_embeddings = (int)js_int(
+            d, js_get(d, cfg, "max_position_embeddings"), 0);
+        c->router_n_group = (int)js_int(
+            d, js_get(d, cfg, "n_group"), -1);
+        c->router_topk_group = (int)js_int(
+            d, js_get(d, cfg, "topk_group"), -1);
+        js_str(d, js_get(d, cfg, "topk_method"), c->topk_method,
+               sizeof c->topk_method);
+        js_str(d, js_get(d, cfg, "moe_router_activation_func"),
+               c->router_activation, sizeof c->router_activation);
+        if (strcmp(c->model_type, "glm_moe_dsa"))
+            attention_error(c,
+                            "GlmMoeDsaForCausalLM requires model_type "
+                            "glm_moe_dsa");
+        return;
+    }
+
     if (!strcmp(c->arch, "KimiLinearForCausalLM") ||
         !strcmp(c->arch, "KimiK3ForConditionalGeneration") ||
         !strcmp(c->arch, "DeepseekV3ForCausalLM") ||
-        !strcmp(c->arch, "Glm4MoeLiteForCausalLM") ||
-        !strcmp(c->arch, "GlmMoeDsaForCausalLM")) {
+        !strcmp(c->arch, "Glm4MoeLiteForCausalLM")) {
         c->attention_kind = WASTE_ATTN_LATENT;
         return;
     }
