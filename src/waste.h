@@ -71,12 +71,154 @@ typedef enum {
     WASTE_E_UNSUPPORTED = -6,  /* arch/quant combination not built in      */
     WASTE_E_CANCELLED = -7,    /* callback asked to stop                   */
     WASTE_E_BUSY = -8,         /* another process owns this container      */
+    WASTE_E_BACKEND = -9,      /* selected external backend failed         */
 } waste_status;
 
 /* Human-readable, static storage; never NULL. A coarse answer by design:
  * an expert record that fails its checksum is a WASTE_E_IO like any
  * other, and waste_error_detail below is what says which record it was. */
 const char *waste_strerror(waste_status s);
+
+/* ---- source-separated backends -----------------------------------------
+ *
+ * This is the stable boundary for an accelerator implementation maintained
+ * outside this repository. It deliberately sits above waste_backend.h's
+ * process-global CPU/SIMD row kernels: an accelerator has model-specific
+ * state, needs the complete model fingerprint before accepting work, and
+ * may own a whole projection without owning routing or the forward pass.
+ *
+ * All structures are size-prefixed. The backend sets struct_size on its
+ * vtable; the engine does the same for every view it passes. The vtable
+ * object must outlive every waste_ctx opened with it because the engine keeps
+ * its address. Version 1 callbacks are synchronous with respect to borrowed
+ * pointers: once a callback returns, the engine may reuse an expert record.
+ * The caller must serialize calls for one waste_ctx. Callbacks for distinct
+ * contexts may run concurrently and must not share mutable state without
+ * their own synchronization.
+ */
+
+#define WASTE_BACKEND_API_VERSION 1u
+
+typedef enum {
+    WASTE_BACKEND_CAP_MATVEC = 1u << 0,
+    WASTE_BACKEND_CAP_VQ     = 1u << 1,
+} waste_backend_capability;
+
+typedef enum {
+    WASTE_BACKEND_VQ_UNKNOWN = 0,
+    WASTE_BACKEND_VQ3R       = 1,  /* byte indices, fp32 lookup table       */
+    WASTE_BACKEND_VQ4P       = 2,  /* four packed 6-bit indices             */
+    WASTE_BACKEND_VQ2R       = 3,  /* two byte-index residual stages        */
+} waste_backend_vq_scheme;
+
+typedef struct {
+    size_t struct_size;
+    const char *arch;                 /* model architecture from manifest   */
+    uint32_t n_layers, n_kda_layers;
+    uint32_t hidden, n_experts, top_k;
+    uint32_t moe_inter, dense_inter, latent_dim;
+    uint32_t n_shared, first_dense;
+    uint32_t n_heads, kv_lora, q_lora;
+    uint32_t qk_nope, qk_rope, v_head;
+    uint32_t vq_scheme;
+    uint32_t vq_stages, vq_entries, vq_vec_dim;
+    uint32_t vq_index_bits, vq_index_block, vq_lut_block;
+    uint32_t n_codebooks;
+    uint32_t expert_rows[3];          /* gate, up, down                     */
+    uint32_t expert_cols[3];
+} waste_backend_model_info;
+
+typedef struct {
+    size_t struct_size;
+    const char *name;                 /* model-owned, valid until close     */
+    /* Quantized row-major payload. Q8 is signed bytes. Q4 stores the low
+     * nibble first and decodes each unsigned nibble as value-8. Q3 is a
+     * little-endian 3-bit stream at bit offset 3*i, decoded as value-4;
+     * row_stride includes any padding or guard byte. */
+    const void *weights;
+    /* fp16 [rows][ceil(cols/group)], one scale per quantization group. */
+    const uint16_t *scales;
+    size_t rows, cols, row_stride;
+    uint32_t bits, group;
+} waste_backend_tensor;
+
+typedef struct {
+    size_t struct_size;
+    waste_backend_model_info info;
+    const waste_backend_tensor *tensors;
+    size_t n_tensors;
+    /* [n_codebooks][vq_vec_dim][vq_entries], transposed for LUT builds.
+     * The allocation remains model-owned and valid until backend close. */
+    const float *codebooks_t;
+    size_t n_codebook_values;
+} waste_backend_model;
+
+typedef struct {
+    size_t struct_size;
+    /* Both schemes use [row_block][vector_position][row_in_block]. VQ3R
+     * then stores one byte per stage, stages innermost. VQ4P instead stores
+     * four little-endian 6-bit stages in three bytes:
+     *   b0=s0|s1<<6, b1=s1>>2|s2<<4, b2=s2>>4|s3<<2.
+     * The final row block is padded to vq_index_block rows. */
+    const uint8_t *indices;
+    size_t indices_bytes;
+    /* fp16, one multiplicative correction per output row. */
+    const uint16_t *channel_scales;
+    size_t n_channel_scales;
+    /* Storage scheme from this expert record, not merely the manifest.
+     * Providers must reject a record scheme they do not implement before
+     * reading indices; version-0 banks can legally contain legacy VQ2R. */
+    uint32_t record_scheme;
+    uint32_t rows, cols, codebook_base;
+} waste_backend_vq_matrix;
+
+typedef struct waste_backend_v1 {
+    uint32_t api_version;
+    size_t struct_size;
+    const char *name;
+
+    /* Called after the CPU model has loaded but before this backend allocates
+     * anything. reserved_bytes is charged against the caller's RAM budget by
+     * shrinking the still-cold expert cache before open is called. */
+    waste_status (*plan)(const waste_backend_model_info *model,
+                         const void *backend_cfg,
+                         uint64_t *reserved_bytes);
+
+    /* `model` and its tensor array remain valid until close. backend_cfg is
+     * borrowed only for this call. The backend returns its effective subset
+     * of WASTE_BACKEND_CAP_* through capabilities. */
+    waste_status (*open)(const waste_backend_model *model,
+                         const void *backend_cfg,
+                         void **backend_ctx,
+                         uint32_t *capabilities);
+
+    /* Claims are resolved once at open. Returning 1 claims the tensor for
+     * one-token decode, 0 leaves it on the CPU, and a negative value fails
+     * the open. Chunked prompt prefill retains the engine's CPU path. */
+    int (*claim_matvec)(void *backend_ctx,
+                        const waste_backend_tensor *tensor);
+    waste_status (*matvec)(void *backend_ctx,
+                           const waste_backend_tensor *tensor,
+                           const float *input, float *output);
+
+    /* A decode MoE begins by building the two LUTs shared by every routed
+     * expert. Gate/up and down produce independent expert outputs. The engine
+     * retains SiLU/SiTU, router weights, and the final accumulation in router
+     * order, so a backend must not weight or combine these outputs. */
+    waste_status (*vq_begin)(void *backend_ctx, const float *input,
+                             uint32_t cols, uint32_t gate_codebook_base,
+                             uint32_t up_codebook_base);
+    waste_status (*vq_gate_up)(void *backend_ctx,
+                               const waste_backend_vq_matrix *gate,
+                               const waste_backend_vq_matrix *up,
+                               float *gate_output, float *up_output);
+    waste_status (*vq_down)(void *backend_ctx, const float *input,
+                            const waste_backend_vq_matrix *down,
+                            float *output);
+
+    const char *(*error_detail)(void *backend_ctx);
+    void (*close)(void *backend_ctx);
+} waste_backend_v1;
 
 /* ---- memory planning (usable before loading anything) ------------------ */
 
@@ -269,6 +411,19 @@ typedef struct waste_ctx waste_ctx;
 
 waste_status waste_open(const char *model_path, const waste_cfg *cfg,
                         waste_ctx **out);
+
+/* Open one context with a source-separated backend. The ordinary waste_open
+ * is exactly equivalent to passing NULL for backend and backend_cfg. An
+ * explicitly selected backend that declines the model returns
+ * WASTE_E_UNSUPPORTED; an execution failure returns WASTE_E_BACKEND and never
+ * falls back midway through a token. Such a failure is terminal for that
+ * context: eval, generate and state operations keep returning WASTE_E_BACKEND,
+ * and state_reset does not clear it. Close and reopen the context. */
+waste_status waste_open_with_backend(const char *model_path,
+                                     const waste_cfg *cfg,
+                                     const waste_backend_v1 *backend,
+                                     const void *backend_cfg,
+                                     waste_ctx **out);
 void waste_close(waste_ctx *ctx);
 
 /* What the engine actually allocated, after open. */

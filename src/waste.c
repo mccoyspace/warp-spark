@@ -240,6 +240,7 @@ const char *waste_strerror(waste_status s)
     case WASTE_E_UNSUPPORTED:  return "unsupported";
     case WASTE_E_CANCELLED:    return "cancelled by callback";
     case WASTE_E_BUSY:         return "container is already open in another process";
+    case WASTE_E_BACKEND:      return "external backend failed";
     }
     return "unknown error";
 }
@@ -553,8 +554,11 @@ waste_status waste_plan_memory(const char *model_path, uint32_t ctx_tokens,
 
 /* ---- lifecycle ---------------------------------------------------------- */
 
-waste_status waste_open(const char *model_path, const waste_cfg *cfg_in,
-                        waste_ctx **out)
+waste_status waste_open_with_backend(const char *model_path,
+                                     const waste_cfg *cfg_in,
+                                     const waste_backend_v1 *backend,
+                                     const void *backend_cfg,
+                                     waste_ctx **out)
 {
     if (!model_path || !out) return WASTE_E_ARG;
     *out = NULL;
@@ -702,6 +706,47 @@ waste_status waste_open(const char *model_path, const waste_cfg *cfg_in,
             return rc == -2 ? WASTE_E_FORMAT : WASTE_E_IO;
         }
     }
+    if (backend) {
+        uint64_t reserved = 0;
+        st = waste_model_backend_plan(&c->m, backend, backend_cfg, &reserved);
+        if (st != WASTE_OK) {
+            waste_model_free(&c->m);
+            model_lock_release(c->model_lock);
+            free(c);
+            return st;
+        }
+        const uint64_t spare = budget - c->plan.floor_bytes;
+        if (reserved > spare || reserved > cache_bytes ||
+            reserved > UINT64_MAX - c->plan.scratch_bytes ||
+            reserved > UINT64_MAX - c->plan.floor_bytes ||
+            reserved > UINT64_MAX - c->plan.recommended_bytes) {
+            waste_model_free(&c->m);
+            model_lock_release(c->model_lock);
+            free(c);
+            return WASTE_E_RAM_BUDGET;
+        }
+        if (reserved) {
+            const uint64_t smaller = cache_bytes - reserved;
+            if (smaller > SIZE_MAX ||
+                waste_model_resize_cache(&c->m, (size_t)smaller)) {
+                waste_model_free(&c->m);
+                model_lock_release(c->model_lock);
+                free(c);
+                return WASTE_E_OOM;
+            }
+            c->plan.scratch_bytes += reserved;
+            c->plan.floor_bytes += reserved;
+            c->plan.recommended_bytes += reserved;
+            c->m.external_reserved_bytes = reserved;
+        }
+        st = waste_model_backend_open(&c->m, backend, backend_cfg);
+        if (st != WASTE_OK) {
+            waste_model_free(&c->m);
+            model_lock_release(c->model_lock);
+            free(c);
+            return st;
+        }
+    }
     /* Before the warm, which reads records too. The load already applied
      * WASTE_VERIFY; this is the other way in, and it can only add. */
     if (cfg.verify_records) c->m.verify = 1;
@@ -719,6 +764,12 @@ waste_status waste_open(const char *model_path, const waste_cfg *cfg_in,
     c->warmed = waste_model_warm_cache(&c->m, c->usage);
     *out = c;
     return WASTE_OK;
+}
+
+waste_status waste_open(const char *model_path, const waste_cfg *cfg,
+                        waste_ctx **out)
+{
+    return waste_open_with_backend(model_path, cfg, NULL, NULL, out);
 }
 
 void waste_close(waste_ctx *c)
@@ -927,9 +978,24 @@ static long ctx_room(const waste_ctx *c)
     return (long)cm - (long)c->pos;
 }
 
+static waste_status backend_error_report(waste_ctx *c)
+{
+    const char *backend = waste_model_backend_error(&c->m);
+    if (!backend) return WASTE_OK;
+    snprintf(c->detail, sizeof c->detail, "%s", backend);
+    return WASTE_E_BACKEND;
+}
+
 static waste_status read_error_report(waste_ctx *c)
 {
-    /* Checked first: it is the one failure that is the caller's doing
+    /* A selected backend failure is terminal for the context and remains the
+     * reason even if the partially executed token happened at the context
+     * boundary. All public stateful entry points fail fast on it below. */
+    {
+        const waste_status st = backend_error_report(c);
+        if (st != WASTE_OK) return st;
+    }
+    /* Context exhaustion is the one failure that is the caller's doing
      * rather than the container's, and reporting it as an I/O error
      * would send someone to re-download 900 GB over a full context. */
     if (waste_model_ctx_full(&c->m)) return ctx_full_report(c);
@@ -954,6 +1020,10 @@ waste_status waste_eval(waste_ctx *c, const int32_t *tokens, size_t n,
                         const float **logits_out, size_t *vocab_out)
 {
     if (!c || !tokens || !n) return WASTE_E_ARG;
+    {
+        const waste_status st = backend_error_report(c);
+        if (st != WASTE_OK) return st;
+    }
     { const waste_status st = check_ids(c, tokens, n); if (st) return st; }
     /* Refused before anything is written, so a prompt that does not fit
      * leaves the conversation as it was rather than half-prefilled. */
@@ -1079,6 +1149,10 @@ waste_status waste_generate(waste_ctx *c, const int32_t *prompt, size_t n,
                             waste_token_cb cb, void *user)
 {
     if (!c || !prompt || !n) return WASTE_E_ARG;
+    {
+        const waste_status st = backend_error_report(c);
+        if (st != WASTE_OK) return st;
+    }
     { const waste_status st = check_ids(c, prompt, n); if (st) return st; }
     /* The prompt has to fit before a single expert is read for it. One
      * position is kept back so there is somewhere to put the first
@@ -1176,7 +1250,7 @@ waste_status waste_generate(waste_ctx *c, const int32_t *prompt, size_t n,
 
 void waste_state_reset(waste_ctx *c)
 {
-    if (!c) return;
+    if (!c || waste_model_backend_error(&c->m)) return;
     c->pos = 0;
     waste_model_reset(&c->m);
 }
@@ -1184,12 +1258,20 @@ void waste_state_reset(waste_ctx *c)
 waste_status waste_state_save(waste_ctx *c, const char *path)
 {
     if (!c || !path) return WASTE_E_ARG;
+    {
+        const waste_status st = backend_error_report(c);
+        if (st != WASTE_OK) return st;
+    }
     return waste_model_state_save(&c->m, path, c->pos) == 0 ? WASTE_OK : WASTE_E_IO;
 }
 
 waste_status waste_state_load(waste_ctx *c, const char *path)
 {
     if (!c || !path) return WASTE_E_ARG;
+    {
+        const waste_status st = backend_error_report(c);
+        if (st != WASTE_OK) return st;
+    }
     int pos = 0;
     const int rc = waste_model_state_load(&c->m, path, &pos);
     if (rc == -2) return WASTE_E_FORMAT;      /* built for a different model */

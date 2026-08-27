@@ -116,6 +116,42 @@ else
     head -20 "$TMP/lock.log"
 fi
 
+head_ "source-separated backend seam"
+if ./test_backend "$MODEL" >"$TMP/backend.log" 2>&1; then
+    ok "public ABI, lifecycle, VQ handoff and terminal execution failure"
+else
+    no "source-separated backend seam"
+    head -20 "$TMP/backend.log"
+fi
+
+# A version-0 bank may contain a legacy VQ2R record even when the manifest
+# tuple looks like VQ3R. The seam must carry the record's own format so a
+# VQ3R-only provider can reject before interpreting its index bytes.
+RECORD_SCHEME="$TMP/backend-record-scheme.waste"
+if ! python3 tools/make_test_container.py "$RECORD_SCHEME" >/dev/null 2>&1; then
+    sk "backend per-record VQ scheme" "could not build its synthetic container"
+else
+    python3 - "$RECORD_SCHEME" <<'PY'
+import glob, os, struct, sys
+for path in glob.glob(os.path.join(sys.argv[1], "experts-L*.bin")):
+    data = bytearray(open(path, "rb").read())
+    offset = 0
+    while offset < len(data):
+        blocks = struct.unpack_from("<I", data, offset + 16)[0]
+        data[offset + 8] = 5  # WQ_VQ2R
+        offset += blocks * 4096
+    with open(path, "wb") as f:
+        f.write(data)
+PY
+    if ./test_backend "$RECORD_SCHEME" --expect-non-vq3r \
+            >"$TMP/backend-record-scheme.log" 2>&1; then
+        ok "public VQ handoff preserves and rejects a legacy record scheme"
+    else
+        no "backend per-record VQ scheme"
+        head -20 "$TMP/backend-record-scheme.log"
+    fi
+fi
+
 # ---------------------------------------------------------------- unit ----
 head_ "kernels vs the reference implementations"
 

@@ -17,6 +17,7 @@
 #include <stdio.h>
 
 #include "ecache.h"
+#include "waste.h"
 
 /* Public image requests are decoded before resize.  Keep the source-image
  * allocation finite so the memory planner can include its true worst case. */
@@ -42,6 +43,7 @@ typedef struct {
      * ever read). q and qs are NULL in that case. */
     int64_t file_off, file_scale_off;   /* not long: 32 bits on Windows */
     int    on_disk;
+    int    backend_slot, backend_claimed; /* resolved once after load     */
 } waste_tensor;
 
 typedef struct {
@@ -218,6 +220,19 @@ typedef struct {
      * counter are the only things it writes. Everything else it touches —
      * the bank table, the expert shapes, `verify` — is fixed at load. */
     pthread_mutex_t fetch_mu;
+
+    /* Optional source-separated backend. Tensor views and claims are built
+     * once after load; the backend owns only backend_ctx. A callback failure
+     * is sticky because recurrent/KV state may already have advanced and a
+     * CPU retry would mix two numerical paths inside one token. */
+    const waste_backend_v1 *external_backend;
+    void *external_backend_ctx;
+    waste_backend_model external_model;
+    waste_backend_tensor *external_tensors;
+    uint32_t external_caps;
+    uint64_t external_reserved_bytes;
+    int external_decode, external_failed;
+    char external_detail[128];
 } waste_model;
 
 /* Everything the load needs that is not in the container. These are
@@ -246,6 +261,18 @@ typedef struct {
 int  waste_model_load(waste_model *m, const char *dir, int kv_cap,
                       const waste_load_opts *opt);
 void waste_model_free(waste_model *m);
+
+/* Source-separated backend lifecycle. Planning is split from opening so the
+ * public wrapper can charge the reservation against the expert cache before
+ * the backend allocates it. */
+waste_status waste_model_backend_plan(waste_model *m,
+                                      const waste_backend_v1 *backend,
+                                      const void *backend_cfg,
+                                      uint64_t *reserved_bytes);
+waste_status waste_model_backend_open(waste_model *m,
+                                      const waste_backend_v1 *backend,
+                                      const void *backend_cfg);
+const char *waste_model_backend_error(const waste_model *m);
 /* Runs one token; returns logits (vocab floats, owned by the model), or
  * NULL when an expert record failed to read or failed verification —
  * waste_model_read_error then says which one and why.

@@ -94,6 +94,118 @@ const waste_tensor *waste_find(const waste_model *m, const char *name)
     return NULL;
 }
 
+static void backend_model_info(const waste_model *m,
+                               waste_backend_model_info *out)
+{
+    const waste_config *c = &m->cfg;
+    memset(out, 0, sizeof *out);
+    out->struct_size = sizeof *out;
+    out->arch = c->arch;
+    out->n_layers = (uint32_t)c->n_layers;
+    for (int L = 0; L < c->n_layers; L++)
+        out->n_kda_layers += (uint32_t)!!c->kda_layer[L];
+    out->hidden = (uint32_t)c->hidden;
+    out->n_experts = (uint32_t)c->n_experts;
+    out->top_k = (uint32_t)c->top_k;
+    out->moe_inter = (uint32_t)c->moe_inter;
+    out->dense_inter = (uint32_t)c->dense_inter;
+    out->latent_dim = (uint32_t)c->latent_dim;
+    out->n_shared = (uint32_t)c->n_shared;
+    out->first_dense = (uint32_t)c->first_dense;
+    out->n_heads = (uint32_t)c->n_heads;
+    out->kv_lora = (uint32_t)c->kv_lora;
+    out->q_lora = (uint32_t)c->q_lora;
+    out->qk_nope = (uint32_t)c->qk_nope;
+    out->qk_rope = (uint32_t)c->qk_rope;
+    out->v_head = (uint32_t)c->v_head;
+    /* A scheme name denotes the complete storage contract, not merely its
+     * index width. Providers still validate every raw field, but calling a
+     * partial or future tuple VQ3R/VQ4P would make a name look stronger than
+     * the descriptor actually is. */
+    if (m->index_bits == 8 && m->stages == 3 && m->cb_entries == 256 &&
+        m->vec_dim == 8)
+        out->vq_scheme = WASTE_BACKEND_VQ3R;
+    else if (m->index_bits == 8 && m->stages == 2 &&
+             m->cb_entries == 256 && m->vec_dim == 8)
+        out->vq_scheme = WASTE_BACKEND_VQ2R;
+    else if (m->index_bits == 6 && m->stages == 4 && m->cb_entries == 64 &&
+             m->vec_dim == 8)
+        out->vq_scheme = WASTE_BACKEND_VQ4P;
+    else
+        out->vq_scheme = WASTE_BACKEND_VQ_UNKNOWN;
+    out->vq_stages = (uint32_t)m->stages;
+    out->vq_entries = (uint32_t)m->cb_entries;
+    out->vq_vec_dim = (uint32_t)m->vec_dim;
+    out->vq_index_bits = (uint32_t)m->index_bits;
+    /* Version-0 expert records are block-64. model.c's VQ_TILE is the same
+     * format invariant; expose the value rather than a private macro. */
+    out->vq_index_block = 64;
+    out->vq_lut_block = WASTE_VQ_LUT_BLK;
+    out->n_codebooks = (uint32_t)m->n_books;
+    for (int i = 0; i < 3; i++) {
+        out->expert_rows[i] = (uint32_t)m->expert_m[i];
+        out->expert_cols[i] = (uint32_t)m->expert_n[i];
+    }
+}
+
+static uint32_t backend_record_scheme(uint8_t fmt)
+{
+    switch (fmt) {
+    case WQ_VQ2R: return WASTE_BACKEND_VQ2R;
+    case WQ_VQ3R: return WASTE_BACKEND_VQ3R;
+    case WQ_VQ4P: return WASTE_BACKEND_VQ4P;
+    default:      return WASTE_BACKEND_VQ_UNKNOWN;
+    }
+}
+
+static void backend_tensor_view(const waste_tensor *t,
+                                waste_backend_tensor *out)
+{
+    memset(out, 0, sizeof *out);
+    out->struct_size = sizeof *out;
+    out->name = t->name;
+    out->weights = t->q;
+    out->scales = t->qs;
+    if (t->ndim >= 2) {
+        out->rows = (size_t)t->shape[t->ndim - 2];
+        out->cols = (size_t)t->shape[t->ndim - 1];
+    }
+    out->row_stride = t->rowbytes;
+    out->bits = (uint32_t)t->bits;
+    out->group = (uint32_t)t->group;
+}
+
+static int backend_vtable_valid(const waste_backend_v1 *backend)
+{
+    return backend &&
+           backend->api_version == WASTE_BACKEND_API_VERSION &&
+           backend->struct_size >= sizeof *backend &&
+           backend->name && backend->name[0] &&
+           backend->open && backend->close;
+}
+
+static void backend_failed(waste_model *m, const char *operation)
+{
+    const char *detail = NULL;
+    if (m->external_backend && m->external_backend->error_detail)
+        detail = m->external_backend->error_detail(m->external_backend_ctx);
+    if (detail && detail[0])
+        snprintf(m->external_detail, sizeof m->external_detail,
+                 "%s: %s", operation, detail);
+    else
+        snprintf(m->external_detail, sizeof m->external_detail,
+                 "%s failed in backend %s", operation,
+                 m->external_backend && m->external_backend->name
+                    ? m->external_backend->name : "(unknown)");
+    m->external_failed = 1;
+}
+
+const char *waste_model_backend_error(const waste_model *m)
+{
+    return m && m->external_failed && m->external_detail[0]
+         ? m->external_detail : NULL;
+}
+
 /* Formats a tensor name. Rotates over several buffers because callers pass
  * two or three of these to the same function, and C does not order
  * argument evaluation — a single static buffer would make them all alias. */
@@ -392,6 +504,23 @@ static void matvec_t(waste_model *m, float *y, const waste_tensor *t,
                      const float *x, int out, int in)
 {
     if (!t || (!t->q && !t->data)) { memset(y, 0, (size_t)out * sizeof(float)); return; }
+    if (m->external_failed) {
+        memset(y, 0, (size_t)out * sizeof(float));
+        return;
+    }
+    if (m->external_decode &&
+        (m->external_caps & WASTE_BACKEND_CAP_MATVEC) &&
+        t->backend_claimed && t->backend_slot >= 0 &&
+        t->backend_slot < m->n_tensors) {
+        const size_t i = (size_t)t->backend_slot;
+        const waste_status st = m->external_backend->matvec(
+            m->external_backend_ctx, &m->external_tensors[i], x, y);
+        if (st != WASTE_OK) {
+            backend_failed(m, "quantized matvec");
+            memset(y, 0, (size_t)out * sizeof(float));
+        }
+        return;
+    }
     if (!t->q) { matvec(y, t->data, x, out, in); return; }
     const int g = t->group, ng = (in + g - 1) / g;
     if (sdot_on && t->bits == 8) {
@@ -1517,6 +1646,98 @@ int waste_model_load(waste_model *m, const char *dir, int kv_cap,
     return 0;
 }
 
+waste_status waste_model_backend_plan(waste_model *m,
+                                      const waste_backend_v1 *backend,
+                                      const void *backend_cfg,
+                                      uint64_t *reserved_bytes)
+{
+    if (!m || !backend || !reserved_bytes) return WASTE_E_ARG;
+    *reserved_bytes = 0;
+    if (!backend_vtable_valid(backend)) return WASTE_E_UNSUPPORTED;
+    if (!backend->plan) return WASTE_OK;
+
+    waste_backend_model_info info;
+    backend_model_info(m, &info);
+    const waste_status st = backend->plan(&info, backend_cfg, reserved_bytes);
+    if (st != WASTE_OK) *reserved_bytes = 0;
+    return st;
+}
+
+waste_status waste_model_backend_open(waste_model *m,
+                                      const waste_backend_v1 *backend,
+                                      const void *backend_cfg)
+{
+    if (!m || !backend || m->external_backend)
+        return WASTE_E_ARG;
+    if (!backend_vtable_valid(backend)) return WASTE_E_UNSUPPORTED;
+
+    waste_backend_tensor *views = (waste_backend_tensor *)calloc(
+        (size_t)m->n_tensors, sizeof *views);
+    if (!views && m->n_tensors) return WASTE_E_OOM;
+    for (int i = 0; i < m->n_tensors; i++)
+        backend_tensor_view(&m->t[i], &views[i]);
+
+    waste_backend_model *model = &m->external_model;
+    memset(model, 0, sizeof *model);
+    model->struct_size = sizeof *model;
+    backend_model_info(m, &model->info);
+    model->tensors = views;
+    model->n_tensors = (size_t)m->n_tensors;
+    model->codebooks_t = m->codebooksT;
+    model->n_codebook_values =
+        (size_t)m->n_books * m->vec_dim * m->cb_entries;
+
+    void *ctx = NULL;
+    uint32_t caps = 0;
+    waste_status st = backend->open(model, backend_cfg, &ctx, &caps);
+    if (st != WASTE_OK) {
+        if (ctx) backend->close(ctx);
+        free(views);
+        memset(&m->external_model, 0, sizeof m->external_model);
+        return st;
+    }
+    if (caps & ~(WASTE_BACKEND_CAP_MATVEC | WASTE_BACKEND_CAP_VQ))
+        st = WASTE_E_UNSUPPORTED;
+    if ((caps & WASTE_BACKEND_CAP_MATVEC) &&
+        (!backend->claim_matvec || !backend->matvec))
+        st = WASTE_E_UNSUPPORTED;
+    if ((caps & WASTE_BACKEND_CAP_VQ) &&
+        (!backend->vq_begin || !backend->vq_gate_up || !backend->vq_down))
+        st = WASTE_E_UNSUPPORTED;
+    if (st != WASTE_OK) {
+        backend->close(ctx);
+        free(views);
+        memset(&m->external_model, 0, sizeof m->external_model);
+        return st;
+    }
+
+    m->external_backend = backend;
+    m->external_backend_ctx = ctx;
+    m->external_tensors = views;
+    m->external_caps = caps;
+    for (int i = 0; i < m->n_tensors; i++) {
+        m->t[i].backend_slot = i;
+        if (!(caps & WASTE_BACKEND_CAP_MATVEC)) continue;
+        const int claimed = backend->claim_matvec(ctx, &views[i]);
+        if (claimed < 0) {
+            backend_failed(m, "tensor claim");
+            st = WASTE_E_BACKEND;
+            break;
+        }
+        m->t[i].backend_claimed = claimed != 0;
+    }
+    if (st != WASTE_OK) {
+        backend->close(ctx);
+        free(views);
+        m->external_backend = NULL;
+        m->external_backend_ctx = NULL;
+        m->external_tensors = NULL;
+        memset(&m->external_model, 0, sizeof m->external_model);
+        m->external_caps = 0;
+    }
+    return st;
+}
+
 void waste_model_free(waste_model *m)
 {
     /* Before anything else: the reader threads pread on the bank fds, and
@@ -1530,6 +1751,15 @@ void waste_model_free(waste_model *m)
      * a failed load left behind, so nothing here may assume the load got
      * as far as its own allocation. */
     if (!m->t) m->n_tensors = 0;
+    /* The source-separated backend may retain tensor/codebook pointers. It
+     * must release them before any model-owned allocation is reclaimed. */
+    if (m->external_backend && m->external_backend->close)
+        m->external_backend->close(m->external_backend_ctx);
+    m->external_backend = NULL;
+    m->external_backend_ctx = NULL;
+    free(m->external_tensors);
+    m->external_tensors = NULL;
+    memset(&m->external_model, 0, sizeof m->external_model);
     /* Device backends may hold no-copy wrappers keyed by these host
      * addresses.  Drop them while the allocations are still alive. */
     waste_backend_release_host_buffers();
@@ -2657,6 +2887,10 @@ static void moe_layer(waste_model *m, int L, const float *in, float *out, int *r
     const int lat = c->latent_dim ? c->latent_dim : hid;
     float *sc = m->att + WASTE_ATT_ROUTER_OFF;
     matvec_t(m, sc, waste_find(m, tname("%smodel.layers.%d.block_sparse_moe.gate.weight", c->prefix, L)), in, E, hid);
+    if (m->external_failed) {
+        memset(out, 0, (size_t)hid * sizeof(float));
+        return;
+    }
     const float *bias = T(m, "%smodel.layers.%d.block_sparse_moe.gate.e_score_correction_bias", c->prefix, L);
     float *score = sc + E;
     for (int e = 0; e < E; e++) score[e] = 1.0f / (1.0f + expf(-sc[e]));
@@ -2787,6 +3021,10 @@ static void moe_layer(waste_model *m, int L, const float *in, float *out, int *r
         matvec_t(m, lat_in, waste_find(m, tname(
                      "%smodel.layers.%d.block_sparse_moe.routed_expert_down_proj.weight",
                      c->prefix, L)), in, lat, hid);
+        if (m->external_failed) {
+            memset(out, 0, (size_t)hid * sizeof(float));
+            return;
+        }
         xin = lat_in;
     }
     float *ysum = c->latent_dim ? lat_out : out;
@@ -2807,7 +3045,8 @@ static void moe_layer(waste_model *m, int L, const float *in, float *out, int *r
      * cache to be able to hold all K records at once — the held set is
      * unevictable, so a cache that is not comfortably larger than K would
      * be asked to find a victim among slots that are all pinned. */
-    if (xpar_on && m->xga && K > 1 && K <= WASTE_PF_MAX &&
+    if (xpar_on && !(m->external_caps & WASTE_BACKEND_CAP_VQ) &&
+        m->xga && K > 1 && K <= WASTE_PF_MAX &&
         m->cache.n_slots >= 4 * K) {
         /* In batches, not all K at once. Holding every record before doing
          * any arithmetic is a barrier against the read-ahead: the hint has
@@ -2882,25 +3121,91 @@ static void moe_layer(waste_model *m, int L, const float *in, float *out, int *r
         /* gate/up see the same input and the same per-layer codebooks for
          * every routed expert, so their tables are built once per token. */
         if (!lut_ready) {
-            vq_build_lut(m, lut_gate, h->codebook_id + 0 * m->stages,
-                         xin, lat, m->stages, m->cb_entries, m->vec_dim,
-                         q_gate, qs_gate);
-            vq_build_lut(m, lut_up, h->codebook_id + 1 * m->stages,
-                         xin, lat, m->stages, m->cb_entries, m->vec_dim,
-                         q_up, qs_up);
+            if (m->external_caps & WASTE_BACKEND_CAP_VQ) {
+                const waste_status st = m->external_backend->vq_begin(
+                    m->external_backend_ctx, xin, (uint32_t)lat,
+                    h->codebook_id, h->codebook_id + (uint32_t)m->stages);
+                if (st != WASTE_OK) {
+                    backend_failed(m, "VQ gate/up preparation");
+                    PROF_END(P_EMM);
+                    break;
+                }
+            } else {
+                vq_build_lut(m, lut_gate, h->codebook_id + 0 * m->stages,
+                             xin, lat, m->stages, m->cb_entries, m->vec_dim,
+                             q_gate, qs_gate);
+                vq_build_lut(m, lut_up, h->codebook_id + 1 * m->stages,
+                             xin, lat, m->stages, m->cb_entries, m->vec_dim,
+                             q_up, qs_up);
+            }
             lut_ready = 1;
         }
-        vq_apply(m, ga, rec + h->gate_off, sc, inter, lat, lut_gate,
-                 q_gate, qs_gate);
-        vq_apply(m, ub, rec + h->up_off, sc + inter, inter, lat, lut_up,
-                 q_up, qs_up);
+        if (m->external_caps & WASTE_BACKEND_CAP_VQ) {
+            const waste_backend_vq_matrix gate = {
+                .struct_size = sizeof(waste_backend_vq_matrix),
+                .indices = rec + h->gate_off,
+                .indices_bytes = (size_t)(h->up_off - h->gate_off),
+                .channel_scales = sc,
+                .n_channel_scales = (size_t)inter,
+                .record_scheme = backend_record_scheme(h->fmt),
+                .rows = (uint32_t)inter,
+                .cols = (uint32_t)lat,
+                .codebook_base = h->codebook_id,
+            };
+            const waste_backend_vq_matrix up = {
+                .struct_size = sizeof(waste_backend_vq_matrix),
+                .indices = rec + h->up_off,
+                .indices_bytes = (size_t)(h->down_off - h->up_off),
+                .channel_scales = sc + inter,
+                .n_channel_scales = (size_t)inter,
+                .record_scheme = backend_record_scheme(h->fmt),
+                .rows = (uint32_t)inter,
+                .cols = (uint32_t)lat,
+                .codebook_base = h->codebook_id + (uint32_t)m->stages,
+            };
+            const waste_status st = m->external_backend->vq_gate_up(
+                m->external_backend_ctx, &gate, &up, ga, ub);
+            if (st != WASTE_OK) {
+                backend_failed(m, "VQ gate/up apply");
+                PROF_END(P_EMM);
+                break;
+            }
+        } else {
+            vq_apply(m, ga, rec + h->gate_off, sc, inter, lat, lut_gate,
+                     q_gate, qs_gate);
+            vq_apply(m, ub, rec + h->up_off, sc + inter, inter, lat, lut_up,
+                     q_up, qs_up);
+        }
         if (c->act_situ)
             for (int i = 0; i < inter; i++)
                 ga[i] = waste_situ_pair(ga[i], ub[i], c->situ_beta, c->situ_linear_beta);
         else
             for (int i = 0; i < inter; i++) ga[i] = silu(ga[i]) * ub[i];
-        vq_matvec(m, acc, rec + h->down_off, sc + 2 * inter, ga, lat, inter,
-                  h->codebook_id + 2 * m->stages, lut_down, q_down, qs_down);
+        if (m->external_caps & WASTE_BACKEND_CAP_VQ) {
+            const waste_backend_vq_matrix down = {
+                .struct_size = sizeof(waste_backend_vq_matrix),
+                .indices = rec + h->down_off,
+                .indices_bytes = (size_t)(h->chan_corr_off - h->down_off),
+                .channel_scales = sc + 2 * inter,
+                .n_channel_scales = (size_t)lat,
+                .record_scheme = backend_record_scheme(h->fmt),
+                .rows = (uint32_t)lat,
+                .cols = (uint32_t)inter,
+                .codebook_base =
+                    h->codebook_id + (uint32_t)(2 * m->stages),
+            };
+            const waste_status st = m->external_backend->vq_down(
+                m->external_backend_ctx, ga, &down, acc);
+            if (st != WASTE_OK) {
+                backend_failed(m, "VQ down apply");
+                PROF_END(P_EMM);
+                break;
+            }
+        } else {
+            vq_matvec(m, acc, rec + h->down_off, sc + 2 * inter, ga,
+                      lat, inter, h->codebook_id + 2 * m->stages,
+                      lut_down, q_down, qs_down);
+        }
         const float wj = w[j];
         for (int i = 0; i < lat; i++) ysum[i] += wj * acc[i];
         PROF_END(P_EMM);
@@ -3750,7 +4055,7 @@ const float *waste_model_prefill(waste_model *m, const int *tokens, int n,
         /* A record already failed: stop instead of streaming the rest of
          * the layers from a container that has been shown to be wrong.
          * On K3 that is gigabytes of pointless reads per token. */
-        if (m->read_error) break;
+        if (m->read_error || m->external_failed) break;
         if (ares_on) {
             memcpy(m->cprefix, m->cx, (size_t)n * hid * sizeof(float));
             ps_live = 1;
@@ -3849,7 +4154,7 @@ const float *waste_model_prefill(waste_model *m, const int *tokens, int n,
     matvec_t(m, m->logits, waste_find(m, tname("%slm_head.weight", c->prefix)), last,
              c->vocab, hid);
     memcpy(m->x, m->cx + (size_t)(n - 1) * hid, (size_t)hid * sizeof(float));
-    return m->read_error ? NULL : m->logits;
+    return (m->read_error || m->external_failed) ? NULL : m->logits;
 }
 
 const float *waste_model_step(waste_model *m, int token, int pos, int *routed)
@@ -3879,13 +4184,16 @@ const float *waste_model_step(waste_model *m, int token, int pos, int *routed)
     float *resid = (float *)malloc((size_t)hid * sizeof(float));
     float *norm = (float *)malloc((size_t)hid * sizeof(float));
     if (!resid || !norm) { free(resid); free(norm); return NULL; }
+    /* The promoted accelerator path is decode-only. Chunked prompt prefill
+     * retains the engine's existing CPU batching and numerical contract. */
+    m->external_decode = 1;
     const int ares_on = c->attn_res_block > 0;
     float *ps = m->prefix_sum;
     int ps_live = 0;
     m->n_blockres = 0;
 
     for (int L = 0; L < c->n_layers; L++) {
-        if (m->read_error) break;        /* see waste_model_prefill */
+        if (m->read_error || m->external_failed) break;
         char b[128];
         if (ares_on) {
             memcpy(ps, m->x, (size_t)hid * sizeof(float));
@@ -3908,6 +4216,7 @@ const float *waste_model_step(waste_model *m, int token, int pos, int *routed)
         waste_rmsnorm(norm, m->x, waste_find(m, b)->data, hid, c->eps);
         if (c->kda_layer[L]) { PROF_START(P_KDA); kda_layer(m, L, norm, resid); PROF_END(P_KDA); }
         else { PROF_START(P_MLA); mla_layer(m, L, norm, resid, pos); PROF_END(P_MLA); }
+        if (m->external_failed) break;
 
         if (ares_on) {
             if (ps_live) for (int i = 0; i < hid; i++) ps[i] += resid[i];
@@ -3963,5 +4272,6 @@ const float *waste_model_step(waste_model *m, int token, int pos, int *routed)
     PROF_END(P_HEAD);
     free(resid);
     free(norm);
-    return m->read_error ? NULL : m->logits;
+    m->external_decode = 0;
+    return (m->read_error || m->external_failed) ? NULL : m->logits;
 }
