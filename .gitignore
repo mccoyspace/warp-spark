@@ -12,6 +12,10 @@ waste
 libwaste.a
 *.a
 
+# Qualification captures contain prompt/generated ids, logits, and routes.
+# Keep the default evidence root private even if a broad git add is used.
+/private-evidence/
+
 # compiler-generated dependency files (-MMD)
 *.d
 

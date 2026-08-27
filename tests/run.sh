@@ -124,6 +124,14 @@ else
     head -20 "$TMP/backend.log"
 fi
 
+if python3 -m unittest tests.test_compare_backend_runs \
+        >"$TMP/backend-comparator.log" 2>&1; then
+    ok "backend qualification comparator and fail-closed capture gates"
+else
+    no "backend qualification comparator"
+    head -20 "$TMP/backend-comparator.log"
+fi
+
 # A version-0 bank may contain a legacy VQ2R record even when the manifest
 # tuple looks like VQ3R. The seam must carry the record's own format so a
 # VQ3R-only provider can reject before interpreting its index bytes.
