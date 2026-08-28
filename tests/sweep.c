@@ -180,13 +180,19 @@ static cuda_vq_target cuda_vq_targets(const waste_model *m, int mode,
     target.applies = target.experts * UINT64_C(3); /* gate, up, down */
     target.lut_builds = mode == 2
         ? layers * UINT64_C(2) * steps + target.experts : UINT64_C(0);
-    target.launches = mode == 1
-        ? target.experts * UINT64_C(2)
-        : layers * steps + target.experts * UINT64_C(3);
-    const uint64_t group = mode == 2
-        ? (uint64_t)waste_model_get_cuda_vq_group(m) : UINT64_C(1);
+    const uint64_t fused_group = mode == 2
+        ? (uint64_t)waste_model_get_cuda_vq_fused_group(m) : UINT64_C(0);
+    const uint64_t group = fused_group
+        ? fused_group
+        : mode == 2
+            ? (uint64_t)waste_model_get_cuda_vq_group(m) : UINT64_C(1);
     const uint64_t groups_per_layer =
         ((uint64_t)m->cfg.top_k + group - UINT64_C(1)) / group;
+    target.launches = mode == 1
+        ? target.experts * UINT64_C(2)
+        : fused_group
+            ? layers * steps * (UINT64_C(1) + UINT64_C(3) * groups_per_layer)
+            : layers * steps + target.experts * UINT64_C(3);
     target.syncs = layers * steps * groups_per_layer * UINT64_C(2);
     return target;
 }
@@ -268,6 +274,7 @@ static int write_capture(const char *dir, const char *key, int value, int rep,
             ", \"gqa_proj_expected_calls\": %" PRIu64
             ", \"vq_mode\": %d, \"vq_effective\": %d"
             ", \"vq_group\": %d"
+            ", \"vq_fused_group\": %d"
             ", \"vq_experts\": %" PRIu64
             ", \"vq_expected_experts\": %" PRIu64
             ", \"vq_applies\": %" PRIu64
@@ -294,6 +301,7 @@ static int write_capture(const char *dir, const char *key, int value, int rep,
             waste_model_cuda_gqa_proj_calls(m), gqa_expected,
             waste_model_get_cuda_vq(m), waste_model_cuda_vq_effective(m),
             waste_model_get_cuda_vq_group(m),
+            waste_model_get_cuda_vq_fused_group(m),
             waste_model_cuda_vq_experts(m), vq_expected.experts,
             waste_model_cuda_vq_applies(m), vq_expected.applies,
             waste_model_cuda_vq_lut_builds(m), vq_expected.lut_builds,
@@ -505,12 +513,12 @@ int main(int argc, char **argv)
      * and it does — a grouped sweep charges the drift to the last arm and
      * an interleaved one spreads it across all of them. */
     printf("%10s %4s %7s %3s %3s %3s %4s %7s %6s %10s %11s %9s %9s %8s %14s "
-           "%18s %18s %18s %4s %7s %4s %7s %4s %9s %9s %9s %9s %9s\n",
+           "%18s %18s %18s %4s %7s %4s %7s %4s %5s %9s %9s %9s %9s %9s\n",
            key, "rep", "slots", "io", "qd", "eff", "fall", "calls", "warm",
            "seconds", "tok/s", "hits", "misses", "hit", "bytes",
            "token_hash", "logit_hash", "route_hash", "deff", "dcalls",
-           "geff", "gcalls",
-           "veff", "vexperts", "vapplies", "vluts", "vlaunch", "vsync");
+           "geff", "gcalls", "veff", "vfuse", "vexperts", "vapplies",
+           "vluts", "vlaunch", "vsync");
     const uint64_t expected_cuda_calls = is_cuda
         ? cuda_call_target(&m, n_gen) : UINT64_C(0);
     for (int r = 0; r < repeat; r++) {
@@ -722,7 +730,7 @@ int main(int argc, char **argv)
                    " %6d %10.6f %11.6f %9" PRIu64
                    " %9" PRIu64 " %7.2f%% %14" PRIu64 " 0x%016" PRIx64
                    " 0x%016" PRIx64 " 0x%016" PRIx64 " %4d %7" PRIu64
-                   " %4d %7" PRIu64 " %4d %9" PRIu64 " %9" PRIu64 " %9" PRIu64
+                   " %4d %7" PRIu64 " %4d %5d %9" PRIu64 " %9" PRIu64 " %9" PRIu64
                    " %9" PRIu64 " %9" PRIu64 "\n",
                    value, r + 1, m.cache.n_slots,
                    waste_ecache_io_threads(&m.cache),
@@ -732,7 +740,8 @@ int main(int argc, char **argv)
                    h, mi, 100.0 * (double)h / (double)(h + mi ? h + mi : 1),
                    bytes, token_hash, logit_hash, route_hash,
                    dense_effective, dense_calls, gqa_effective, gqa_calls,
-                   vq_effective, vq_experts,
+                   vq_effective, waste_model_get_cuda_vq_fused_group(&m),
+                   vq_experts,
                    vq_applies, vq_lut_builds, vq_launches, vq_syncs);
             if (profile) {
                 printf("profile %s=%d rep=%d", key, value, r + 1);

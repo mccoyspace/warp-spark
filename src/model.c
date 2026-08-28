@@ -75,6 +75,15 @@ int  waste_cuda_vq_group_down_enqueue(
         const float *x, int cb_base, int rows, int cols);
 int  waste_cuda_vq_group_down_finish(
         waste_model *m, int count, const float **host_outputs);
+int  waste_cuda_vq_fused_pair(
+        waste_model *m, int prepared_rows, int count, const int *lut_rows,
+        const uint8_t *const *gate_idx, const uint8_t *const *up_idx,
+        const uint16_t *const *scale, int rows, int cols,
+        const float **host_outputs);
+int  waste_cuda_vq_fused_down(
+        waste_model *m, int count, const uint8_t *const *idx,
+        const uint16_t *const *scale, const float *const *x,
+        int cb_base, int rows, int cols, const float **host_outputs);
 int  waste_cuda_vq_group_drain(waste_model *m);
 void waste_cuda_kda_free(waste_model *m);
 #endif
@@ -1542,6 +1551,7 @@ static int cuda_vq_preflight(waste_model *m, int mode)
         const uint8_t *rec = m->miss_buf;
         const uint16_t *scale =
             (const uint16_t *)(rec + h->chan_corr_off);
+        const int fused = mode == 2 && m->cuda_vq_fused_group != 0;
         const int grouped = mode == 2 && m->cuda_vq_group > 1;
         const float *group_pair[1] = { NULL };
         const float *group_down[1] = { NULL };
@@ -1555,7 +1565,18 @@ static int cuda_vq_preflight(waste_model *m, int mode)
         if (waste_cuda_vq_prepare_pair(
                 m, mode, m->x, gate_lut, up_lut, h->codebook_id, lat))
             goto fail;
-        if (grouped) {
+        if (fused) {
+            const int lut_rows[1] = { 0 };
+            const uint8_t *gate_idx[1] = { rec + h->gate_off };
+            const uint8_t *up_idx[1] = { rec + h->up_off };
+            const uint16_t *pair_scale[1] = { scale };
+            if (waste_cuda_vq_fused_pair(
+                    m, 1, 1, lut_rows, gate_idx, up_idx, pair_scale,
+                    inter, lat, group_pair))
+                goto fail;
+            gate = (float *)group_pair[0];
+            up = gate + inter;
+        } else if (grouped) {
             if (waste_cuda_vq_group_pair_enqueue(
                     m, 0, rec + h->gate_off, rec + h->up_off,
                     scale, inter, lat) ||
@@ -1577,7 +1598,18 @@ static int cuda_vq_preflight(waste_model *m, int mode)
             vq_build_lut(m, down_lut, h->codebook_id + 2 * m->stages,
                          gate, inter, m->stages, m->cb_entries, m->vec_dim,
                          NULL, NULL);
-        if (grouped) {
+        if (fused) {
+            const uint8_t *down_idx[1] = { rec + h->down_off };
+            const uint16_t *down_scale[1] = { scale + 2 * inter };
+            const float *down_x[1] = { gate };
+            if (waste_cuda_vq_fused_down(
+                    m, 1, down_idx, down_scale, down_x,
+                    h->codebook_id + 2 * m->stages,
+                    lat, inter, group_down))
+                goto fail;
+            down = (float *)group_down[0];
+            if (waste_cuda_vq_group_drain(m)) goto fail;
+        } else if (grouped) {
             if (waste_cuda_vq_group_down_enqueue(
                     m, 0, rec + h->down_off, scale + 2 * inter, gate,
                     h->codebook_id + 2 * m->stages, lat, inter) ||
@@ -1595,6 +1627,55 @@ static int cuda_vq_preflight(waste_model *m, int mode)
             if (!isfinite(gate[i]) || !isfinite(up[i])) goto fail;
         for (int i = 0; i < lat; i++)
             if (!isfinite(down[i])) goto fail;
+
+        /* The cross-row verifier selects the same task-major kernel with a
+         * two-row LUT contract. Prove both row selectors and the multi-task
+         * down launch at load time as well, before recurrent state exists. */
+        if (fused && m->mtp_verify2_vq2) {
+            const int lut_rows[2] = { 0, 1 };
+            const uint8_t *gate_idx[2] = {
+                rec + h->gate_off, rec + h->gate_off
+            };
+            const uint8_t *up_idx[2] = {
+                rec + h->up_off, rec + h->up_off
+            };
+            const uint16_t *pair_scale[2] = { scale, scale };
+            const float *pair2[2] = { NULL, NULL };
+            const uint8_t *down_idx[2] = {
+                rec + h->down_off, rec + h->down_off
+            };
+            const uint16_t *down_scale[2] = {
+                scale + 2 * inter, scale + 2 * inter
+            };
+            const float *down_x[2] = { NULL, NULL };
+            const float *down2[2] = { NULL, NULL };
+            if (waste_cuda_vq_prepare_pair2(
+                    m, m->x, m->x, h->codebook_id, lat) ||
+                waste_cuda_vq_fused_pair(
+                    m, 2, 2, lut_rows, gate_idx, up_idx, pair_scale,
+                    inter, lat, pair2))
+                goto fail;
+            for (int task = 0; task < 2; task++) {
+                float *task_gate = (float *)pair2[task];
+                const float *task_up = pair2[task] + inter;
+                for (int i = 0; i < inter; i++)
+                    task_gate[i] = c->act_situ
+                        ? waste_situ_pair(
+                            task_gate[i], task_up[i], c->situ_beta,
+                            c->situ_linear_beta)
+                        : swiglu_pair(c, task_gate[i], task_up[i]);
+                down_x[task] = task_gate;
+            }
+            if (waste_cuda_vq_fused_down(
+                    m, 2, down_idx, down_scale, down_x,
+                    h->codebook_id + 2 * m->stages,
+                    lat, inter, down2) ||
+                waste_cuda_vq_group_drain(m))
+                goto fail;
+            for (int task = 0; task < 2; task++)
+                for (int i = 0; i < lat; i++)
+                    if (!isfinite(down2[task][i])) goto fail;
+        }
     }
     /* Layer 45 has its own bank and codebook range.  The base-bank launch
      * above proves the kernel tuple; this second launch proves that the
@@ -1616,22 +1697,51 @@ static int cuda_vq_preflight(waste_model *m, int mode)
         float *gate = m->ff;
         float *up = gate + inter;
         float *down = m->e_gate;
+        const int fused = m->cuda_vq_fused_group != 0;
+        const float *pair_out[1] = { NULL };
+        const float *down_out[1] = { NULL };
         if (h->fmt != WQ_VQ3R || h->codebook_id != m->bank[L].cb_base ||
             waste_cuda_vq_prepare_pair(m, mode, m->x, NULL, NULL,
-                                       h->codebook_id, lat) ||
-            waste_cuda_vq_apply_pair(m, gate, up,
-                                     rec + h->gate_off, rec + h->up_off,
-                                     scale, inter, lat))
+                                       h->codebook_id, lat))
             goto fail;
+        if (fused) {
+            const int lut_rows[1] = { 0 };
+            const uint8_t *gate_idx[1] = { rec + h->gate_off };
+            const uint8_t *up_idx[1] = { rec + h->up_off };
+            const uint16_t *pair_scale[1] = { scale };
+            if (waste_cuda_vq_fused_pair(
+                    m, 1, 1, lut_rows, gate_idx, up_idx, pair_scale,
+                    inter, lat, pair_out))
+                goto fail;
+            gate = (float *)pair_out[0];
+            up = gate + inter;
+        } else if (waste_cuda_vq_apply_pair(
+                       m, gate, up, rec + h->gate_off, rec + h->up_off,
+                       scale, inter, lat)) {
+            goto fail;
+        }
         for (int i = 0; i < inter; i++)
             gate[i] = c->act_situ
                 ? waste_situ_pair(gate[i], up[i], c->situ_beta,
                                   c->situ_linear_beta)
                 : swiglu_pair(c, gate[i], up[i]);
-        if (waste_cuda_vq_apply_down(
-                m, mode, down, rec + h->down_off, scale + 2 * inter,
-                gate, NULL, h->codebook_id + 2 * m->stages, lat, inter))
+        if (fused) {
+            const uint8_t *down_idx[1] = { rec + h->down_off };
+            const uint16_t *down_scale[1] = { scale + 2 * inter };
+            const float *down_x[1] = { gate };
+            if (waste_cuda_vq_fused_down(
+                    m, 1, down_idx, down_scale, down_x,
+                    h->codebook_id + 2 * m->stages,
+                    lat, inter, down_out) ||
+                waste_cuda_vq_group_drain(m))
+                goto fail;
+            down = (float *)down_out[0];
+        } else if (waste_cuda_vq_apply_down(
+                       m, mode, down, rec + h->down_off, scale + 2 * inter,
+                       gate, NULL, h->codebook_id + 2 * m->stages,
+                       lat, inter)) {
             goto fail;
+        }
         for (int i = 0; i < inter; i++)
             if (!isfinite(gate[i]) || !isfinite(up[i])) goto fail;
         for (int i = 0; i < lat; i++)
@@ -2925,6 +3035,35 @@ int waste_model_load(waste_model *m, const char *dir, int kv_cap,
         }
 #endif
     }
+    {
+        const char *e = getenv("WASTE_CUDA_VQ_FUSED");
+        if (!e || !strcmp(e, "0"))
+            m->cuda_vq_fused_group = 0;
+        else if (!strcmp(e, "4"))
+            m->cuda_vq_fused_group = 4;
+        else if (!strcmp(e, "8"))
+            m->cuda_vq_fused_group = 8;
+        else if (!strcmp(e, "16"))
+            m->cuda_vq_fused_group = 16;
+        else {
+            fprintf(stderr,
+                    "waste: WASTE_CUDA_VQ_FUSED must be 0, 4, 8 or 16\n");
+            return -1;
+        }
+        /* CPU is an explicit bracket, not a malformed CUDA profile. Once a
+         * selector is syntactically valid, match the other CUDA selectors
+         * by disabling it before the build/tuple checks below. */
+        const char *backend = getenv("WASTE_BACKEND");
+        if (backend && !strcmp(backend, "cpu"))
+            m->cuda_vq_fused_group = 0;
+#if !defined(WASTE_ENABLE_CUDA)
+        if (m->cuda_vq_fused_group) {
+            fprintf(stderr,
+                    "waste: WASTE_CUDA_VQ_FUSED requires a CUDA build\n");
+            return -1;
+        }
+#endif
+    }
 #if defined(WASTE_ENABLE_CUDA)
     {
         const char *e = getenv("WASTE_CUDA_KDA");
@@ -2975,6 +3114,13 @@ int waste_model_load(waste_model *m, const char *dir, int kv_cap,
         if (vq_mode == 1 && vq_group != 1) {
             fprintf(stderr,
                     "waste: grouped CUDA VQ currently requires mode 2\n");
+            return -1;
+        }
+        if (m->cuda_vq_fused_group &&
+            (vq_mode != 2 || vq_group != 1)) {
+            fprintf(stderr,
+                    "waste: WASTE_CUDA_VQ_FUSED requires "
+                    "WASTE_CUDA_VQ=2 and WASTE_CUDA_VQ_GROUP=1\n");
             return -1;
         }
         m->cuda_kda_mode = mode;
@@ -3582,6 +3728,13 @@ int waste_model_load(waste_model *m, const char *dir, int kv_cap,
         return -1;
     }
 #if defined(WASTE_ENABLE_CUDA)
+    if (m->cuda_vq_fused_group &&
+        m->cache.n_slots < m->cuda_vq_fused_group) {
+        fprintf(stderr,
+                "waste: fused CUDA VQ needs at least %d expert-cache slots\n",
+                m->cuda_vq_fused_group);
+        return -1;
+    }
     if (m->cuda_vq_mode == 2 && m->cuda_vq_group > 1 &&
         m->cache.n_slots < m->cuda_vq_group) {
         fprintf(stderr,
@@ -5490,20 +5643,21 @@ static void release_expert_holds(waste_model *m, waste_ecache_hold *hold,
         waste_ecache_release_hold(&m->cache, &hold[i]);
 }
 
-/* Queue several already-validated mode-2 expert kernels between stream
- * synchronizations. This changes only scheduling: SiTU and the final expert
- * sum remain the original CPU loops, and that sum consumes j in caller order
- * (router order for decode, ascending expert id for chunk prefill). Explicit
- * cache holds keep every pageable record pointer valid until CUDA drains the
- * group. */
+/* Batch several already-validated mode-2 expert kernels. The released group
+ * path queues one grid per expert; the explicit fused selector instead makes
+ * task the second grid dimension. Both keep SiTU and the final expert sum in
+ * the original CPU/router order. Cache holds keep every coherent expert
+ * pointer valid through the corresponding synchronous batch. */
 static int moe_vq_grouped(waste_model *m, int L, const int *idx,
                           const float *weight, int K, const float *xin,
                           float *ysum, int lat, int inter,
-                          double *expert_acquire_s)
+                          double *expert_acquire_s, int use_fused)
 {
     const waste_config *c = &m->cfg;
-    const int group = m->cuda_vq_group;
+    const int fused = use_fused && m->cuda_vq_fused_group != 0;
+    const int group = fused ? m->cuda_vq_fused_group : m->cuda_vq_group;
     int pair_ready = 0;
+    int pair_codebook_id = -1;
 
     for (int j0 = 0; j0 < K; j0 += group) {
         const int count = K - j0 < group ? K - j0 : group;
@@ -5512,6 +5666,13 @@ static int moe_vq_grouped(waste_model *m, int L, const int *idx,
         waste_ecache_hold hold[16];
         const float *pair_out[16] = { 0 };
         const float *down_out[16] = { 0 };
+        int lut_rows[16] = { 0 };
+        const uint8_t *gate_idx[16] = { 0 };
+        const uint8_t *up_idx[16] = { 0 };
+        const uint16_t *pair_scale[16] = { 0 };
+        const uint8_t *down_idx[16] = { 0 };
+        const uint16_t *down_scale[16] = { 0 };
+        const float *down_x[16] = { 0 };
         for (int s = 0; s < 16; s++)
             hold[s] = (waste_ecache_hold)WASTE_ECACHE_HOLD_INIT;
 
@@ -5531,9 +5692,16 @@ static int moe_vq_grouped(waste_model *m, int L, const int *idx,
                 release_expert_holds(m, hold, count);
                 return cuda_projection_failed(m, "VQ3R record validation");
             }
+            if (pair_codebook_id < 0)
+                pair_codebook_id = hdr[s]->codebook_id;
+            else if (hdr[s]->codebook_id != pair_codebook_id) {
+                waste_cuda_vq_group_drain(m);
+                release_expert_holds(m, hold, count);
+                return cuda_projection_failed(m, "VQ codebook validation");
+            }
             if (!pair_ready) {
                 if (waste_cuda_vq_prepare_pair(
-                        m, 2, xin, NULL, NULL, hdr[s]->codebook_id, lat)) {
+                        m, 2, xin, NULL, NULL, pair_codebook_id, lat)) {
                     waste_cuda_vq_group_drain(m);
                     release_expert_holds(m, hold, count);
                     return cuda_projection_failed(m, "VQ group prepare");
@@ -5544,7 +5712,11 @@ static int moe_vq_grouped(waste_model *m, int L, const int *idx,
             }
             const uint16_t *scale = (const uint16_t *)(
                 rec[s] + hdr[s]->chan_corr_off);
-            {
+            if (fused) {
+                gate_idx[s] = rec[s] + hdr[s]->gate_off;
+                up_idx[s] = rec[s] + hdr[s]->up_off;
+                pair_scale[s] = scale;
+            } else {
                 PROF_START(P_LUTA);
                 const int failed = waste_cuda_vq_group_pair_enqueue(
                     m, s, rec[s] + hdr[s]->gate_off,
@@ -5556,14 +5728,17 @@ static int moe_vq_grouped(waste_model *m, int L, const int *idx,
                     return cuda_projection_failed(m, "VQ group pair enqueue");
                 }
             }
-            m->cuda_vq_launches++;
+            if (!fused) m->cuda_vq_launches++;
         }
 
         PROF_START(P_EMM);
         {
             PROF_START(P_LUTA);
-            const int failed = waste_cuda_vq_group_pair_finish(
-                m, count, pair_out);
+            const int failed = fused
+                ? waste_cuda_vq_fused_pair(
+                    m, 1, count, lut_rows, gate_idx, up_idx, pair_scale,
+                    inter, lat, pair_out)
+                : waste_cuda_vq_group_pair_finish(m, count, pair_out);
             PROF_END(P_LUTA);
             if (failed) {
                 waste_cuda_vq_group_drain(m);
@@ -5571,6 +5746,7 @@ static int moe_vq_grouped(waste_model *m, int L, const int *idx,
                 return cuda_projection_failed(m, "VQ group pair finish");
             }
         }
+        if (fused) m->cuda_vq_launches++;
         m->cuda_vq_syncs++;
 
         for (int s = 0; s < count; s++) {
@@ -5586,7 +5762,11 @@ static int moe_vq_grouped(waste_model *m, int L, const int *idx,
 
             const uint16_t *scale = (const uint16_t *)(
                 rec[s] + hdr[s]->chan_corr_off);
-            {
+            if (fused) {
+                down_idx[s] = rec[s] + hdr[s]->down_off;
+                down_scale[s] = scale + 2 * inter;
+                down_x[s] = gate;
+            } else {
                 PROF_START(P_LUTA);
                 const int failed = waste_cuda_vq_group_down_enqueue(
                     m, s, rec[s] + hdr[s]->down_off, scale + 2 * inter,
@@ -5599,19 +5779,29 @@ static int moe_vq_grouped(waste_model *m, int L, const int *idx,
                     return cuda_projection_failed(m, "VQ group down enqueue");
                 }
             }
-            m->cuda_vq_lut_builds++;
-            m->cuda_vq_launches += 2;
+            if (!fused) {
+                m->cuda_vq_lut_builds++;
+                m->cuda_vq_launches += 2;
+            }
         }
         {
             PROF_START(P_LUTA);
-            const int failed = waste_cuda_vq_group_down_finish(
-                m, count, down_out);
+            const int failed = fused
+                ? waste_cuda_vq_fused_down(
+                    m, count, down_idx, down_scale, down_x,
+                    pair_codebook_id + 2 * m->stages,
+                    lat, inter, down_out)
+                : waste_cuda_vq_group_down_finish(m, count, down_out);
             PROF_END(P_LUTA);
             if (failed) {
                 waste_cuda_vq_group_drain(m);
                 release_expert_holds(m, hold, count);
                 return cuda_projection_failed(m, "VQ group down finish");
             }
+        }
+        if (fused) {
+            m->cuda_vq_lut_builds += (uint64_t)count;
+            m->cuda_vq_launches += 2;
         }
         m->cuda_vq_syncs++;
 
@@ -5803,8 +5993,10 @@ static int moe_layer(waste_model *m, int L, const float *in, float *out, int *ro
     int lut_ready = 0;
     int routed_grouped = 0;
 #if defined(WASTE_ENABLE_CUDA)
-    if (m->cuda_vq_mode == 2 && m->cuda_vq_group > 1) {
-        if (moe_vq_grouped(m, L, idx, w, K, xin, ysum, lat, inter, NULL))
+    if (m->cuda_vq_mode == 2 &&
+        (m->cuda_vq_fused_group || m->cuda_vq_group > 1)) {
+        if (moe_vq_grouped(
+                m, L, idx, w, K, xin, ysum, lat, inter, NULL, 1))
             return -1;
         routed_grouped = 1;
     }
@@ -5981,6 +6173,7 @@ static int moe_layer2_vq(waste_model *m, int L,
     double emm_start = 0.0;
 
     if (c->latent_dim || K < 1 || K > 8 || count > 16 ||
+        !m->mtp_verify2_vq2 ||
         m->cuda_vq_mode != 2 || m->cuda_vq_group != 1 ||
         m->cache.n_slots < count)
         return 1;                   /* clean request for the serial fallback */
@@ -6005,6 +6198,164 @@ static int moe_layer2_vq(waste_model *m, int L,
                 if (!seen) hint[n_hint++] = id;
             }
         waste_ecache_hint(&m->cache, L, hint, n_hint);
+    }
+
+    if (m->cuda_vq_fused_group) {
+        const int group = m->cuda_vq_fused_group;
+        int pair_ready = 0;
+        int fused_codebook_id = -1;
+        memset(out0, 0, (size_t)hid * sizeof(float));
+        memset(out1, 0, (size_t)hid * sizeof(float));
+
+        /* Consume the same row-0 then row-1 demand order as the released
+         * verifier, but put only one fused group behind each read barrier.
+         * This preserves the union hint and pointer lifetime contract while
+         * allowing group 4/8 to overlap later reads with earlier compute. */
+        for (int base = 0; base < count; base += group) {
+            const int n = count - base < group ? count - base : group;
+            int lut_rows[16] = { 0 };
+            const uint8_t *gate_idx[16] = { 0 };
+            const uint8_t *up_idx[16] = { 0 };
+            const uint16_t *pair_scale[16] = { 0 };
+            const uint8_t *down_idx[16] = { 0 };
+            const uint16_t *down_scale[16] = { 0 };
+            const float *down_x[16] = { 0 };
+            const float *fused_pair[16] = { 0 };
+            const float *fused_down[16] = { 0 };
+            waste_ecache_hold fused_hold[16];
+            int fused_acquired = 0;
+            int read_failed = 0, record_failed = 0, codebook_failed = 0;
+            for (int s = 0; s < 16; s++)
+                fused_hold[s] =
+                    (waste_ecache_hold)WASTE_ECACHE_HOLD_INIT;
+
+            PROF_START(P_EDEQ);
+            for (int s = 0; s < n; s++) {
+                const int task = base + s;
+                const int row = task / K;
+                const int j = task % K;
+                rec[s] = read_expert_hold(
+                    m, L, idx[row][j], &fused_hold[s]);
+                if (!rec[s]) { read_failed = 1; break; }
+                fused_acquired++;
+                hdr[s] = (const waste_expert_hdr *)rec[s];
+                if (hdr[s]->fmt != WQ_VQ3R) {
+                    record_failed = 1;
+                    break;
+                }
+                if (fused_codebook_id < 0)
+                    fused_codebook_id = hdr[s]->codebook_id;
+                else if (hdr[s]->codebook_id != fused_codebook_id) {
+                    codebook_failed = 1;
+                    break;
+                }
+            }
+            PROF_END(P_EDEQ);
+            if (read_failed || record_failed || codebook_failed) {
+                const int cuda_failed = waste_cuda_vq_group_drain(m);
+                release_expert_holds(m, fused_hold, fused_acquired);
+                if (codebook_failed)
+                    return cuda_projection_failed(
+                        m, "verify2 fused VQ codebook validation");
+                if (record_failed)
+                    return cuda_projection_failed(
+                        m, "verify2 fused VQ3R record validation");
+                return cuda_failed
+                    ? cuda_projection_failed(
+                        m, "verify2 fused VQ read drain") : -1;
+            }
+
+            const double fused_emm_start = prof_on ? pnow() : 0.0;
+            if (!pair_ready) {
+                if (waste_cuda_vq_prepare_pair2(
+                        m, in0, in1, fused_codebook_id, hid)) {
+                    prof_interval_end(P_EMM, fused_emm_start);
+                    waste_cuda_vq_group_drain(m);
+                    release_expert_holds(m, fused_hold, fused_acquired);
+                    return cuda_projection_failed(
+                        m, "verify2 fused VQ prepare");
+                }
+                m->cuda_vq_lut_builds += 4;
+                m->cuda_vq_launches += 2;
+                pair_ready = 1;
+            }
+            for (int s = 0; s < n; s++) {
+                const int task = base + s;
+                const uint16_t *scale = (const uint16_t *)(
+                    rec[s] + hdr[s]->chan_corr_off);
+                lut_rows[s] = task / K;
+                gate_idx[s] = rec[s] + hdr[s]->gate_off;
+                up_idx[s] = rec[s] + hdr[s]->up_off;
+                pair_scale[s] = scale;
+            }
+            {
+                PROF_START(P_LUTA);
+                const int failed = waste_cuda_vq_fused_pair(
+                    m, 2, n, lut_rows, gate_idx, up_idx, pair_scale,
+                    inter, hid, fused_pair);
+                PROF_END(P_LUTA);
+                if (failed) {
+                    prof_interval_end(P_EMM, fused_emm_start);
+                    waste_cuda_vq_group_drain(m);
+                    release_expert_holds(m, fused_hold, fused_acquired);
+                    return cuda_projection_failed(
+                        m, "verify2 fused VQ pair");
+                }
+            }
+            m->cuda_vq_launches++;
+            m->cuda_vq_syncs++;
+
+            for (int s = 0; s < n; s++) {
+                float *gate = (float *)fused_pair[s];
+                const float *up = fused_pair[s] + inter;
+                if (c->act_situ)
+                    for (int i = 0; i < inter; i++)
+                        gate[i] = waste_situ_pair(
+                            gate[i], up[i], c->situ_beta,
+                            c->situ_linear_beta);
+                else
+                    for (int i = 0; i < inter; i++)
+                        gate[i] = swiglu_pair(c, gate[i], up[i]);
+                const uint16_t *scale = (const uint16_t *)(
+                    rec[s] + hdr[s]->chan_corr_off);
+                down_idx[s] = rec[s] + hdr[s]->down_off;
+                down_scale[s] = scale + 2 * inter;
+                down_x[s] = gate;
+            }
+            {
+                PROF_START(P_LUTA);
+                const int failed = waste_cuda_vq_fused_down(
+                    m, n, down_idx, down_scale, down_x,
+                    fused_codebook_id + 2 * m->stages,
+                    hid, inter, fused_down);
+                PROF_END(P_LUTA);
+                if (failed) {
+                    prof_interval_end(P_EMM, fused_emm_start);
+                    waste_cuda_vq_group_drain(m);
+                    release_expert_holds(m, fused_hold, fused_acquired);
+                    return cuda_projection_failed(
+                        m, "verify2 fused VQ down");
+                }
+            }
+            m->cuda_vq_lut_builds += (uint64_t)n;
+            m->cuda_vq_launches += 2;
+            m->cuda_vq_syncs++;
+
+            for (int s = 0; s < n; s++) {
+                const int task = base + s;
+                const int row = task / K;
+                const int j = task % K;
+                const float w = weight[row][j];
+                for (int i = 0; i < hid; i++)
+                    out[row][i] += w * fused_down[s][i];
+                m->cuda_vq_experts++;
+                m->cuda_vq_applies += 3;
+            }
+            m->cuda_vq_effective = 2;
+            prof_interval_end(P_EMM, fused_emm_start);
+            release_expert_holds(m, fused_hold, fused_acquired);
+        }
+        goto routed_vq_done;
     }
 
     PROF_START(P_EDEQ);
@@ -6102,6 +6453,7 @@ static int moe_layer2_vq(waste_model *m, int L,
     emm_open = 0;
     release_expert_holds(m, hold, acquired);
 
+routed_vq_done: ;
     /* Shared expert is independent between rows.  Keep its outputs outside
      * the gate/up workspace and use the same pair projection selector as the
      * dense verifier path. */
@@ -6713,8 +7065,12 @@ int waste_model_set_cuda_vq(waste_model *m, int mode)
         mode != 0 && mode != 2)
         return -1;
     if (m->cuda_prefill_vq && mode != 0 && mode != 2) return -1;
+    if (m->cuda_vq_fused_group && mode != 0 && mode != 2) return -1;
     if (mode == 2 && m->cuda_vq_group > 1 &&
         m->cache.n_slots < m->cuda_vq_group) return -1;
+    if (mode == 2 && m->cuda_vq_fused_group &&
+        (m->cuda_vq_group != 1 ||
+         m->cache.n_slots < m->cuda_vq_fused_group)) return -1;
     m->cuda_vq_mode = mode;
     if (clear_prefill_vq) m->cuda_prefill_vq = 0;
     /* Mode zero is the explicit atomic exit from the composite experiment.
@@ -6744,6 +7100,11 @@ int waste_model_get_cuda_vq(const waste_model *m)
 int waste_model_get_cuda_vq_group(const waste_model *m)
 {
     return m && m->cuda_vq_group > 0 ? m->cuda_vq_group : 1;
+}
+
+int waste_model_get_cuda_vq_fused_group(const waste_model *m)
+{
+    return m && m->cuda_vq_fused_group > 0 ? m->cuda_vq_fused_group : 0;
 }
 
 int waste_model_cuda_vq_effective(const waste_model *m)
@@ -7386,7 +7747,7 @@ static int moe_chunk(waste_model *m, int L, const float *in, float *out,
                         m, L, sorted_ids, sorted_weights, nk,
                         xin + (size_t)t * lat,
                         ysum + (size_t)t * lat, lat, inter,
-                        expert_acquire_s))
+                        expert_acquire_s, 0))
                     return -1;          /* sticky CUDA/read error; no fallback */
             }
         }

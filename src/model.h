@@ -281,6 +281,7 @@ typedef struct {
     int      cuda_gqa_proj_preflight;
     int      cuda_vq_mode, cuda_vq_effective, cuda_vq_preflight_modes;
     int      cuda_vq_group;          /* experts between mode-2 stream syncs */
+    int      cuda_vq_fused_group;    /* explicit task-major batch, 0 off    */
     int      cuda_prefill_vq;        /* opt-in GLM Flash chunk VQ3R pilot   */
     int      cuda_prefill_dense;     /* 1 fast diagnostic, 2 ordered-exact */
     int      cuda_prefill_dense_preflight_mode;
@@ -489,6 +490,7 @@ uint64_t    waste_model_cuda_gqa_proj_calls(const waste_model *m);
 int         waste_model_set_cuda_vq(waste_model *m, int mode);
 int         waste_model_get_cuda_vq(const waste_model *m);
 int         waste_model_get_cuda_vq_group(const waste_model *m);
+int         waste_model_get_cuda_vq_fused_group(const waste_model *m);
 int         waste_model_cuda_vq_effective(const waste_model *m);
 uint64_t    waste_model_cuda_vq_experts(const waste_model *m);
 uint64_t    waste_model_cuda_vq_applies(const waste_model *m);
