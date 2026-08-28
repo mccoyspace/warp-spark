@@ -1121,6 +1121,45 @@ static int cuda_dense_preflight(waste_model *m, int scope)
                 goto fail;
         }
     }
+    /* The appended MTP block reuses the same dense CUDA primitives, but it
+     * is intentionally outside cfg.n_layers.  Validate every projection it
+     * can dispatch before activation; eh_proj/router/shared-head/lm-head stay
+     * on the ordinary CPU path and are covered by tensor-shape validation. */
+    if (m->mtp_available) {
+        const int L = m->mtp_layer;
+        if (cuda_dense_tensor_ok(m, tname(
+                "%smodel.layers.%d.block_sparse_moe.shared_experts.gate_proj.weight",
+                c->prefix, L), &first) ||
+            cuda_dense_tensor_ok(m, tname(
+                "%smodel.layers.%d.block_sparse_moe.shared_experts.up_proj.weight",
+                c->prefix, L), &first) ||
+            cuda_dense_tensor_ok(m, tname(
+                "%smodel.layers.%d.block_sparse_moe.shared_experts.down_proj.weight",
+                c->prefix, L), &first))
+            goto fail;
+        if (scope >= 2) {
+            if (c->q_lora) {
+                if (cuda_dense_tensor_ok(m, tname(
+                        "%smodel.layers.%d.self_attn.q_a_proj.weight",
+                        c->prefix, L), &first) ||
+                    cuda_dense_tensor_ok(m, tname(
+                        "%smodel.layers.%d.self_attn.q_b_proj.weight",
+                        c->prefix, L), &first))
+                    goto fail;
+            } else if (cuda_dense_tensor_ok(m, tname(
+                    "%smodel.layers.%d.self_attn.q_proj.weight",
+                    c->prefix, L), &first)) {
+                goto fail;
+            }
+            if (cuda_dense_tensor_ok(m, tname(
+                    "%smodel.layers.%d.self_attn.kv_a_proj_with_mqa.weight",
+                    c->prefix, L), &first) ||
+                cuda_dense_tensor_ok(m, tname(
+                    "%smodel.layers.%d.self_attn.o_proj.weight",
+                    c->prefix, L), &first))
+                goto fail;
+        }
+    }
     if (!first || !moe_layers ||
         (scope >= 2 && !full_gqa && !mla_layers) ||
         (scope >= 3 && !dense_layers)) {
@@ -1408,6 +1447,47 @@ static int cuda_vq_preflight(waste_model *m, int mode)
                        h->codebook_id + 2 * m->stages, lat, inter)) {
             goto fail;
         }
+        for (int i = 0; i < inter; i++)
+            if (!isfinite(gate[i]) || !isfinite(up[i])) goto fail;
+        for (int i = 0; i < lat; i++)
+            if (!isfinite(down[i])) goto fail;
+    }
+    /* Layer 45 has its own bank and codebook range.  The base-bank launch
+     * above proves the kernel tuple; this second launch proves that the
+     * separately declared MTP record, offsets and codebooks participate in
+     * that same tuple before an MTP cache row can be mutated. */
+    if (m->mtp_available) {
+        const int L = m->mtp_layer;
+        const int lat = c->latent_dim ? c->latent_dim : c->hidden;
+        const int inter = c->moe_inter;
+        const uint64_t reads_before = m->expert_reads;
+        if (mode != 2 || m->cuda_vq_group != 1 ||
+            bank_fetch(m, L, 0, m->miss_buf))
+            goto fail;
+        m->expert_reads = reads_before;
+        const uint8_t *rec = m->miss_buf;
+        const waste_expert_hdr *h = (const waste_expert_hdr *)rec;
+        const uint16_t *scale =
+            (const uint16_t *)(rec + h->chan_corr_off);
+        float *gate = m->ff;
+        float *up = gate + inter;
+        float *down = m->e_gate;
+        if (h->fmt != WQ_VQ3R || h->codebook_id != m->bank[L].cb_base ||
+            waste_cuda_vq_prepare_pair(m, mode, m->x, NULL, NULL,
+                                       h->codebook_id, lat) ||
+            waste_cuda_vq_apply_pair(m, gate, up,
+                                     rec + h->gate_off, rec + h->up_off,
+                                     scale, inter, lat))
+            goto fail;
+        for (int i = 0; i < inter; i++)
+            gate[i] = c->act_situ
+                ? waste_situ_pair(gate[i], up[i], c->situ_beta,
+                                  c->situ_linear_beta)
+                : swiglu_pair(c, gate[i], up[i]);
+        if (waste_cuda_vq_apply_down(
+                m, mode, down, rec + h->down_off, scale + 2 * inter,
+                gate, NULL, h->codebook_id + 2 * m->stages, lat, inter))
+            goto fail;
         for (int i = 0; i < inter; i++)
             if (!isfinite(gate[i]) || !isfinite(up[i])) goto fail;
         for (int i = 0; i < lat; i++)
@@ -2005,6 +2085,64 @@ static int validate_text_tensors(waste_model *m)
     return 1;
 }
 
+/* The appended GLM NextN layer deliberately does not inherit mHC.  It is a
+ * conventional residual DSA/MLA + MoE decoder block preceded by the
+ * embedding/hidden fusion and followed by its own shared-head norm.  Keep
+ * this validator separate from the base-layer loop so a manifest cannot make
+ * layer 45 look like a 46th mHC target layer by accident. */
+static int validate_mtp_tensors(waste_model *m)
+{
+    if (!m->mtp_available) return 1;
+    const waste_config *c = &m->cfg;
+    const int L = m->mtp_layer, hid = c->hidden;
+    const int qd = c->qk_nope + c->qk_rope;
+    const int shared = c->moe_inter * (c->n_shared ? c->n_shared : 1);
+
+    REQUIRE_VECTOR(tname("%smodel.layers.%d.enorm.weight", c->prefix, L), hid);
+    REQUIRE_VECTOR(tname("%smodel.layers.%d.hnorm.weight", c->prefix, L), hid);
+    REQUIRE_MATRIX(tname("%smodel.layers.%d.eh_proj.weight", c->prefix, L),
+                   hid, 2 * hid);
+    REQUIRE_VECTOR(tname("%smodel.layers.%d.shared_head.norm.weight",
+                         c->prefix, L), hid);
+    REQUIRE_VECTOR(tname("%smodel.layers.%d.input_layernorm.weight",
+                         c->prefix, L), hid);
+    REQUIRE_VECTOR(tname("%smodel.layers.%d.post_attention_layernorm.weight",
+                         c->prefix, L), hid);
+
+    if (c->q_lora) {
+        REQUIRE_MATRIX(tname("%smodel.layers.%d.self_attn.q_a_proj.weight",
+                             c->prefix, L), c->q_lora, hid);
+        REQUIRE_VECTOR(tname("%smodel.layers.%d.self_attn.q_a_layernorm.weight",
+                             c->prefix, L), c->q_lora);
+        REQUIRE_MATRIX(tname("%smodel.layers.%d.self_attn.q_b_proj.weight",
+                             c->prefix, L), c->n_heads * qd, c->q_lora);
+    } else {
+        REQUIRE_MATRIX(tname("%smodel.layers.%d.self_attn.q_proj.weight",
+                             c->prefix, L), c->n_heads * qd, hid);
+    }
+    REQUIRE_MATRIX(tname("%smodel.layers.%d.self_attn.kv_a_proj_with_mqa.weight",
+                         c->prefix, L), c->kv_lora + c->qk_rope, hid);
+    REQUIRE_VECTOR(tname("%smodel.layers.%d.self_attn.kv_a_layernorm.weight",
+                         c->prefix, L), c->kv_lora);
+    REQUIRE_MATRIX(tname("%smodel.layers.%d.self_attn.kv_b_proj.weight",
+                         c->prefix, L),
+                   c->n_heads * (c->qk_nope + c->v_head), c->kv_lora);
+    REQUIRE_MATRIX(tname("%smodel.layers.%d.self_attn.o_proj.weight",
+                         c->prefix, L), hid, c->n_heads * c->v_head);
+
+    REQUIRE_MATRIX(tname("%smodel.layers.%d.block_sparse_moe.gate.weight",
+                         c->prefix, L), c->n_experts, hid);
+    REQUIRE_VECTOR(tname("%smodel.layers.%d.block_sparse_moe.gate.e_score_correction_bias",
+                         c->prefix, L), c->n_experts);
+    REQUIRE_MATRIX(tname("%smodel.layers.%d.block_sparse_moe.shared_experts.gate_proj.weight",
+                         c->prefix, L), shared, hid);
+    REQUIRE_MATRIX(tname("%smodel.layers.%d.block_sparse_moe.shared_experts.up_proj.weight",
+                         c->prefix, L), shared, hid);
+    REQUIRE_MATRIX(tname("%smodel.layers.%d.block_sparse_moe.shared_experts.down_proj.weight",
+                         c->prefix, L), hid, shared);
+    return 1;
+}
+
 #undef REQUIRE_MATRIX
 #undef REQUIRE_VECTOR
 #undef REQUIRE_DATA
@@ -2034,6 +2172,11 @@ static int cfg_sane(const waste_config *c)
         !(c->mla_rms_norm_eps < 1.0f)) return 0;
     if (c->dsa_dense_context_limit < 0 ||
         c->dsa_dense_context_limit > (1 << 24)) return 0;
+    if (c->mtp_layers < 0 || c->mtp_layers > 1) return 0;
+    if ((!c->mtp_layers && c->mtp_source_layer != -1) ||
+        (c->mtp_layers && (c->mtp_source_layer < c->n_layers ||
+                           c->mtp_source_layer >= WASTE_MAX_LAYERS)))
+        return 0;
     /* MoE is optional, but if there are experts the routing has to make
      * sense: top_k above the pool overruns the per-token index array. */
     if (c->n_experts < 0 || c->n_experts > (1 << 20)) return 0;
@@ -2405,6 +2548,20 @@ static void cfg_from_json(waste_config *c, const js_doc *d, int cfg)
     c->n_shared = (int)js_int(d, js_get(d, cfg, "num_shared_experts"), 0);
     c->first_dense = (int)js_int(d, js_get(d, cfg, "first_k_dense_replace"), 0);
     c->vocab = (int)js_int(d, js_get(d, cfg, "vocab_size"), 0);
+    {
+        const int ml = js_get(d, cfg, "mtp_layers");
+        const int ms = js_get(d, cfg, "mtp_source_layer");
+        const double mlv = js_num(d, ml, NAN);
+        const double msv = js_num(d, ms, NAN);
+        c->mtp_layers = ml < 0 ? 0 :
+            (js_typeof(d, ml) == JS_NUM && isfinite(mlv) &&
+             trunc(mlv) == mlv && mlv >= INT_MIN && mlv <= INT_MAX
+             ? (int)mlv : -1);
+        c->mtp_source_layer = ms < 0 ? -1 :
+            (js_typeof(d, ms) == JS_NUM && isfinite(msv) &&
+             trunc(msv) == msv && msv >= INT_MIN && msv <= INT_MAX
+             ? (int)msv : -2);
+    }
     c->eos_token_id = (int)js_int(d, js_get(d, cfg, "eos_token_id"), 0);
     c->n_eos = 0;
     {
@@ -2580,6 +2737,11 @@ int waste_model_load(waste_model *m, const char *dir, int kv_cap,
     memset(m, 0, sizeof *m);
     pthread_mutex_init(&m->fetch_mu, NULL);
     m->trunk_fd = -1;
+    m->mtp_layer = -1;
+    m->mtp_target_hidden_pos = -1;
+    m->mtp_last_pos = -1;
+    m->mtp_last_token = -1;
+    m->mtp_shadow_argmax = -1;
     for (int L = 0; L < WASTE_MAX_LAYERS; L++) m->bank[L].fd = -1;
     m->want_vision = opt->want_vision;
     m->want_direct = opt->direct_io;
@@ -2956,10 +3118,101 @@ int waste_model_load(waste_model *m, const char *dir, int kv_cap,
                                   &m->direct_io);
         if (m->bank[L].fd < 0) { js_free(&d); free(src); return -1; }
     }
+
+    /* Appended GLM NextN/MTP is an explicit, independent manifest contract.
+     * Do not infer it from source-era num_nextn_predict_layers: older
+     * containers intentionally retained that source fact while omitting all
+     * MTP weights.  Conversely, neither config keys nor a bank on their own
+     * are sufficient — both declarations must agree exactly. */
+    {
+        const int mt = js_get(&d, 0, "mtp");
+        const int cfg_mtp = c->mtp_layers != 0 || c->mtp_source_layer != -1;
+        if ((mt >= 0) != cfg_mtp) {
+            fprintf(stderr,
+                    "waste: MTP manifest/config declarations do not agree\n");
+            js_free(&d); free(src); return -2;
+        }
+        if (mt >= 0) {
+            const int version_t = js_get(&d, mt, "version");
+            const int count_t = js_get(&d, mt, "num_layers");
+            const int source_t = js_get(&d, mt, "source_layer");
+            const int limit_t = js_get(&d, mt, "context_limit");
+            const double version_n = js_num(&d, version_t, NAN);
+            const double count_n = js_num(&d, count_t, NAN);
+            const double source_n = js_num(&d, source_t, NAN);
+            const double limit_n = js_num(&d, limit_t, NAN);
+            char attention[32];
+            js_str(&d, js_get(&d, mt, "attention"), attention,
+                   sizeof attention);
+            const int recurrent_t = js_get(&d, mt, "recurrent");
+            char layer_key[16];
+            snprintf(layer_key, sizeof layer_key, "%d", c->n_layers);
+            if (js_typeof(&d, mt) != JS_OBJ ||
+                js_typeof(&d, version_t) != JS_NUM || version_n != 1.0 ||
+                js_typeof(&d, count_t) != JS_NUM || count_n != 1.0 ||
+                js_typeof(&d, source_t) != JS_NUM ||
+                !isfinite(source_n) || trunc(source_n) != source_n ||
+                source_n != c->n_layers ||
+                js_typeof(&d, limit_t) != JS_NUM || limit_n != 2048.0 ||
+                strcmp(attention, "dense_equivalent_dsa") ||
+                js_typeof(&d, recurrent_t) != JS_BOOL ||
+                !js_bool(&d, recurrent_t, 0) ||
+                strcmp(c->arch, "Glm5NextForConditionalGeneration") ||
+                c->mtp_layers != 1 || c->mtp_source_layer != c->n_layers ||
+                c->n_layers != 45 || c->dsa_dense_context_limit != 2048 ||
+                js_get(&d, layers, layer_key) >= 0) {
+                fprintf(stderr,
+                        "waste: unsupported or inconsistent GLM MTP contract\n");
+                js_free(&d); free(src); return -2;
+            }
+
+            const int L = c->mtp_source_layer;
+            const int bank = js_get(&d, mt, "bank");
+            const int experts_t = js_get(&d, bank, "experts");
+            const int bytes_t = js_get(&d, bank, "bytes");
+            const int cb_t = js_get(&d, bank, "codebook_base");
+            const double experts_n = js_num(&d, experts_t, NAN);
+            const double bytes_n = js_num(&d, bytes_t, NAN);
+            const double cb_n = js_num(&d, cb_t, NAN);
+            char fn[64];
+            js_str(&d, js_get(&d, bank, "file"), fn, sizeof fn);
+            if (js_typeof(&d, bank) != JS_OBJ || !fn[0] ||
+                js_typeof(&d, experts_t) != JS_NUM ||
+                experts_n != c->n_experts ||
+                js_typeof(&d, bytes_t) != JS_NUM || !isfinite(bytes_n) ||
+                trunc(bytes_n) != bytes_n || bytes_n <= 0.0 ||
+                bytes_n > (double)INT64_MAX ||
+                js_typeof(&d, cb_t) != JS_NUM || !isfinite(cb_n) ||
+                trunc(cb_n) != cb_n || cb_n < 0.0 || cb_n > INT_MAX) {
+                fprintf(stderr, "waste: malformed GLM MTP expert bank\n");
+                js_free(&d); free(src); return -2;
+            }
+            const int64_t bytes = (int64_t)bytes_n;
+            m->bank[L].n_experts = (int)experts_n;
+            m->bank[L].cb_base = (int)cb_n;
+            if (bytes % m->bank[L].n_experts != 0 ||
+                3 * m->stages > m->n_books ||
+                m->bank[L].cb_base > m->n_books - 3 * m->stages) {
+                fprintf(stderr, "waste: GLM MTP expert bank is inconsistent\n");
+                js_free(&d); free(src); return -2;
+            }
+            m->bank[L].rec_bytes = bytes / m->bank[L].n_experts;
+            snprintf(path, sizeof path, "%s/%s", dir, fn);
+            m->bank[L].fd = bank_open(path, m->bank[L].rec_bytes,
+                                      m->want_direct, &m->direct_io);
+            if (m->bank[L].fd < 0) {
+                js_free(&d); free(src); return -1;
+            }
+            m->mtp_available = 1;
+            m->mtp_layer = L;
+            m->mtp_context_limit = (int)limit_n;
+        }
+    }
     js_free(&d);
     free(src);
 
-    if (!validate_text_tensors(m)) return -2;      /* -> WASTE_E_FORMAT */
+    if (!validate_text_tensors(m) || !validate_mtp_tensors(m))
+        return -2;                                 /* -> WASTE_E_FORMAT */
 
     /* state + scratch */
     const int H = c->kda_heads, D = c->kda_dim, C = H * D;
@@ -2979,6 +3232,11 @@ int waste_model_load(waste_model *m, const char *dir, int kv_cap,
             m->latcache[L] = (float *)calloc(
                 (size_t)kv_cap * (c->kv_lora + c->qk_rope), sizeof(float));
         }
+    }
+    if (m->mtp_available) {
+        const int L = m->mtp_layer;
+        m->latcache[L] = (float *)calloc(
+            (size_t)kv_cap * (c->kv_lora + c->qk_rope), sizeof(float));
     }
     int big = c->hidden > C ? c->hidden : C;
     if (c->attention_kind == WASTE_ATTN_GQA &&
@@ -3037,6 +3295,14 @@ int waste_model_load(waste_model *m, const char *dir, int kv_cap,
         m->mrow = (float *)calloc(n, sizeof(float));
     }
     m->logits = (float *)calloc((size_t)c->vocab, sizeof(float));
+    if (m->mtp_available) {
+        m->mtp_target_hidden = (float *)calloc((size_t)c->hidden,
+                                               sizeof(float));
+        m->mtp_hidden = (float *)calloc((size_t)c->hidden, sizeof(float));
+        m->mtp_logits = (float *)calloc((size_t)c->vocab, sizeof(float));
+        /* [enorm(embed), hnorm(previous)] + fused hidden + norm + sublayer. */
+        m->mtp_work = (float *)calloc((size_t)5 * c->hidden, sizeof(float));
+    }
     m->ff = (float *)calloc((size_t)2 * (c->dense_inter > c->moe_inter ? c->dense_inter : c->moe_inter), sizeof(float));
     m->e_gate = (float *)malloc((size_t)c->moe_inter * c->hidden * sizeof(float));
     m->e_up = (float *)malloc((size_t)c->moe_inter * c->hidden * sizeof(float));
@@ -3100,7 +3366,8 @@ int waste_model_load(waste_model *m, const char *dir, int kv_cap,
     }
     {   /* expert cache, sized by the caller's budget */
         int64_t rec = 0;
-        for (int L = 0; L < c->n_layers; L++)
+        const int end = m->mtp_available ? m->mtp_layer + 1 : c->n_layers;
+        for (int L = 0; L < end; L++)
             if (m->bank[L].rec_bytes > rec) rec = m->bank[L].rec_bytes;
         if (waste_ecache_init(&m->cache, cache_bytes, (size_t)rec, opt->policy))
             return -1;
@@ -3128,6 +3395,10 @@ int waste_model_load(waste_model *m, const char *dir, int kv_cap,
             if (!m->S[L] || !m->conv[L]) return -1;
         } else if (!m->latcache[L]) return -1;
     }
+    if (m->mtp_available &&
+        (!m->latcache[m->mtp_layer] || !m->mtp_target_hidden ||
+         !m->mtp_hidden || !m->mtp_logits || !m->mtp_work))
+        return -1;
     if (c->attn_res_block && !m->blockres) return -1;
     if (m->gqa_chunk_prefill &&
         !waste_model_gqa_chunk_prefill_compatible(m)) {
@@ -3224,6 +3495,8 @@ void waste_model_free(waste_model *m)
         if (m->bank[L].fd >= 0) close(m->bank[L].fd);
     }
     free(m->x); free(m->h); free(m->tmp); free(m->att); free(m->logits);
+    free(m->mtp_target_hidden); free(m->mtp_hidden);
+    free(m->mtp_logits); free(m->mtp_work);
     free(m->ff); free(m->e_gate); free(m->e_up); free(m->e_down); free(m->lut);
     free(m->lut8); free(m->lut8_scale);
     free(m->xga); free(m->xub); free(m->xacc);
@@ -3446,6 +3719,13 @@ static int bank_fail(waste_model *m, rec_status st, int layer, int expert)
     return -1;
 }
 
+static int storage_layer_ok(const waste_model *m, int layer)
+{
+    return m && layer >= 0 && layer < WASTE_MAX_LAYERS &&
+           (layer < m->cfg.n_layers ||
+            (m->mtp_available && layer == m->mtp_layer));
+}
+
 static int bank_fetch(void *user, int layer, int expert, uint8_t *dst)
 {
     waste_model *m = (waste_model *)user;
@@ -3455,8 +3735,10 @@ static int bank_fetch(void *user, int layer, int expert, uint8_t *dst)
      * 16 bits against a bank array of WASTE_MAX_LAYERS. Indexing it
      * unchecked gave a garbage fd and a garbage record size to a pread
      * aimed at a fixed-size cache slot. */
-    const int bad_layer = layer < 0 || layer >= m->cfg.n_layers ||
-                          layer >= WASTE_MAX_LAYERS;
+    /* Storage layers are base decoder layers plus exactly the explicitly
+     * declared appended MTP layer.  Never widen this to n_layers+1: stale
+     * hotlists are untrusted input and an ordinary model has no layer 45. */
+    const int bad_layer = !storage_layer_ok(m, layer);
     waste_bank *b = bad_layer ? NULL : &m->bank[layer];
     if (bad_layer || expert < 0 || expert >= b->n_experts ||
         b->fd < 0 || b->rec_bytes <= 0)
@@ -5269,6 +5551,10 @@ static int state_add_bytes(uint64_t *total, uint64_t count, uint64_t width)
 int waste_model_state_size(const waste_model *m, int pos, size_t *bytes)
 {
     if (!m || !bytes) return -1;
+    /* v1 has no appended MTP cache/hidden representation.  Availability by
+     * itself is harmless and preserves old snapshots; refuse only while the
+     * caller has explicitly activated experimental MTP state. */
+    if (m->mtp_active) return -1;
     /* v1 snapshots encode every non-KDA layer as one MLA latent cache. A
      * standard-GQA K/V pair needs a new header/version and is deliberately
      * unsupported in this first runtime slice. */
@@ -5360,6 +5646,7 @@ int waste_model_state_import(waste_model *m, const void *src, size_t bytes,
                              int *pos)
 {
     if (!m || !src || bytes < sizeof(waste_state_hdr)) return -2;
+    if (m->mtp_active) return -2;
     if (m->cfg.attention_kind == WASTE_ATTN_GQA) return -2;
     const waste_config *c = &m->cfg;
     waste_state_hdr h, want;
@@ -5434,6 +5721,12 @@ int waste_model_state_import(waste_model *m, const void *src, size_t bytes,
         memcpy(m->blockres, p, n); p += n;
     }
     memcpy(m->x, p, (size_t)c->hidden * sizeof(float));
+    if (m->mtp_available) {
+        m->n_kv[m->mtp_layer] = 0;
+        /* v1 does not carry the post-final-norm target hidden required to
+         * resume MTP.  -2 distinguishes this from a fresh/reset model. */
+        m->mtp_target_hidden_pos = -2;
+    }
     if (pos) *pos = h.pos;
     return 0;
 }
@@ -5453,6 +5746,28 @@ void waste_model_reset(waste_model *m)
                    (size_t)3 * c->kda_heads * c->kda_dim * (c->conv_k - 1) * sizeof(float));
         m->n_kv[L] = 0;
     }
+    if (m->mtp_available) {
+        const int L = m->mtp_layer;
+        m->n_kv[L] = 0;
+        if (m->latcache[L])
+            memset(m->latcache[L], 0,
+                   (size_t)m->kv_cap * (c->kv_lora + c->qk_rope) *
+                   sizeof(float));
+        if (m->mtp_target_hidden)
+            memset(m->mtp_target_hidden, 0,
+                   (size_t)c->hidden * sizeof(float));
+        if (m->mtp_hidden)
+            memset(m->mtp_hidden, 0, (size_t)c->hidden * sizeof(float));
+    }
+    m->mtp_target_hidden_pos = -1;
+    m->mtp_alignment_error = 0;
+    m->mtp_last_pos = -1;
+    m->mtp_last_token = -1;
+    m->mtp_shadow_argmax = -1;
+    m->mtp_steps = 0;
+    m->mtp_shadow_steps = 0;
+    m->mtp_shadow_matches = 0;
+    m->mtp_seconds = 0.0;
     m->n_blockres = 0;
     if (m->x) memset(m->x, 0, (size_t)c->hidden * sizeof(float));
     if (m->blockres && c->attn_res_block) {
@@ -5745,7 +6060,8 @@ int waste_model_resize_cache(waste_model *m, size_t cache_bytes)
 {
     const int policy = m->cache.policy;
     int64_t rec = 0;
-    for (int L = 0; L < m->cfg.n_layers; L++)
+    const int end = m->mtp_available ? m->mtp_layer + 1 : m->cfg.n_layers;
+    for (int L = 0; L < end; L++)
         if (m->bank[L].rec_bytes > rec) rec = m->bank[L].rec_bytes;
     if (rec <= 0) return -1;
     waste_ecache_free(&m->cache);          /* stops the readers first */
@@ -5803,6 +6119,7 @@ int waste_model_state_save(const waste_model *m, const char *path, int pos)
 int waste_model_state_load(waste_model *m, const char *path, int *pos)
 {
     const waste_config *c = &m->cfg;
+    if (m->mtp_active) return -2;
     if (c->attention_kind == WASTE_ATTN_GQA) return -2;
     FILE *f = fopen(path, "rb");
     if (!f) return -1;
@@ -5888,6 +6205,10 @@ int waste_model_state_load(waste_model *m, const char *path, int *pos)
     }
     if (!rc && fread(m->x, sizeof(float), (size_t)c->hidden, f) != (size_t)c->hidden) rc = -1;
     fclose(f);
+    if (!rc && m->mtp_available) {
+        m->n_kv[m->mtp_layer] = 0;
+        m->mtp_target_hidden_pos = -2;
+    }
     if (!rc && pos) *pos = h.pos;
     /* -3 means the file changed or the device failed after the successful
      * preflight and live state may have been touched.  The public wrapper
@@ -6507,6 +6828,224 @@ static int clamp_token(const waste_model *m, int token)
     return 0;
 }
 
+static int mtp_argmax(const float *logits, int n)
+{
+    int best = 0;
+    for (int i = 1; i < n; i++)
+        if (logits[i] > logits[best]) best = i;
+    return best;
+}
+
+static int mtp_alignment_fail(waste_model *m, const char *what,
+                              int have, int need)
+{
+    if (!m->mtp_alignment_error)
+        fprintf(stderr, "waste: MTP %s alignment mismatch (have %d, need %d)\n",
+                what, have, need);
+    m->mtp_alignment_error = 1;
+    return -1;
+}
+
+/* One exact appended NextN decoder step.  Position p pairs target/draft
+ * hidden h_p with the embedding of token x_{p+1}; the release masks the
+ * embedding half at p=0 before enorm.  The MTP layer itself is conventional
+ * residual DSA/MLA + MoE — it does not carry the target's four mHC streams. */
+static const float *mtp_step(waste_model *m, int token, int pos,
+                             const float *previous_hidden, int *routed)
+{
+    if (!m || !m->mtp_available || !m->mtp_active || !previous_hidden ||
+        m->mtp_alignment_error)
+        return NULL;
+    const waste_config *c = &m->cfg;
+    const int L = m->mtp_layer, hid = c->hidden;
+    if (pos < 0 || pos >= m->kv_cap || pos >= m->mtp_context_limit) {
+        m->ctx_full = 1;
+        return NULL;
+    }
+    if (m->n_kv[L] != pos) {
+        mtp_alignment_fail(m, "cache", m->n_kv[L], pos);
+        return NULL;
+    }
+
+    const double started = pnow();
+    float *pair = m->mtp_work;
+    float *hidden = pair + (size_t)2 * hid;
+    float *norm = hidden + hid;
+    float *sub = norm + hid;
+    if (waste_embed_row(m, token, pair)) return NULL;
+    if (pos == 0) memset(pair, 0, (size_t)hid * sizeof(float));
+    waste_rmsnorm(pair, pair,
+                  T(m, "%smodel.layers.%d.enorm.weight", c->prefix, L),
+                  hid, c->eps);
+    waste_rmsnorm(pair + hid, previous_hidden,
+                  T(m, "%smodel.layers.%d.hnorm.weight", c->prefix, L),
+                  hid, c->eps);
+    matvec_t(m, hidden,
+             waste_find(m, tname("%smodel.layers.%d.eh_proj.weight",
+                                 c->prefix, L)),
+             pair, hid, 2 * hid);
+
+    waste_rmsnorm(norm, hidden,
+                  T(m, "%smodel.layers.%d.input_layernorm.weight",
+                    c->prefix, L), hid, c->eps);
+    if (mla_layer(m, L, norm, sub, pos,
+                  m->cuda_dense_scope, m->cuda_kda_mode)) {
+        m->n_kv[L] = pos;
+        return NULL;
+    }
+    for (int i = 0; i < hid; i++) hidden[i] += sub[i];
+
+    waste_rmsnorm(norm, hidden,
+                  T(m, "%smodel.layers.%d.post_attention_layernorm.weight",
+                    c->prefix, L), hid, c->eps);
+    if (moe_layer(m, L, norm, sub, routed)) {
+        m->n_kv[L] = pos;
+        return NULL;
+    }
+    for (int i = 0; i < hid; i++) hidden[i] += sub[i];
+    memcpy(m->mtp_hidden, hidden, (size_t)hid * sizeof(float));
+
+    waste_rmsnorm(norm, hidden,
+                  T(m, "%smodel.layers.%d.shared_head.norm.weight",
+                    c->prefix, L), hid, c->eps);
+    matvec_t(m, m->mtp_logits,
+             waste_find(m, tname("%slm_head.weight", c->prefix)),
+             norm, c->vocab, hid);
+    if (m->read_error || m->cuda_kda_state_dirty ||
+        ((m->cuda_kda_mode || m->cuda_dense_scope ||
+          m->cuda_gqa_proj || m->cuda_vq_mode) && m->cuda_kda_failed)) {
+        m->n_kv[L] = pos;
+        return NULL;
+    }
+    m->mtp_last_pos = pos;
+    m->mtp_last_token = clamp_token(m, token);
+    m->mtp_steps++;
+    m->mtp_seconds += pnow() - started;
+    return m->mtp_logits;
+}
+
+int waste_model_mtp_available(const waste_model *m)
+{
+    return m && m->mtp_available;
+}
+
+int waste_model_mtp_set_enabled(waste_model *m, int enabled)
+{
+    if (!m || (enabled != 0 && enabled != 1)) return -1;
+    if (!enabled) {
+        m->mtp_active = 0;
+        return 0;
+    }
+    if (!m->mtp_available || m->mtp_alignment_error ||
+        m->mtp_target_hidden_pos < -1) return -1;
+    /* A clean target state with p as its last position must already have p
+     * completed MTP rows.  This permits enabling before prefill (p=-1), or
+     * just after token zero, and rejects a silently cold cache after a longer
+     * ordinary prefill. */
+    const int need = m->mtp_target_hidden_pos < 0
+                   ? 0 : m->mtp_target_hidden_pos;
+    if (m->n_kv[m->mtp_layer] != need)
+        return mtp_alignment_fail(m, "enable", m->n_kv[m->mtp_layer], need);
+    m->mtp_active = 1;
+    return 0;
+}
+
+int waste_model_mtp_enabled(const waste_model *m)
+{
+    return m && m->mtp_active;
+}
+
+const float *waste_model_mtp_target_hidden(const waste_model *m, int *pos)
+{
+    if (!m || !m->mtp_available || m->mtp_target_hidden_pos < 0) return NULL;
+    if (pos) *pos = m->mtp_target_hidden_pos;
+    return m->mtp_target_hidden;
+}
+
+const float *waste_model_mtp_propose(waste_model *m, int next_token,
+                                     int target_pos, int *routed)
+{
+    if (!m || !m->mtp_active || target_pos != m->mtp_target_hidden_pos)
+        return NULL;
+    if (m->n_kv[m->mtp_layer] != target_pos) {
+        mtp_alignment_fail(m, "proposal", m->n_kv[m->mtp_layer], target_pos);
+        return NULL;
+    }
+    dump_pos0 = target_pos;
+    const float *draft = mtp_step(m, next_token, target_pos,
+                                  m->mtp_target_hidden, routed);
+    if (draft) m->mtp_shadow_argmax = mtp_argmax(draft, m->cfg.vocab);
+    return draft;
+}
+
+int waste_model_mtp_cache_pos(const waste_model *m)
+{
+    return m && m->mtp_available ? m->n_kv[m->mtp_layer] : -1;
+}
+
+uint64_t waste_model_mtp_steps(const waste_model *m)
+{
+    return m ? m->mtp_steps : 0;
+}
+
+double waste_model_mtp_seconds(const waste_model *m)
+{
+    return m ? m->mtp_seconds : 0.0;
+}
+
+uint64_t waste_model_mtp_shadow_steps(const waste_model *m)
+{
+    return m ? m->mtp_shadow_steps : 0;
+}
+
+uint64_t waste_model_mtp_shadow_matches(const waste_model *m)
+{
+    return m ? m->mtp_shadow_matches : 0;
+}
+
+/* Advance the MTP history before the target consumes a known token.  A
+ * proposal may already have filled exactly this row; record and require the
+ * token identity so a rejected/deviating path never reuses the wrong cache. */
+static int mtp_before_target_step(waste_model *m, int token, int pos)
+{
+    if (!m->mtp_active) return 0;
+    if (m->mtp_alignment_error) return -1;
+    const int L = m->mtp_layer;
+    if (pos == 0) {
+        if (m->mtp_target_hidden_pos != -1 || m->n_kv[L] != 0)
+            return mtp_alignment_fail(m, "prompt start", m->n_kv[L], 0);
+        return 0;
+    }
+    if (m->mtp_target_hidden_pos != pos - 1)
+        return mtp_alignment_fail(m, "target hidden",
+                                  m->mtp_target_hidden_pos, pos - 1);
+    if (m->n_kv[L] == pos) {
+        if (m->mtp_last_pos != pos - 1 ||
+            m->mtp_last_token != clamp_token(m, token))
+            return mtp_alignment_fail(m, "proposal token",
+                                      m->mtp_last_token,
+                                      clamp_token(m, token));
+        return 0;
+    }
+    if (m->n_kv[L] != pos - 1)
+        return mtp_alignment_fail(m, "bootstrap cache", m->n_kv[L], pos - 1);
+    dump_pos0 = pos - 1;
+    const float *draft = mtp_step(m, token, pos - 1,
+                                  m->mtp_target_hidden, NULL);
+    if (!draft) return -1;
+    m->mtp_shadow_argmax = mtp_argmax(draft, m->cfg.vocab);
+    return 0;
+}
+
+static void mtp_after_target_step(waste_model *m, const float *target_logits)
+{
+    if (!m->mtp_active || m->mtp_shadow_argmax < 0 || !target_logits) return;
+    const int target = mtp_argmax(target_logits, m->cfg.vocab);
+    m->mtp_shadow_steps++;
+    if (target == m->mtp_shadow_argmax) m->mtp_shadow_matches++;
+    m->mtp_shadow_argmax = -1;
+}
+
 const float *waste_model_prefill(waste_model *m, const int *tokens, int n,
                                  int pos0)
 {
@@ -6942,6 +7481,11 @@ static const float *model_step_mhc(waste_model *m, int pos, int *routed)
                  waste_find(m, tname("%slm_head.weight", c->prefix)),
                  collapsed, c->vocab, hid);
         PROF_END(P_HEAD);
+        if (m->mtp_available) {
+            memcpy(m->mtp_target_hidden, collapsed,
+                   (size_t)hid * sizeof(float));
+            m->mtp_target_hidden_pos = pos;
+        }
     } else {
         failed = 1;
     }
@@ -6962,6 +7506,10 @@ const float *waste_model_step(waste_model *m, int token, int pos, int *routed)
         const int cm = waste_model_ctx_max(m);
         if (cm && (pos < 0 || pos >= cm)) { m->ctx_full = 1; return NULL; }
     }
+    if (mtp_before_target_step(m, token, pos)) return NULL;
+    /* The MTP bootstrap step reports its own pair position.  Restore the
+     * target position before route/hidden diagnostics run. */
+    dump_pos0 = pos;
     /* one embedding row; the table may be kept quantized */
     /* Same splice as the prefill: a chunked prompt whose last chunk is a
      * single token comes through here, and if that token is a media
@@ -6977,7 +7525,15 @@ const float *waste_model_step(waste_model *m, int token, int pos, int *routed)
         waste_embed_row(m, token, m->x);
     }
 
-    if (c->mhc) return model_step_mhc(m, pos, routed);
+    if (c->mhc) {
+        const float *target = model_step_mhc(m, pos, routed);
+        if (!target) {
+            if (m->mtp_active) m->mtp_alignment_error = 1;
+            return NULL;
+        }
+        mtp_after_target_step(m, target);
+        return target;
+    }
 
     float *resid = (float *)malloc((size_t)hid * sizeof(float));
     float *norm = (float *)malloc((size_t)hid * sizeof(float));
@@ -7097,11 +7653,19 @@ const float *waste_model_step(waste_model *m, int token, int pos, int *routed)
     PROF_START(P_HEAD);
     matvec_t(m, m->logits, waste_find(m, tname("%slm_head.weight", c->prefix)), norm, c->vocab, hid);
     PROF_END(P_HEAD);
+    const int target_ok = !(m->read_error ||
+        ((m->cuda_kda_mode || m->cuda_dense_scope || m->cuda_gqa_proj ||
+          m->cuda_vq_mode) && m->cuda_kda_failed));
+    if (target_ok && m->mtp_available) {
+        memcpy(m->mtp_target_hidden, norm, (size_t)hid * sizeof(float));
+        m->mtp_target_hidden_pos = pos;
+    }
     free(resid);
     free(norm);
-    return (m->read_error ||
-            ((m->cuda_kda_mode || m->cuda_dense_scope || m->cuda_gqa_proj ||
-              m->cuda_vq_mode) &&
-             m->cuda_kda_failed))
-         ? NULL : m->logits;
+    if (!target_ok) {
+        if (m->mtp_active) m->mtp_alignment_error = 1;
+        return NULL;
+    }
+    mtp_after_target_step(m, m->logits);
+    return m->logits;
 }

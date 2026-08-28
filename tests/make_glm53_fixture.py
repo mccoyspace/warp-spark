@@ -17,6 +17,7 @@ import json
 import os
 from pathlib import Path
 import random
+import struct
 import sys
 
 
@@ -164,7 +165,137 @@ def append_mhc(helper, out: Path, *, seed: int, prefix: str):
     manifest_path.write_text(json.dumps(manifest, indent=1) + "\n")
 
 
-def build(out: Path, seed: int):
+def append_mtp(helper, out: Path, *, seed: int, prefix: str):
+    """Append the exact one-layer MTP shape at the fixture's tiny geometry.
+
+    Layer 45 is a conventional residual DSA+MoE decoder, not a 46th mHC
+    layer. Its nonexpert tensors join the trunk, while its routed experts use
+    a distinct bank whose codebooks extend the base decoder's global table.
+    """
+    manifest_path = out / "manifest.json"
+    manifest = json.loads(manifest_path.read_text())
+    config = manifest["config"]
+    layer, hidden = config["num_hidden_layers"], config["hidden_size"]
+    if layer != 45:
+        raise RuntimeError(f"GLM-5.3 MTP fixture requires source layer 45, got {layer}")
+
+    rng = random.Random(seed ^ 0x53A17A)
+    extra = helper.Trunk(rng, prefix)
+    p = f"model.layers.{layer}."
+
+    # Adapter and independent shared-head normalization.
+    extra.f32(p + "enorm.weight", [hidden])
+    extra.f32(p + "hnorm.weight", [hidden])
+    extra.quant(p + "eh_proj.weight", [hidden, 2 * hidden])
+    extra.f32(p + "shared_head.norm.weight", [hidden])
+
+    # Standard-residual dense-equivalent DSA. There are intentionally no
+    # hc_attn_* or hc_ffn_* tensors on this appended layer.
+    extra.f32(p + "input_layernorm.weight", [hidden])
+    extra.f32(p + "post_attention_layernorm.weight", [hidden])
+    a = p + "self_attn."
+    heads = config["num_attention_heads"]
+    qd = config["qk_nope_head_dim"] + config["qk_rope_head_dim"]
+    ql = config["q_lora_rank"]
+    kvl = config["kv_lora_rank"]
+    rope = config["qk_rope_head_dim"]
+    vh = config["v_head_dim"]
+    extra.quant(a + "q_a_proj.weight", [ql, hidden])
+    extra.f32(a + "q_a_layernorm.weight", [ql])
+    extra.quant(a + "q_b_proj.weight", [heads * qd, ql])
+    extra.quant(a + "kv_a_proj_with_mqa.weight", [kvl + rope, hidden])
+    extra.f32(a + "kv_a_layernorm.weight", [kvl])
+    extra.quant(a + "kv_b_proj.weight",
+                [heads * (config["qk_nope_head_dim"] + vh), kvl])
+    extra.quant(a + "o_proj.weight", [hidden, heads * vh])
+
+    # Router and shared expert are resident. Routed experts remain a separate
+    # bank, just as they are for base layers 3..44.
+    moe = config["moe_intermediate_size"]
+    m = p + "block_sparse_moe."
+    extra.quant(m + "gate.weight", [config["num_experts"], hidden])
+    extra.f32(m + "gate.e_score_correction_bias",
+              [config["num_experts"]])
+    shared = moe * config["num_shared_experts"]
+    extra.quant(m + "shared_experts.gate_proj.weight", [shared, hidden])
+    extra.quant(m + "shared_experts.up_proj.weight", [shared, hidden])
+    extra.quant(m + "shared_experts.down_proj.weight", [hidden, shared])
+
+    trunk_path = out / "trunk.bin"
+    old_size = trunk_path.stat().st_size
+    with trunk_path.open("ab") as stream:
+        stream.write(extra.buf)
+    for entry in extra.index:
+        entry["off"] += old_size
+        manifest["trunk"].append(entry)
+
+    codebooks_path = out / "codebooks.bin"
+    record_bytes = 16 + helper.CB_ENTRIES * helper.VEC_DIM * 2
+    current_bytes = codebooks_path.stat().st_size
+    if current_bytes % record_bytes:
+        raise RuntimeError("base fixture codebooks have a partial record")
+    cb_base = current_bytes // record_bytes
+    with codebooks_path.open("ab") as stream:
+        for kind in range(len(helper.KINDS)):
+            for stage in range(helper.STAGES):
+                cid = cb_base + kind * helper.STAGES + stage
+                stream.write(struct.pack(
+                    "<IHBBII", helper.MAGIC_CODEBOOK, cid & 0xFFFF,
+                    helper.FMT_VQ3R, helper.VEC_DIM, helper.CB_ENTRIES, 0))
+                stream.write(helper.f16([
+                    rng.uniform(-0.3, 0.3)
+                    for _ in range(helper.CB_ENTRIES * helper.VEC_DIM)
+                ]))
+
+    shapes = [(moe, hidden), (moe, hidden), (hidden, moe)]
+    bank_name = f"experts-L{layer}.bin"
+    bank_path = out / bank_name
+    with bank_path.open("wb") as stream:
+        bank_bytes = sum(
+            helper.write_expert(stream, layer, expert, cb_base, shapes, rng)
+            for expert in range(config["num_experts"])
+        )
+
+    # The production parser intentionally accepts only the qualified 2048
+    # dense-equivalence contract. Tiny dimensions keep allocation/runtime
+    # cheap; tests use only the first few positions within this bound.
+    config["dsa_dense_context_limit"] = 2048
+    config["max_position_embeddings"] = 2048
+    config["index_topk"] = 2048
+    config["mtp_layers"] = 1
+    config["mtp_source_layer"] = layer
+    manifest.pop("source_ignored_layers", None)
+    manifest["unsupported_features"] = [
+        {
+            "name": "deepseek_sparse_attention_indexer",
+            "action": "dense_equivalent",
+            "context_limit": 2048,
+            "reason": "index_topk covers the complete causal history",
+        },
+        {
+            "name": "vision_tower",
+            "action": "omitted",
+            "reason": "initial GLM-5.3 contract is text-only",
+        },
+    ]
+    manifest["mtp"] = {
+        "version": 1,
+        "num_layers": 1,
+        "source_layer": layer,
+        "context_limit": 2048,
+        "attention": "dense_equivalent_dsa",
+        "recurrent": True,
+        "bank": {
+            "file": bank_name,
+            "experts": config["num_experts"],
+            "bytes": bank_bytes,
+            "codebook_base": cb_base,
+        },
+    }
+    manifest_path.write_text(json.dumps(manifest, indent=1) + "\n")
+
+
+def build(out: Path, seed: int, *, mtp: bool = False):
     helper = load_helper()
     kda = [layer for layer in range(45) if layer % 4 != 3]
 
@@ -183,20 +314,25 @@ def build(out: Path, seed: int):
     if rc:
         raise RuntimeError(f"base fixture generator exited {rc}")
     append_mhc(helper, out, seed=seed, prefix=prefix)
+    if mtp:
+        append_mtp(helper, out, seed=seed, prefix=prefix)
 
 
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("out", type=Path)
     parser.add_argument("--seed", type=int, default=0)
+    parser.add_argument("--mtp", action="store_true",
+                        help="append the exact one-layer GLM-5.3 MTP contract")
     args = parser.parse_args()
     if args.out.exists() and any(args.out.iterdir()):
         parser.error(f"output directory is not empty: {args.out}")
     os.makedirs(args.out, exist_ok=True)
-    build(args.out, args.seed)
+    build(args.out, args.seed, mtp=args.mtp)
     size = sum(path.stat().st_size for path in args.out.iterdir())
     print(f"wrote {args.out}: integrated GLM-5.3 fixture, "
-          f"45 layers, {size / (1 << 20):.1f} MB")
+          f"45 base layers, MTP {'on' if args.mtp else 'off'}, "
+          f"{size / (1 << 20):.1f} MB")
     return 0
 
 

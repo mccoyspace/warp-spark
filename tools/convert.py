@@ -424,9 +424,12 @@ def chat_profile(cfg):
                                "Glm4MoeLite" in arch) else "")
 
 
-def normalise_cfg(cfg):
+def normalise_cfg(cfg, mtp=False):
     """A copy of the HF config with MoE keys under the names the engine reads."""
     out = dict(cfg)
+    if mtp and not is_glm53(out):
+        raise ValueError("--mtp is supported only for the exact GLM-5.3-Flash "
+                         "text architecture")
     for canon, hf in CONFIG_ALIASES:
         if canon not in out and hf in out:
             out[canon] = out[hf]
@@ -513,10 +516,15 @@ def normalise_cfg(cfg):
         # class default.
         out.setdefault("topk_method", "noaux_tc")
         out.setdefault("moe_router_activation_func", "sigmoid")
+    if mtp:
+        if out.get("num_nextn_predict_layers") != 1:
+            raise ValueError("GLM-5.3 --mtp requires exactly one source MTP layer")
+        out["mtp_layers"] = 1
+        out["mtp_source_layer"] = out["num_hidden_layers"]
     return out
 
 
-def unsupported_source_features(cfg):
+def unsupported_source_features(cfg, mtp=False):
     """Source features deliberately omitted from this v0 container.
 
     The released full GLM-4.7 checkpoint may append one MTP decoder layer
@@ -539,7 +547,7 @@ def unsupported_source_features(cfg):
                               else GLM52_DENSE_CONTEXT),
             "reason": "index_topk covers the complete causal history",
         })
-    if count:
+    if count and not (mtp and is_glm53(cfg)):
         base = cfg["num_hidden_layers"]
         features.append({"name": "multi_token_prediction",
                          "source_layers": list(range(base, base + count)),
@@ -572,13 +580,61 @@ def is_source_only_layer(name, n_layers):
     return layer is not None and layer >= n_layers
 
 
-def is_omitted_source_tensor(name, cfg, n_layers):
+def is_omitted_source_tensor(name, cfg, n_layers, mtp=False):
     """True when a source tensor is intentionally absent from the container."""
     if is_source_only_layer(name, n_layers):
-        return True
+        layer = source_layer_index(name)
+        if not (mtp and is_glm53(cfg) and layer == n_layers):
+            return True
     if (is_glm52(cfg) or is_glm53(cfg)) and ".self_attn.indexer." in name:
         return True
     return is_glm53(cfg) and name.startswith("model.visual.")
+
+
+def glm53_mtp_manifest(cfg, bank):
+    """The versioned runtime contract for GLM-5.3's one recurrent MTP layer."""
+    if not is_glm53(cfg) or cfg.get("num_hidden_layers") != 45:
+        raise ValueError("MTP manifest requires the exact GLM-5.3-Flash release")
+    if cfg.get("num_nextn_predict_layers") != 1:
+        raise ValueError("MTP manifest requires exactly one source MTP layer")
+    required = {"file", "experts", "bytes", "codebook_base"}
+    if not isinstance(bank, dict) or set(bank) != required:
+        raise ValueError("MTP bank must contain exactly file, experts, bytes, "
+                         "and codebook_base")
+    if bank.get("file") != "experts-L45.bin":
+        raise ValueError("MTP bank must be experts-L45.bin")
+    if bank.get("experts") != cfg.get("n_routed_experts"):
+        raise ValueError("MTP bank expert count does not match the release")
+    if not isinstance(bank.get("bytes"), int) or bank["bytes"] <= 0:
+        raise ValueError("MTP bank byte count must be positive")
+    if (not isinstance(bank.get("codebook_base"), int) or
+            bank["codebook_base"] < 0):
+        raise ValueError("MTP bank codebook_base must be non-negative")
+    return {
+        "version": 1,
+        "num_layers": 1,
+        "source_layer": 45,
+        "context_limit": GLM53_DENSE_CONTEXT,
+        "attention": "dense_equivalent_dsa",
+        "recurrent": True,
+        "bank": dict(bank),
+    }
+
+
+def selected_expert_layers(spec, first_dense, n_layers, mtp=False):
+    """Resolve base expert work and append GLM-5.3's MTP bank when enabled."""
+    layers = ([int(x) for x in spec.split(",")] if spec
+              else list(range(first_dense, n_layers)))
+    if len(layers) != len(set(layers)):
+        raise ValueError("--layers contains a duplicate layer")
+    upper = n_layers + (1 if mtp else 0)
+    if any(layer < first_dense or layer >= upper for layer in layers):
+        allowed = (f"{first_dense}..{upper - 1}" if mtp
+                   else f"{first_dense}..{n_layers - 1}")
+        raise ValueError(f"--layers must select MoE layers in {allowed}")
+    if mtp and n_layers not in layers:
+        layers.append(n_layers)
+    return layers
 
 
 def moe_layout_at(st, model_prefix, layer):
@@ -1045,15 +1101,15 @@ def validate_glm52_source(cfg, source, prefix=""):
         raise ValueError("GLM-5.2 source contract failed: " + shown + more)
 
 
-def validate_glm53_source(cfg, source, prefix=""):
+def validate_glm53_source(cfg, source, prefix="", mtp=False):
     """Fail closed on the pinned GLM-5.3-Flash text checkpoint geometry.
 
     This first container is deliberately text-only and dense-equivalent only
     through 2048 tokens.  The validator nevertheless binds conversion to the
     published hybrid KDA/DSA schedule, mHC weights, FP8 block layout, one MTP
-    layer and the presence of the omitted vision tower.  That makes omission
-    an explicit implementation choice rather than a partially downloaded
-    checkpoint masquerading as a supported model.
+    layer and the presence of the omitted vision tower.  With ``mtp=True``,
+    layer 45 is additionally bound to the released standard-residual DSA+MoE
+    geometry and every one of its source tensors must still be readable.
     """
     arch = hf_architecture(cfg)
     model_type = cfg.get("model_type")
@@ -1070,7 +1126,7 @@ def validate_glm53_source(cfg, source, prefix=""):
     if outer.get("model_type") != "glm5_next":
         errors.append("outer model_type must be 'glm5_next'")
     try:
-        normalise_cfg(cfg)
+        normalise_cfg(cfg, mtp=mtp)
     except ValueError as exc:
         errors.append(str(exc))
 
@@ -1210,9 +1266,13 @@ def validate_glm53_source(cfg, source, prefix=""):
             errors.append(f"cannot read header for {name}: {exc}")
             return None
 
-    def require(name, shape, dtype="BF16"):
+    def require(name, shape, dtype="BF16", readable=False):
         meta = metadata(name)
-        if meta is None or meta.get("reclaimed"):
+        if meta is None:
+            return
+        if meta.get("reclaimed"):
+            if readable:
+                errors.append(f"{name} was reclaimed and cannot feed --mtp")
             return
         if tuple(meta.get("shape", ())) != tuple(shape):
             errors.append(
@@ -1220,10 +1280,11 @@ def validate_glm53_source(cfg, source, prefix=""):
         if meta.get("dtype") != dtype:
             errors.append(f"{name} dtype {meta.get('dtype')!r}, expected {dtype}")
 
-    def require_fp8(name, shape):
-        require(name, shape, "F8_E4M3")
+    def require_fp8(name, shape, readable=False):
+        require(name, shape, "F8_E4M3", readable=readable)
         require(name + "_scale_inv",
-                tuple((int(d) + 127) // 128 for d in shape), "F32")
+                tuple((int(d) + 127) // 128 for d in shape), "F32",
+                readable=readable)
 
     p = "model.language_model."
     H, heads, kd, qa, kv, qd, vh = 4096, 64, 128, 1536, 512, 256, 256
@@ -1296,6 +1357,63 @@ def validate_glm53_source(cfg, source, prefix=""):
     require(mtp + "hnorm.weight", (H,))
     require(mtp + "enorm.weight", (H,))
     require(mtp + "eh_proj.weight", (H, 2 * H))
+
+    if mtp:
+        # The release's MTP decoder is deliberately not another mHC layer.
+        # It is exactly the standard-residual DSA+MoE layer at 43, with the
+        # six mHC tensors removed and four MTP adapter tensors added.  Bind to
+        # that complete suffix set and to every dtype/shape, not merely the
+        # four conspicuous adapter tensors: a plausible future layer must not
+        # be accepted as this one.
+        reference = p + "layers.43."
+        ref_suffixes = {
+            name[len(reference):] for name in names if name.startswith(reference)
+        }
+        mtp_suffixes = {
+            name[len(mtp):] for name in names if name.startswith(mtp)
+        }
+        mhc_suffixes = {
+            f"hc_{branch}_{tail}"
+            for branch in ("attn", "ffn")
+            for tail in ("base", "fn", "scale")
+        }
+        adapter_suffixes = {
+            "shared_head.norm.weight", "hnorm.weight", "enorm.weight",
+            "eh_proj.weight",
+        }
+        expected_mtp = (ref_suffixes - mhc_suffixes) | adapter_suffixes
+        missing = sorted(expected_mtp - mtp_suffixes)
+        extra = sorted(mtp_suffixes - expected_mtp)
+        if missing:
+            errors.append("MTP layer 45 is missing " + ", ".join(missing[:4]))
+        if extra:
+            errors.append("MTP layer 45 has unexpected " + ", ".join(extra[:4]))
+
+        for suffix in sorted(ref_suffixes - mhc_suffixes):
+            ref_meta = metadata(reference + suffix)
+            got_meta = metadata(mtp + suffix)
+            if ref_meta is None or got_meta is None:
+                continue
+            if ref_meta.get("reclaimed"):
+                errors.append(f"{reference + suffix} was reclaimed; cannot "
+                              "validate the MTP geometry")
+                continue
+            if got_meta.get("reclaimed"):
+                errors.append(f"{mtp + suffix} was reclaimed and cannot feed --mtp")
+                continue
+            ref_shape = tuple(ref_meta.get("shape", ()))
+            got_shape = tuple(got_meta.get("shape", ()))
+            if got_shape != ref_shape:
+                errors.append(f"{mtp + suffix} shape {got_shape}, expected "
+                              f"layer 43 shape {ref_shape}")
+            if got_meta.get("dtype") != ref_meta.get("dtype"):
+                errors.append(f"{mtp + suffix} dtype {got_meta.get('dtype')!r}, "
+                              f"expected layer 43 dtype {ref_meta.get('dtype')!r}")
+
+        require(mtp + "shared_head.norm.weight", (H,), readable=True)
+        require(mtp + "hnorm.weight", (H,), readable=True)
+        require(mtp + "enorm.weight", (H,), readable=True)
+        require(mtp + "eh_proj.weight", (H, 2 * H), readable=True)
     require("model.visual.patch_embed.proj.weight", (1024, 3, 2, 14, 14))
     require("model.visual.post_layernorm.weight", (1024,))
 
@@ -1850,7 +1968,8 @@ def build_trunk(args, sr, st, existing, manifest_path, n_layers, cfg):
         # interval.
         with open(trunk_tmp, "wb") as tf:
             for name in sorted(sr.names()):
-                if (is_omitted_source_tensor(name, cfg, n_layers) or
+                if (is_omitted_source_tensor(
+                        name, cfg, n_layers, mtp=getattr(args, "mtp", False)) or
                         ".experts." in name or
                         (name.endswith(("_packed", "_scale", "_scale_inv"))
                          and not is_f32_trunk_tensor(name, cfg))):
@@ -1902,6 +2021,9 @@ def main():
                     help="HF checkpoint directory, as published")
     ap.add_argument("--out", required=True)
     ap.add_argument("--layers", default="", help="comma list; default = all MoE layers")
+    ap.add_argument("--mtp", action="store_true",
+                    help="include GLM-5.3-Flash's exact recurrent MTP layer; "
+                         "the source MTP expert bank is always added")
     ap.add_argument("--stages", type=int, choices=(2, 3, 4, 6), default=3,
                     help="3 = VQ3R, 2 = VQ2R; 4 and 6 exist to pair with "
                          "--entries below the byte")
@@ -1952,6 +2074,15 @@ def main():
         # take weights this container does not contain.
         ap.error("--reclaim and --experts are exclusive: a layer converted "
                  "with an expert subset has not consumed its shards")
+    if args.mtp and args.reclaim != "off":
+        ap.error("--mtp and --reclaim are exclusive: retain the complete "
+                 "source until the MTP container passes source-backed gates")
+    if args.mtp and args.skip_trunk:
+        ap.error("--mtp and --skip-trunk are exclusive: the opt-in contract "
+                 "must rebuild and publish the layer-45 trunk tensors")
+    if args.mtp and args.experts:
+        ap.error("--mtp requires all released experts; --experts is a partial "
+                 "debug container")
     # The packing is 4x6 into 3 bytes and nothing else; a 6-bit field cannot
     # hold an index into more than 64 entries, and the engine's unpack is
     # written for exactly four stages.
@@ -1975,6 +2106,10 @@ def main():
         cfg = {**cfg["text_config"], "_outer": {k: v for k, v in cfg.items()
                                                 if k != "text_config"}}
         prefix = "language_model."
+    if args.mtp and not is_glm53(cfg):
+        print("--mtp is supported only for the exact GLM-5.3-Flash text "
+              "architecture", file=sys.stderr)
+        return 1
     model_prefix = source_model_prefix(cfg, prefix)
     n_layers = cfg["num_hidden_layers"]
     st = ST(args.src)
@@ -1988,8 +2123,8 @@ def main():
     try:
         validate_glm47_full_source(cfg, sr, prefix)
         validate_glm52_source(cfg, sr, prefix)
-        validate_glm53_source(cfg, sr, prefix)
-        source_unsupported = unsupported_source_features(cfg)
+        validate_glm53_source(cfg, sr, prefix, mtp=args.mtp)
+        source_unsupported = unsupported_source_features(cfg, mtp=args.mtp)
     except ValueError as exc:
         print(str(exc), file=sys.stderr)
         return 1
@@ -2068,8 +2203,12 @@ def main():
     first_dense = cfg.get("first_k_dense_replace", 0)
     if args.experts:
         n_exp = min(n_exp, args.experts)
-    layers = ([int(x) for x in args.layers.split(",")] if args.layers
-              else list(range(first_dense, n_layers)))
+    try:
+        layers = selected_expert_layers(args.layers, first_dense, n_layers,
+                                        mtp=args.mtp)
+    except ValueError as exc:
+        print(str(exc), file=sys.stderr)
+        return 1
 
     # ---- expert banks, one layer at a time ------------------------------
     manifest_path = os.path.join(args.out, "manifest.json")
@@ -2093,9 +2232,17 @@ def main():
         os.path.getsize(merged) % cb_record_bytes == 0)
     if compatible:
         old_books = os.path.getsize(merged) // cb_record_bytes
-        manifest_layers = dict(existing.get("layers", {}))
+        # Base-layer metadata remains exactly layers 3..44.  The MTP bank has
+        # its own versioned contract and must never masquerade as decoder 46.
+        manifest_layers = {
+            key: value for key, value in existing.get("layers", {}).items()
+            if str(key).isdigit() and int(key) < n_layers
+        }
+        existing_mtp_bank = dict(
+            ((existing.get("mtp") or {}).get("bank") or {}))
     else:
         manifest_layers = {}
+        existing_mtp_bank = {}
 
 
     # Layout is a property of the checkpoint, so probe once on the first MoE layer
@@ -2116,7 +2263,8 @@ def main():
     next_base = old_books
     jobs = []
     for L in layers:
-        meta = manifest_layers.get(str(L), {})
+        meta = (existing_mtp_bank if args.mtp and L == n_layers
+                else manifest_layers.get(str(L), {}))
         bank = os.path.join(args.out, f"experts-L{L}.bin")
         part = os.path.join(args.out, f"codebooks-L{L}.bin")
         base = meta.get("codebook_base", -1)
@@ -2138,7 +2286,7 @@ def main():
             # the base in the bank reflects the run that wrote it, which may
             # have been converting far more layers than this one is.
             if (old_books <= recovered <=
-                    old_books + n_layers * n_cb_per_layer and
+                    old_books + (n_layers + int(args.mtp)) * n_cb_per_layer and
                     os.path.exists(part) and
                     os.path.getsize(part) == n_cb_per_layer * cb_record_bytes
                     and os.path.getsize(bank) > 0):
@@ -2213,13 +2361,26 @@ def main():
             print(f"  layer {res[0]}: {res[1]/2**20:.0f} MB [{res[3]}]", flush=True)
             reclaim_layer(res[0], res[1])
 
+    mtp_bank = None
     for L, sz, base, how in sorted(results):
+        record = {"file": f"experts-L{L}.bin", "experts": n_exp,
+                  "bytes": sz, "codebook_base": base}
+        if args.mtp and L == n_layers:
+            if sz:
+                mtp_bank = record
+            continue
         if sz:
-            manifest_layers[str(L)] = {"file": f"experts-L{L}.bin",
-                                       "experts": n_exp, "bytes": sz,
-                                       "codebook_base": base}
+            manifest_layers[str(L)] = record
         else:
             manifest_layers.pop(str(L), None)
+
+    if args.mtp:
+        mtp_path = os.path.join(args.out, "experts-L45.bin")
+        if (mtp_bank is None or not bank_is_sound(mtp_path, 45, n_exp) or
+                mtp_bank["bytes"] != os.path.getsize(mtp_path)):
+            print("--mtp refuses to publish: experts-L45.bin is not a complete "
+                  f"bank of {n_exp} released experts", file=sys.stderr)
+            return 1
 
     # Append new records after the already-published books. A cached base
     # comes from the old manifest or from the bank itself; a new one starts
@@ -2431,7 +2592,7 @@ def main():
         "format_version": 0,
         "arch": arch,
         "tensor_prefix": prefix,
-        "config": normalise_cfg(cfg),
+        "config": normalise_cfg(cfg, mtp=args.mtp),
         # The record's fmt byte is FMT_VQ3R for every stage count but 2 — the
         # engine takes the stage and entry counts from here, not from the
         # byte, and only refuses a fmt that is neither VQ3R nor VQ2R.
@@ -2448,10 +2609,12 @@ def main():
         "layers": manifest_layers,
         "trunk": tindex,
     }
+    if args.mtp:
+        manifest["mtp"] = glm53_mtp_manifest(cfg, mtp_bank)
     source_only_layers = sorted({
         layer for name in sr.names()
         if (layer := source_layer_index(name)) is not None and
-        layer >= n_layers
+        layer >= n_layers and not (args.mtp and layer == n_layers)
     })
     if source_only_layers:
         manifest["source_ignored_layers"] = source_only_layers
@@ -2469,6 +2632,9 @@ def main():
             elif feature["name"] == "vision_tower":
                 print("source: GLM-5.3 vision tower omitted; container is "
                       "explicitly text-only")
+    if args.mtp:
+        print("source: GLM-5.3 MTP layer 45 included as one recurrent, "
+              "dense-equivalent DSA layer through 2048 context tokens")
     # A manifest that lists fewer expert layers than the one it replaces
     # publishes a container the engine will refuse to open, and the banks it
     # drops are still on disk taking up room. Never intended; say so.

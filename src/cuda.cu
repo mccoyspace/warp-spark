@@ -38,6 +38,10 @@ enum {
     VQ_GROUP_DOWN = 2
 };
 
+static_assert(Q4_THREADS > 0 &&
+              (Q4_THREADS & (Q4_THREADS - 1)) == 0,
+              "Q4 reduction requires a power-of-two thread count");
+
 typedef struct {
     cudaStream_t stream;
     float *host_x, *host_y;
@@ -101,6 +105,48 @@ __global__ static void q4_fast(const uint8_t *weights,
         __syncthreads();
     }
     if (lane == 0) y[row_index] = partial[0];
+}
+
+/* Two verifier positions against one projection. A CTA still owns one
+ * output row, as in q4_fast, but every quantized weight is decoded once and
+ * feeds two independent fp32 FMA chains. The lane assignment and reduction
+ * tree of each chain are deliberately identical to q4_fast: batching must
+ * not turn the qualified mode-1 target into a different numerical kernel. */
+__global__ static void q4_fast2(const uint8_t *weights,
+                                const uint16_t *scales,
+                                const float *x, float *y,
+                                int out, int in, size_t rowbytes)
+{
+    const int row_index = (int)blockIdx.x;
+    const int lane = (int)threadIdx.x;
+    if (row_index >= out || lane >= Q4_THREADS) return;
+    const int groups = (in + Q4_GROUP - 1) / Q4_GROUP;
+    const uint8_t *row = weights + (size_t)row_index * rowbytes;
+    const uint16_t *row_scales = scales + (size_t)row_index * groups;
+    const float *x0 = x;
+    const float *x1 = x + in;
+    float sum0 = 0.0f, sum1 = 0.0f;
+    for (int i = lane; i < in; i += Q4_THREADS) {
+        const float w = q4_half(row_scales[i / Q4_GROUP]) *
+                        (float)q4_at(row, i);
+        sum0 = fmaf(w, x0[i], sum0);
+        sum1 = fmaf(w, x1[i], sum1);
+    }
+    __shared__ float partial[2][Q4_THREADS];
+    partial[0][lane] = sum0;
+    partial[1][lane] = sum1;
+    __syncthreads();
+    for (int stride = Q4_THREADS / 2; stride; stride >>= 1) {
+        if (lane < stride) {
+            partial[0][lane] += partial[0][lane + stride];
+            partial[1][lane] += partial[1][lane + stride];
+        }
+        __syncthreads();
+    }
+    if (lane == 0) {
+        y[row_index] = partial[0][0];
+        y[(size_t)out + row_index] = partial[1][0];
+    }
 }
 
 __global__ static void q4_neon_order(const uint8_t *weights,
@@ -327,13 +373,15 @@ static waste_cuda_kda *cuda_create(const waste_model *m)
     GROW_CAPACITY(m->cfg.dense_inter);
 #undef GROW_CAPACITY
     status = cudaStreamCreateWithFlags(&ctx->stream, cudaStreamNonBlocking);
+    /* Scalar decode uses row zero; the additive verifier primitive uses both
+     * rows. Capacity is measured in floats per row. */
     if (status == cudaSuccess)
         status = cudaHostAlloc((void **)&ctx->host_x,
-                               ctx->capacity * sizeof(float),
+                               2 * ctx->capacity * sizeof(float),
                                cudaHostAllocMapped);
     if (status == cudaSuccess)
         status = cudaHostAlloc((void **)&ctx->host_y,
-                               ctx->capacity * sizeof(float),
+                               2 * ctx->capacity * sizeof(float),
                                cudaHostAllocMapped);
     if (status == cudaSuccess)
         status = cudaHostGetDevicePointer((void **)&ctx->device_x,
@@ -385,6 +433,41 @@ extern "C" int waste_cuda_q4_matvec(waste_model *m, float *y,
         return -1;
     }
     memcpy(y, ctx->host_y, (size_t)out * sizeof(float));
+    return 0;
+}
+
+/* Additive two-row entry point for the bounded MTP verifier. Only the
+ * qualified mode-1 arithmetic is implemented: accepting another selector
+ * here would silently give the target a prefill-specific numerical meaning.
+ * X is [2][in] and Y is [2][out], both row-major. */
+extern "C" int waste_cuda_q4_matvec2(waste_model *m, float *y,
+                                      const waste_tensor *tensor,
+                                      const float *x, int out, int in,
+                                      int mode)
+{
+    if (!m || !tensor || !tensor->q || !tensor->qs || !x || !y ||
+        tensor->bits != 4 || tensor->group != Q4_GROUP || mode != 1 ||
+        out < 1 || in < 1 || (size_t)out > (size_t)INT32_MAX)
+        return -1;
+    waste_cuda_kda *ctx = (waste_cuda_kda *)m->cuda_kda_ctx;
+    if (!ctx) {
+        ctx = cuda_create(m);
+        if (!ctx) return -1;
+        m->cuda_kda_ctx = ctx;
+    }
+    if ((size_t)in > ctx->capacity || (size_t)out > ctx->capacity)
+        return -1;
+    memcpy(ctx->host_x, x, (size_t)2 * in * sizeof(float));
+    q4_fast2<<<out, Q4_THREADS, 0, ctx->stream>>>(
+        (const uint8_t *)tensor->q, tensor->qs,
+        ctx->device_x, ctx->device_y, out, in, tensor->rowbytes);
+    cudaError_t status = cudaGetLastError();
+    if (status == cudaSuccess) status = cudaStreamSynchronize(ctx->stream);
+    if (status != cudaSuccess) {
+        cuda_problem("two-row projection", status);
+        return -1;
+    }
+    memcpy(y, ctx->host_y, (size_t)2 * out * sizeof(float));
     return 0;
 }
 

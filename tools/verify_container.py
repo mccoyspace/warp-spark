@@ -32,9 +32,12 @@ KINDS = (("gate", "w1"), ("up", "w3"), ("down", "w2"))
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from mxfp4 import ST                                              # noqa: E402
-from convert import (ShardReader, is_omitted_source_tensor,
+from convert import (ShardReader, bank_is_sound, glm53_mtp_manifest,
+                     is_omitted_source_tensor,
                      is_source_only_layer, moe_layout_at,
+                     runtime_tensor_name,
                      source_layer_index, source_model_prefix,
+                     trunk_rename,
                      unsupported_source_features,
                      validate_glm47_full_source,
                      validate_glm52_source,
@@ -45,6 +48,103 @@ def source_moe_layout(source, cfg, runtime_prefix, layer):
     """Resolve a manifest prefix back to the published expert namespace."""
     model_prefix = source_model_prefix(cfg, runtime_prefix)
     return (model_prefix, *moe_layout_at(source, model_prefix, layer))
+
+
+def expected_mtp_trunk_names(source, cfg, runtime_prefix, source_layer):
+    """Runtime names of every released layer-45 nonexpert tensor we store."""
+    model_prefix = source_model_prefix(cfg, runtime_prefix)
+    layer_prefix = f"{model_prefix}layers.{source_layer}."
+    expected = set()
+    for name in source.names():
+        if not name.startswith(layer_prefix):
+            continue
+        if (".experts." in name or ".self_attn.indexer." in name or
+                name.endswith(("_packed", "_scale", "_scale_inv"))):
+            continue
+        runtime = runtime_tensor_name(name, cfg, runtime_prefix)
+        expected.add(trunk_rename(runtime, "mlp"))
+    return expected
+
+
+def validate_manifest_source_contract(man, source_index, container):
+    """Bind manifest omissions and optional MTP assets to the source index.
+
+    Returns the expert banks to verify numerically, including the distinct
+    MTP bank when present. Assertions are intentional: this is a gate tool,
+    not a tolerant loader.
+    """
+    cfg = man["config"]
+    prefix = man.get("tensor_prefix", "")
+    mtp = man.get("mtp")
+    mtp_enabled = mtp is not None
+
+    validate_glm47_full_source(cfg, source_index, prefix)
+    validate_glm52_source(cfg, source_index, prefix)
+    validate_glm53_source(cfg, source_index, prefix, mtp=mtp_enabled)
+
+    n_layers = cfg["num_hidden_layers"]
+    source_only = sorted({
+        layer for name in source_index.names()
+        if (layer := source_layer_index(name)) is not None and
+        layer >= n_layers
+    })
+    expected_ignored = list(source_only)
+    mtp_bank = None
+    if mtp_enabled:
+        assert isinstance(mtp, dict), "top-level MTP contract must be an object"
+        assert cfg.get("mtp_layers") == 1, (
+            "MTP manifest requires config.mtp_layers == 1")
+        assert cfg.get("mtp_source_layer") == n_layers, (
+            "MTP manifest/source-layer config mismatch")
+        expected_mtp = glm53_mtp_manifest(cfg, mtp.get("bank"))
+        assert mtp == expected_mtp, "MTP manifest does not match version-1 schema"
+        source_layer = mtp["source_layer"]
+        assert source_layer in source_only, "MTP source layer is absent"
+        expected_ignored.remove(source_layer)
+
+        bank_meta = mtp["bank"]
+        bank_path = os.path.join(container, bank_meta["file"])
+        assert os.path.isfile(bank_path), f"MTP bank is missing: {bank_path}"
+        assert os.path.getsize(bank_path) == bank_meta["bytes"], (
+            "MTP bank byte count does not match manifest")
+        assert bank_is_sound(bank_path, source_layer, bank_meta["experts"]), (
+            "MTP bank is truncated or has invalid record geometry")
+        mtp_bank = (str(source_layer), bank_meta)
+
+        trunk_names = {entry["name"] for entry in man["trunk"]}
+        expected_trunk = expected_mtp_trunk_names(
+            source_index, cfg, prefix, source_layer)
+        missing = sorted(expected_trunk - trunk_names)
+        assert not missing, f"MTP trunk tensors missing: {missing[:3]}"
+        published_mtp = {
+            name for name in trunk_names
+            if source_layer_index(name) == source_layer
+        }
+        unexpected = sorted(published_mtp - expected_trunk)
+        assert not unexpected, f"unexpected MTP trunk tensors: {unexpected[:3]}"
+    else:
+        assert "mtp_layers" not in cfg and "mtp_source_layer" not in cfg, (
+            "MTP config keys require a top-level MTP manifest")
+
+    assert man.get("source_ignored_layers", []) == expected_ignored, (
+        "manifest/source ignored-layer mismatch: "
+        f"{man.get('source_ignored_layers', [])} != {expected_ignored}")
+    expected_unsupported = unsupported_source_features(cfg, mtp=mtp_enabled)
+    assert man.get("unsupported_features", []) == expected_unsupported, (
+        "manifest does not exactly record the source features conversion omitted")
+    bad_layers = [int(layer) for layer in man["layers"]
+                  if int(layer) >= n_layers]
+    assert not bad_layers, f"source-only layers published as base banks: {bad_layers}"
+    bad_trunk = [entry["name"] for entry in man["trunk"]
+                 if is_omitted_source_tensor(
+                     entry["name"], cfg, n_layers, mtp=mtp_enabled)]
+    assert not bad_trunk, (
+        f"source-only/omitted tensors published in trunk: {bad_trunk[:3]}")
+
+    banks = list(man["layers"].items())
+    if mtp_bank is not None:
+        banks.append(mtp_bank)
+    return banks
 
 
 def load_codebooks(path):
@@ -111,43 +211,20 @@ def main():
     man = json.load(open(os.path.join(args.container, "manifest.json")))
     source_index = ShardReader(args.src)
     cfg = man["config"]
-    validate_glm47_full_source(cfg, source_index,
-                               man.get("tensor_prefix", ""))
-    validate_glm52_source(cfg, source_index,
-                          man.get("tensor_prefix", ""))
-    validate_glm53_source(cfg, source_index,
-                          man.get("tensor_prefix", ""))
-    n_layers = cfg["num_hidden_layers"]
-    source_only = sorted({
-        layer for name in source_index.names()
-        if (layer := source_layer_index(name)) is not None and
-        layer >= n_layers
-    })
-    assert man.get("source_ignored_layers", []) == source_only, (
-        "manifest/source ignored-layer mismatch: "
-        f"{man.get('source_ignored_layers', [])} != {source_only}")
-    expected_unsupported = unsupported_source_features(cfg)
-    if expected_unsupported:
-        assert man.get("unsupported_features", []) == expected_unsupported, (
-            "manifest does not record the source features conversion omitted")
-    bad_layers = [int(layer) for layer in man["layers"]
-                  if int(layer) >= n_layers]
-    assert not bad_layers, f"source-only layers published as expert banks: {bad_layers}"
-    bad_trunk = [entry["name"] for entry in man["trunk"]
-                 if is_omitted_source_tensor(entry["name"], cfg, n_layers)]
-    assert not bad_trunk, (
-        f"source-only/omitted tensors published in trunk: {bad_trunk[:3]}")
+    banks = validate_manifest_source_contract(man, source_index, args.container)
 
     stages = man["expert_quant"]["stages"]
     books = load_codebooks(os.path.join(args.container, "codebooks.bin"))
     print(f"container: {man['expert_quant']['fmt']}, {len(books)} codebooks, "
-          f"layers {list(man['layers'])}")
+          f"layers {[layer for layer, _meta in banks]}")
 
     sr = ST(args.src)
     prefix = man.get("tensor_prefix", "")
     ok = True
-    for lstr, meta in man["layers"].items():
+    for lstr, meta in banks:
         L = int(lstr)
+        assert meta["codebook_base"] + 3 * stages <= len(books), (
+            f"layer {L} codebook range exceeds codebooks.bin")
         bank = open(os.path.join(args.container, meta["file"]), "rb").read()
         assert len(bank) == meta["bytes"]
         model_prefix, layout, segment, source_kinds = source_moe_layout(

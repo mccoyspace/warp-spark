@@ -220,6 +220,15 @@ def glm53_source_meta():
                 fp8(ep + "up_proj.weight", (2048, H))
                 fp8(ep + "down_proj.weight", (H, 2048))
     mtp = p + "layers.45."
+    reference = p + "layers.43."
+    for name, entry in list(meta.items()):
+        if not name.startswith(reference):
+            continue
+        suffix = name[len(reference):]
+        if suffix.startswith(("hc_attn_", "hc_ffn_")):
+            continue
+        meta[mtp + suffix] = {
+            "shape": list(entry["shape"]), "dtype": entry["dtype"]}
     add(mtp + "shared_head.norm.weight", (H,))
     add(mtp + "hnorm.weight", (H,))
     add(mtp + "enorm.weight", (H,))
@@ -362,6 +371,81 @@ class GlmConversionBoundaryTest(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "layers.44.hc_ffn_fn shape"):
             CONVERT.validate_glm53_source(cfg, source, "language_model.")
 
+    def test_glm53_mtp_contract_binds_complete_standard_residual_layer(self):
+        cfg = flattened_glm53_config()
+        meta = glm53_source_meta()
+        source = HeaderFixture(meta)
+        CONVERT.validate_glm53_source(
+            cfg, source, "language_model.", mtp=True)
+
+        normal = CONVERT.normalise_cfg(cfg)
+        enabled = CONVERT.normalise_cfg(cfg, mtp=True)
+        self.assertNotIn("mtp_layers", normal)
+        self.assertNotIn("mtp_source_layer", normal)
+        self.assertEqual(enabled["mtp_layers"], 1)
+        self.assertEqual(enabled["mtp_source_layer"], 45)
+
+        mtp = "model.language_model.layers.45."
+        self.assertTrue(CONVERT.is_omitted_source_tensor(
+            mtp + "eh_proj.weight", cfg, 45))
+        self.assertFalse(CONVERT.is_omitted_source_tensor(
+            mtp + "eh_proj.weight", cfg, 45, mtp=True))
+        self.assertFalse(CONVERT.is_omitted_source_tensor(
+            mtp + "mlp.experts.0.gate_proj.weight", cfg, 45, mtp=True))
+        self.assertTrue(CONVERT.is_omitted_source_tensor(
+            mtp + "self_attn.indexer.wk.weight", cfg, 45, mtp=True))
+        self.assertTrue(CONVERT.is_omitted_source_tensor(
+            "model.visual.patch_embed.proj.weight", cfg, 45, mtp=True))
+
+        features = CONVERT.unsupported_source_features(cfg, mtp=True)
+        self.assertEqual([item["name"] for item in features], [
+            "deepseek_sparse_attention_indexer", "vision_tower"])
+
+    def test_glm53_mtp_rejects_shape_drift_hc_and_reclaimed_source(self):
+        cfg = flattened_glm53_config()
+        mtp = "model.language_model.layers.45."
+
+        meta = glm53_source_meta()
+        meta[mtp + "mlp.experts.73.down_proj.weight"] = {
+            "shape": [4095, 2048], "dtype": "F8_E4M3"}
+        with self.assertRaisesRegex(ValueError, "layers.45.*experts.73"):
+            CONVERT.validate_glm53_source(
+                cfg, HeaderFixture(meta), "language_model.", mtp=True)
+
+        meta = glm53_source_meta()
+        meta[mtp + "hc_attn_base"] = {"shape": [24], "dtype": "F32"}
+        with self.assertRaisesRegex(ValueError, "unexpected hc_attn_base"):
+            CONVERT.validate_glm53_source(
+                cfg, HeaderFixture(meta), "language_model.", mtp=True)
+
+        meta = glm53_source_meta()
+        meta[mtp + "eh_proj.weight"] = {"reclaimed": True}
+        with self.assertRaisesRegex(ValueError, "reclaimed.*--mtp"):
+            CONVERT.validate_glm53_source(
+                cfg, HeaderFixture(meta), "language_model.", mtp=True)
+
+    def test_glm53_mtp_manifest_and_layer_selection_are_separate_from_base(self):
+        cfg = flattened_glm53_config()
+        bank = {"file": "experts-L45.bin", "experts": 288,
+                "bytes": 2723807232, "codebook_base": 378}
+        self.assertEqual(CONVERT.glm53_mtp_manifest(cfg, bank), {
+            "version": 1,
+            "num_layers": 1,
+            "source_layer": 45,
+            "context_limit": 2048,
+            "attention": "dense_equivalent_dsa",
+            "recurrent": True,
+            "bank": bank,
+        })
+        self.assertEqual(
+            CONVERT.selected_expert_layers("", 3, 45)[-1], 44)
+        selected = CONVERT.selected_expert_layers("3,44", 3, 45, mtp=True)
+        self.assertEqual(selected, [3, 44, 45])
+        with self.assertRaisesRegex(ValueError, "3..44"):
+            CONVERT.selected_expert_layers("45", 3, 45)
+        with self.assertRaisesRegex(ValueError, "exact GLM-5.3"):
+            CONVERT.normalise_cfg(FULL_CFG, mtp=True)
+
     def test_glm53_trunk_reads_source_prefix_maps_runtime_and_drops_omissions(self):
         cfg = flattened_glm53_config()
         kept = ["model.language_model.layers.0.hc_attn_fn",
@@ -417,13 +501,78 @@ class GlmConversionBoundaryTest(unittest.TestCase):
                     os.path.join(tmp, "manifest.json"), 45, cfg)
         finally:
             CONVERT.raw_bytes = old_raw
-        self.assertEqual(weights.read, kept)
+        self.assertEqual(weights.read, sorted(kept))
         self.assertEqual([entry["name"] for entry in index], [
             "language_model.model.layers.0.hc_attn_fn",
             "language_model.model.layers.0.hc_attn_scale",
         ])
         self.assertEqual([entry["fmt"] for entry in index],
                          [CONVERT.FMT_F32, CONVERT.FMT_F32])
+
+    def test_glm53_mtp_trunk_includes_adapters_but_not_indexer_or_vision(self):
+        cfg = flattened_glm53_config()
+        mtp = "model.language_model.layers.45."
+        kept = [
+            mtp + "enorm.weight",
+            mtp + "hnorm.weight",
+            mtp + "shared_head.norm.weight",
+            mtp + "mlp.gate.e_score_correction_bias",
+        ]
+        omitted = [
+            mtp + "self_attn.indexer.wk.weight",
+            mtp + "mlp.experts.0.gate_proj.weight",
+            "model.visual.patch_embed.proj.weight",
+        ]
+
+        class FakeTensor:
+            shape = (8,)
+
+            def dim(self):
+                return 1
+
+            def numel(self):
+                return 8
+
+            def float(self):
+                return self
+
+        class FakeSource:
+            def names(self):
+                return kept + omitted
+
+        class FakeWeights:
+            def __init__(self):
+                self.read = []
+
+            def have(self, _name):
+                return True
+
+            def tensor(self, name):
+                self.read.append(name)
+                return FakeTensor()
+
+        args = types.SimpleNamespace(
+            skip_trunk=False, trunk8=False, trunk_bits=4, mtp=True)
+        weights = FakeWeights()
+        old_raw = CONVERT.raw_bytes
+        CONVERT.raw_bytes = lambda _tensor: b"mtp-f32"
+        try:
+            with tempfile.TemporaryDirectory(prefix="glm53-mtp-trunk-") as tmp:
+                args.out = tmp
+                index = CONVERT.build_trunk(
+                    args, FakeSource(), weights, None,
+                    os.path.join(tmp, "manifest.json"), 45, cfg)
+        finally:
+            CONVERT.raw_bytes = old_raw
+
+        self.assertEqual(weights.read, sorted(kept))
+        names = [entry["name"] for entry in index]
+        self.assertIn("language_model.model.layers.45.enorm.weight", names)
+        self.assertIn(
+            "language_model.model.layers.45.block_sparse_moe.gate."
+            "e_score_correction_bias", names)
+        self.assertFalse(any("indexer" in name for name in names))
+        self.assertFalse(any("visual" in name for name in names))
 
     def test_glm53_contradictory_implicit_math_fails_closed(self):
         cfg = flattened_glm53_config()

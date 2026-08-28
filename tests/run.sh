@@ -1527,7 +1527,7 @@ if ! command -v python3 >/dev/null 2>&1; then
     sk "GLM converter metadata" "python3 not installed"
 elif python3 -m unittest -q \
         tests.test_convert_tokenizer_json tests.test_convert_glm \
-        tests.test_glm53_release \
+        tests.test_glm53_release tests.test_glm53_mtp_fixture \
         >/dev/null 2>&1; then
     ok "GLM tokenizer, EOS, source boundaries and GLM-5.3 intake gate"
 else
@@ -1577,6 +1577,56 @@ else
     sed -n '1,12p' "$TMP/glm53-build.log" \
         "$TMP/glm53-prefill.log" "$TMP/glm53-step.log" \
         "$TMP/glm53-context.log" 2>/dev/null
+fi
+
+# The opt-in NextN layer has a separate recurrent cache and expert bank.  A
+# paired fixture keeps the target decoder byte-identical to the omitted-MTP
+# control while checking the token/position handoff, v1 state refusal only
+# while active, reset/replay, and strict contract/bank loader gates.
+GLM53_MTP="$TMP/glm53-mtp.waste"
+if [ ! -d "$GLM53" ]; then
+    sk "GLM-5.3 MTP alignment/runtime" "base container not built"
+elif ! python3 tests/make_glm53_fixture.py --mtp "$GLM53_MTP" \
+        >"$TMP/glm53-mtp-build.log" 2>&1; then
+    sk "GLM-5.3 MTP alignment/runtime" "MTP container not built"
+elif ! python3 - "$GLM53_MTP" "$TMP" <<'PY_GLM53_MTP_BAD'
+import json
+from pathlib import Path
+import shutil
+import sys
+
+source, temp = map(Path, sys.argv[1:])
+
+def clone(name):
+    destination = temp / ("glm53-mtp-bad-" + name)
+    shutil.copytree(source, destination)
+    return destination
+
+def rewrite(directory, change):
+    path = directory / "manifest.json"
+    manifest = json.loads(path.read_text())
+    change(manifest)
+    path.write_text(json.dumps(manifest, indent=1) + "\n")
+
+rewrite(clone("missing-contract"), lambda m: m.pop("mtp"))
+rewrite(clone("nonrecurrent"),
+        lambda m: m["mtp"].__setitem__("recurrent", False))
+rewrite(clone("missing-config"), lambda m: m["config"].pop("mtp_layers"))
+rewrite(clone("bank-bytes"),
+        lambda m: m["mtp"]["bank"].__setitem__("bytes", 1))
+missing = clone("missing-bank")
+(missing / "experts-L45.bin").unlink()
+PY_GLM53_MTP_BAD
+then
+    no "GLM-5.3 MTP malformed fixture setup"
+elif ./test_glm53_mtp "$GLM53" "$GLM53_MTP" \
+        "$TMP"/glm53-mtp-bad-* \
+        >"$TMP/glm53-mtp-runtime.log" 2>&1; then
+    ok "GLM-5.3 MTP aligns proposals, replays exactly, and rejects malformed contracts"
+else
+    no "GLM-5.3 MTP alignment/runtime"
+    sed -n '1,20p' "$TMP/glm53-mtp-build.log" \
+        "$TMP/glm53-mtp-runtime.log" 2>/dev/null
 fi
 
 # Flash names three terminal turn markers.  A valid bounded set must load;

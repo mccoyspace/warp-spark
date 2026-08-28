@@ -98,6 +98,11 @@ typedef struct {
     int   hc_sinkhorn_iters;
     float hc_eps;
     float swiglu_limit;              /* 0 = the historical unclamped SwiGLU */
+    /* Converter-owned opt-in contract for an appended GLM NextN/MTP layer.
+     * These keys are absent (0/-1) from ordinary containers, including old
+     * GLM-5.3 containers that deliberately omitted the source MTP weights. */
+    int   mtp_layers;
+    int   mtp_source_layer;
 
     /* --- K3 additions (all absent/0 for Kimi-Linear) ------------------- */
     int   latent_dim;                /* routed_expert_hidden_size; 0 = none */
@@ -212,6 +217,18 @@ typedef struct {
 
     /* scratch */
     float *x, *h, *tmp, *att, *logits;
+    /* Experimental GLM NextN/MTP state.  Availability is a property of the
+     * converted container; active is an explicit runtime choice.  The target
+     * hidden is the post-final-norm target representation.  mtp_hidden keeps
+     * the unnormalised residual output of the appended decoder layer, while
+     * mtp_logits is deliberately separate from the target logits so a shadow
+     * calibration step cannot perturb generation. */
+    int    mtp_available, mtp_active, mtp_layer, mtp_context_limit;
+    int    mtp_target_hidden_pos, mtp_alignment_error;
+    int    mtp_last_pos, mtp_last_token, mtp_shadow_argmax;
+    float *mtp_target_hidden, *mtp_hidden, *mtp_logits, *mtp_work;
+    uint64_t mtp_steps, mtp_shadow_steps, mtp_shadow_matches;
+    double mtp_seconds;
     /* 1 when at least one layer owns per-token attention state (MLA or
      * standard GQA), i.e. when the sequence is bounded by kv_cap. KDA state
      * is O(1) in context and imposes no such limit. */
@@ -366,6 +383,24 @@ void waste_model_free(waste_model *m);
  * waste_model_read_error then says which one and why.
  * `pos` is the position in the sequence (0-based). */
 const float *waste_model_step(waste_model *m, int token, int pos, int *routed);
+
+/* Experimental GLM NextN/MTP hooks.  Enabling before prompt evaluation makes
+ * each known token after the first advance the appended layer's cache with
+ * the previous target hidden.  This leaves N-1 MTP rows after an N-token
+ * prompt, which is the required state for a first proposal.  The proposal
+ * call pairs `next_token` with the saved target hidden at `target_pos` and
+ * returns MTP logits without changing target logits or sampling state. */
+int         waste_model_mtp_available(const waste_model *m);
+int         waste_model_mtp_set_enabled(waste_model *m, int enabled);
+int         waste_model_mtp_enabled(const waste_model *m);
+const float *waste_model_mtp_target_hidden(const waste_model *m, int *pos);
+const float *waste_model_mtp_propose(waste_model *m, int next_token,
+                                     int target_pos, int *routed);
+int         waste_model_mtp_cache_pos(const waste_model *m);
+uint64_t    waste_model_mtp_steps(const waste_model *m);
+double      waste_model_mtp_seconds(const waste_model *m);
+uint64_t    waste_model_mtp_shadow_steps(const waste_model *m);
+uint64_t    waste_model_mtp_shadow_matches(const waste_model *m);
 
 /* Why the last read failed, and where. NULL when nothing has. The string
  * is static; `layer` and `expert` name the record. Sticky, so a caller

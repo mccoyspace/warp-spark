@@ -87,7 +87,36 @@ fuzzer in `tools/fuzz_container.py` exists for this file). Keys:
 | `config` | the release's own config verbatim, with the multimodal wrapper under `_outer` |
 | `expert_quant` | `stages`, `vec_dim`, `entries`, `index_block`, `index_bits`, `bits_per_weight` |
 | `layers` | per MoE layer: `file`, `experts`, `bytes`, `codebook_base` |
+| `mtp` | optional versioned recurrent-MTP contract and its distinct expert bank |
 | `trunk` | per tensor: `name`, `fmt`, `off`, `shape`, `group`, `scale_off`, `bytes` |
+
+The experimental GLM-5.3 opt-in writes exactly one `mtp` object:
+
+```json
+{
+ "version": 1,
+ "num_layers": 1,
+ "source_layer": 45,
+ "context_limit": 2048,
+ "attention": "dense_equivalent_dsa",
+ "recurrent": true,
+ "bank": {
+  "file": "experts-L45.bin",
+  "experts": 288,
+  "bytes": 2723807232,
+  "codebook_base": 378
+ }
+}
+```
+
+The numbers shown for `bytes` and `codebook_base` are illustrative; the
+converter records the generated bank. `config.mtp_layers = 1` and
+`config.mtp_source_layer = 45` appear only with this object. The ordinary
+`layers` map remains the base decoder's MoE layers 3–44. Layer 45's adapter,
+attention, router and shared-expert tensors live in `trunk`; its routed
+experts live only in the `mtp.bank`; its DSA indexer remains omitted under
+the stated 2048-token dense-equivalence bound. Because layer 45 is consumed,
+it must not appear in `source_ignored_layers`.
 
 Two fields from the original design are **not** here. There is no
 `bits[]`: the GEMQ-style per-expert bit allocator was specified, measured
