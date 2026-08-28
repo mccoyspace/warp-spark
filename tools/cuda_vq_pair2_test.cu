@@ -226,41 +226,85 @@ static int ordinary_run(waste_model &model, const Fixture &fixture,
     return 0;
 }
 
-static int pair2_run(waste_model &model, const Fixture &fixture,
-                     Work &work, bool capture)
+using Clock = std::chrono::steady_clock;
+
+struct StageTimes {
+    double prepare_ms = 0.0;
+    double pair_ms = 0.0;
+    double activation_ms = 0.0;
+    double down_ms = 0.0;
+};
+
+static double elapsed_ms(Clock::time_point begin)
 {
+    return std::chrono::duration<double, std::milli>(
+        Clock::now() - begin).count();
+}
+
+static int pair2_run(waste_model &model, const Fixture &fixture,
+                     Work &work, int pair_group, int down_group,
+                     bool capture, StageTimes *stages)
+{
+    if (pair_group < 1 || pair_group > kTasks ||
+        down_group < 1 || down_group > kTasks ||
+        kTasks % pair_group || kTasks % down_group)
+        return -1;
+    auto begin = Clock::now();
     if (waste_cuda_vq_prepare_pair2(
             &model, fixture.row_x(0), fixture.row_x(1), 0, kLat))
         return -1;
-    for (int task = 0; task < kTasks; task++) {
-        const int row = task / kExpertsPerRow;
-        if (waste_cuda_vq_group_pair2_enqueue(
-                &model, task, row, fixture.gate(task), fixture.up(task),
-                fixture.scales(task), kInter, kLat))
-            return -1;
-    }
-    const float *pair_out[kTasks] = {};
-    if (waste_cuda_vq_group_pair_finish(&model, kTasks, pair_out)) return -1;
-    for (int task = 0; task < kTasks; task++) {
-        if (!pair_out[task]) return -1;
-        if (capture)
-            memcpy(work.pair_at(task), pair_out[task],
-                   (size_t)2 * kInter * sizeof(float));
-        activate(pair_out[task], work.act_at(task));
-        if (waste_cuda_vq_group_down_enqueue(
-                &model, task, fixture.down(task),
-                fixture.scales(task) + 2 * kInter,
-                work.act_at(task), 2 * kStages, kLat, kInter))
-            return -1;
-    }
-    const float *down_out[kTasks] = {};
-    if (waste_cuda_vq_group_down_finish(&model, kTasks, down_out)) return -1;
-    if (capture)
-        for (int task = 0; task < kTasks; task++) {
-            if (!down_out[task]) return -1;
-            memcpy(work.down_at(task), down_out[task],
-                   (size_t)kLat * sizeof(float));
+    if (stages) stages->prepare_ms += elapsed_ms(begin);
+    for (int base = 0; base < kTasks; base += pair_group) {
+        begin = Clock::now();
+        for (int slot = 0; slot < pair_group; slot++) {
+            const int task = base + slot;
+            const int row = task / kExpertsPerRow;
+            if (waste_cuda_vq_group_pair2_enqueue(
+                    &model, slot, row, fixture.gate(task), fixture.up(task),
+                    fixture.scales(task), kInter, kLat))
+                return -1;
         }
+        const float *pair_out[kTasks] = {};
+        if (waste_cuda_vq_group_pair_finish(
+                &model, pair_group, pair_out))
+            return -1;
+        if (stages) stages->pair_ms += elapsed_ms(begin);
+
+        begin = Clock::now();
+        for (int slot = 0; slot < pair_group; slot++) {
+            const int task = base + slot;
+            if (!pair_out[slot]) return -1;
+            if (capture)
+                memcpy(work.pair_at(task), pair_out[slot],
+                       (size_t)2 * kInter * sizeof(float));
+            activate(pair_out[slot], work.act_at(task));
+        }
+        if (stages) stages->activation_ms += elapsed_ms(begin);
+    }
+
+    begin = Clock::now();
+    for (int base = 0; base < kTasks; base += down_group) {
+        for (int slot = 0; slot < down_group; slot++) {
+            const int task = base + slot;
+            if (waste_cuda_vq_group_down_enqueue(
+                    &model, slot, fixture.down(task),
+                    fixture.scales(task) + 2 * kInter,
+                    work.act_at(task), 2 * kStages, kLat, kInter))
+                return -1;
+        }
+        const float *down_out[kTasks] = {};
+        if (waste_cuda_vq_group_down_finish(
+                &model, down_group, down_out))
+            return -1;
+        if (capture)
+            for (int slot = 0; slot < down_group; slot++) {
+                const int task = base + slot;
+                if (!down_out[slot]) return -1;
+                memcpy(work.down_at(task), down_out[slot],
+                       (size_t)kLat * sizeof(float));
+            }
+    }
+    if (stages) stages->down_ms += elapsed_ms(begin);
     return 0;
 }
 
@@ -394,45 +438,92 @@ int main(int argc, char **argv)
     Work ordinary, pair2;
     waste_model model{};
     configure(model, fixture);
-    if (waste_cuda_vq_init(&model) ||
-        ordinary_run(model, fixture, ordinary) ||
-        pair2_run(model, fixture, pair2, true)) {
+    if (waste_cuda_vq_init(&model) || ordinary_run(model, fixture, ordinary)) {
         std::fprintf(stderr, "initial VQ pair2 execution failed\n");
         waste_cuda_kda_free(&model);
         return 1;
     }
-    if (compare_bits("gate-up", ordinary.pair, pair2.pair) ||
-        compare_bits("activated", ordinary.act, pair2.act) ||
-        compare_bits("down", ordinary.down, pair2.down)) {
-        waste_cuda_kda_free(&model);
-        return 1;
-    }
-
-    for (int i = 0; i < warmup; i++) {
-        if (ordinary_run(model, fixture, ordinary) ||
-            pair2_run(model, fixture, pair2, false)) {
-            std::fprintf(stderr, "VQ pair2 warmup failed\n");
+    static constexpr int groups[] = { 2, 4, 8, 16 };
+    for (int group : groups) {
+        if (pair2_run(model, fixture, pair2, group, group, true, nullptr)) {
+            std::fprintf(stderr,
+                         "initial VQ pair2 group-%d execution failed\n",
+                         group);
+            waste_cuda_kda_free(&model);
+            return 1;
+        }
+        char label[48];
+        snprintf(label, sizeof label, "gate-up-group%d", group);
+        if (compare_bits(label, ordinary.pair, pair2.pair)) {
+            waste_cuda_kda_free(&model);
+            return 1;
+        }
+        snprintf(label, sizeof label, "activated-group%d", group);
+        if (compare_bits(label, ordinary.act, pair2.act)) {
+            waste_cuda_kda_free(&model);
+            return 1;
+        }
+        snprintf(label, sizeof label, "down-group%d", group);
+        if (compare_bits(label, ordinary.down, pair2.down)) {
             waste_cuda_kda_free(&model);
             return 1;
         }
     }
+
+    for (int i = 0; i < warmup; i++)
+        if (ordinary_run(model, fixture, ordinary)) {
+            std::fprintf(stderr, "ordinary VQ warmup failed\n");
+            waste_cuda_kda_free(&model);
+            return 1;
+        }
     const auto ordinary_call = [&] {
         return ordinary_run(model, fixture, ordinary);
     };
-    const auto pair2_call = [&] {
-        return pair2_run(model, fixture, pair2, false);
-    };
     const double ordinary_before = milliseconds_per(iterations, ordinary_call);
-    const double pair2_ms = milliseconds_per(iterations, pair2_call);
+
+    struct Result {
+        int group;
+        double total_ms;
+        StageTimes stages;
+    } results[4] = {};
+    int result_index = 0;
+    for (int group : groups) {
+        for (int i = 0; i < warmup; i++)
+            if (pair2_run(model, fixture, pair2, group, group,
+                          false, nullptr)) {
+                std::fprintf(stderr,
+                             "VQ pair2 group-%d warmup failed\n", group);
+                waste_cuda_kda_free(&model);
+                return 1;
+            }
+        Result &result = results[result_index++];
+        result.group = group;
+        const auto pair2_call = [&] {
+            return pair2_run(model, fixture, pair2, group, group,
+                             false, &result.stages);
+        };
+        result.total_ms = milliseconds_per(iterations, pair2_call);
+    }
     const double ordinary_after = milliseconds_per(iterations, ordinary_call);
     const double ordinary_ms = 0.5 * (ordinary_before + ordinary_after);
     std::printf("shape=rows2-top8 lat=%d inter=%d tasks=%d iterations=%d "
                 "warmup=%d\n", kLat, kInter, kTasks, iterations, warmup);
     std::printf("path=ordinary2-before wall_ms=%.6f\n", ordinary_before);
-    std::printf("path=pair2-group16 wall_ms=%.6f\n", pair2_ms);
+    for (const Result &result : results) {
+        const double n = (double)iterations;
+        std::printf("path=pair2-group%d wall_ms=%.6f speedup=%.4f "
+                    "saved_ms=%.6f\n",
+                    result.group, result.total_ms,
+                    ordinary_ms / result.total_ms,
+                    ordinary_ms - result.total_ms);
+        std::printf("breakdown=pair2-group%d prepare_submit_ms=%.6f "
+                    "gate_up_ms=%.6f activation_ms=%.6f down_ms=%.6f\n",
+                    result.group, result.stages.prepare_ms / n,
+                    result.stages.pair_ms / n,
+                    result.stages.activation_ms / n,
+                    result.stages.down_ms / n);
+    }
     std::printf("path=ordinary2-after wall_ms=%.6f\n", ordinary_after);
-    std::printf("comparison=bracketed speedup=%.4f saved_ms=%.6f\n",
-                ordinary_ms / pair2_ms, ordinary_ms - pair2_ms);
     waste_cuda_kda_free(&model);
 
     if (established_group_reuse_gate(fixture) || sticky_bounds_gate(fixture)) {

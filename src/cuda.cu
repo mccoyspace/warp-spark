@@ -936,12 +936,10 @@ extern "C" int waste_cuda_vq_group_pair_finish(
         host_outputs[slot] = ctx->vq_group_pair_host_y +
             (size_t)slot * ctx->vq_group_pair_slot_values;
     cuda_vq_group_reset(ctx);
-    /* Ordinary grouped MoE may split top-k into several groups after one LUT
-     * prepare.  Preserve that established prepared=1 reuse.  Verify2 has one
-     * bounded 16-task group and owns two row-specific LUT pairs, so retire its
-     * prepared=2 transaction at the sole finish. */
-    if (ctx->vq_group_pair_prepared == 2)
-        ctx->vq_group_pair_prepared = 0;
+    /* Preserve both ordinary prepared=1 and pair2 prepared=2 LUTs across
+     * bounded group finishes.  This lets either path split top-k without
+     * rebuilding tables.  The next prepare replaces them, while group_drain
+     * explicitly retires them after an aborted or caller-ended sequence. */
     return 0;
 }
 
