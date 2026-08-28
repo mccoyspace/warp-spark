@@ -285,6 +285,119 @@ static int same_oracle_state(const waste_model *a, const waste_model *b)
     return 1;
 }
 
+static int prepare_chain_model(waste_model *model, const char *path,
+                               const int *prompt, int n_prompt)
+{
+    waste_load_opts opts;
+    load_opts(&opts);
+    if (waste_model_load(model, path, 8, &opts)) return -1;
+    if (waste_model_mtp_set_enabled(model, 1) ||
+        !waste_model_prefill(model, prompt, n_prompt, 0))
+        goto fail;
+    int hidden_pos = -1;
+    if (!waste_model_mtp_target_hidden(model, &hidden_pos) ||
+        hidden_pos != n_prompt - 1 ||
+        waste_model_mtp_cache_pos(model) != n_prompt - 1)
+        goto fail;
+    return 0;
+fail:
+    waste_model_free(model);
+    return -1;
+}
+
+static int run_recursive_chain_contract(const char *path)
+{
+    static const int prompt[] = {3, 7, 11, 5};
+    enum { N_PROMPT = 4, N_MODELS = 5 };
+    const int token0 = 9, target_pos = N_PROMPT - 1;
+    waste_model model[N_MODELS];
+    int loaded = 0;
+    int draft1[3] = {-1, -1, -1};
+    int draft2[3] = {-1, -1, -1};
+    int draft3a[3] = {-1, -1, -1};
+    int draft3b[3] = {-1, -1, -1};
+    double seconds1 = 0.0, seconds2 = 0.0;
+    double seconds3a = 0.0, seconds3b = 0.0;
+
+    memset(model, 0, sizeof model);
+    for (int i = 0; i < N_MODELS; i++) {
+        if (prepare_chain_model(&model[i], path, prompt, N_PROMPT))
+            goto fail;
+        loaded++;
+    }
+
+    /* All argument and complete-chain capacity gates are pre-mutation. */
+    int rejected[3] = {101, 102, 103};
+    double rejected_seconds = 1.0;
+    if (waste_model_mtp_propose_greedy_chain(
+            &model[1], token0, target_pos, 0, rejected,
+            &rejected_seconds) == 0 || rejected_seconds != 0.0 ||
+        memcmp(rejected, (int[3]){101, 102, 103}, sizeof rejected))
+        goto fail;
+    rejected_seconds = 1.0;
+    if (waste_model_mtp_propose_greedy_chain(
+            &model[1], token0, target_pos, 4, rejected,
+            &rejected_seconds) == 0 || rejected_seconds != 0.0 ||
+        memcmp(rejected, (int[3]){101, 102, 103}, sizeof rejected))
+        goto fail;
+    const int saved_cap = model[1].kv_cap;
+    model[1].kv_cap = target_pos + 2;
+    rejected_seconds = 1.0;
+    if (waste_model_mtp_propose_greedy_chain(
+            &model[1], token0, target_pos, 3, rejected,
+            &rejected_seconds) == 0 || rejected_seconds != 0.0 ||
+        memcmp(rejected, (int[3]){101, 102, 103}, sizeof rejected)) {
+        model[1].kv_cap = saved_cap;
+        goto fail;
+    }
+    model[1].kv_cap = saved_cap;
+    if (!same_oracle_state(&model[0], &model[1])) goto fail;
+
+    const float *ordinary = waste_model_mtp_propose(
+        &model[0], token0, target_pos, NULL);
+    if (!ordinary) goto fail;
+    const int ordinary_draft = logits_argmax(ordinary, model[0].cfg.vocab);
+    if (waste_model_mtp_propose_greedy_chain(
+            &model[1], token0, target_pos, 1, draft1, &seconds1) ||
+        waste_model_mtp_propose_greedy_chain(
+            &model[2], token0, target_pos, 2, draft2, &seconds2) ||
+        waste_model_mtp_propose_greedy_chain(
+            &model[3], token0, target_pos, 3, draft3a, &seconds3a) ||
+        waste_model_mtp_propose_greedy_chain(
+            &model[4], token0, target_pos, 3, draft3b, &seconds3b))
+        goto fail;
+    if (draft1[0] != ordinary_draft || draft2[0] != ordinary_draft ||
+        draft3a[0] != ordinary_draft || draft3b[0] != ordinary_draft ||
+        draft2[1] != draft3a[1] ||
+        memcmp(draft3a, draft3b, sizeof draft3a) ||
+        seconds1 <= 0.0 || seconds2 <= 0.0 ||
+        seconds3a <= 0.0 || seconds3b <= 0.0)
+        goto fail;
+
+    /* Every depth unwinds to the exact state of the grounded first row.
+     * A target continuation therefore cannot observe the deeper draft work. */
+    for (int i = 1; i < N_MODELS; i++)
+        if (!same_oracle_state(&model[0], &model[i])) goto fail;
+    const int vocab = model[0].cfg.vocab;
+    const float *control = waste_model_step(
+        &model[0], token0, N_PROMPT, NULL);
+    if (!control) goto fail;
+    for (int i = 1; i < N_MODELS; i++) {
+        const float *continued = waste_model_step(
+            &model[i], token0, N_PROMPT, NULL);
+        if (!continued ||
+            memcmp(control, continued, (size_t)vocab * sizeof(float)) ||
+            !same_oracle_state(&model[0], &model[i]))
+            goto fail;
+    }
+
+    for (int i = 0; i < loaded; i++) waste_model_free(&model[i]);
+    return 0;
+fail:
+    for (int i = 0; i < loaded; i++) waste_model_free(&model[i]);
+    return -1;
+}
+
 static int run_oracle_contract(const char *path)
 {
     static const int prompt[] = {3, 7, 11, 5};
@@ -705,6 +818,7 @@ int main(int argc, char **argv)
     waste_model_free(&model);
     loaded = 0;
     REQUIRE(embedding_failure_is_sticky(argv[2]) == 0);
+    REQUIRE(run_recursive_chain_contract(argv[2]) == 0);
     REQUIRE(run_oracle_contract(argv[2]) == 0);
     REQUIRE(run_fast_verify2_contract(argv[2]) == 0);
     for (int i = 3; i < argc; i++) {
