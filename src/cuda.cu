@@ -463,7 +463,6 @@ static int q4_fast2_shape_eligible(int out, int in)
            (out == 8192  && in == 128)  ||
            (out == 1536  && in == 4096) ||
            (out == 16384 && in == 1536) ||
-           (out == 32768 && in == 512)  ||
            (out == 4096  && in == 16384) ||
            (out == 2048  && in == 4096) ||
            (out == 4096  && in == 2048) ||

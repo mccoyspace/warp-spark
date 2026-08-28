@@ -187,7 +187,7 @@ static constexpr ShapeGate kGlm53Shapes[] = {
     { 1536,  4096, true,  "MLA q_a" },
     {16384,  1536, true,  "MLA q_b" },
     {  512,  4096, false, "MLA kv_a" },
-    {32768,   512, true,  "MLA kv_b row store" },
+    {32768,   512, false, "MLA kv_b row store (staging-capacity guard)" },
     { 4096, 16384, true,  "MLA o" },
     {12288,  4096, true,  "dense gate/up" },
     { 4096, 12288, false, "dense down" },
