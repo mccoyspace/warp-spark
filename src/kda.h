@@ -35,6 +35,14 @@ void waste_kda_step(int H, int K, int V,
                     const float *g_log, const float *beta,
                     float *S, float *o, float *scratch);
 
+/* Same recurrence with an explicit q/k L2-normalization epsilon.  The
+ * original entry point remains the 1e-12 Kimi/K3 contract. */
+void waste_kda_step_ex(int H, int K, int V,
+                       const float *q, const float *k, const float *v,
+                       const float *g_log, const float *beta,
+                       float l2_eps,
+                       float *S, float *o, float *scratch);
+
 
 /* Sequential prefill: T steps of the above. Inputs are [T][H][*]
  * (time-major, as the reference lays them out). Used for validation and

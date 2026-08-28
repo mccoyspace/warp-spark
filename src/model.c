@@ -221,6 +221,7 @@ static const char *dump_prefill = NULL; /* WASTE_DUMP_PREFILL, JSONL */
 static int dump_pos0 = 0;
 static int lookahead_n = 0;            /* WASTE_LOOKAHEAD, see moe_layer  */
 static int p6_chunk = 4;               /* WASTE_P6_CHUNK, see vq_apply    */
+static inline float swiglu_pair(const waste_config *c, float gate, float up);
 static int xpar_on = 0;                /* WASTE_XPAR=1 opts in; see below   */
 static int xpar_batch = 4;             /* WASTE_XPAR_BATCH, see moe_layer  */
 static pthread_once_t model_opts_once = PTHREAD_ONCE_INIT;
@@ -682,6 +683,74 @@ int waste_model_cuda_glm52_profile_compatible(const waste_model *m,
            waste_model_cuda_glm52_vq3r_compatible(m);
 }
 
+/* GLM-5.3's mHC mapping remains a small fp32 CPU operation, while its KDA,
+ * MLA, dense/shared FFNs and routed experts reuse the existing exact CUDA
+ * primitives.  Keep that composition on the one released geometry and its
+ * exact 3-linear/1-MLA layer pattern; a merely similar hybrid must not enter
+ * a profile qualified against different recurrent-state or residual math. */
+int waste_model_cuda_glm53_dense_compatible(const waste_model *m)
+{
+    if (!m) return 0;
+    const waste_config *c = &m->cfg;
+    if (strcmp(c->arch, "Glm5NextForConditionalGeneration") ||
+        strcmp(c->model_type, "glm5_next_text") ||
+        strcmp(c->hidden_act, "silu") ||
+        strcmp(c->topk_method, "noaux_tc") ||
+        strcmp(c->router_activation, "sigmoid") ||
+        c->attention_kind != WASTE_ATTN_LATENT ||
+        c->n_layers != 45 || c->hidden != 4096 ||
+        c->n_experts != 288 || c->top_k != 8 ||
+        c->moe_inter != 2048 || c->dense_inter != 12288 ||
+        c->n_shared != 1 || c->first_dense != 3 ||
+        c->n_heads != 64 || c->n_kv_heads != 64 ||
+        c->kv_lora != 512 || c->q_lora != 1536 ||
+        c->qk_nope != 256 || c->qk_rope != 0 || c->v_head != 256 ||
+        c->mla_nope != 1 || c->dsa_dense_context_limit != 2048 ||
+        c->max_position_embeddings != 2048 ||
+        fabsf(c->eps - 1e-5f) > 1e-12f ||
+        fabsf(c->mla_rms_norm_eps - 1e-5f) > 1e-12f ||
+        c->router_n_group != 1 || c->router_topk_group != 1 ||
+        !c->renorm || fabsf(c->routed_scale - 2.5f) > 1e-6f ||
+        !c->mhc || c->hc_mult != 4 || c->hc_sinkhorn_iters != 20 ||
+        fabsf(c->hc_eps - 1e-6f) > 1e-12f ||
+        fabsf(c->swiglu_limit - 10.0f) > 1e-6f ||
+        c->kda_heads != 64 || c->kda_dim != 128 || c->conv_k != 4 ||
+        c->full_rank_gate || fabsf(c->gate_lower_bound + 5.0f) > 1e-6f ||
+        c->kda_layer_index_base != 0 ||
+        fabsf(c->kda_l2_eps - 1e-6f) > 1e-12f ||
+        c->latent_dim != 0 || c->mla_output_gate || c->act_situ ||
+        m->expert_m[0] != 2048 || m->expert_m[1] != 2048 ||
+        m->expert_m[2] != 4096 || m->expert_n[0] != 4096 ||
+        m->expert_n[1] != 4096 || m->expert_n[2] != 2048)
+        return 0;
+    for (int L = 0; L < c->n_layers; L++)
+        if (!!c->kda_layer[L] != (L % 4 != 3)) return 0;
+    return 1;
+}
+
+int waste_model_cuda_glm53_vq3r_compatible(const waste_model *m)
+{
+    return waste_model_cuda_glm53_dense_compatible(m) &&
+           m->index_bits == 8 && m->stages == 3 && m->vec_dim == 8 &&
+           m->cb_entries == 256 &&
+           m->index_block == WASTE_VQ_INDEX_BLOCK &&
+           m->expert_m[0] % (int)WASTE_VQ_INDEX_BLOCK == 0 &&
+           m->expert_m[2] % (int)WASTE_VQ_INDEX_BLOCK == 0;
+}
+
+int waste_model_cuda_glm53_profile_compatible(const waste_model *m,
+                                               int kda_mode,
+                                               int dense_scope,
+                                               int vq_mode,
+                                               int vq_group)
+{
+    if (!waste_model_cuda_glm53_dense_compatible(m) ||
+        kda_mode != 1 || dense_scope != 3 || vq_group != 1)
+        return 0;
+    if (!vq_mode) return 1;
+    return vq_mode == 2 && waste_model_cuda_glm53_vq3r_compatible(m);
+}
+
 /* The first hardware pilot deliberately qualifies one selector tuple, plus
  * its VQ-off control.  Disabled components remain valid so one-load sweeps
  * and orderly CUDA-to-CPU recovery can build/tear down the tuple in stages;
@@ -716,6 +785,11 @@ int waste_model_cuda_vq_dense_scope_compatible(const waste_model *m,
                                                 int scope)
 {
     if (!m) return 0;
+    /* A manifest that claims GLM-5.3 must match the whole bounded release
+     * profile; it must not fall through to the generic scope-2 rule merely
+     * because one release field drifted. */
+    if (!strcmp(m->cfg.arch, "Glm5NextForConditionalGeneration"))
+        return scope == 3 && waste_model_cuda_glm53_vq3r_compatible(m);
     if (waste_model_cuda_glm52_dense_compatible(m))
         return scope == 3 && waste_model_cuda_glm52_vq3r_compatible(m);
     if (waste_model_cuda_glm47_full_dense_compatible(m))
@@ -874,6 +948,15 @@ static int cuda_dense_tensor_ok(waste_model *m, const char *name,
 static int cuda_kda_preflight(waste_model *m, int mode)
 {
     if (!mode) return 0;
+    const int glm53_claim =
+        !strcmp(m->cfg.arch, "Glm5NextForConditionalGeneration");
+    const int glm53 = waste_model_cuda_glm53_dense_compatible(m);
+    if (glm53_claim && (!glm53 || mode != 1)) {
+        fprintf(stderr,
+                "waste: GLM-5.3 CUDA decode requires exact bounded release "
+                "geometry and KDA mode 1\n");
+        goto fail;
+    }
     const waste_tensor *first = NULL;
     static const char *base[] = {"q", "k", "v", "f_a", "f_b", "b", "o"};
     int kda_layers = 0;
@@ -947,6 +1030,9 @@ static int cuda_dense_preflight(waste_model *m, int scope)
     for (int L = 0; L < c->n_layers; L++) kda_layers += !!c->kda_layer[L];
     const int full_gqa = waste_model_cuda_glm47_full_dense_compatible(m);
     const int glm52 = waste_model_cuda_glm52_dense_compatible(m);
+    const int glm53_claim =
+        !strcmp(c->arch, "Glm5NextForConditionalGeneration");
+    const int glm53 = waste_model_cuda_glm53_dense_compatible(m);
     if (full_gqa && !waste_model_cuda_glm47_full_profile_compatible(
                         m, m->cuda_kda_mode, scope, 0, 1)) {
         fprintf(stderr,
@@ -959,6 +1045,14 @@ static int cuda_dense_preflight(waste_model *m, int scope)
         fprintf(stderr,
                 "waste: GLM-5.2 CUDA dense requires KDA mode 1 and "
                 "dense scope 3\n");
+        goto fail;
+    }
+    if (glm53_claim && (!glm53 ||
+        !waste_model_cuda_glm53_profile_compatible(
+            m, m->cuda_kda_mode, scope, 0, m->cuda_vq_group))) {
+        fprintf(stderr,
+                "waste: GLM-5.3 CUDA dense requires exact bounded release "
+                "geometry, KDA mode 1, and dense scope 3\n");
         goto fail;
     }
     if (!kda_layers && !waste_model_cuda_k2_dense_compatible(m) &&
@@ -1159,9 +1253,12 @@ static int cuda_vq_preflight(waste_model *m, int mode)
     const int glm47_full_geometry =
         waste_model_cuda_glm47_full_vq3r_compatible(m);
     const int glm52_geometry = waste_model_cuda_glm52_vq3r_compatible(m);
+    const int glm53_claim =
+        !strcmp(c->arch, "Glm5NextForConditionalGeneration");
+    const int glm53_geometry = waste_model_cuda_glm53_vq3r_compatible(m);
     const int qualified_decode_geometry =
         k2_geometry || glm47_flash_geometry || glm47_full_geometry ||
-        glm52_geometry;
+        glm52_geometry || glm53_geometry;
     const int dense_scope_ok = waste_model_cuda_vq_dense_scope_compatible(
         m, m->cuda_dense_scope);
     if (mode < 1 || mode > 2 || m->cuda_kda_mode != 1 ||
@@ -1188,6 +1285,16 @@ static int cuda_vq_preflight(waste_model *m, int mode)
                 "3, VQ mode 2, and VQ group 1\n");
         goto fail;
     }
+    if (glm53_claim && (!glm53_geometry ||
+        !waste_model_cuda_glm53_profile_compatible(
+            m, m->cuda_kda_mode, m->cuda_dense_scope, mode,
+            m->cuda_vq_group))) {
+        fprintf(stderr,
+                "waste: GLM-5.3 CUDA VQ requires exact bounded release "
+                "geometry, KDA mode 1, dense scope 3, VQ mode 2, and VQ "
+                "group 1\n");
+        goto fail;
+    }
     if (m->index_bits != 8) {
         fprintf(stderr,
                 "waste: CUDA VQ is VQ3R-complete; VQ4P is rejected "
@@ -1203,7 +1310,8 @@ static int cuda_vq_preflight(waste_model *m, int mode)
                 "waste: CUDA VQ requires K3 VQ3R 3584/3072 top-16 or "
                 "allowlisted K2 7168/2048 top-8 or GLM-4.7-Flash "
                 "2048/1536 top-4 or full GLM-4.7 5120/1536 top-8 "
-                "or GLM-5.2 6144/2048 top-8 VQ3R geometry\n");
+                "or GLM-5.2 6144/2048 top-8 or GLM-5.3 4096/2048 "
+                "top-8 VQ3R geometry\n");
         goto fail;
     }
     if (waste_cuda_vq_init(m)) {
@@ -1281,7 +1389,7 @@ static int cuda_vq_preflight(waste_model *m, int mode)
             gate[i] = c->act_situ
                 ? waste_situ_pair(gate[i], up[i], c->situ_beta,
                                   c->situ_linear_beta)
-                : (gate[i] / (1.0f + expf(-gate[i]))) * up[i];
+                : swiglu_pair(c, gate[i], up[i]);
         if (mode == 1)
             vq_build_lut(m, down_lut, h->codebook_id + 2 * m->stages,
                          gate, inter, m->stages, m->cb_entries, m->vec_dim,
@@ -1421,6 +1529,17 @@ int waste_embed_row(waste_model *m, int token, float *dst)
 
 static inline float silu(float v) { return v / (1.0f + expf(-v)); }
 
+static inline float swiglu_pair(const waste_config *c, float gate, float up)
+{
+    const float lim = c->swiglu_limit;
+    if (lim > 0.0f) {
+        if (gate > lim) gate = lim;       /* no lower clamp in the reference */
+        if (up > lim) up = lim;
+        else if (up < -lim) up = -lim;
+    }
+    return silu(gate) * up;
+}
+
 /* SiTU (K3): beta*tanh(g/beta)*sigmoid(g) * [linear_beta*tanh(u/linear_beta)]
  * — replaces SiLU-and-multiply, and unlike it the "up" half is squashed too. */
 float waste_situ_pair(float g, float u, float beta, float lbeta)
@@ -1436,6 +1555,139 @@ static void softmax(float *x, int n)
     float s = 0;
     for (int i = 0; i < n; i++) { x[i] = expf(x[i] - mx); s += x[i]; }
     for (int i = 0; i < n; i++) x[i] /= s;
+}
+
+/* Complete the mHC map after its fp32 linear projection.  `mix` starts as
+ * [pre logits, post logits, comb logits] and is deliberately reused for the
+ * corresponding weights.  This follows the released Transformers source in
+ * its slightly asymmetric initial Sinkhorn iteration: row softmax, epsilon,
+ * column normalization, then (row, column) another iters-1 times. */
+static void mhc_finish(int hc, int hidden, int sinkhorn_iters, float eps,
+                       const float *streams, float *mix,
+                       const float *base, const float *scale,
+                       float *post, float *comb, float *collapsed)
+{
+    float *pre = mix;
+    float *post_mix = mix + hc;
+    float *comb_mix = mix + 2 * hc;
+    for (int i = 0; i < hc; i++) {
+        const float x = pre[i] * scale[0] + base[i];
+        pre[i] = 1.0f / (1.0f + expf(-x)) + eps;
+    }
+    for (int i = 0; i < hc; i++) {
+        const float x = post_mix[i] * scale[1] + base[hc + i];
+        post_mix[i] = 2.0f / (1.0f + expf(-x));
+        post[i] = post_mix[i];
+    }
+    for (int i = 0; i < hc * hc; i++)
+        comb_mix[i] = comb_mix[i] * scale[2] + base[2 * hc + i];
+    for (int r = 0; r < hc; r++) {
+        softmax(comb_mix + (size_t)r * hc, hc);
+        for (int j = 0; j < hc; j++)
+            comb_mix[(size_t)r * hc + j] += eps;
+    }
+    /* dim=-2 in [hc][hc] is a column reduction. */
+    for (int j = 0; j < hc; j++) {
+        float s = 0.0f;
+        for (int i = 0; i < hc; i++) s += comb_mix[(size_t)i * hc + j];
+        const float d = s + eps;
+        for (int i = 0; i < hc; i++) comb_mix[(size_t)i * hc + j] /= d;
+    }
+    for (int it = 1; it < sinkhorn_iters; it++) {
+        for (int i = 0; i < hc; i++) {
+            float s = 0.0f;
+            for (int j = 0; j < hc; j++) s += comb_mix[(size_t)i * hc + j];
+            const float d = s + eps;
+            for (int j = 0; j < hc; j++) comb_mix[(size_t)i * hc + j] /= d;
+        }
+        for (int j = 0; j < hc; j++) {
+            float s = 0.0f;
+            for (int i = 0; i < hc; i++) s += comb_mix[(size_t)i * hc + j];
+            const float d = s + eps;
+            for (int i = 0; i < hc; i++) comb_mix[(size_t)i * hc + j] /= d;
+        }
+    }
+    memcpy(comb, comb_mix, (size_t)hc * hc * sizeof(float));
+
+    for (int d = 0; d < hidden; d++) {
+        float s = 0.0f;
+        for (int i = 0; i < hc; i++)
+            s += pre[i] * streams[(size_t)i * hidden + d];
+        collapsed[d] = s;
+    }
+}
+
+int waste_mhc_f32(int hc, int hidden, int sinkhorn_iters,
+                  float hc_eps, float norm_eps,
+                  const float *streams, const float *fn,
+                  const float *base, const float *scale,
+                  float *post, float *comb, float *collapsed,
+                  float *scratch)
+{
+    const int64_t flat64 = (int64_t)hc * hidden;
+    const int64_t mix64 = ((int64_t)hc + 2) * hc;
+    if (hc < 1 || hidden < 1 || sinkhorn_iters < 1 ||
+        !isfinite(hc_eps) || hc_eps < 0.0f ||
+        !isfinite(norm_eps) || norm_eps <= 0.0f ||
+        flat64 > INT_MAX || mix64 > INT_MAX ||
+        !streams || !fn || !base || !scale || !post || !comb ||
+        !collapsed || !scratch)
+        return -1;
+    const int flatn = (int)flat64;
+    const int mixn = (int)mix64;
+    float *flat = scratch, *mix = flat + flatn;
+    float ss = 0.0f;
+    for (int i = 0; i < flatn; i++) ss += streams[i] * streams[i];
+    const float r = 1.0f / sqrtf(ss / (float)flatn + norm_eps);
+    for (int i = 0; i < flatn; i++) flat[i] = streams[i] * r;
+    for (int o = 0; o < mixn; o++) {
+        float s = 0.0f;
+        const float *row = fn + (size_t)o * flatn;
+        for (int i = 0; i < flatn; i++) s += row[i] * flat[i];
+        mix[o] = s;
+    }
+    mhc_finish(hc, hidden, sinkhorn_iters, hc_eps, streams, mix,
+               base, scale, post, comb, collapsed);
+    return 0;
+}
+
+void waste_mhc_merge(int hc, int hidden, const float *streams,
+                     const float *sublayer, const float *post,
+                     const float *comb, float *out)
+{
+    /* Reference: matmul(comb.transpose(-1,-2), residual).  Therefore output
+     * stream j consumes comb[i,j] from every old stream i. */
+    for (int j = 0; j < hc; j++) {
+        for (int d = 0; d < hidden; d++) {
+            float s = 0.0f;
+            for (int i = 0; i < hc; i++)
+                s += comb[(size_t)i * hc + j] *
+                     streams[(size_t)i * hidden + d];
+            out[(size_t)j * hidden + d] = post[j] * sublayer[d] + s;
+        }
+    }
+}
+
+static void mhc_model_map(waste_model *m, int L, const char *site,
+                          const float *streams, float *post, float *comb,
+                          float *collapsed, float *scratch)
+{
+    const waste_config *c = &m->cfg;
+    const int flatn = c->hc_mult * c->hidden;
+    const int mixn = (2 + c->hc_mult) * c->hc_mult;
+    float *flat = scratch, *mix = flat + flatn;
+    float ss = 0.0f;
+    for (int i = 0; i < flatn; i++) ss += streams[i] * streams[i];
+    const float r = 1.0f / sqrtf(ss / (float)flatn + c->eps);
+    for (int i = 0; i < flatn; i++) flat[i] = streams[i] * r;
+    matvec_t(m, mix, waste_find(m, tname("%smodel.layers.%d.hc_%s_fn",
+                                         c->prefix, L, site)),
+             flat, mixn, flatn);
+    mhc_finish(c->hc_mult, c->hidden, c->hc_sinkhorn_iters, c->hc_eps,
+               streams, mix,
+               T(m, "%smodel.layers.%d.hc_%s_base", c->prefix, L, site),
+               T(m, "%smodel.layers.%d.hc_%s_scale", c->prefix, L, site),
+               post, comb, collapsed);
 }
 
 /* ---- loading ----------------------------------------------------------- */
@@ -1641,6 +1893,20 @@ static int validate_text_tensors(waste_model *m)
         REQUIRE_VECTOR(tname("%smodel.layers.%d.input_layernorm.weight", c->prefix, L), hid);
         REQUIRE_VECTOR(tname("%smodel.layers.%d.post_attention_layernorm.weight", c->prefix, L), hid);
 
+        if (c->mhc) {
+            const int mix = (2 + c->hc_mult) * c->hc_mult;
+            const char *site[2] = { "attn", "ffn" };
+            for (int s = 0; s < 2; s++) {
+                REQUIRE_MATRIX(tname("%smodel.layers.%d.hc_%s_fn",
+                                     c->prefix, L, site[s]),
+                               mix, c->hc_mult * hid);
+                REQUIRE_VECTOR(tname("%smodel.layers.%d.hc_%s_base",
+                                     c->prefix, L, site[s]), mix);
+                REQUIRE_VECTOR(tname("%smodel.layers.%d.hc_%s_scale",
+                                     c->prefix, L, site[s]), 3);
+            }
+        }
+
         if (c->attention_kind == WASTE_ATTN_GQA) {
             const int qrows = c->n_heads * c->head_dim;
             const int kvrows = c->n_kv_heads * c->head_dim;
@@ -1713,7 +1979,8 @@ static int validate_text_tensors(waste_model *m)
             const int shared = c->moe_inter * (c->n_shared ? c->n_shared : 1);
             REQUIRE_MATRIX(tname("%smodel.layers.%d.block_sparse_moe.gate.weight", c->prefix, L), c->n_experts, hid);
             if (c->attention_kind == WASTE_ATTN_GQA ||
-                !strcmp(c->arch, "GlmMoeDsaForCausalLM"))
+                !strcmp(c->arch, "GlmMoeDsaForCausalLM") ||
+                !strcmp(c->arch, "Glm5NextForConditionalGeneration"))
                 REQUIRE_VECTOR(tname("%smodel.layers.%d.block_sparse_moe.gate.e_score_correction_bias",
                                      c->prefix, L), c->n_experts);
             REQUIRE_MATRIX(tname("%smodel.layers.%d.block_sparse_moe.shared_experts.gate_proj.weight", c->prefix, L), shared, hid);
@@ -1777,6 +2044,8 @@ static int cfg_sane(const waste_config *c)
     if (c->kda_heads < 0 || c->kda_heads > (1 << 16)) return 0;
     if (c->kda_dim   < 0 || c->kda_dim   > (1 << 16)) return 0;
     if (c->conv_k    < 0 || c->conv_k    > 64) return 0;
+    if ((c->kda_layer_index_base != 0 && c->kda_layer_index_base != 1) ||
+        c->kda_l2_eps <= 0.0f || !(c->kda_l2_eps < 1.0f)) return 0;
     if (c->kv_lora < 0 || c->kv_lora > (1 << 20) ||
         c->q_lora < 0 || c->q_lora > (1 << 20)) return 0;
     if (c->qk_nope < 0 || c->qk_nope > (1 << 20) ||
@@ -1786,6 +2055,18 @@ static int cfg_sane(const waste_config *c)
     if (c->n_shared  < 0 || c->n_shared  > 64) return 0;
     if (c->latent_dim < 0 || c->latent_dim > (1 << 20)) return 0;
     if (c->attn_res_block < 0 || c->attn_res_block > c->n_layers) return 0;
+    if (c->mhc) {
+        if (c->hc_mult < 1 || c->hc_mult > 16 ||
+            c->hc_sinkhorn_iters < 1 || c->hc_sinkhorn_iters > 100 ||
+            c->hc_eps <= 0.0f || !(c->hc_eps < 1.0f) ||
+            c->swiglu_limit <= 0.0f || !isfinite(c->swiglu_limit) ||
+            c->attn_res_block) return 0;
+        if ((int64_t)c->hc_mult * c->hidden > INT_MAX ||
+            (int64_t)(2 + c->hc_mult) * c->hc_mult > INT_MAX)
+            return 0;
+    } else if (c->hc_mult || c->hc_sinkhorn_iters || c->hc_eps != 0.0f) {
+        return 0;
+    }
     int n_kda = 0;
     for (int L = 0; L < c->n_layers; L++) n_kda += !!c->kda_layer[L];
     if (n_kda) {
@@ -2080,6 +2361,27 @@ static void attention_init(waste_config *c, const js_doc *d, int cfg)
         return;
     }
 
+    if (!strcmp(c->arch, "Glm5NextForConditionalGeneration")) {
+        c->attention_kind = WASTE_ATTN_LATENT;
+        c->n_kv_heads = (int)js_int(
+            d, js_get(d, cfg, "num_key_value_heads"), 0);
+        c->max_position_embeddings = (int)js_int(
+            d, js_get(d, cfg, "max_position_embeddings"), 0);
+        c->router_n_group = (int)js_int(
+            d, js_get(d, cfg, "n_group"), -1);
+        c->router_topk_group = (int)js_int(
+            d, js_get(d, cfg, "topk_group"), -1);
+        js_str(d, js_get(d, cfg, "topk_method"), c->topk_method,
+               sizeof c->topk_method);
+        js_str(d, js_get(d, cfg, "scoring_func"),
+               c->router_activation, sizeof c->router_activation);
+        if (strcmp(c->model_type, "glm5_next_text"))
+            attention_error(c,
+                            "Glm5NextForConditionalGeneration requires "
+                            "model_type glm5_next_text");
+        return;
+    }
+
     if (!strcmp(c->arch, "KimiLinearForCausalLM") ||
         !strcmp(c->arch, "KimiK3ForConditionalGeneration") ||
         !strcmp(c->arch, "DeepseekV3ForCausalLM") ||
@@ -2153,6 +2455,15 @@ static void cfg_from_json(waste_config *c, const js_doc *d, int cfg)
         js_str(d, js_at(d, a, 0), c->arch, sizeof c->arch);
     }
 
+    int mhc_ok = 1;
+    c->mhc = config_bool(d, cfg, "mhc", 0, 0, &mhc_ok);
+    c->hc_mult = (int)js_int(d, js_get(d, cfg, "hc_mult"), 0);
+    c->hc_sinkhorn_iters = (int)js_int(
+        d, js_get(d, cfg, "hc_sinkhorn_iters"), 0);
+    c->hc_eps = (float)js_num(d, js_get(d, cfg, "hc_eps"), 0.0);
+    c->swiglu_limit = (float)js_num(
+        d, js_get(d, cfg, "swiglu_limit"), 0.0);
+
     attention_init(c, d, cfg);
     rope_init(c, d, cfg);
 
@@ -2162,11 +2473,60 @@ static void cfg_from_json(waste_config *c, const js_doc *d, int cfg)
     c->kda_heads = (int)js_int(d, js_get(d, lac, "num_heads"), 0);
     c->kda_dim = (int)js_int(d, js_get(d, lac, "head_dim"), 0);
     c->conv_k = (int)js_int(d, js_get(d, lac, "short_conv_kernel_size"), 4);
+    const int kib = js_get(d, lac, "kda_layer_index_base");
+    c->kda_layer_index_base = (int)js_int(d, kib, 1);
+    c->kda_l2_eps = (float)js_num(
+        d, js_get(d, cfg, "kda_qk_l2_norm_eps"), 1e-12);
     memset(c->kda_layer, 0, sizeof c->kda_layer);
     int kl = js_get(d, lac, "kda_layers");
+    const int glm53 = !strcmp(c->arch, "Glm5NextForConditionalGeneration");
+    int kda_list_values_ok = 1;
     for (int i = 0; i < js_size(d, kl); i++) {
-        int v = (int)js_int(d, js_at(d, kl, i), -1) - 1;   /* list is 1-based */
+        const int kt = js_at(d, kl, i);
+        const double raw = js_num(d, kt, NAN);
+        if (glm53 && (!isfinite(raw) || trunc(raw) != raw ||
+                      raw < c->kda_layer_index_base ||
+                      raw - c->kda_layer_index_base >= 45)) {
+            kda_list_values_ok = 0;
+            continue;
+        }
+        int v = (int)js_int(d, kt, -1) - c->kda_layer_index_base;
         if (v >= 0 && v < 128) c->kda_layer[v] = 1;
+    }
+
+    if (glm53) {
+        if (!mhc_ok || !c->mhc || c->hc_mult != 4 ||
+            c->hc_sinkhorn_iters != 20 ||
+            fabsf(c->hc_eps - 1e-6f) > 1e-12f)
+            attention_error(c,
+                            "GLM-5.3 requires mhc=true, hc_mult=4, "
+                            "hc_sinkhorn_iters=20 and hc_eps=1e-6");
+        if (fabsf(c->swiglu_limit - 10.0f) > 1e-6f)
+            attention_error(c, "GLM-5.3 requires swiglu_limit=10");
+        if (kib < 0 || c->kda_layer_index_base != 0)
+            attention_error(c,
+                            "GLM-5.3 requires explicit zero-based "
+                            "linear_attn_config.kda_layer_index_base=0");
+        if (fabsf(c->kda_l2_eps - 1e-6f) > 1e-12f)
+            attention_error(c,
+                            "GLM-5.3 requires kda_qk_l2_norm_eps=1e-6");
+        if (c->n_layers != 45 || js_typeof(d, kl) != JS_ARR ||
+            js_size(d, kl) != 34 ||
+            !kda_list_values_ok) {
+            attention_error(c,
+                            "GLM-5.3 requires the released 34-layer KDA "
+                            "schedule");
+        } else {
+            for (int L = 0; L < 45; L++)
+                if (!!c->kda_layer[L] != (L % 4 != 3)) {
+                    attention_error(c,
+                                    "GLM-5.3 requires the released "
+                                    "3-KDA/1-DSA layer schedule");
+                    break;
+                }
+        }
+    } else if (c->mhc) {
+        attention_error(c, "mHC is supported only for GLM-5.3");
     }
 }
 
@@ -3679,7 +4039,8 @@ static void moe_expert_range(int b, int e, void *p)
                 ga[i] = waste_situ_pair(ga[i], ub[i], c->situ_beta,
                                         c->situ_linear_beta);
         else
-            for (int i = 0; i < inter; i++) ga[i] = silu(ga[i]) * ub[i];
+            for (int i = 0; i < inter; i++)
+                ga[i] = swiglu_pair(c, ga[i], ub[i]);
         vq_matvec_serial(m, acc, rec + h->down_off, sc + 2 * inter, ga, lat,
                          inter, h->codebook_id + 2 * m->stages, ld, qd, qsd);
         /* acc is left unweighted on purpose: the caller applies w[j] in the
@@ -3736,6 +4097,7 @@ void waste_kda_decay_gate(float *g, const float *A_log, const float *dt_bias,
 
 typedef struct {
     int K, V;
+    float l2_eps;
     const float *q, *k, *v, *g, *beta;
     float *S, *o, *u;
 } kda_par;
@@ -3743,13 +4105,15 @@ typedef struct {
 static void kda_step_range(int lo, int hi, void *ap)
 {
     const kda_par *a = (const kda_par *)ap;
-    waste_k.kda_step(hi - lo, a->K, a->V,
-                     a->q + (size_t)lo * a->K, a->k + (size_t)lo * a->K,
-                     a->v + (size_t)lo * a->V, a->g + (size_t)lo * a->K,
-                     a->beta + lo,
-                     a->S + (size_t)lo * a->K * a->V,
-                     a->o + (size_t)lo * a->V,
-                     a->u + (size_t)lo * a->V);
+    waste_k.kda_step_ex(hi - lo, a->K, a->V,
+                        a->q + (size_t)lo * a->K,
+                        a->k + (size_t)lo * a->K,
+                        a->v + (size_t)lo * a->V,
+                        a->g + (size_t)lo * a->K,
+                        a->beta + lo, a->l2_eps,
+                        a->S + (size_t)lo * a->K * a->V,
+                        a->o + (size_t)lo * a->V,
+                        a->u + (size_t)lo * a->V);
 }
 
 static int kda_layer(waste_model *m, int L, const float *in, float *out,
@@ -3814,7 +4178,8 @@ static int kda_layer(waste_model *m, int L, const float *in, float *out,
          * whole-head ranges keep the result bit-identical to the serial
          * version. Worth doing: K3 spends 19% of a decode step in this call,
          * 69 layers x 96 heads, and it was running on one core. */
-        kda_par a = { D, D, q, k, v, g, beta, m->S[L], o, m->att };
+        kda_par a = { D, D, c->kda_l2_eps, q, k, v, g, beta,
+                      m->S[L], o, m->att };
         PROF_START(P_KDA_REC);
         waste_parallel_for(H, 1, kda_step_range, &a);
         PROF_END(P_KDA_REC);
@@ -4215,7 +4580,8 @@ static int ffn(waste_model *m, const waste_tensor *W1, const waste_tensor *W3,
         for (int i = 0; i < inter; i++)
             a[i] = waste_situ_pair(a[i], b[i], m->cfg.situ_beta, m->cfg.situ_linear_beta);
     else
-        for (int i = 0; i < inter; i++) a[i] = silu(a[i]) * b[i];
+        for (int i = 0; i < inter; i++)
+            a[i] = swiglu_pair(&m->cfg, a[i], b[i]);
     float *dst = accum ? m->h : out;
     if (dense_matvec_t(m, dst, W2, a, hid, inter, cuda_scope)) return -1;
     if (accum) for (int i = 0; i < hid; i++) out[i] += w * dst[i];
@@ -4433,7 +4799,7 @@ static int moe_vq_grouped(waste_model *m, int L, const int *idx,
                         gate[i], up[i], c->situ_beta, c->situ_linear_beta);
             else
                 for (int i = 0; i < inter; i++)
-                    gate[i] = silu(gate[i]) * up[i];
+                    gate[i] = swiglu_pair(c, gate[i], up[i]);
 
             const uint16_t *scale = (const uint16_t *)(
                 rec[s] + hdr[s]->chan_corr_off);
@@ -4730,7 +5096,8 @@ static int moe_layer(waste_model *m, int L, const float *in, float *out, int *ro
             for (int i = 0; i < inter; i++)
                 ga[i] = waste_situ_pair(ga[i], ub[i], c->situ_beta, c->situ_linear_beta);
         else
-            for (int i = 0; i < inter; i++) ga[i] = silu(ga[i]) * ub[i];
+            for (int i = 0; i < inter; i++)
+                ga[i] = swiglu_pair(c, ga[i], ub[i]);
 #if defined(WASTE_ENABLE_CUDA)
         if (m->cuda_vq_mode) {
             if (m->cuda_vq_mode == 1)
@@ -6005,7 +6372,8 @@ static int moe_chunk(waste_model *m, int L, const float *in, float *out,
                 for (int i = 0; i < inter; i++)
                     ga[i] = waste_situ_pair(ga[i], ub[i], c->situ_beta, c->situ_linear_beta);
             else
-                for (int i = 0; i < inter; i++) ga[i] = silu(ga[i]) * ub[i];
+                for (int i = 0; i < inter; i++)
+                    ga[i] = swiglu_pair(c, ga[i], ub[i]);
             vq_matvec(m, acc, rec + h->down_off, s16 + 2 * inter, ga, lat, inter,
                       h->codebook_id + 2 * m->stages, lut_down,
                       q_down, qs_down);
@@ -6046,7 +6414,7 @@ chunk_experts_done:
                  c->prefix, L)), in, si, hid, nT);
     for (int i = 0; i < nT * si; i++)
         sa[i] = c->act_situ ? waste_situ_pair(sa[i], sb[i], c->situ_beta, c->situ_linear_beta)
-                            : silu(sa[i]) * sb[i];
+                            : swiglu_pair(c, sa[i], sb[i]);
     waste_matmul_t(m, sh, waste_find(m, tname(
                  "%smodel.layers.%d.block_sparse_moe.shared_experts.down_proj.weight",
                  c->prefix, L)), sa, hid, si, nT);
@@ -6179,6 +6547,19 @@ const float *waste_model_prefill(waste_model *m, const int *tokens, int n,
     {
         const int cm = waste_model_ctx_max(m);
         if (cm && (pos0 < 0 || pos0 > cm - n)) { m->ctx_full = 1; return NULL; }
+    }
+    /* mHC carries four residual streams inside every token.  The ordinary
+     * chunk path has one [T][hidden] stream and its batched MoE/FFN kernels
+     * cannot represent that state yet, so retain the exact token-major path.
+     * KDA/MLA caches still advance normally and the streams themselves never
+     * enter saved session state. */
+    if (c->mhc) {
+        const float *logits = NULL;
+        for (int t = 0; t < n; t++) {
+            logits = waste_model_step(m, tokens[t], pos0 + t, NULL);
+            if (!logits) break;
+        }
+        return logits;
     }
     /* Layer-major GQA assumes that every layer owns the same contiguous
      * causal prefix. Refuse a stale, gapped, or partially failed state before
@@ -6384,7 +6765,7 @@ const float *waste_model_prefill(waste_model *m, const int *tokens, int n,
             waste_matmul_t(m, b, waste_find(m, tname("%smodel.layers.%d.mlp.up_proj.weight", c->prefix, L)), m->cnorm, inter, hid, n);
             for (int i = 0; i < n * inter; i++)
                 a[i] = c->act_situ ? waste_situ_pair(a[i], b[i], c->situ_beta, c->situ_linear_beta)
-                                   : silu(a[i]) * b[i];
+                                   : swiglu_pair(c, a[i], b[i]);
             waste_matmul_t(m, m->cresid, waste_find(m, tname("%smodel.layers.%d.mlp.down_proj.weight", c->prefix, L)), a, hid, inter, n);
         }
         if (r) r->feed_forward_s = pnow() - r->feed_forward_s;
@@ -6449,6 +6830,125 @@ const float *waste_model_prefill(waste_model *m, const int *tokens, int n,
     return m->read_error ? NULL : m->logits;
 }
 
+static const float *model_step_mhc(waste_model *m, int pos, int *routed)
+{
+    const waste_config *c = &m->cfg;
+    const int hc = c->hc_mult, hid = c->hidden;
+    const size_t streamn = (size_t)hc * hid;
+    const int mixn = (2 + hc) * hc;
+    const size_t nf = 3 * streamn + (size_t)mixn + hc +
+                      (size_t)hc * hc + (size_t)2 * hid;
+    float *work = (float *)malloc(nf * sizeof(float));
+    if (!work) return NULL;
+    float *streams[2] = { work, work + streamn };
+    float *scratch = work + 2 * streamn;
+    float *post = scratch + streamn + mixn;
+    float *comb = post + hc;
+    float *collapsed = comb + (size_t)hc * hc;
+    float *sub = collapsed + hid;
+    for (int s = 0; s < hc; s++)
+        memcpy(streams[0] + (size_t)s * hid, m->x,
+               (size_t)hid * sizeof(float));
+
+    int cur = 0, failed = 0;
+    m->n_blockres = 0;
+    for (int L = 0; L < c->n_layers; L++) {
+        if (m->read_error ||
+            ((m->cuda_kda_mode || m->cuda_dense_scope || m->cuda_gqa_proj ||
+              m->cuda_vq_mode) && m->cuda_kda_failed)) {
+            failed = 1;
+            break;
+        }
+
+        mhc_model_map(m, L, "attn", streams[cur], post, comb,
+                      collapsed, scratch);
+        waste_rmsnorm(collapsed, collapsed,
+                      T(m, "%smodel.layers.%d.input_layernorm.weight",
+                        c->prefix, L), hid, c->eps);
+        if (c->kda_layer[L]) {
+            PROF_START(P_KDA);
+            failed = kda_layer(m, L, collapsed, sub, m->cuda_kda_mode);
+            PROF_END(P_KDA);
+        } else {
+            PROF_START(P_MLA);
+            failed = mla_layer(m, L, collapsed, sub, pos,
+                               m->cuda_dense_scope, m->cuda_kda_mode);
+            PROF_END(P_MLA);
+        }
+        if (failed) break;
+        waste_mhc_merge(hc, hid, streams[cur], sub, post, comb,
+                        streams[1 - cur]);
+        cur = 1 - cur;
+
+        mhc_model_map(m, L, "ffn", streams[cur], post, comb,
+                      collapsed, scratch);
+        waste_rmsnorm(collapsed, collapsed,
+                      T(m, "%smodel.layers.%d.post_attention_layernorm.weight",
+                        c->prefix, L), hid, c->eps);
+        if (waste_find(m, tname(
+                "%smodel.layers.%d.block_sparse_moe.gate.weight",
+                c->prefix, L))) {
+            PROF_START(P_ROUTE);
+            failed = moe_layer(
+                m, L, collapsed, sub,
+                routed ? routed + (size_t)L * c->top_k : NULL);
+            PROF_END(P_ROUTE);
+        } else {
+            failed = ffn(
+                m, waste_find(m, tname(
+                    "%smodel.layers.%d.mlp.gate_proj.weight", c->prefix, L)),
+                waste_find(m, tname(
+                    "%smodel.layers.%d.mlp.up_proj.weight", c->prefix, L)),
+                waste_find(m, tname(
+                    "%smodel.layers.%d.mlp.down_proj.weight", c->prefix, L)),
+                collapsed, sub, c->dense_inter, hid, 1.0f, 0, 3);
+        }
+        if (failed) break;
+        waste_mhc_merge(hc, hid, streams[cur], sub, post, comb,
+                        streams[1 - cur]);
+        cur = 1 - cur;
+
+        const char *dump_hidden = getenv("WASTE_DUMP_HIDDEN");
+        if (dump_hidden) {
+            for (int d = 0; d < hid; d++) {
+                float s = 0.0f;
+                for (int h = 0; h < hc; h++)
+                    s += streams[cur][(size_t)h * hid + d];
+                collapsed[d] = s / (float)hc;
+            }
+            FILE *df = fopen(dump_hidden, L ? "ab" : "wb");
+            if (df) {
+                fwrite(collapsed, sizeof(float), (size_t)hid, df);
+                fclose(df);
+            }
+        }
+    }
+
+    if (!failed && !m->read_error && !m->cuda_kda_state_dirty &&
+        !((m->cuda_kda_mode || m->cuda_dense_scope || m->cuda_gqa_proj ||
+           m->cuda_vq_mode) && m->cuda_kda_failed)) {
+        /* Glm5NextTextHyperHead is an unweighted mean, followed by the final
+         * learned RMSNorm. */
+        for (int d = 0; d < hid; d++) {
+            float s = 0.0f;
+            for (int h = 0; h < hc; h++)
+                s += streams[cur][(size_t)h * hid + d];
+            m->x[d] = s / (float)hc;
+        }
+        waste_rmsnorm(collapsed, m->x,
+                      T(m, "%smodel.norm.weight", c->prefix), hid, c->eps);
+        PROF_START(P_HEAD);
+        matvec_t(m, m->logits,
+                 waste_find(m, tname("%slm_head.weight", c->prefix)),
+                 collapsed, c->vocab, hid);
+        PROF_END(P_HEAD);
+    } else {
+        failed = 1;
+    }
+    free(work);
+    return failed ? NULL : m->logits;
+}
+
 const float *waste_model_step(waste_model *m, int token, int pos, int *routed)
 {
     dump_pos0 = pos;
@@ -6476,6 +6976,8 @@ const float *waste_model_step(waste_model *m, int token, int pos, int *routed)
     } else {
         waste_embed_row(m, token, m->x);
     }
+
+    if (c->mhc) return model_step_mhc(m, pos, routed);
 
     float *resid = (float *)malloc((size_t)hid * sizeof(float));
     float *norm = (float *)malloc((size_t)hid * sizeof(float));

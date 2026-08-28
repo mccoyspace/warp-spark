@@ -18,7 +18,7 @@
 #include <math.h>
 #include <string.h>
 
-static float l2_rnorm_neon(const float *x, int n)
+static float l2_rnorm_neon(const float *x, int n, float eps)
 {
     float32x4_t acc = vdupq_n_f32(0.0f);
     int i = 0;
@@ -28,13 +28,14 @@ static float l2_rnorm_neon(const float *x, int n)
     }
     float s = vaddvq_f32(acc);
     for (; i < n; i++) s += x[i] * x[i];
-    return 1.0f / sqrtf(s + 1e-12f);
+    return 1.0f / sqrtf(s + eps);
 }
 
-static void kda_step_neon(int H, int K, int V,
-                          const float *q, const float *k, const float *v,
-                          const float *g_log, const float *beta,
-                          float *S, float *o, float *u)
+static void kda_step_neon_ex(int H, int K, int V,
+                             const float *q, const float *k, const float *v,
+                             const float *g_log, const float *beta,
+                             float l2_eps,
+                             float *S, float *o, float *u)
 {
     const float qscale = 1.0f / sqrtf((float)K);
 
@@ -47,8 +48,8 @@ static void kda_step_neon(int H, int K, int V,
         float *oh = o + (size_t)h * V;
         const float b = beta[h];
 
-        const float qn = l2_rnorm_neon(qh, K) * qscale;
-        const float kn = l2_rnorm_neon(kh, K);
+        const float qn = l2_rnorm_neon(qh, K, l2_eps) * qscale;
+        const float kn = l2_rnorm_neon(kh, K, l2_eps);
 
         memset(u, 0, (size_t)V * sizeof(float));
 
@@ -96,9 +97,19 @@ static void kda_step_neon(int H, int K, int V,
     }
 }
 
+static void kda_step_neon(int H, int K, int V,
+                          const float *q, const float *k, const float *v,
+                          const float *g_log, const float *beta,
+                          float *S, float *o, float *u)
+{
+    kda_step_neon_ex(H, K, V, q, k, v, g_log, beta, 1e-12f,
+                     S, o, u);
+}
+
 const char *waste_kda_register_neon(waste_kernels *t)
 {
     t->kda_step = kda_step_neon;
+    t->kda_step_ex = kda_step_neon_ex;
     /* short_conv_step and rmsnorm_gated stay on the CPU baseline until
      * they show up in a profile — partial override is the whole point. */
     /* The name reports what this build *uses*, not what the CPU offers.

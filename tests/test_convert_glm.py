@@ -76,6 +76,159 @@ FULL_CFG = {
 }
 
 
+def glm53_config():
+    kda = [i for i in range(45) if i % 4 != 3]
+    full = [i for i in range(45) if i % 4 == 3]
+    return {
+        "architectures": ["Glm5NextForConditionalGeneration"],
+        "model_type": "glm5_next",
+        "image_start_token_id": 154830,
+        "image_end_token_id": 154831,
+        "video_start_token_id": 154832,
+        "video_end_token_id": 154833,
+        "image_token_id": 154854,
+        "video_token_id": 154855,
+        "quantization_config": {
+            "quant_method": "fp8", "fmt": "e4m3",
+            "activation_scheme": "dynamic", "weight_block_size": [128, 128],
+        },
+        "vision_config": {
+            "model_type": "glm5_next_vision", "depth": 24,
+            "hidden_size": 1024, "intermediate_size": 4096,
+            "out_hidden_size": 4096, "num_heads": 16,
+            "image_size": 448, "patch_size": 14,
+            "temporal_patch_size": 2, "spatial_merge_size": 2,
+            "in_channels": 3, "rms_norm_eps": 1e-5,
+            "hidden_act": "silu", "swiglu_limit": 10.0,
+            "attention_bias": True,
+        },
+        "text_config": {
+            "model_type": "glm5_next_text",
+            "eos_token_id": [154820, 154827, 154829],
+            "num_hidden_layers": 45, "hidden_size": 4096,
+            "vocab_size": 154880, "n_routed_experts": 288,
+            "num_experts_per_tok": 8, "n_shared_experts": 1,
+            "first_k_dense_replace": 3, "intermediate_size": 12288,
+            "moe_intermediate_size": 2048, "num_attention_heads": 64,
+            "num_key_value_heads": 64, "q_lora_rank": 1536,
+            "kv_lora_rank": 512, "qk_head_dim": 256,
+            "qk_nope_head_dim": 256, "qk_rope_head_dim": 0,
+            "v_head_dim": 256, "index_topk": 2048,
+            "index_head_dim": 128, "index_n_heads": 32,
+            "index_kpool": 4, "index_kpool_compress": True,
+            "index_kpool_always_select_tail": True,
+            "indexer_rope_interleave": True,
+            "max_position_embeddings": 1048576, "rms_norm_eps": 1e-5,
+            "hidden_act": "silu", "swiglu_limit": 10.0,
+            "routed_scaling_factor": 2.5, "topk_method": "noaux_tc",
+            "scoring_func": "sigmoid", "norm_topk_prob": True,
+            "n_group": 1, "topk_group": 1, "attention_bias": False,
+            "tie_word_embeddings": False, "mhc": True, "hc_mult": 4,
+            "hc_eps": 1e-6, "hc_sinkhorn_iters": 20,
+            "mla_use_nope": True, "moe_router_dtype": "float32",
+            "num_nextn_predict_layers": 1,
+            "layer_types": [
+                "linear_attention" if i in kda
+                else "deepseek_sparse_attention" for i in range(45)
+            ],
+            "mlp_layer_types": ["dense"] * 3 + ["sparse"] * 42,
+            "indexer_types": ["full"] * 45,
+            "linear_attn_config": {
+                "kda_layers": kda, "full_attn_layers": full,
+                "num_heads": 64, "head_dim": 128,
+                "short_conv_kernel_size": 4, "gate_lower_bound": -5.0,
+            },
+        },
+    }
+
+
+def flattened_glm53_config():
+    raw = glm53_config()
+    return {**raw["text_config"],
+            "_outer": {k: v for k, v in raw.items() if k != "text_config"}}
+
+
+def glm53_source_meta():
+    """The complete positive text-header contract, without model bytes."""
+    meta = {}
+
+    def add(name, shape, dtype="BF16"):
+        meta[name] = {"shape": list(shape), "dtype": dtype}
+
+    def fp8(name, shape):
+        add(name, shape, "F8_E4M3")
+        add(name + "_scale_inv", [(int(d) + 127) // 128 for d in shape],
+            "F32")
+
+    p, H, heads, kd, qa, kv, qd, vh = (
+        "model.language_model.", 4096, 64, 128, 1536, 512, 256, 256)
+    add(p + "embed_tokens.weight", (154880, H))
+    add(p + "norm.weight", (H,))
+    add("lm_head.weight", (154880, H))
+    kda_layers = {i for i in range(45) if i % 4 != 3}
+    for layer in range(45):
+        base = f"{p}layers.{layer}."
+        for branch in ("attn", "ffn"):
+            add(base + f"hc_{branch}_base", (24,), "F32")
+            add(base + f"hc_{branch}_fn", (24, 4 * H))
+            add(base + f"hc_{branch}_scale", (3,), "F32")
+        add(base + "input_layernorm.weight", (H,))
+        add(base + "post_attention_layernorm.weight", (H,))
+        attn = base + "self_attn."
+        if layer in kda_layers:
+            add(attn + "A_log", (heads,), "F32")
+            add(attn + "dt_bias", (heads * kd,), "F32")
+            add(attn + "b_proj.weight", (heads, H))
+            for projection in ("q", "k", "v"):
+                add(attn + f"{projection}_proj.weight", (heads * kd, H))
+                add(attn + f"{projection}_conv1d.weight", (heads * kd, 1, 4))
+            for projection in ("f", "g"):
+                add(attn + f"{projection}_a_proj.weight", (kd, H))
+                add(attn + f"{projection}_b_proj.weight", (heads * kd, kd))
+            add(attn + "o_norm.weight", (kd,))
+            add(attn + "o_proj.weight", (H, heads * kd))
+        else:
+            fp8(attn + "q_a_proj.weight", (qa, H))
+            add(attn + "q_a_layernorm.weight", (qa,))
+            fp8(attn + "q_b_proj.weight", (heads * qd, qa))
+            fp8(attn + "kv_a_proj_with_mqa.weight", (kv, H))
+            add(attn + "kv_a_layernorm.weight", (kv,))
+            add(attn + "kv_b_proj.weight", (heads * (qd + vh), kv))
+            fp8(attn + "o_proj.weight", (H, heads * vh))
+            ix = attn + "indexer."
+            add(ix + "wq_b.weight", (32 * 128, qa))
+            add(ix + "wk.weight", (128, H))
+            add(ix + "k_norm.weight", (128,))
+            add(ix + "k_norm.bias", (128,))
+            add(ix + "weights_proj.weight", (32, H))
+            add(ix + "index_kpool_compress_ape", (4, 128))
+            add(ix + "index_kpool_compress_gate", (128, H))
+        mlp = base + "mlp."
+        if layer < 3:
+            fp8(mlp + "gate_proj.weight", (12288, H))
+            fp8(mlp + "up_proj.weight", (12288, H))
+            fp8(mlp + "down_proj.weight", (H, 12288))
+        else:
+            add(mlp + "gate.weight", (288, H))
+            add(mlp + "gate.e_score_correction_bias", (288,), "F32")
+            fp8(mlp + "shared_experts.gate_proj.weight", (2048, H))
+            fp8(mlp + "shared_experts.up_proj.weight", (2048, H))
+            fp8(mlp + "shared_experts.down_proj.weight", (H, 2048))
+            for expert in range(288):
+                ep = mlp + f"experts.{expert}."
+                fp8(ep + "gate_proj.weight", (2048, H))
+                fp8(ep + "up_proj.weight", (2048, H))
+                fp8(ep + "down_proj.weight", (H, 2048))
+    mtp = p + "layers.45."
+    add(mtp + "shared_head.norm.weight", (H,))
+    add(mtp + "hnorm.weight", (H,))
+    add(mtp + "enorm.weight", (H,))
+    add(mtp + "eh_proj.weight", (H, 2 * H))
+    add("model.visual.patch_embed.proj.weight", (1024, 3, 2, 14, 14))
+    add("model.visual.post_layernorm.weight", (1024,))
+    return meta
+
+
 def full_source_meta():
     """A header-only official-layout fixture: exact names/shapes, no weights."""
     meta = {}
@@ -139,6 +292,151 @@ class HeaderFixture:
 
 
 class GlmConversionBoundaryTest(unittest.TestCase):
+    def test_glm53_text_contract_is_bounded_explicit_and_prefix_safe(self):
+        source_cfg = flattened_glm53_config()
+        cfg = CONVERT.normalise_cfg(source_cfg)
+        self.assertEqual(cfg["source_max_position_embeddings"], 1048576)
+        self.assertEqual(cfg["max_position_embeddings"], 2048)
+        self.assertEqual(cfg["dsa_dense_context_limit"], 2048)
+        self.assertEqual(cfg["kda_qk_l2_norm_eps"], 1e-6)
+        self.assertEqual(cfg["swiglu_limit"], 10.0)
+        self.assertEqual(cfg["hc_mult"], 4)
+        self.assertEqual(cfg["hc_sinkhorn_iters"], 20)
+        self.assertEqual(
+            cfg["linear_attn_config"]["kda_layer_index_base"], 0)
+        self.assertEqual(cfg["linear_attn_config"]["kda_layers"][:4],
+                         [0, 1, 2, 4])
+
+        self.assertEqual(CONVERT.source_model_prefix(source_cfg,
+                                                     "language_model."),
+                         "model.language_model.")
+        self.assertEqual(CONVERT.runtime_tensor_name(
+            "model.language_model.layers.4.hc_attn_fn", source_cfg,
+            "language_model."),
+            "language_model.model.layers.4.hc_attn_fn")
+        self.assertEqual(CONVERT.runtime_tensor_name(
+            "lm_head.weight", source_cfg, "language_model."),
+            "language_model.lm_head.weight")
+        self.assertTrue(CONVERT.is_f32_trunk_tensor(
+            "language_model.model.layers.4.hc_attn_fn", source_cfg))
+        self.assertFalse(CONVERT.is_f32_trunk_tensor(
+            "language_model.model.layers.4.self_attn.q_proj.weight",
+            source_cfg))
+        self.assertFalse(CONVERT.emits_kimi_vision_json(source_cfg))
+        self.assertTrue(CONVERT.emits_kimi_vision_json({
+            "_outer": {"vision_config": {"hidden_size": 1024}},
+            "model_type": "kimi_linear",
+        }))
+
+        self.assertTrue(CONVERT.is_omitted_source_tensor(
+            "model.language_model.layers.3.self_attn.indexer.wk.weight",
+            source_cfg, 45))
+        self.assertTrue(CONVERT.is_omitted_source_tensor(
+            "model.language_model.layers.45.shared_head.norm.weight",
+            source_cfg, 45))
+        self.assertTrue(CONVERT.is_omitted_source_tensor(
+            "model.visual.patch_embed.proj.weight", source_cfg, 45))
+        self.assertEqual(CONVERT.source_layer_index(
+            "model.language_model.layers.45.shared_head.norm.weight"), 45)
+        features = CONVERT.unsupported_source_features(source_cfg)
+        self.assertEqual([f["name"] for f in features], [
+            "deepseek_sparse_attention_indexer",
+            "multi_token_prediction",
+            "vision_tower",
+        ])
+        self.assertIn("text-only", features[-1]["reason"])
+
+    def test_glm53_header_contract_passes_and_rejects_drift(self):
+        cfg = flattened_glm53_config()
+        meta = glm53_source_meta()
+        source = HeaderFixture(meta)
+        CONVERT.validate_glm53_source(cfg, source, "language_model.")
+        layout, segment, kinds = CONVERT.moe_layout_at(
+            source, "model.language_model.", 3)
+        self.assertEqual((layout, segment), ("deepseek", "mlp"))
+        self.assertEqual([tag for _kind, tag in kinds],
+                         ["gate_proj", "up_proj", "down_proj"])
+
+        name = "model.language_model.layers.44.hc_ffn_fn"
+        meta[name] = {"shape": [24, 16383], "dtype": "BF16"}
+        with self.assertRaisesRegex(ValueError, "layers.44.hc_ffn_fn shape"):
+            CONVERT.validate_glm53_source(cfg, source, "language_model.")
+
+    def test_glm53_trunk_reads_source_prefix_maps_runtime_and_drops_omissions(self):
+        cfg = flattened_glm53_config()
+        kept = ["model.language_model.layers.0.hc_attn_fn",
+                "model.language_model.layers.0.hc_attn_scale"]
+        omitted = [
+            "model.language_model.layers.3.self_attn.indexer.wk.weight",
+            "model.language_model.layers.45.shared_head.norm.weight",
+            "model.visual.patch_embed.proj.weight",
+        ]
+
+        class FakeTensor:
+            def __init__(self, shape):
+                self.shape = shape
+
+            def dim(self):
+                return len(self.shape)
+
+            def numel(self):
+                total = 1
+                for dim in self.shape:
+                    total *= dim
+                return total
+
+            def float(self):
+                return self
+
+        class FakeSource:
+            def names(self):
+                return kept + omitted
+
+        class FakeWeights:
+            def __init__(self):
+                self.read = []
+
+            def have(self, _name):
+                return True
+
+            def tensor(self, name):
+                self.read.append(name)
+                return FakeTensor((3,) if name.endswith("_scale")
+                                  else (24, 16384))
+
+        args = types.SimpleNamespace(skip_trunk=False, trunk8=False,
+                                     trunk_bits=4)
+        weights = FakeWeights()
+        old_raw = CONVERT.raw_bytes
+        CONVERT.raw_bytes = lambda _tensor: b"hc-f32"
+        try:
+            with tempfile.TemporaryDirectory(prefix="glm53-trunk-") as tmp:
+                args.out = tmp
+                index = CONVERT.build_trunk(
+                    args, FakeSource(), weights, None,
+                    os.path.join(tmp, "manifest.json"), 45, cfg)
+        finally:
+            CONVERT.raw_bytes = old_raw
+        self.assertEqual(weights.read, kept)
+        self.assertEqual([entry["name"] for entry in index], [
+            "language_model.model.layers.0.hc_attn_fn",
+            "language_model.model.layers.0.hc_attn_scale",
+        ])
+        self.assertEqual([entry["fmt"] for entry in index],
+                         [CONVERT.FMT_F32, CONVERT.FMT_F32])
+
+    def test_glm53_contradictory_implicit_math_fails_closed(self):
+        cfg = flattened_glm53_config()
+        cfg["kda_qk_l2_norm_eps"] = 1e-5
+        with self.assertRaisesRegex(ValueError, "L2 epsilon"):
+            CONVERT.normalise_cfg(cfg)
+
+        cfg = flattened_glm53_config()
+        cfg["linear_attn_config"] = dict(cfg["linear_attn_config"],
+                                          kda_layer_index_base=1)
+        with self.assertRaisesRegex(ValueError, "zero-based"):
+            CONVERT.normalise_cfg(cfg)
+
     def test_glm52_dense_equivalent_contract_is_explicit_and_bounded(self):
         source_cfg = {
             "architectures": ["GlmMoeDsaForCausalLM"],

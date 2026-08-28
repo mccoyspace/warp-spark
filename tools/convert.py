@@ -339,6 +339,9 @@ CONFIG_FLAG_ALIASES = (("moe_renormalize", "norm_topk_prob"),)
 GLM47_FULL_ARCH = "Glm4MoeForCausalLM"
 GLM52_ARCH = "GlmMoeDsaForCausalLM"
 GLM52_DENSE_CONTEXT = 2048
+GLM53_ARCH = "Glm5NextForConditionalGeneration"
+GLM53_TEXT_TYPE = "glm5_next_text"
+GLM53_DENSE_CONTEXT = 2048
 
 
 def hf_architecture(cfg):
@@ -358,6 +361,50 @@ def is_glm52(cfg):
     """True only for the official GLM-5.x DSA causal-LM architecture."""
     return (hf_architecture(cfg) == GLM52_ARCH and
             cfg.get("model_type") == "glm_moe_dsa")
+
+
+def is_glm53(cfg):
+    """True only for GLM-5.3-Flash's nested text architecture."""
+    return (hf_architecture(cfg) == GLM53_ARCH and
+            cfg.get("model_type") == GLM53_TEXT_TYPE)
+
+
+def source_model_prefix(cfg, tensor_prefix=""):
+    """Source checkpoint prefix through the decoder's ``layers`` parent.
+
+    K3 stores ``language_model.model.layers`` and the older GLM releases
+    store ``model.layers``.  GLM-5.3 reverses the two wrapper components in
+    its published checkpoint: ``model.language_model.layers``.  Keep that
+    source spelling separate from the runtime prefix written to the manifest.
+    """
+    if is_glm53(cfg):
+        return "model.language_model."
+    return tensor_prefix + "model."
+
+
+def runtime_tensor_name(name, cfg, tensor_prefix=""):
+    """Map a published tensor name to the stable names the C runtime reads."""
+    if not is_glm53(cfg):
+        return name
+    source = "model.language_model."
+    if name.startswith(source):
+        return tensor_prefix + "model." + name[len(source):]
+    if name.startswith("lm_head."):
+        return tensor_prefix + name
+    return name
+
+
+def is_f32_trunk_tensor(name, cfg):
+    """Weights whose fp32 storage is part of the GLM-5.3 mHC contract."""
+    if not is_glm53(cfg) or ".hc_" not in name:
+        return False
+    return name.endswith(("hc_attn_base", "hc_attn_fn", "hc_attn_scale",
+                          "hc_ffn_base", "hc_ffn_fn", "hc_ffn_scale"))
+
+
+def emits_kimi_vision_json(cfg):
+    """Whether the nested tower implements the Kimi vision.json contract."""
+    return bool(cfg.get("_outer", {}).get("vision_config")) and not is_glm53(cfg)
 
 
 def chat_profile(cfg):
@@ -399,6 +446,29 @@ def normalise_cfg(cfg):
         # the release config omits the key. WARP's MLA rotation uses that
         # layout; a future explicit false is preserved for a fail-closed load.
         out.setdefault("rope_interleave", True)
+    elif is_glm53(out):
+        # GLM-5.3 has no rotary component in its MLA path.  At S <= 2048,
+        # its DSA top-k includes every causal key, so dense no-PE MLA is an
+        # exact bounded implementation just as dense MLA is for GLM-5.2.
+        if not out.get("mla_use_nope") or out.get("qk_rope_head_dim") != 0:
+            raise ValueError("GLM-5.3 v0 requires no-PE MLA (qk_rope_head_dim=0)")
+        out.setdefault("mla_rms_norm_eps", out.get("rms_norm_eps", 1e-5))
+        out.setdefault("topk_method", "noaux_tc")
+        out.setdefault("moe_router_activation_func", "sigmoid")
+        out.setdefault("kda_qk_l2_norm_eps", 1e-6)
+        if out["kda_qk_l2_norm_eps"] != 1e-6:
+            raise ValueError("GLM-5.3 KDA q/k L2 epsilon must be 1e-6")
+
+        linear = dict(out.get("linear_attn_config") or {})
+        if linear.get("kda_layer_index_base", 0) != 0:
+            raise ValueError("GLM-5.3 KDA layer indices must be zero-based")
+        linear["kda_layer_index_base"] = 0
+        out["linear_attn_config"] = linear
+
+        out["source_max_position_embeddings"] = out.get(
+            "max_position_embeddings")
+        out["dsa_dense_context_limit"] = GLM53_DENSE_CONTEXT
+        out["max_position_embeddings"] = GLM53_DENSE_CONTEXT
     elif is_glm52(out):
         # The reference implementation constructs both low-rank RMSNorms
         # without passing the model-wide epsilon, so their class default is
@@ -447,17 +517,18 @@ def unsupported_source_features(cfg):
     accidentally treating it as a 93rd base layer. Keep that decision in the
     manifest: an ignored layer number alone does not explain why it vanished.
     """
-    if not (is_glm47_full(cfg) or is_glm52(cfg)):
+    if not (is_glm47_full(cfg) or is_glm52(cfg) or is_glm53(cfg)):
         return []
     count = cfg.get("num_nextn_predict_layers", 0) or 0
     if not isinstance(count, int) or count < 0:
         raise ValueError("num_nextn_predict_layers must be a non-negative integer")
     features = []
-    if is_glm52(cfg):
+    if is_glm52(cfg) or is_glm53(cfg):
         features.append({
             "name": "deepseek_sparse_attention_indexer",
             "action": "dense_equivalent",
-            "context_limit": GLM52_DENSE_CONTEXT,
+            "context_limit": (GLM53_DENSE_CONTEXT if is_glm53(cfg)
+                              else GLM52_DENSE_CONTEXT),
             "reason": "index_topk covers the complete causal history",
         })
     if count:
@@ -466,6 +537,12 @@ def unsupported_source_features(cfg):
                          "source_layers": list(range(base, base + count)),
                          "action": "omitted",
                          "reason": "unsupported"})
+    if is_glm53(cfg):
+        features.append({
+            "name": "vision_tower",
+            "action": "omitted",
+            "reason": "initial GLM-5.3 contract is text-only",
+        })
     return features
 
 
@@ -475,7 +552,9 @@ def source_layer_index(name):
     The optional language-model prefix on K3 means startswith is insufficient;
     anchoring on ``model.layers`` also avoids a vision tower's layer numbers.
     """
-    match = re.search(r"(?:^|\.)model\.layers\.(\d+)\.", name)
+    match = re.search(
+        r"(?:^|\.)(?:model\.language_model|language_model\.model|model)"
+        r"\.layers\.(\d+)\.", name)
     return int(match.group(1)) if match else None
 
 
@@ -489,16 +568,23 @@ def is_omitted_source_tensor(name, cfg, n_layers):
     """True when a source tensor is intentionally absent from the container."""
     if is_source_only_layer(name, n_layers):
         return True
-    return is_glm52(cfg) and ".self_attn.indexer." in name
+    if (is_glm52(cfg) or is_glm53(cfg)) and ".self_attn.indexer." in name:
+        return True
+    return is_glm53(cfg) and name.startswith("model.visual.")
+
+
+def moe_layout_at(st, model_prefix, layer):
+    """MoE layout under an already-resolved source decoder prefix."""
+    for name, seg, tags in MOE_LAYOUTS:
+        probe = f"{model_prefix}layers.{layer}.{seg}.experts.0.{tags[0]}.weight"
+        if st.have(probe) or st.have(probe + "_packed"):
+            return name, seg, tuple(zip(KIND_ORDER, tags))
+    return None, None, None
 
 
 def moe_layout(st, prefix, layer):
     """Which of MOE_LAYOUTS this checkpoint uses, from what is actually on disk."""
-    for name, seg, tags in MOE_LAYOUTS:
-        probe = f"{prefix}model.layers.{layer}.{seg}.experts.0.{tags[0]}.weight"
-        if st.have(probe) or st.have(probe + "_packed"):
-            return name, seg, tuple(zip(KIND_ORDER, tags))
-    return None, None, None
+    return moe_layout_at(st, prefix + "model.", layer)
 
 
 # Trunk tensors the engine expects under `block_sparse_moe` but a DeepSeek checkpoint
@@ -951,6 +1037,266 @@ def validate_glm52_source(cfg, source, prefix=""):
         raise ValueError("GLM-5.2 source contract failed: " + shown + more)
 
 
+def validate_glm53_source(cfg, source, prefix=""):
+    """Fail closed on the pinned GLM-5.3-Flash text checkpoint geometry.
+
+    This first container is deliberately text-only and dense-equivalent only
+    through 2048 tokens.  The validator nevertheless binds conversion to the
+    published hybrid KDA/DSA schedule, mHC weights, FP8 block layout, one MTP
+    layer and the presence of the omitted vision tower.  That makes omission
+    an explicit implementation choice rather than a partially downloaded
+    checkpoint masquerading as a supported model.
+    """
+    arch = hf_architecture(cfg)
+    model_type = cfg.get("model_type")
+    claims = arch == GLM53_ARCH or model_type == GLM53_TEXT_TYPE
+    if not claims:
+        return
+
+    errors = []
+    outer = cfg.get("_outer") or {}
+    if arch != GLM53_ARCH:
+        errors.append(f"architectures[0]={arch!r}, expected {GLM53_ARCH!r}")
+    if model_type != GLM53_TEXT_TYPE:
+        errors.append(f"model_type must be {GLM53_TEXT_TYPE!r}")
+    if outer.get("model_type") != "glm5_next":
+        errors.append("outer model_type must be 'glm5_next'")
+    try:
+        normalise_cfg(cfg)
+    except ValueError as exc:
+        errors.append(str(exc))
+
+    expected = {
+        "num_hidden_layers": 45,
+        "hidden_size": 4096,
+        "vocab_size": 154880,
+        "n_routed_experts": 288,
+        "num_experts_per_tok": 8,
+        "n_shared_experts": 1,
+        "first_k_dense_replace": 3,
+        "intermediate_size": 12288,
+        "moe_intermediate_size": 2048,
+        "num_attention_heads": 64,
+        "num_key_value_heads": 64,
+        "q_lora_rank": 1536,
+        "kv_lora_rank": 512,
+        "qk_head_dim": 256,
+        "qk_nope_head_dim": 256,
+        "qk_rope_head_dim": 0,
+        "v_head_dim": 256,
+        "index_topk": GLM53_DENSE_CONTEXT,
+        "index_head_dim": 128,
+        "index_n_heads": 32,
+        "index_kpool": 4,
+        "index_kpool_compress": True,
+        "index_kpool_always_select_tail": True,
+        "indexer_rope_interleave": True,
+        "max_position_embeddings": 1048576,
+        "rms_norm_eps": 1e-5,
+        "hidden_act": "silu",
+        "swiglu_limit": 10.0,
+        "routed_scaling_factor": 2.5,
+        "topk_method": "noaux_tc",
+        "scoring_func": "sigmoid",
+        "norm_topk_prob": True,
+        "n_group": 1,
+        "topk_group": 1,
+        "attention_bias": False,
+        "tie_word_embeddings": False,
+        "mhc": True,
+        "hc_mult": 4,
+        "hc_eps": 1e-6,
+        "hc_sinkhorn_iters": 20,
+        "mla_use_nope": True,
+        "moe_router_dtype": "float32",
+    }
+    for key, want in expected.items():
+        got = (cfg.get("source_max_position_embeddings")
+               if key == "max_position_embeddings" and
+               "source_max_position_embeddings" in cfg else cfg.get(key))
+        if isinstance(want, float):
+            matches = (isinstance(got, (int, float)) and
+                       abs(float(got) - want) <=
+                       max(1e-12, abs(want) * 1e-9))
+        elif isinstance(want, bool):
+            matches = got is want
+        else:
+            matches = got == want
+        if not matches:
+            errors.append(f"{key}={got!r}, expected {want!r}")
+
+    kda_layers = [i for i in range(45) if i % 4 != 3]
+    full_layers = [i for i in range(45) if i % 4 == 3]
+    expected_types = [
+        "linear_attention" if i in kda_layers
+        else "deepseek_sparse_attention" for i in range(45)
+    ]
+    if cfg.get("layer_types") != expected_types:
+        errors.append("layer_types must be the qualified 3-KDA/1-DSA schedule")
+    if cfg.get("mlp_layer_types") != ["dense"] * 3 + ["sparse"] * 42:
+        errors.append("mlp_layer_types must be 3 dense then 42 sparse")
+    if cfg.get("indexer_types") != ["full"] * 45:
+        errors.append("indexer_types must name a full indexer for every layer")
+    linear = cfg.get("linear_attn_config") or {}
+    expected_linear = {
+        "kda_layers": kda_layers,
+        "full_attn_layers": full_layers,
+        "num_heads": 64,
+        "head_dim": 128,
+        "short_conv_kernel_size": 4,
+        "gate_lower_bound": -5.0,
+    }
+    for key, want in expected_linear.items():
+        if linear.get(key) != want:
+            errors.append(f"linear_attn_config.{key} does not match the release")
+    if linear.get("kda_layer_index_base", 0) != 0:
+        errors.append("linear_attn_config.kda_layer_index_base must be 0")
+
+    quant = outer.get("quantization_config") or cfg.get("quantization_config") or {}
+    if (quant.get("quant_method") != "fp8" or quant.get("fmt") != "e4m3" or
+            quant.get("activation_scheme") != "dynamic" or
+            quant.get("weight_block_size") != [128, 128]):
+        errors.append("quantization_config must be dynamic e4m3 FP8 with 128x128 blocks")
+
+    vision = outer.get("vision_config") or {}
+    vision_expected = {
+        "model_type": "glm5_next_vision", "depth": 24,
+        "hidden_size": 1024, "intermediate_size": 4096,
+        "out_hidden_size": 4096, "num_heads": 16,
+        "image_size": 448, "patch_size": 14,
+        "temporal_patch_size": 2, "spatial_merge_size": 2,
+        "in_channels": 3, "rms_norm_eps": 1e-5,
+        "hidden_act": "silu", "swiglu_limit": 10.0,
+        "attention_bias": True,
+    }
+    for key, want in vision_expected.items():
+        if vision.get(key) != want:
+            errors.append(f"vision_config.{key}={vision.get(key)!r}, expected {want!r}")
+    token_expected = {
+        "image_start_token_id": 154830, "image_end_token_id": 154831,
+        "video_start_token_id": 154832, "video_end_token_id": 154833,
+        "image_token_id": 154854, "video_token_id": 154855,
+    }
+    for key, want in token_expected.items():
+        if outer.get(key) != want:
+            errors.append(f"outer {key}={outer.get(key)!r}, expected {want}")
+
+    n_mtp = cfg.get("num_nextn_predict_layers", 0) or 0
+    if n_mtp != 1:
+        errors.append("num_nextn_predict_layers must be 1")
+    names = set(source.names())
+    source_only = sorted({
+        layer for name in names
+        if (layer := source_layer_index(name)) is not None and layer >= 45
+    })
+    if source_only != [45]:
+        errors.append(f"appended source layers are {source_only}, expected [45]")
+
+    def metadata(name):
+        if name not in names:
+            errors.append(f"missing {name}")
+            return None
+        try:
+            return source.tensor_meta(name)
+        except (KeyError, OSError, ValueError) as exc:
+            errors.append(f"cannot read header for {name}: {exc}")
+            return None
+
+    def require(name, shape, dtype="BF16"):
+        meta = metadata(name)
+        if meta is None or meta.get("reclaimed"):
+            return
+        if tuple(meta.get("shape", ())) != tuple(shape):
+            errors.append(
+                f"{name} shape {tuple(meta.get('shape', ()))}, expected {tuple(shape)}")
+        if meta.get("dtype") != dtype:
+            errors.append(f"{name} dtype {meta.get('dtype')!r}, expected {dtype}")
+
+    def require_fp8(name, shape):
+        require(name, shape, "F8_E4M3")
+        require(name + "_scale_inv",
+                tuple((int(d) + 127) // 128 for d in shape), "F32")
+
+    p = "model.language_model."
+    H, heads, kd, qa, kv, qd, vh = 4096, 64, 128, 1536, 512, 256, 256
+    require(p + "embed_tokens.weight", (154880, H))
+    require(p + "norm.weight", (H,))
+    require("lm_head.weight", (154880, H))
+
+    for layer in range(45):
+        base = f"{p}layers.{layer}."
+        for branch in ("attn", "ffn"):
+            require(base + f"hc_{branch}_base", (24,), "F32")
+            require(base + f"hc_{branch}_fn", (24, 4 * H))
+            require(base + f"hc_{branch}_scale", (3,), "F32")
+        require(base + "input_layernorm.weight", (H,))
+        require(base + "post_attention_layernorm.weight", (H,))
+
+        attn = base + "self_attn."
+        if layer in kda_layers:
+            require(attn + "A_log", (heads,), "F32")
+            require(attn + "dt_bias", (heads * kd,), "F32")
+            require(attn + "b_proj.weight", (heads, H))
+            for projection in ("q", "k", "v"):
+                require(attn + f"{projection}_proj.weight", (heads * kd, H))
+                require(attn + f"{projection}_conv1d.weight",
+                        (heads * kd, 1, 4))
+            for projection in ("f", "g"):
+                require(attn + f"{projection}_a_proj.weight", (kd, H))
+                require(attn + f"{projection}_b_proj.weight",
+                        (heads * kd, kd))
+            require(attn + "o_norm.weight", (kd,))
+            require(attn + "o_proj.weight", (H, heads * kd))
+        else:
+            require_fp8(attn + "q_a_proj.weight", (qa, H))
+            require(attn + "q_a_layernorm.weight", (qa,))
+            require_fp8(attn + "q_b_proj.weight", (heads * qd, qa))
+            require_fp8(attn + "kv_a_proj_with_mqa.weight", (kv, H))
+            require(attn + "kv_a_layernorm.weight", (kv,))
+            require(attn + "kv_b_proj.weight", (heads * (qd + vh), kv))
+            require_fp8(attn + "o_proj.weight", (H, heads * vh))
+            indexer = attn + "indexer."
+            require(indexer + "wq_b.weight", (32 * 128, qa))
+            require(indexer + "wk.weight", (128, H))
+            require(indexer + "k_norm.weight", (128,))
+            require(indexer + "k_norm.bias", (128,))
+            require(indexer + "weights_proj.weight", (32, H))
+            require(indexer + "index_kpool_compress_ape", (4, 128))
+            require(indexer + "index_kpool_compress_gate", (128, H))
+
+        mlp = base + "mlp."
+        if layer < 3:
+            require_fp8(mlp + "gate_proj.weight", (12288, H))
+            require_fp8(mlp + "up_proj.weight", (12288, H))
+            require_fp8(mlp + "down_proj.weight", (H, 12288))
+        else:
+            require(mlp + "gate.weight", (288, H))
+            require(mlp + "gate.e_score_correction_bias", (288,), "F32")
+            require_fp8(mlp + "shared_experts.gate_proj.weight", (2048, H))
+            require_fp8(mlp + "shared_experts.up_proj.weight", (2048, H))
+            require_fp8(mlp + "shared_experts.down_proj.weight", (H, 2048))
+            for expert in range(288):
+                ep = mlp + f"experts.{expert}."
+                require_fp8(ep + "gate_proj.weight", (2048, H))
+                require_fp8(ep + "up_proj.weight", (2048, H))
+                require_fp8(ep + "down_proj.weight", (H, 2048))
+
+    # The unsupported branches still need positive evidence that this is the
+    # complete multimodal release, not a text-only or MTP-truncated mirror.
+    mtp = p + "layers.45."
+    require(mtp + "shared_head.norm.weight", (H,))
+    require(mtp + "hnorm.weight", (H,))
+    require(mtp + "enorm.weight", (H,))
+    require(mtp + "eh_proj.weight", (H, 2 * H))
+    require("model.visual.patch_embed.proj.weight", (1024, 3, 2, 14, 14))
+    require("model.visual.post_layernorm.weight", (1024,))
+
+    if errors:
+        shown = "; ".join(errors[:12])
+        more = f"; ... {len(errors) - 12} more" if len(errors) > 12 else ""
+        raise ValueError("GLM-5.3 source contract failed: " + shown + more)
+
+
 # ------------------------------------------------------------ quantizers --
 
 def train_codebooks(X, n_stages, dev, iters=10, sample=300000, seed=0,
@@ -1391,7 +1737,7 @@ def convert_layer(job):
     file and separate codebook file. The parent decides the base — from the
     published manifest, from an existing bank's own records, or new after
     the published record count — and never renumbers a bank that exists."""
-    (L, src, out, prefix, n_exp, stages, entries, index_bits, device,
+    (L, src, out, model_prefix, n_exp, stages, entries, index_bits, device,
      cb_sample, cb_base, cached_ok) = job
     import time as _t
     bank = os.path.join(out, f"experts-L{L}.bin")
@@ -1406,12 +1752,12 @@ def convert_layer(job):
     st = ST(src)
     dev = torch.device(device)
 
-    lname, seg, kinds = moe_layout(st, prefix, L)
+    lname, seg, kinds = moe_layout_at(st, model_prefix, L)
     if lname is None:
         return (L, 0, cb_base, "missing")
 
     def ename(e, tag):
-        return f"{prefix}model.layers.{L}.{seg}.experts.{e}.{tag}.weight"
+        return f"{model_prefix}layers.{L}.{seg}.experts.{e}.{tag}.weight"
 
     t0 = _t.time()
     shapes = [tuple(st.tensor(ename(0, tag)).shape) for _, tag in kinds]
@@ -1498,14 +1844,19 @@ def build_trunk(args, sr, st, existing, manifest_path, n_layers, cfg):
             for name in sorted(sr.names()):
                 if (is_omitted_source_tensor(name, cfg, n_layers) or
                         ".experts." in name or
-                        name.endswith(("_packed", "_scale", "_scale_inv"))):
+                        (name.endswith(("_packed", "_scale", "_scale_inv"))
+                         and not is_f32_trunk_tensor(name, cfg))):
                     continue
                 if not st.have(name):
                     continue                  # shard not downloaded yet
                 t = st.tensor(name)
+                name = runtime_tensor_name(name, cfg,
+                                           "language_model." if is_glm53(cfg)
+                                           else "")
                 name = trunk_rename(name, _trunk_seg)
                 off = tf.tell()
-                if t.dim() == 1 or t.numel() < 1 << 16:
+                if (is_f32_trunk_tensor(name, cfg) or t.dim() == 1 or
+                        t.numel() < 1 << 16):
                     tf.write(raw_bytes(t.float()))
                     tindex.append({"name": name, "fmt": FMT_F32, "off": off,
                                    "shape": list(t.shape),
@@ -1616,6 +1967,7 @@ def main():
         cfg = {**cfg["text_config"], "_outer": {k: v for k, v in cfg.items()
                                                 if k != "text_config"}}
         prefix = "language_model."
+    model_prefix = source_model_prefix(cfg, prefix)
     n_layers = cfg["num_hidden_layers"]
     st = ST(args.src)
     sr = ShardReader(args.src)
@@ -1628,6 +1980,7 @@ def main():
     try:
         validate_glm47_full_source(cfg, sr, prefix)
         validate_glm52_source(cfg, sr, prefix)
+        validate_glm53_source(cfg, sr, prefix)
         source_unsupported = unsupported_source_features(cfg)
     except ValueError as exc:
         print(str(exc), file=sys.stderr)
@@ -1702,7 +2055,8 @@ def main():
           f"({args.stages * args.index_bits / VEC_DIM:.2f} b/w)")
 
     n_exp = cfg.get("num_experts") or cfg.get("n_routed_experts")
-    print(f"prefix {prefix!r}  layers {n_layers}  experts {n_exp}")
+    print(f"prefix {prefix!r}  source_model {model_prefix!r}  "
+          f"layers {n_layers}  experts {n_exp}")
     first_dense = cfg.get("first_k_dense_replace", 0)
     if args.experts:
         n_exp = min(n_exp, args.experts)
@@ -1741,14 +2095,14 @@ def main():
     # which would be a corrupt source rather than a shape to support.
     _lname, _seg, _kinds = (None, None, None)
     for _L in range(n_layers):
-        _lname, _seg, _kinds = moe_layout(st, prefix, _L)
+        _lname, _seg, _kinds = moe_layout_at(st, model_prefix, _L)
         if _lname:
             break
     if _lname is None:
         _seg, _kinds = MOE_LAYOUTS[0][1], KINDS
 
     def ename(L, e, tag):
-        return f"{prefix}model.layers.{L}.{_seg}.experts.{e}.{tag}.weight"
+        return f"{model_prefix}layers.{L}.{_seg}.experts.{e}.{tag}.weight"
 
     n_cb_per_layer = 3 * args.stages
     next_base = old_books
@@ -1791,7 +2145,7 @@ def main():
                 next_base += n_cb_per_layer
         elif base + n_cb_per_layer > next_base:
             next_base = base + n_cb_per_layer
-        jobs.append((L, args.src, args.out, prefix, n_exp, args.stages,
+        jobs.append((L, args.src, args.out, model_prefix, n_exp, args.stages,
                      args.entries, args.index_bits, str(dev), args.cb_sample,
                      base, cached_ok))
 
@@ -2006,7 +2360,7 @@ def main():
     # does, and K3 normalizes to [-1, 1] with mean = std = 0.5, which is
     # not what CLIP does. Guess nothing that the release states.
     vc = cfg.get("_outer", {}).get("vision_config")
-    if vc:
+    if emits_kimi_vision_json(cfg):
         vj = {k: v for k, v in vc.items() if not k.startswith("_")}
         vj["vt_rms_eps"] = 1.1920928955078125e-07
         mp = cfg.get("_outer", {}).get("media_placeholder_token_id")
@@ -2038,6 +2392,11 @@ def main():
         print(f"vision: {vj.get('vt_num_hidden_layers', '?')}-layer tower, "
               f"patch {vj.get('patch_size', '?')}, "
               f"max_patches {vj['max_patches']}")
+    elif vc and is_glm53(cfg):
+        # This tower is not Kimi-compatible despite sharing a nested
+        # vision_config.  Writing Kimi's vision.json would make the C API
+        # advertise image support and then run the wrong architecture.
+        print("vision: GLM-5.3 tower omitted; this container is text-only")
 
     # ---- trunk ----------------------------------------------------------
     # --reclaim has already run this, before the experts, so that the shards
@@ -2100,6 +2459,9 @@ def main():
             elif feature["name"] == "multi_token_prediction":
                 print("source: multi-token prediction is unsupported; "
                       "appended MTP layer omitted")
+            elif feature["name"] == "vision_tower":
+                print("source: GLM-5.3 vision tower omitted; container is "
+                      "explicitly text-only")
     # A manifest that lists fewer expert layers than the one it replaces
     # publishes a container the engine will refuse to open, and the banks it
     # drops are still on disk taking up room. Never intended; say so.

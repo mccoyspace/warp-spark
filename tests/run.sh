@@ -1550,6 +1550,35 @@ else
     no "GLM-5.2 dense-equivalent context guard"
 fi
 
+# The isolated mHC/KDA tests above pin individual formulas.  This fixture is
+# the complementary integration gate: a shape-scaled but otherwise exact
+# GLM-5.3 text contract goes through waste_model_load, all 45 layers of the
+# real 3-KDA/1-NoPE-MLA schedule, the token-serial mHC prefill path, decode,
+# reset/replay, and the dense-DSA context refusal.  Comparing the prompt
+# logits to ordinary stepping also catches state drift hidden by replaying the
+# same path twice.
+GLM53="$TMP/glm53.waste"
+if ! python3 tests/make_glm53_fixture.py "$GLM53" \
+        >"$TMP/glm53-build.log" 2>&1; then
+    sk "GLM-5.3 integrated mHC runtime" "container not built"
+elif WASTE_TEST_CTX=8 WASTE_TEST_GLM53_CONTRACT=1 \
+        WASTE_TEST_RESET_REPLAY=1 WASTE_CHUNK=1 \
+        ./test_forward "$GLM53" 3,7,11,5 "$TMP/glm53-prefill.bin" 1 \
+        >"$TMP/glm53-prefill.log" 2>&1 &&
+     WASTE_TEST_CTX=8 WASTE_TEST_GLM53_CONTRACT=1 \
+        ./test_forward "$GLM53" 3,7,11,5 "$TMP/glm53-step.bin" 0 \
+        >"$TMP/glm53-step.log" 2>&1 &&
+     cmp -s "$TMP/glm53-prefill.bin" "$TMP/glm53-step.bin" &&
+     ! WASTE_TEST_CTX=9 ./test_forward "$GLM53" 3,7 \
+        >"$TMP/glm53-context.log" 2>&1; then
+    ok "GLM-5.3 loads, mHC prefill/step/replay agree, mixed attention runs, and context fails closed"
+else
+    no "GLM-5.3 integrated mHC runtime"
+    sed -n '1,12p' "$TMP/glm53-build.log" \
+        "$TMP/glm53-prefill.log" "$TMP/glm53-step.log" \
+        "$TMP/glm53-context.log" 2>/dev/null
+fi
+
 # Flash names three terminal turn markers.  A valid bounded set must load;
 # malformed sets must fail with a format error before generation.  Scalar-only
 # Kimi manifests keep the old tokenizer path and are exercised everywhere else

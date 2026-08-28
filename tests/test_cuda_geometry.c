@@ -185,6 +185,64 @@ static waste_model glm52_cuda(void)
     return m;
 }
 
+static waste_model glm53_cuda(void)
+{
+    waste_model m;
+    memset(&m, 0, sizeof m);
+    strcpy(m.cfg.arch, "Glm5NextForConditionalGeneration");
+    strcpy(m.cfg.model_type, "glm5_next_text");
+    strcpy(m.cfg.hidden_act, "silu");
+    strcpy(m.cfg.topk_method, "noaux_tc");
+    strcpy(m.cfg.router_activation, "sigmoid");
+    m.cfg.attention_kind = WASTE_ATTN_LATENT;
+    m.cfg.n_layers = 45;
+    m.cfg.hidden = 4096;
+    m.cfg.n_experts = 288;
+    m.cfg.top_k = 8;
+    m.cfg.moe_inter = 2048;
+    m.cfg.dense_inter = 12288;
+    m.cfg.n_shared = 1;
+    m.cfg.first_dense = 3;
+    m.cfg.n_heads = 64;
+    m.cfg.n_kv_heads = 64;
+    m.cfg.kv_lora = 512;
+    m.cfg.q_lora = 1536;
+    m.cfg.qk_nope = 256;
+    m.cfg.v_head = 256;
+    m.cfg.mla_nope = 1;
+    m.cfg.dsa_dense_context_limit = 2048;
+    m.cfg.max_position_embeddings = 2048;
+    m.cfg.eps = 1e-5f;
+    m.cfg.mla_rms_norm_eps = 1e-5f;
+    m.cfg.router_n_group = 1;
+    m.cfg.router_topk_group = 1;
+    m.cfg.renorm = 1;
+    m.cfg.routed_scale = 2.5f;
+    m.cfg.mhc = 1;
+    m.cfg.hc_mult = 4;
+    m.cfg.hc_sinkhorn_iters = 20;
+    m.cfg.hc_eps = 1e-6f;
+    m.cfg.swiglu_limit = 10.0f;
+    m.cfg.kda_heads = 64;
+    m.cfg.kda_dim = 128;
+    m.cfg.conv_k = 4;
+    m.cfg.gate_lower_bound = -5.0f;
+    m.cfg.kda_layer_index_base = 0;
+    m.cfg.kda_l2_eps = 1e-6f;
+    for (int L = 0; L < m.cfg.n_layers; L++)
+        m.cfg.kda_layer[L] = L % 4 != 3;
+    m.expert_m[0] = m.expert_m[1] = 2048;
+    m.expert_m[2] = 4096;
+    m.expert_n[0] = m.expert_n[1] = 4096;
+    m.expert_n[2] = 2048;
+    m.index_bits = 8;
+    m.stages = 3;
+    m.vec_dim = 8;
+    m.cb_entries = 256;
+    m.index_block = WASTE_VQ_INDEX_BLOCK;
+    return m;
+}
+
 #define REJECT_DENSE(field, value) do {                                     \
     waste_model changed = k2();                                             \
     changed.field = (value);                                                \
@@ -242,6 +300,22 @@ static waste_model glm52_cuda(void)
     CHECK(!waste_model_cuda_vq_dense_scope_compatible(&changed, 3));        \
 } while (0)
 
+#define REJECT_GLM53_DENSE(field, value) do {                               \
+    waste_model changed = glm53_cuda();                                     \
+    changed.field = (value);                                                \
+    CHECK(!waste_model_cuda_glm53_dense_compatible(&changed));              \
+    CHECK(!waste_model_cuda_vq_dense_scope_compatible(&changed, 2));        \
+    CHECK(!waste_model_cuda_vq_dense_scope_compatible(&changed, 3));        \
+} while (0)
+
+#define REJECT_GLM53_VQ(field, value) do {                                  \
+    waste_model changed = glm53_cuda();                                     \
+    changed.field = (value);                                                \
+    CHECK(waste_model_cuda_glm53_dense_compatible(&changed));               \
+    CHECK(!waste_model_cuda_glm53_vq3r_compatible(&changed));               \
+    CHECK(!waste_model_cuda_vq_dense_scope_compatible(&changed, 3));        \
+} while (0)
+
 int main(void)
 {
     waste_model exact = k2();
@@ -250,6 +324,7 @@ int main(void)
     CHECK(!waste_model_cuda_glm47_flash_dense_compatible(NULL));
     CHECK(!waste_model_cuda_glm47_full_dense_compatible(NULL));
     CHECK(!waste_model_cuda_glm52_dense_compatible(NULL));
+    CHECK(!waste_model_cuda_glm53_dense_compatible(NULL));
     CHECK(waste_model_cuda_k2_dense_compatible(&exact));
     CHECK(waste_model_cuda_k2_vq3r_compatible(&exact));
     CHECK(!waste_model_cuda_glm47_flash_dense_compatible(&exact));
@@ -655,6 +730,77 @@ int main(void)
     REJECT_GLM52_VQ(vec_dim, 4);
     REJECT_GLM52_VQ(cb_entries, 64);
     REJECT_GLM52_VQ(index_block, 32);
+
+    {
+        waste_model glm53 = glm53_cuda();
+        CHECK(waste_model_cuda_glm53_dense_compatible(&glm53));
+        CHECK(waste_model_cuda_glm53_vq3r_compatible(&glm53));
+        CHECK(!waste_model_cuda_k2_dense_compatible(&glm53));
+        CHECK(!waste_model_cuda_glm47_flash_dense_compatible(&glm53));
+        CHECK(!waste_model_cuda_glm47_full_dense_compatible(&glm53));
+        CHECK(!waste_model_cuda_glm52_dense_compatible(&glm53));
+        CHECK(!waste_model_cuda_vq_dense_scope_compatible(&glm53, 2));
+        CHECK(waste_model_cuda_vq_dense_scope_compatible(&glm53, 3));
+        CHECK(waste_model_cuda_glm53_profile_compatible(&glm53, 1, 3, 0, 1));
+        CHECK(waste_model_cuda_glm53_profile_compatible(&glm53, 1, 3, 2, 1));
+        CHECK(!waste_model_cuda_glm53_profile_compatible(&glm53, 2, 3, 2, 1));
+        CHECK(!waste_model_cuda_glm53_profile_compatible(&glm53, 1, 2, 2, 1));
+        CHECK(!waste_model_cuda_glm53_profile_compatible(&glm53, 1, 3, 1, 1));
+        CHECK(!waste_model_cuda_glm53_profile_compatible(&glm53, 1, 3, 0, 2));
+        CHECK(!waste_model_cuda_glm53_profile_compatible(&glm53, 1, 3, 2, 2));
+    }
+
+    changed = glm53_cuda(); strcpy(changed.cfg.arch, "GlmMoeDsaForCausalLM");
+    CHECK(!waste_model_cuda_glm53_dense_compatible(&changed));
+    changed = glm53_cuda(); strcpy(changed.cfg.model_type, "glm_moe_dsa");
+    CHECK(!waste_model_cuda_glm53_dense_compatible(&changed));
+    changed = glm53_cuda(); changed.cfg.kda_layer[3] = 1;
+    CHECK(!waste_model_cuda_glm53_dense_compatible(&changed));
+    changed = glm53_cuda(); changed.cfg.kda_layer[4] = 0;
+    CHECK(!waste_model_cuda_glm53_dense_compatible(&changed));
+    REJECT_GLM53_DENSE(cfg.attention_kind, WASTE_ATTN_GQA);
+    REJECT_GLM53_DENSE(cfg.n_layers, 44);
+    REJECT_GLM53_DENSE(cfg.hidden, 4097);
+    REJECT_GLM53_DENSE(cfg.n_experts, 256);
+    REJECT_GLM53_DENSE(cfg.top_k, 4);
+    REJECT_GLM53_DENSE(cfg.moe_inter, 1536);
+    REJECT_GLM53_DENSE(cfg.dense_inter, 10240);
+    REJECT_GLM53_DENSE(cfg.first_dense, 1);
+    REJECT_GLM53_DENSE(cfg.n_heads, 32);
+    REJECT_GLM53_DENSE(cfg.n_kv_heads, 8);
+    REJECT_GLM53_DENSE(cfg.q_lora, 2048);
+    REJECT_GLM53_DENSE(cfg.qk_nope, 192);
+    REJECT_GLM53_DENSE(cfg.qk_rope, 64);
+    REJECT_GLM53_DENSE(cfg.v_head, 128);
+    REJECT_GLM53_DENSE(cfg.mla_nope, 0);
+    REJECT_GLM53_DENSE(cfg.dsa_dense_context_limit, 4096);
+    REJECT_GLM53_DENSE(cfg.max_position_embeddings, 1048576);
+    REJECT_GLM53_DENSE(cfg.eps, 1e-6f);
+    REJECT_GLM53_DENSE(cfg.mla_rms_norm_eps, 1e-6f);
+    REJECT_GLM53_DENSE(cfg.renorm, 0);
+    REJECT_GLM53_DENSE(cfg.routed_scale, 1.0f);
+    REJECT_GLM53_DENSE(cfg.mhc, 0);
+    REJECT_GLM53_DENSE(cfg.hc_mult, 8);
+    REJECT_GLM53_DENSE(cfg.hc_sinkhorn_iters, 19);
+    REJECT_GLM53_DENSE(cfg.hc_eps, 1e-5f);
+    REJECT_GLM53_DENSE(cfg.swiglu_limit, 0.0f);
+    REJECT_GLM53_DENSE(cfg.kda_heads, 32);
+    REJECT_GLM53_DENSE(cfg.kda_dim, 64);
+    REJECT_GLM53_DENSE(cfg.conv_k, 3);
+    REJECT_GLM53_DENSE(cfg.full_rank_gate, 1);
+    REJECT_GLM53_DENSE(cfg.gate_lower_bound, 0.0f);
+    REJECT_GLM53_DENSE(cfg.kda_layer_index_base, 1);
+    REJECT_GLM53_DENSE(cfg.kda_l2_eps, 1e-12f);
+    REJECT_GLM53_DENSE(cfg.latent_dim, 4096);
+    REJECT_GLM53_DENSE(cfg.mla_output_gate, 1);
+    REJECT_GLM53_DENSE(cfg.act_situ, 1);
+    REJECT_GLM53_DENSE(expert_m[2], 4032);
+    REJECT_GLM53_DENSE(expert_n[0], 4032);
+    REJECT_GLM53_VQ(index_bits, 6);
+    REJECT_GLM53_VQ(stages, 2);
+    REJECT_GLM53_VQ(vec_dim, 4);
+    REJECT_GLM53_VQ(cb_entries, 64);
+    REJECT_GLM53_VQ(index_block, 32);
 
     if (bad) return 1;
     puts("CUDA GEOMETRY OK");

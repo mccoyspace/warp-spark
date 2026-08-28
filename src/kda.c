@@ -16,17 +16,18 @@
 #include <math.h>
 #include <string.h>
 
-static float l2_rnorm(const float *x, int n)
+static float l2_rnorm(const float *x, int n, float eps)
 {
     float s = 0.0f;
     for (int i = 0; i < n; i++) s += x[i] * x[i];
-    return 1.0f / sqrtf(s + 1e-12f);
+    return 1.0f / sqrtf(s + eps);
 }
 
-void waste_kda_step(int H, int K, int V,
-                    const float *q, const float *k, const float *v,
-                    const float *g_log, const float *beta,
-                    float *S, float *o, float *u)
+void waste_kda_step_ex(int H, int K, int V,
+                       const float *q, const float *k, const float *v,
+                       const float *g_log, const float *beta,
+                       float l2_eps,
+                       float *S, float *o, float *u)
 {
     const float qscale = 1.0f / sqrtf((float)K);
 
@@ -40,8 +41,8 @@ void waste_kda_step(int H, int K, int V,
         const float b = beta[h];
 
         /* q, k are L2-normalized per head; q additionally scaled by K^-0.5 */
-        const float qn = l2_rnorm(qh, K) * qscale;
-        const float kn = l2_rnorm(kh, K);
+        const float qn = l2_rnorm(qh, K, l2_eps) * qscale;
+        const float kn = l2_rnorm(kh, K, l2_eps);
 
         memset(u, 0, (size_t)V * sizeof(float));
 
@@ -65,6 +66,15 @@ void waste_kda_step(int H, int K, int V,
             for (int i = 0; i < V; i++) { row[i] += u[i] * kv; oh[i] += row[i] * qv; }
         }
     }
+}
+
+void waste_kda_step(int H, int K, int V,
+                    const float *q, const float *k, const float *v,
+                    const float *g_log, const float *beta,
+                    float *S, float *o, float *u)
+{
+    waste_kda_step_ex(H, K, V, q, k, v, g_log, beta, 1e-12f,
+                      S, o, u);
 }
 
 void waste_kda_forward(int T, int H, int K, int V,
@@ -118,6 +128,7 @@ void waste_lutb_range(int lo, int hi, void *p);
 const char *waste_kda_register_cpu(waste_kernels *t)
 {
     t->kda_step = waste_kda_step;
+    t->kda_step_ex = waste_kda_step_ex;
     /* The portable range kernels live in model.c, next to the code that
      * builds their arguments; an ISA backend overwrites these two. */
     t->mvq_rows_f32 = waste_mvq_rows_f32;

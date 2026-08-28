@@ -12,6 +12,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <math.h>
 #include <stdlib.h>
 #include <time.h>
 
@@ -72,6 +73,35 @@ int main(int argc, char **argv)
     const char *ctxe = getenv("WASTE_TEST_CTX");
     const int ctx_cap = ctxe ? atoi(ctxe) : 4096;
     if (waste_model_load(&m, dir, ctx_cap, &lo)) { fprintf(stderr, "load failed\n"); return 1; }
+    if (getenv("WASTE_TEST_KDA_DEFAULTS") &&
+        (m.cfg.kda_layer_index_base != 1 ||
+         fabsf(m.cfg.kda_l2_eps - 1e-12f) > 1e-18f)) {
+        fprintf(stderr,
+                "legacy KDA defaults changed (base %d, epsilon %.9g)\n",
+                m.cfg.kda_layer_index_base, m.cfg.kda_l2_eps);
+        waste_model_free(&m);
+        return 1;
+    }
+    if (getenv("WASTE_TEST_GLM53_CONTRACT") &&
+        (strcmp(m.cfg.arch, "Glm5NextForConditionalGeneration") ||
+         strcmp(m.cfg.model_type, "glm5_next_text") || !m.cfg.mhc ||
+         m.cfg.hc_mult != 4 || m.cfg.hc_sinkhorn_iters != 20 ||
+         fabsf(m.cfg.hc_eps - 1e-6f) > 1e-12f ||
+         fabsf(m.cfg.swiglu_limit - 10.0f) > 1e-6f ||
+         m.cfg.kda_layer_index_base != 0 ||
+         fabsf(m.cfg.kda_l2_eps - 1e-6f) > 1e-12f)) {
+        fprintf(stderr, "GLM-5.3 runtime contract was not preserved\n");
+        waste_model_free(&m);
+        return 1;
+    }
+    if (getenv("WASTE_TEST_GLM53_CONTRACT")) {
+        for (int L = 0; L < m.cfg.n_layers; L++)
+            if (!!m.cfg.kda_layer[L] != (L % 4 != 3)) {
+                fprintf(stderr, "GLM-5.3 KDA schedule was not preserved\n");
+                waste_model_free(&m);
+                return 1;
+            }
+    }
     printf("%s\n", waste_build_info());
     printf("loaded in %.1fs — %d layers, %d experts, top-%d, vocab %d; "
            "expert cache %d slots (%.0f MB, %.1f%% of the expert set)\n",

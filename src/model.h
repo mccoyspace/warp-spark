@@ -83,8 +83,21 @@ typedef struct {
 #define WASTE_MAX_ROPE_HALF 64
 #define WASTE_MAX_EOS 8
     int kda_layer[WASTE_MAX_LAYERS]; /* 1 if layer is KDA                   */
+    /* KDA checkpoints have used both one-based and zero-based layer lists.
+     * The normalized container records which it carries; guessing from the
+     * values makes a list that happens not to contain layer zero ambiguous. */
+    int kda_layer_index_base;
+    float kda_l2_eps;                /* q/k L2 norm epsilon                  */
     float eps, mla_rms_norm_eps, routed_scale;
     int renorm;
+
+    /* GLM-5.3's manifold-constrained Hyper-Connection.  Zero hc_mult keeps
+     * the conventional single residual stream used by all older models. */
+    int   mhc;
+    int   hc_mult;
+    int   hc_sinkhorn_iters;
+    float hc_eps;
+    float swiglu_limit;              /* 0 = the historical unclamped SwiGLU */
 
     /* --- K3 additions (all absent/0 for Kimi-Linear) ------------------- */
     int   latent_dim;                /* routed_expert_hidden_size; 0 = none */
@@ -290,6 +303,13 @@ int waste_model_cuda_glm52_profile_compatible(const waste_model *m,
                                                int dense_scope,
                                                int vq_mode,
                                                int vq_group);
+int waste_model_cuda_glm53_dense_compatible(const waste_model *m);
+int waste_model_cuda_glm53_vq3r_compatible(const waste_model *m);
+int waste_model_cuda_glm53_profile_compatible(const waste_model *m,
+                                               int kda_mode,
+                                               int dense_scope,
+                                               int vq_mode,
+                                               int vq_group);
 int waste_model_cuda_glm47_full_profile_compatible(const waste_model *m,
                                                     int kda_mode,
                                                     int dense_scope,
@@ -467,6 +487,19 @@ float *waste_image_load(const char *path, int max_patches,
  * K3 whose maths is new, so they are checked against the reference
  * implementation directly rather than only end to end. */
 float waste_situ_pair(float gate, float up, float beta, float linear_beta);
+
+/* GLM-5.3 mHC reference primitives.  `waste_mhc_f32` performs the exact
+ * fp32 mapping used by the model path with its converter-preserved resident
+ * fp32 fn tensor. scratch holds hc*hidden + (2+hc)*hc floats. */
+int waste_mhc_f32(int hc, int hidden, int sinkhorn_iters,
+                  float hc_eps, float norm_eps,
+                  const float *streams, const float *fn,
+                  const float *base, const float *scale,
+                  float *post, float *comb, float *collapsed,
+                  float *scratch);
+void waste_mhc_merge(int hc, int hidden, const float *streams,
+                     const float *sublayer, const float *post,
+                     const float *comb, float *out);
 void  waste_kda_decay_gate(float *g, const float *A_log, const float *dt_bias,
                            int H, int D, float lower_bound);
 void  waste_kda_decay_gate_ex(float *g, const float *A_log, const float *dt_bias,

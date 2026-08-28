@@ -70,6 +70,11 @@ typedef struct {
                      const float *q, const float *k, const float *v,
                      const float *g_log, const float *beta,
                      float *S, float *o, float *scratch);
+    void (*kda_step_ex)(int H, int K, int V,
+                        const float *q, const float *k, const float *v,
+                        const float *g_log, const float *beta,
+                        float l2_eps,
+                        float *S, float *o, float *scratch);
     void (*short_conv_step)(int C, int KS, const float *w, const float *bias,
                             float *ring, const float *x, float *y);
     void (*rmsnorm_gated)(int C, const float *x, const float *gate,
