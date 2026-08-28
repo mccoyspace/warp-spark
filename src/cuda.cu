@@ -48,6 +48,23 @@ static_assert(Q4_THREADS > 0 &&
               (Q4_THREADS & (Q4_THREADS - 1)) == 0,
               "Q4 reduction requires a power-of-two thread count");
 
+#if defined(WASTE_CUDA_VQ_FUSED_TEST)
+/* Test-only descriptors for the true task-major VQ prototype.  Production
+ * grouping deliberately remains untouched until the standalone gate says
+ * whether exposing several expert grids at once buys useful occupancy. */
+typedef struct {
+    const uint8_t *gate_idx;
+    const uint8_t *up_idx;
+    const uint16_t *scale;
+    int lut_row;
+} vq_fused_pair_task;
+
+typedef struct {
+    const uint8_t *idx;
+    const uint16_t *scale;
+} vq_fused_down_task;
+#endif
+
 typedef struct {
     cudaStream_t stream;
     float *host_x, *host_y;
@@ -69,6 +86,11 @@ typedef struct {
     int vq_group_rows, vq_group_cols;
     int vq_group_pair_prepared, vq_group_failed;
     int vq_ready;
+#if defined(WASTE_CUDA_VQ_FUSED_TEST)
+    vq_fused_pair_task *vq_fused_pair_tasks;
+    vq_fused_down_task *vq_fused_down_tasks;
+    float *vq_fused_down_lut;
+#endif
 } waste_cuda_kda;
 
 __device__ static float q4_half(uint16_t h)
@@ -291,6 +313,97 @@ __global__ static void vq_apply_one(float *y, const uint8_t *idx,
     }
     y[row] = __fmul_rn(acc, q4_half(scale[row]));
 }
+
+#if defined(WASTE_CUDA_VQ_FUSED_TEST)
+/* Same arithmetic as vq_apply_pair, with blockIdx.y selecting an expert
+ * task.  In particular each output owns the same thread, visits vector
+ * positions in the same order and uses the same explicit round-to-nearest
+ * additions.  The only experiment here is making all task blocks visible to
+ * the scheduler in one launch. */
+__global__ static void vq_apply_pair_fused_test(
+    float *y, const vq_fused_pair_task *tasks,
+    const float *gate0, const float *up0,
+    const float *gate1, const float *up1,
+    int rows, int nv, size_t output_stride)
+{
+    const int task_index = (int)blockIdx.y;
+    const vq_fused_pair_task task = tasks[task_index];
+    const int kind = (int)threadIdx.x / VQ_INDEX_BLOCK;
+    const int lane = (int)threadIdx.x % VQ_INDEX_BLOCK;
+    const int row = (int)blockIdx.x * VQ_INDEX_BLOCK + lane;
+    if (kind >= 2 || row >= rows) return;
+    const uint8_t *idx = kind ? task.up_idx : task.gate_idx;
+    const float *lut = task.lut_row
+        ? (kind ? up1 : gate1) : (kind ? up0 : gate0);
+    float acc = 0.0f;
+    for (int v = 0; v < nv; v++) {
+        const size_t off =
+            (((size_t)blockIdx.x * nv + v) * VQ_INDEX_BLOCK + lane) *
+            VQ_STAGES;
+        const float *block = lut + (size_t)v * VQ_STAGES * VQ_ENTRIES;
+        float term = block[idx[off]];
+        term = __fadd_rn(term, block[VQ_ENTRIES + idx[off + 1]]);
+        term = __fadd_rn(term, block[2 * VQ_ENTRIES + idx[off + 2]]);
+        acc = __fadd_rn(acc, term);
+    }
+    y[(size_t)task_index * output_stride + (size_t)kind * rows + row] =
+        __fmul_rn(acc, q4_half(task.scale[(size_t)kind * rows + row]));
+}
+
+/* Task-major copies of vq_build_one and vq_apply_one.  Every LUT entry and
+ * output row retains its original scalar dependency chain; blockIdx.y only
+ * provides enough independent work to test the occupancy hypothesis. */
+__global__ static void vq_build_one_fused_test(
+    float *luts, const float *books, const float *xs,
+    int nv, int cb_base, size_t lut_stride, size_t x_stride)
+{
+    const int p = (int)(blockIdx.x * blockDim.x + threadIdx.x);
+    const int total = nv * VQ_STAGES * VQ_ENTRIES;
+    if (p >= total) return;
+    const int task = (int)blockIdx.y;
+    const int code = p % VQ_ENTRIES;
+    const int vs = p / VQ_ENTRIES;
+    const int stage = vs % VQ_STAGES;
+    const int vector = vs / VQ_STAGES;
+    const float *book = books +
+        (size_t)(cb_base + stage) * VQ_VEC_DIM * VQ_ENTRIES;
+    const float *x = xs + (size_t)task * x_stride;
+    float sum = 0.0f;
+#pragma unroll
+    for (int d = 0; d < VQ_VEC_DIM; d++)
+        sum = fmaf(x[(size_t)vector * VQ_VEC_DIM + d],
+                   book[(size_t)d * VQ_ENTRIES + code], sum);
+    luts[(size_t)task * lut_stride + p] = sum;
+}
+
+__global__ static void vq_apply_one_fused_test(
+    float *y, const vq_fused_down_task *tasks, const float *luts,
+    int rows, int nv, size_t output_stride, size_t lut_stride)
+{
+    const int row = (int)(blockIdx.x * blockDim.x + threadIdx.x);
+    if (row >= rows) return;
+    const int task_index = (int)blockIdx.y;
+    const vq_fused_down_task task = tasks[task_index];
+    const int block_row = row / VQ_INDEX_BLOCK;
+    const int lane = row % VQ_INDEX_BLOCK;
+    const float *lut = luts + (size_t)task_index * lut_stride;
+    float acc = 0.0f;
+    for (int v = 0; v < nv; v++) {
+        const size_t off =
+            (((size_t)block_row * nv + v) * VQ_INDEX_BLOCK + lane) *
+            VQ_STAGES;
+        const float *block = lut + (size_t)v * VQ_STAGES * VQ_ENTRIES;
+        float term = block[task.idx[off]];
+        term = __fadd_rn(term,
+                         block[VQ_ENTRIES + task.idx[off + 1]]);
+        term = __fadd_rn(term,
+                         block[2 * VQ_ENTRIES + task.idx[off + 2]]);
+        acc = __fadd_rn(acc, term);
+    }
+    y[(size_t)task_index * output_stride + row] =
+        __fmul_rn(acc, q4_half(task.scale[row]));
+}
+#endif
 
 static void cuda_problem(const char *where, cudaError_t status)
 {
@@ -561,6 +674,14 @@ static void cuda_vq_release(waste_cuda_kda *ctx)
     if (!ctx) return;
     if (ctx->stream && ctx->vq_group_phase != VQ_GROUP_IDLE)
         cudaStreamSynchronize(ctx->stream);
+#if defined(WASTE_CUDA_VQ_FUSED_TEST)
+    if (ctx->vq_fused_down_lut) cudaFree(ctx->vq_fused_down_lut);
+    if (ctx->vq_fused_down_tasks) cudaFree(ctx->vq_fused_down_tasks);
+    if (ctx->vq_fused_pair_tasks) cudaFree(ctx->vq_fused_pair_tasks);
+    ctx->vq_fused_down_lut = NULL;
+    ctx->vq_fused_down_tasks = NULL;
+    ctx->vq_fused_pair_tasks = NULL;
+#endif
     if (ctx->vq_group_down_device_y)
         cudaFree(ctx->vq_group_down_device_y);
     if (ctx->vq_group_down_host_y)
@@ -640,7 +761,12 @@ extern "C" int waste_cuda_vq_init(waste_model *m)
         ctx->vq_group_down_x_slot_values >
             SIZE_MAX / VQ_GROUP_MAX / sizeof(float) ||
         ctx->vq_group_down_y_slot_values >
-            SIZE_MAX / VQ_GROUP_MAX / sizeof(float)) {
+            SIZE_MAX / VQ_GROUP_MAX / sizeof(float)
+#if defined(WASTE_CUDA_VQ_FUSED_TEST)
+        || ctx->vq_lut_values[VQ_LUT_DOWN] >
+            SIZE_MAX / VQ_GROUP_MAX / sizeof(float)
+#endif
+        ) {
         cuda_vq_release(ctx);
         return -1;
     }
@@ -681,6 +807,19 @@ extern "C" int waste_cuda_vq_init(waste_model *m)
     if (status == cudaSuccess)
         status = cudaMalloc((void **)&ctx->vq_group_down_device_y,
                             group_down_y_bytes);
+#if defined(WASTE_CUDA_VQ_FUSED_TEST)
+    if (status == cudaSuccess)
+        status = cudaMalloc((void **)&ctx->vq_fused_pair_tasks,
+                            VQ_GROUP_MAX * sizeof(vq_fused_pair_task));
+    if (status == cudaSuccess)
+        status = cudaMalloc((void **)&ctx->vq_fused_down_tasks,
+                            VQ_GROUP_MAX * sizeof(vq_fused_down_task));
+    if (status == cudaSuccess)
+        status = cudaMalloc((void **)&ctx->vq_fused_down_lut,
+                            VQ_GROUP_MAX *
+                            ctx->vq_lut_values[VQ_LUT_DOWN] *
+                            sizeof(float));
+#endif
     if (status == cudaSuccess)
         status = cudaMemcpyAsync(ctx->vq_books, m->codebooksT,
                                  book_values * sizeof(float),
@@ -947,6 +1086,72 @@ extern "C" int waste_cuda_vq_group_pair_finish(
     return 0;
 }
 
+#if defined(WASTE_CUDA_VQ_FUSED_TEST)
+/* Synchronous standalone-only gate for a real task-major launch.  Unlike the
+ * production grouped API, this does not enqueue one kernel per expert: the
+ * task is blockIdx.y in one grid. */
+extern "C" int waste_cuda_vq_fused_pair2_test(
+    waste_model *m, int count, const int *lut_rows,
+    const uint8_t *const *gate_idx, const uint8_t *const *up_idx,
+    const uint16_t *const *scale, int rows, int cols,
+    const float **host_outputs)
+{
+    waste_cuda_kda *ctx = m ? (waste_cuda_kda *)m->cuda_kda_ctx : NULL;
+    if (!ctx || !ctx->vq_ready || ctx->vq_group_failed) return -1;
+    const size_t values = cols > 0 && cols % VQ_VEC_DIM == 0
+        ? (size_t)(cols / VQ_VEC_DIM) * VQ_STAGES * VQ_ENTRIES : 0;
+    if (!lut_rows || !gate_idx || !up_idx || !scale || !host_outputs ||
+        ctx->vq_group_phase != VQ_GROUP_IDLE ||
+        ctx->vq_group_pair_prepared != 2 ||
+        count < 1 || count > VQ_GROUP_MAX || rows < 1 ||
+        rows % VQ_INDEX_BLOCK || cols < 1 || cols % VQ_VEC_DIM ||
+        (size_t)(2 * rows) != ctx->vq_group_pair_slot_values ||
+        values != ctx->vq_lut_values[VQ_LUT_GATE0])
+        return cuda_vq_group_abort(ctx, "VQ fused pair arguments",
+                                   cudaErrorInvalidValue);
+
+    vq_fused_pair_task tasks[VQ_GROUP_MAX];
+    for (int slot = 0; slot < count; slot++) {
+        if ((lut_rows[slot] != 0 && lut_rows[slot] != 1) ||
+            !gate_idx[slot] || !up_idx[slot] || !scale[slot])
+            return cuda_vq_group_abort(ctx, "VQ fused pair task",
+                                       cudaErrorInvalidValue);
+        tasks[slot].gate_idx = gate_idx[slot];
+        tasks[slot].up_idx = up_idx[slot];
+        tasks[slot].scale = scale[slot];
+        tasks[slot].lut_row = lut_rows[slot];
+    }
+
+    cudaError_t status = cudaMemcpyAsync(
+        ctx->vq_fused_pair_tasks, tasks,
+        (size_t)count * sizeof *tasks, cudaMemcpyHostToDevice, ctx->stream);
+    if (status == cudaSuccess) {
+        const dim3 grid((unsigned)(rows / VQ_INDEX_BLOCK),
+                        (unsigned)count);
+        vq_apply_pair_fused_test<<<grid, 2 * VQ_INDEX_BLOCK,
+                                   0, ctx->stream>>>(
+            ctx->vq_group_pair_device_y, ctx->vq_fused_pair_tasks,
+            ctx->vq_lut[VQ_LUT_GATE0], ctx->vq_lut[VQ_LUT_UP0],
+            ctx->vq_lut[VQ_LUT_GATE1], ctx->vq_lut[VQ_LUT_UP1],
+            rows, cols / VQ_VEC_DIM, ctx->vq_group_pair_slot_values);
+        status = cudaGetLastError();
+    }
+    const size_t bytes = (size_t)count *
+        ctx->vq_group_pair_slot_values * sizeof(float);
+    if (status == cudaSuccess)
+        status = cudaMemcpyAsync(
+            ctx->vq_group_pair_host_y, ctx->vq_group_pair_device_y, bytes,
+            cudaMemcpyDeviceToHost, ctx->stream);
+    if (status == cudaSuccess) status = cudaStreamSynchronize(ctx->stream);
+    if (status != cudaSuccess)
+        return cuda_vq_group_abort(ctx, "VQ fused pair", status);
+    for (int slot = 0; slot < count; slot++)
+        host_outputs[slot] = ctx->vq_group_pair_host_y +
+            (size_t)slot * ctx->vq_group_pair_slot_values;
+    return 0;
+}
+#endif
+
 /* Down uses one pinned and one device x slot per expert. This makes the
  * caller free to reuse or modify its activation as soon as enqueue returns.
  * The stream deliberately reuses the one down LUT in build/apply order:
@@ -1037,6 +1242,85 @@ extern "C" int waste_cuda_vq_group_down_finish(
     cuda_vq_group_reset(ctx);
     return 0;
 }
+
+#if defined(WASTE_CUDA_VQ_FUSED_TEST)
+extern "C" int waste_cuda_vq_fused_down_test(
+    waste_model *m, int count, const uint8_t *const *idx,
+    const uint16_t *const *scale, const float *const *x,
+    int cb_base, int rows, int cols, const float **host_outputs)
+{
+    waste_cuda_kda *ctx = m ? (waste_cuda_kda *)m->cuda_kda_ctx : NULL;
+    if (!ctx || !ctx->vq_ready || ctx->vq_group_failed) return -1;
+    const size_t values = cols > 0 && cols % VQ_VEC_DIM == 0
+        ? (size_t)(cols / VQ_VEC_DIM) * VQ_STAGES * VQ_ENTRIES : 0;
+    if (!idx || !scale || !x || !host_outputs || cb_base < 0 ||
+        cb_base + VQ_STAGES > m->n_books ||
+        ctx->vq_group_phase != VQ_GROUP_IDLE ||
+        count < 1 || count > VQ_GROUP_MAX || rows < 1 ||
+        rows % VQ_INDEX_BLOCK || cols < 1 || cols % VQ_VEC_DIM ||
+        (size_t)rows != ctx->vq_group_down_y_slot_values ||
+        (size_t)cols != ctx->vq_group_down_x_slot_values ||
+        values != ctx->vq_lut_values[VQ_LUT_DOWN])
+        return cuda_vq_group_abort(ctx, "VQ fused down arguments",
+                                   cudaErrorInvalidValue);
+
+    vq_fused_down_task tasks[VQ_GROUP_MAX];
+    for (int slot = 0; slot < count; slot++) {
+        if (!idx[slot] || !scale[slot] || !x[slot])
+            return cuda_vq_group_abort(ctx, "VQ fused down task",
+                                       cudaErrorInvalidValue);
+        tasks[slot].idx = idx[slot];
+        tasks[slot].scale = scale[slot];
+        memcpy(ctx->vq_group_down_host_x +
+                   (size_t)slot * ctx->vq_group_down_x_slot_values,
+               x[slot], (size_t)cols * sizeof(float));
+    }
+
+    cudaError_t status = cudaMemcpyAsync(
+        ctx->vq_fused_down_tasks, tasks,
+        (size_t)count * sizeof *tasks, cudaMemcpyHostToDevice, ctx->stream);
+    if (status == cudaSuccess)
+        status = cudaMemcpyAsync(
+            ctx->vq_group_down_device_x, ctx->vq_group_down_host_x,
+            (size_t)count * ctx->vq_group_down_x_slot_values * sizeof(float),
+            cudaMemcpyHostToDevice, ctx->stream);
+    if (status == cudaSuccess) {
+        const dim3 grid((unsigned)((values + VQ_BUILD_THREADS - 1) /
+                                   VQ_BUILD_THREADS),
+                        (unsigned)count);
+        vq_build_one_fused_test<<<grid, VQ_BUILD_THREADS, 0, ctx->stream>>>(
+            ctx->vq_fused_down_lut, ctx->vq_books,
+            ctx->vq_group_down_device_x, cols / VQ_VEC_DIM, cb_base,
+            ctx->vq_lut_values[VQ_LUT_DOWN],
+            ctx->vq_group_down_x_slot_values);
+        status = cudaGetLastError();
+    }
+    if (status == cudaSuccess) {
+        const dim3 grid((unsigned)((rows + VQ_DOWN_THREADS - 1) /
+                                   VQ_DOWN_THREADS),
+                        (unsigned)count);
+        vq_apply_one_fused_test<<<grid, VQ_DOWN_THREADS, 0, ctx->stream>>>(
+            ctx->vq_group_down_device_y, ctx->vq_fused_down_tasks,
+            ctx->vq_fused_down_lut, rows, cols / VQ_VEC_DIM,
+            ctx->vq_group_down_y_slot_values,
+            ctx->vq_lut_values[VQ_LUT_DOWN]);
+        status = cudaGetLastError();
+    }
+    const size_t bytes = (size_t)count *
+        ctx->vq_group_down_y_slot_values * sizeof(float);
+    if (status == cudaSuccess)
+        status = cudaMemcpyAsync(
+            ctx->vq_group_down_host_y, ctx->vq_group_down_device_y, bytes,
+            cudaMemcpyDeviceToHost, ctx->stream);
+    if (status == cudaSuccess) status = cudaStreamSynchronize(ctx->stream);
+    if (status != cudaSuccess)
+        return cuda_vq_group_abort(ctx, "VQ fused down", status);
+    for (int slot = 0; slot < count; slot++)
+        host_outputs[slot] = ctx->vq_group_down_host_y +
+            (size_t)slot * ctx->vq_group_down_y_slot_values;
+    return 0;
+}
+#endif
 
 /* Used when CPU-side collection fails after some kernels were enqueued.
  * Successful drain is reusable; a CUDA error remains sticky and is never

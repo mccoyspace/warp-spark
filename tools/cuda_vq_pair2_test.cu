@@ -10,7 +10,8 @@
  *
  *   nvcc -O3 -std=c++17 -arch=native -fmad=false \
  *     -Xcompiler=-ffp-contract=off -Xcompiler=-pthread \
- *     -DWASTE_ENABLE_CUDA=1 -I src -o cuda_vq_pair2_test \
+ *     -DWASTE_ENABLE_CUDA=1 -DWASTE_CUDA_VQ_FUSED_TEST=1 \
+ *     -I src -o cuda_vq_pair2_test \
  *     tools/cuda_vq_pair2_test.cu src/cuda.cu
  *   ./cuda_vq_pair2_test [ITERATIONS] [WARMUP]
  */
@@ -51,6 +52,13 @@ extern "C" int waste_cuda_vq_group_down_enqueue(
     int, int, int);
 extern "C" int waste_cuda_vq_group_down_finish(
     waste_model *, int, const float **);
+extern "C" int waste_cuda_vq_fused_pair2_test(
+    waste_model *, int, const int *, const uint8_t *const *,
+    const uint8_t *const *, const uint16_t *const *, int, int,
+    const float **);
+extern "C" int waste_cuda_vq_fused_down_test(
+    waste_model *, int, const uint8_t *const *, const uint16_t *const *,
+    const float *const *, int, int, int, const float **);
 extern "C" int waste_cuda_vq_group_drain(waste_model *);
 extern "C" void waste_cuda_kda_free(waste_model *);
 
@@ -308,6 +316,84 @@ static int pair2_run(waste_model &model, const Fixture &fixture,
     return 0;
 }
 
+/* True task-major control: one gate/up grid and one build/apply down pair per
+ * group.  The production pair2 path above remains the one-kernel-per-expert
+ * control, so this isolates occupancy from LUT reuse, transfers and host
+ * activation. */
+static int fused_run(waste_model &model, const Fixture &fixture,
+                     Work &work, int pair_group, int down_group,
+                     bool capture, StageTimes *stages)
+{
+    if (pair_group < 1 || pair_group > kTasks ||
+        down_group < 1 || down_group > kTasks ||
+        kTasks % pair_group || kTasks % down_group)
+        return -1;
+    auto begin = Clock::now();
+    if (waste_cuda_vq_prepare_pair2(
+            &model, fixture.row_x(0), fixture.row_x(1), 0, kLat))
+        return -1;
+    if (stages) stages->prepare_ms += elapsed_ms(begin);
+
+    for (int base = 0; base < kTasks; base += pair_group) {
+        int lut_rows[kTasks] = {};
+        const uint8_t *gate[kTasks] = {};
+        const uint8_t *up[kTasks] = {};
+        const uint16_t *scale[kTasks] = {};
+        for (int slot = 0; slot < pair_group; slot++) {
+            const int task = base + slot;
+            lut_rows[slot] = task / kExpertsPerRow;
+            gate[slot] = fixture.gate(task);
+            up[slot] = fixture.up(task);
+            scale[slot] = fixture.scales(task);
+        }
+        const float *pair_out[kTasks] = {};
+        begin = Clock::now();
+        if (waste_cuda_vq_fused_pair2_test(
+                &model, pair_group, lut_rows, gate, up, scale,
+                kInter, kLat, pair_out))
+            return -1;
+        if (stages) stages->pair_ms += elapsed_ms(begin);
+
+        begin = Clock::now();
+        for (int slot = 0; slot < pair_group; slot++) {
+            const int task = base + slot;
+            if (!pair_out[slot]) return -1;
+            if (capture)
+                memcpy(work.pair_at(task), pair_out[slot],
+                       (size_t)2 * kInter * sizeof(float));
+            activate(pair_out[slot], work.act_at(task));
+        }
+        if (stages) stages->activation_ms += elapsed_ms(begin);
+    }
+
+    begin = Clock::now();
+    for (int base = 0; base < kTasks; base += down_group) {
+        const uint8_t *idx[kTasks] = {};
+        const uint16_t *scale[kTasks] = {};
+        const float *x[kTasks] = {};
+        for (int slot = 0; slot < down_group; slot++) {
+            const int task = base + slot;
+            idx[slot] = fixture.down(task);
+            scale[slot] = fixture.scales(task) + 2 * kInter;
+            x[slot] = work.act_at(task);
+        }
+        const float *down_out[kTasks] = {};
+        if (waste_cuda_vq_fused_down_test(
+                &model, down_group, idx, scale, x, 2 * kStages,
+                kLat, kInter, down_out))
+            return -1;
+        if (capture)
+            for (int slot = 0; slot < down_group; slot++) {
+                const int task = base + slot;
+                if (!down_out[slot]) return -1;
+                memcpy(work.down_at(task), down_out[slot],
+                       (size_t)kLat * sizeof(float));
+            }
+    }
+    if (stages) stages->down_ms += elapsed_ms(begin);
+    return 0;
+}
+
 static int compare_bits(const char *what, const std::vector<float> &a,
                         const std::vector<float> &b)
 {
@@ -435,7 +521,7 @@ int main(int argc, char **argv)
         ? positive_arg(argv[1], "ITERATIONS") : 3;
     const int warmup = argc > 2 ? positive_arg(argv[2], "WARMUP") : 1;
     Fixture fixture;
-    Work ordinary, pair2;
+    Work ordinary, pair2, fused;
     waste_model model{};
     configure(model, fixture);
     if (waste_cuda_vq_init(&model) || ordinary_run(model, fixture, ordinary)) {
@@ -468,6 +554,28 @@ int main(int argc, char **argv)
             waste_cuda_kda_free(&model);
             return 1;
         }
+        if (fused_run(model, fixture, fused, group, group, true, nullptr)) {
+            std::fprintf(stderr,
+                         "initial fused VQ group-%d execution failed\n",
+                         group);
+            waste_cuda_kda_free(&model);
+            return 1;
+        }
+        snprintf(label, sizeof label, "fused-gate-up-group%d", group);
+        if (compare_bits(label, ordinary.pair, fused.pair)) {
+            waste_cuda_kda_free(&model);
+            return 1;
+        }
+        snprintf(label, sizeof label, "fused-activated-group%d", group);
+        if (compare_bits(label, ordinary.act, fused.act)) {
+            waste_cuda_kda_free(&model);
+            return 1;
+        }
+        snprintf(label, sizeof label, "fused-down-group%d", group);
+        if (compare_bits(label, ordinary.down, fused.down)) {
+            waste_cuda_kda_free(&model);
+            return 1;
+        }
     }
 
     for (int i = 0; i < warmup; i++)
@@ -485,7 +593,7 @@ int main(int argc, char **argv)
         int group;
         double total_ms;
         StageTimes stages;
-    } results[4] = {};
+    } results[4] = {}, fused_results[4] = {};
     int result_index = 0;
     for (int group : groups) {
         for (int i = 0; i < warmup; i++)
@@ -504,6 +612,24 @@ int main(int argc, char **argv)
         };
         result.total_ms = milliseconds_per(iterations, pair2_call);
     }
+    result_index = 0;
+    for (int group : groups) {
+        for (int i = 0; i < warmup; i++)
+            if (fused_run(model, fixture, fused, group, group,
+                          false, nullptr)) {
+                std::fprintf(stderr,
+                             "fused VQ group-%d warmup failed\n", group);
+                waste_cuda_kda_free(&model);
+                return 1;
+            }
+        Result &result = fused_results[result_index++];
+        result.group = group;
+        const auto fused_call = [&] {
+            return fused_run(model, fixture, fused, group, group,
+                             false, &result.stages);
+        };
+        result.total_ms = milliseconds_per(iterations, fused_call);
+    }
     const double ordinary_after = milliseconds_per(iterations, ordinary_call);
     const double ordinary_ms = 0.5 * (ordinary_before + ordinary_after);
     std::printf("shape=rows2-top8 lat=%d inter=%d tasks=%d iterations=%d "
@@ -517,6 +643,22 @@ int main(int argc, char **argv)
                     ordinary_ms / result.total_ms,
                     ordinary_ms - result.total_ms);
         std::printf("breakdown=pair2-group%d prepare_submit_ms=%.6f "
+                    "gate_up_ms=%.6f activation_ms=%.6f down_ms=%.6f\n",
+                    result.group, result.stages.prepare_ms / n,
+                    result.stages.pair_ms / n,
+                    result.stages.activation_ms / n,
+                    result.stages.down_ms / n);
+    }
+    for (const Result &result : fused_results) {
+        const double n = (double)iterations;
+        std::printf("path=fused2-group%d wall_ms=%.6f speedup=%.4f "
+                    "saved_ms=%.6f versus_pair2=%.4f\n",
+                    result.group, result.total_ms,
+                    ordinary_ms / result.total_ms,
+                    ordinary_ms - result.total_ms,
+                    results[&result - fused_results].total_ms /
+                        result.total_ms);
+        std::printf("breakdown=fused2-group%d prepare_submit_ms=%.6f "
                     "gate_up_ms=%.6f activation_ms=%.6f down_ms=%.6f\n",
                     result.group, result.stages.prepare_ms / n,
                     result.stages.pair_ms / n,
