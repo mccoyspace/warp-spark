@@ -180,19 +180,19 @@ struct ShapeGate {
 static constexpr ShapeGate kGlm53Shapes[] = {
     { 8192,  4096, true,  "KDA q/k/v" },
     {  128,  4096, false, "KDA f_a/g_a" },
-    { 8192,   128, false, "KDA f_b/g_b" },
+    { 8192,   128, true,  "KDA f_b/g_b" },
     {   64,  4096, false, "KDA beta" },
     {  288,  4096, false, "MoE router" },
     { 4096,  8192, false, "KDA o and MTP eh" },
     { 1536,  4096, true,  "MLA q_a" },
-    {16384,  1536, false, "MLA q_b" },
+    {16384,  1536, true,  "MLA q_b" },
     {  512,  4096, false, "MLA kv_a" },
-    {32768,   512, false, "MLA kv_b row store" },
-    { 4096, 16384, false, "MLA o" },
+    {32768,   512, true,  "MLA kv_b row store" },
+    { 4096, 16384, true,  "MLA o" },
     {12288,  4096, true,  "dense gate/up" },
     { 4096, 12288, false, "dense down" },
-    { 2048,  4096, false, "shared gate/up" },
-    { 4096,  2048, false, "shared down" },
+    { 2048,  4096, true,  "shared gate/up" },
+    { 4096,  2048, true,  "shared down" },
 };
 
 /* Measured-positive geometries not present as standalone projections in the

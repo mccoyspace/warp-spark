@@ -449,19 +449,24 @@ extern "C" int waste_cuda_q4_matvec(waste_model *m, float *y,
 
 /* The two-row kernel is not automatically faster.  These are the shapes
  * whose bracketed GB10 screen beat two qualified mode-1 launches.  Keep this
- * an exact allowlist: small auxiliaries and wide-to-hidden projections remain
- * sequential until they produce their own positive measurements.  In
- * particular, every out=4096, in>4096 projection is excluded; both measured
- * examples regressed (4096x8192 and 4096x12288).
+ * an exact allowlist: small auxiliaries remain sequential until their saved
+ * launch time is material.  Wide-to-hidden projections are shape-specific:
+ * 4096x8192 regressed, 4096x12288 was only marginal, while 4096x16384 stayed
+ * positive in three repeated clean brackets.
  *
  * The three entries not used by the released GLM-5.3 projection set remain
  * here because they were independently measured positive and make the
  * primitive reusable without turning this into a heuristic threshold. */
 static int q4_fast2_shape_eligible(int out, int in)
 {
-    if (out == 4096 && in > 4096) return 0;
     return (out == 8192  && in == 4096) ||
+           (out == 8192  && in == 128)  ||
            (out == 1536  && in == 4096) ||
+           (out == 16384 && in == 1536) ||
+           (out == 32768 && in == 512)  ||
+           (out == 4096  && in == 16384) ||
+           (out == 2048  && in == 4096) ||
+           (out == 4096  && in == 2048) ||
            (out == 4096  && in == 1536) ||
            (out == 4096  && in == 4096) ||
            (out == 12288 && in == 4096) ||
