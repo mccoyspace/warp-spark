@@ -37,6 +37,9 @@
 
 #include "../src/model.h"
 
+extern double waste_prof[16];
+extern uint64_t waste_prof_n[16];
+
 typedef struct {
     int cycle, pos0, current, draft, target1, accepted, committed;
     int bonus, bonus_emitted, emitted;
@@ -253,6 +256,8 @@ int main(int argc, char **argv)
     uint64_t accepted = 0, committed = 0, rejected = 0, bonuses = 0;
     double draft_seconds = 0.0, verify_begin_seconds = 0.0;
     double finish_seconds = 0.0;
+    double spec_prof[16] = {0};
+    uint64_t spec_prof_n[16] = {0};
 
     if (argc == 2 && !strcmp(argv[1], "--self-test"))
         return scheduler_self_test();
@@ -361,6 +366,11 @@ int main(int argc, char **argv)
         goto fail;
     }
 
+    const int profile = getenv("WASTE_PROFILE") != NULL;
+    if (profile) {
+        memset(waste_prof, 0, sizeof spec_prof);
+        memset(waste_prof_n, 0, sizeof spec_prof_n);
+    }
     const double decode_start = now();
     while (emitted < n_gen) {
         spec_record *rec = &records[n_records];
@@ -465,6 +475,10 @@ int main(int argc, char **argv)
     }
     waste_ecache_drain(&model.cache);
     const double decode_seconds = now() - decode_start;
+    if (profile) {
+        memcpy(spec_prof, waste_prof, sizeof spec_prof);
+        memcpy(spec_prof_n, waste_prof_n, sizeof spec_prof_n);
+    }
     const int final_cache_pos = waste_model_mtp_cache_pos(&model);
     const int final_hidden_pos = hidden_pos;
 
@@ -541,6 +555,19 @@ int main(int argc, char **argv)
            verify_begin_seconds, finish_seconds, scheduler_residual,
            2 * n_records,
            final_cache_pos, final_hidden_pos);
+    if (profile) {
+        puts("profile_schema p0=lut_build p1=kda p2=mla p3=route_moe "
+             "p4=expert_read p5=expert_mm p6=head p7=lut_apply "
+             "p8=dense_mm p9=kda_recurrent p10=kda_qkv p11=kda_conv "
+             "p12=kda_aux p13=kda_gate p14=kda_norm p15=kda_out");
+        printf("profile verifier=%s vq2=%d",
+               verifier == VERIFY_FAST ? "fast" : "serial_oracle",
+               waste_model_mtp_verify2_get_vq2(&model));
+        for (int pidx = 0; pidx < 16; pidx++)
+            printf(" p%d=%.9f n%d=%" PRIu64,
+                   pidx, spec_prof[pidx], pidx, spec_prof_n[pidx]);
+        putchar('\n');
+    }
 
     waste_model_free(&model);
     free(records);
