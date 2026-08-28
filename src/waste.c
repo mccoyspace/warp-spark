@@ -1028,8 +1028,12 @@ static waste_status read_error_report(waste_ctx *c)
      * chunk scratch it could not allocate. Nothing named a record, so it
      * was the second. */
     if (!why) return WASTE_E_OOM;
-    snprintf(c->detail, sizeof c->detail,
-             "expert %d of layer %d: %s", expert, layer, why);
+    if (layer < 0)
+        snprintf(c->detail, sizeof c->detail,
+                 "embedding token %d: %s", expert, why);
+    else
+        snprintf(c->detail, sizeof c->detail,
+                 "expert %d of layer %d: %s", expert, layer, why);
     return WASTE_E_IO;
 }
 

@@ -69,6 +69,17 @@ void waste_cuda_kda_free(waste_model *m);
 
 #define MAXP 512
 
+typedef enum {
+    REC_OK = 0,
+    REC_E_READ,      /* expert-bank short read                            */
+    REC_E_HEADER,    /* expert magic, identity, offsets                   */
+    REC_E_CRC,       /* expert payload differs from converter output      */
+    REC_E_NOSLOT,    /* expert cache could not free a slot                */
+    REC_E_TRUNK,     /* embedding row could not be read from the trunk    */
+} rec_status;
+
+static int bank_fail(waste_model *m, rec_status st, int layer, int expert);
+
 /* ---- lightweight phase profiling (WASTE_PROFILE=1) --------------------- */
 #include <time.h>
 double waste_prof[16];
@@ -115,6 +126,31 @@ static char *slurp(const char *path, size_t *len)
     fclose(f);
     if (len) *len = (size_t)n;
     return b;
+}
+
+/* Parse a manifest byte count without routing it through double.  INT64_MAX
+ * is not exactly representable as a double, so comparing js_num() against
+ * (double)INT64_MAX and then casting can admit 2^63 and invoke undefined
+ * behaviour.  A byte count is deliberately a plain, positive decimal JSON
+ * integer; exponent and fractional spellings are rejected rather than
+ * silently rounded. */
+static int js_pos_i64_exact(const js_doc *d, int t, int64_t *out)
+{
+    if (!d || !out || t < 0 || t >= d->n || d->tok[t].type != JS_NUM)
+        return -1;
+    const int start = d->tok[t].start, end = d->tok[t].end;
+    if (start >= end) return -1;
+    int64_t value = 0;
+    for (int i = start; i < end; i++) {
+        const unsigned char ch = (unsigned char)d->src[i];
+        if (ch < '0' || ch > '9') return -1;
+        const int digit = ch - '0';
+        if (value > (INT64_MAX - digit) / 10) return -1;
+        value = value * 10 + digit;
+    }
+    if (value <= 0) return -1;
+    *out = value;
+    return 0;
 }
 
 static int bank_open(const char *path, size_t rec_bytes, int want, int *direct);
@@ -1154,6 +1190,9 @@ static int cuda_dense_preflight(waste_model *m, int scope)
             if (cuda_dense_tensor_ok(m, tname(
                     "%smodel.layers.%d.self_attn.kv_a_proj_with_mqa.weight",
                     c->prefix, L), &first) ||
+                (c->mla_output_gate && cuda_dense_tensor_ok(m, tname(
+                    "%smodel.layers.%d.self_attn.g_proj.weight",
+                    c->prefix, L), &first)) ||
                 cuda_dense_tensor_ok(m, tname(
                     "%smodel.layers.%d.self_attn.o_proj.weight",
                     c->prefix, L), &first))
@@ -1551,14 +1590,14 @@ void waste_deq_row(const waste_tensor *t, long r, int cols, float *dst)
 /* One row of a tensor that was left on disk, into the model's row scratch.
  * Falls through to the resident pointers when the tensor is in RAM, so
  * callers do not branch. */
-static void trunk_row(waste_model *m, const waste_tensor *t, long row,
-                      const int8_t **q, const uint16_t **qs)
+static int trunk_row(waste_model *m, const waste_tensor *t, long row,
+                     const int8_t **q, const uint16_t **qs)
 {
     const int ng = (t->shape[t->ndim - 1] + t->group - 1) / t->group;
     if (!t->on_disk) {
         *q  = t->q  + (size_t)row * t->rowbytes;
         *qs = t->qs + (size_t)row * ng;
-        return;
+        return 0;
     }
     if (pread_all(m->trunk_fd, m->embrow, t->rowbytes,
                   t->file_off + row * (long)t->rowbytes) ||
@@ -1566,8 +1605,11 @@ static void trunk_row(waste_model *m, const waste_tensor *t, long row,
                   t->file_scale_off + row * (long)ng * 2)) {
         memset(m->embrow, 0, t->rowbytes);
         memset(m->embsc, 0, (size_t)ng * sizeof(uint16_t));
+        *q = m->embrow; *qs = m->embsc;
+        return -1;
     }
     *q = m->embrow; *qs = m->embsc;
+    return 0;
 }
 
 static int clamp_token(const waste_model *m, int token);
@@ -1581,17 +1623,24 @@ static int clamp_token(const waste_model *m, int token);
 int waste_embed_row(waste_model *m, int token, float *dst)
 {
     const int hid = m->cfg.hidden;
+    const int id = clamp_token(m, token);
     const waste_tensor *emb = waste_find(m, tname("%smodel.embed_tokens.weight",
                                                   m->cfg.prefix));
     if (!emb) return -1;
     if (emb->data) {
-        memcpy(dst, emb->data + (size_t)clamp_token(m, token) * hid,
+        memcpy(dst, emb->data + (size_t)id * hid,
                (size_t)hid * sizeof(float));
         return 0;
     }
     const int g = emb->group, ng = (hid + g - 1) / g;
     const int8_t *row; const uint16_t *sc;
-    trunk_row(m, emb, clamp_token(m, token), &row, &sc);
+    if (trunk_row(m, emb, id, &row, &sc)) {
+        /* Use the same sticky, first-failure-wins channel as expert-bank
+         * I/O.  Returning a zero row used to let generation continue with
+         * corrupted state and no error visible to the caller. */
+        bank_fail(m, REC_E_TRUNK, -1, id);
+        return -1;
+    }
     for (int k = 0; k < ng; k++) {
         const float sv = f16_to_f32(sc[k]);
         for (int i = 0; i < g && k * g + i < hid; i++) {
@@ -2741,6 +2790,7 @@ int waste_model_load(waste_model *m, const char *dir, int kv_cap,
     m->mtp_target_hidden_pos = -1;
     m->mtp_last_pos = -1;
     m->mtp_last_token = -1;
+    m->mtp_target_token = -1;
     m->mtp_shadow_argmax = -1;
     for (int L = 0; L < WASTE_MAX_LAYERS; L++) m->bank[L].fd = -1;
     m->want_vision = opt->want_vision;
@@ -3172,22 +3222,19 @@ int waste_model_load(waste_model *m, const char *dir, int kv_cap,
             const int bytes_t = js_get(&d, bank, "bytes");
             const int cb_t = js_get(&d, bank, "codebook_base");
             const double experts_n = js_num(&d, experts_t, NAN);
-            const double bytes_n = js_num(&d, bytes_t, NAN);
             const double cb_n = js_num(&d, cb_t, NAN);
+            int64_t bytes = 0;
             char fn[64];
             js_str(&d, js_get(&d, bank, "file"), fn, sizeof fn);
             if (js_typeof(&d, bank) != JS_OBJ || !fn[0] ||
                 js_typeof(&d, experts_t) != JS_NUM ||
                 experts_n != c->n_experts ||
-                js_typeof(&d, bytes_t) != JS_NUM || !isfinite(bytes_n) ||
-                trunc(bytes_n) != bytes_n || bytes_n <= 0.0 ||
-                bytes_n > (double)INT64_MAX ||
+                js_pos_i64_exact(&d, bytes_t, &bytes) ||
                 js_typeof(&d, cb_t) != JS_NUM || !isfinite(cb_n) ||
                 trunc(cb_n) != cb_n || cb_n < 0.0 || cb_n > INT_MAX) {
                 fprintf(stderr, "waste: malformed GLM MTP expert bank\n");
                 js_free(&d); free(src); return -2;
             }
-            const int64_t bytes = (int64_t)bytes_n;
             m->bank[L].n_experts = (int)experts_n;
             m->bank[L].cb_base = (int)cb_n;
             if (bytes % m->bank[L].n_experts != 0 ||
@@ -3197,6 +3244,10 @@ int waste_model_load(waste_model *m, const char *dir, int kv_cap,
                 js_free(&d); free(src); return -2;
             }
             m->bank[L].rec_bytes = bytes / m->bank[L].n_experts;
+            if ((uint64_t)m->bank[L].rec_bytes > (uint64_t)SIZE_MAX) {
+                fprintf(stderr, "waste: GLM MTP expert record is too large\n");
+                js_free(&d); free(src); return -2;
+            }
             snprintf(path, sizeof path, "%s/%s", dir, fn);
             m->bank[L].fd = bank_open(path, m->bank[L].rec_bytes,
                                       m->want_direct, &m->direct_io);
@@ -3299,6 +3350,8 @@ int waste_model_load(waste_model *m, const char *dir, int kv_cap,
         m->mtp_target_hidden = (float *)calloc((size_t)c->hidden,
                                                sizeof(float));
         m->mtp_hidden = (float *)calloc((size_t)c->hidden, sizeof(float));
+        m->mtp_input_embed = (float *)calloc((size_t)c->hidden,
+                                             sizeof(float));
         m->mtp_logits = (float *)calloc((size_t)c->vocab, sizeof(float));
         /* [enorm(embed), hnorm(previous)] + fused hidden + norm + sublayer. */
         m->mtp_work = (float *)calloc((size_t)5 * c->hidden, sizeof(float));
@@ -3397,7 +3450,8 @@ int waste_model_load(waste_model *m, const char *dir, int kv_cap,
     }
     if (m->mtp_available &&
         (!m->latcache[m->mtp_layer] || !m->mtp_target_hidden ||
-         !m->mtp_hidden || !m->mtp_logits || !m->mtp_work))
+         !m->mtp_hidden || !m->mtp_input_embed || !m->mtp_logits ||
+         !m->mtp_work))
         return -1;
     if (c->attn_res_block && !m->blockres) return -1;
     if (m->gqa_chunk_prefill &&
@@ -3496,6 +3550,7 @@ void waste_model_free(waste_model *m)
     }
     free(m->x); free(m->h); free(m->tmp); free(m->att); free(m->logits);
     free(m->mtp_target_hidden); free(m->mtp_hidden);
+    free(m->mtp_input_embed);
     free(m->mtp_logits); free(m->mtp_work);
     free(m->ff); free(m->e_gate); free(m->e_up); free(m->e_down); free(m->lut);
     free(m->lut8); free(m->lut8_scale);
@@ -3642,14 +3697,6 @@ static int bank_open(const char *path, size_t rec_bytes, int asked, int *direct)
  * each of the three matrices.
  */
 
-typedef enum {
-    REC_OK = 0,
-    REC_E_READ,      /* short read                                        */
-    REC_E_HEADER,    /* magic, identity, offsets                          */
-    REC_E_CRC,       /* the payload is not what the converter wrote       */
-    REC_E_NOSLOT,    /* the cache could not free a slot to read into      */
-} rec_status;
-
 static rec_status record_check(const waste_model *m, int layer, int expert,
                                const uint8_t *rec)
 {
@@ -3673,6 +3720,10 @@ static rec_status record_check(const waste_model *m, int layer, int expert,
         !(m->index_bits == 8 && h->fmt == WQ_VQ2R))
         return REC_E_HEADER;
     if (h->lowrank_id != 0) return REC_E_HEADER;             /* v0 */
+    /* A record must name the exact codebook group declared for its bank.
+     * Merely being globally in range allows a spliced record to decode
+     * against a different, valid codebook and silently return wrong math. */
+    if (h->codebook_id != m->bank[layer].cb_base) return REC_E_HEADER;
     /* codebook_id indexes the table three stage-groups deep and nothing
      * downstream bounds it. */
     if ((long)h->codebook_id + 3L * m->stages > m->n_books) return REC_E_HEADER;
@@ -3800,6 +3851,7 @@ const char *waste_model_read_error(const waste_model *m, int *layer, int *expert
         case REC_E_READ:   return "short read";
         case REC_E_HEADER: return "record header is not what the bank index describes";
         case REC_E_NOSLOT: return "expert cache could not free a slot to read into";
+        case REC_E_TRUNK:  return "embedding row short read";
         default:           return "checksum mismatch";
     }
 }
@@ -5758,11 +5810,15 @@ void waste_model_reset(waste_model *m)
                    (size_t)c->hidden * sizeof(float));
         if (m->mtp_hidden)
             memset(m->mtp_hidden, 0, (size_t)c->hidden * sizeof(float));
+        if (m->mtp_input_embed)
+            memset(m->mtp_input_embed, 0,
+                   (size_t)c->hidden * sizeof(float));
     }
     m->mtp_target_hidden_pos = -1;
     m->mtp_alignment_error = 0;
     m->mtp_last_pos = -1;
     m->mtp_last_token = -1;
+    m->mtp_target_token = -1;
     m->mtp_shadow_argmax = -1;
     m->mtp_steps = 0;
     m->mtp_shadow_steps = 0;
@@ -6851,7 +6907,8 @@ static int mtp_alignment_fail(waste_model *m, const char *what,
  * embedding half at p=0 before enorm.  The MTP layer itself is conventional
  * residual DSA/MLA + MoE — it does not carry the target's four mHC streams. */
 static const float *mtp_step(waste_model *m, int token, int pos,
-                             const float *previous_hidden, int *routed)
+                             const float *previous_hidden,
+                             const float *input_embedding, int *routed)
 {
     if (!m || !m->mtp_available || !m->mtp_active || !previous_hidden ||
         m->mtp_alignment_error)
@@ -6872,7 +6929,18 @@ static const float *mtp_step(waste_model *m, int token, int pos,
     float *hidden = pair + (size_t)2 * hid;
     float *norm = hidden + hid;
     float *sub = norm + hid;
-    if (waste_embed_row(m, token, pair)) return NULL;
+    /* Preserve the unnormalised row.  A speculative proposal and the target
+     * token that consumes it need identical embeddings; keeping this one-H
+     * copy avoids a second trunk pread/dequantization.  The bootstrap path
+     * receives the row the target already loaded, so it avoids the duplicate
+     * in the opposite call order as well. */
+    if (input_embedding) {
+        memcpy(m->mtp_input_embed, input_embedding,
+               (size_t)hid * sizeof(float));
+    } else if (waste_embed_row(m, token, m->mtp_input_embed)) {
+        return NULL;
+    }
+    memcpy(pair, m->mtp_input_embed, (size_t)hid * sizeof(float));
     if (pos == 0) memset(pair, 0, (size_t)hid * sizeof(float));
     waste_rmsnorm(pair, pair,
                   T(m, "%smodel.layers.%d.enorm.weight", c->prefix, L),
@@ -6934,10 +7002,22 @@ int waste_model_mtp_set_enabled(waste_model *m, int enabled)
     if (!m || (enabled != 0 && enabled != 1)) return -1;
     if (!enabled) {
         m->mtp_active = 0;
+        /* A pending comparison belongs to the target step that the caller
+         * chose to run without MTP.  Never compare it against a later row
+         * after a disable/re-enable cycle. */
+        m->mtp_shadow_argmax = -1;
         return 0;
     }
     if (!m->mtp_available || m->mtp_alignment_error ||
         m->mtp_target_hidden_pos < -1) return -1;
+    /* The NextN release contract is text-only.  A media placeholder replaces
+     * the target embedding with a tower row, while MTP currently always
+     * pairs against a vocabulary embedding.  Refuse that mixed state until
+     * the media/NextN pairing contract is implemented and tested. */
+    if (m->media) {
+        fprintf(stderr, "waste: GLM MTP does not yet support media embeddings\n");
+        return -1;
+    }
     /* A clean target state with p as its last position must already have p
      * completed MTP rows.  This permits enabling before prefill (p=-1), or
      * just after token zero, and rejects a silently cold cache after a longer
@@ -6946,6 +7026,16 @@ int waste_model_mtp_set_enabled(waste_model *m, int enabled)
                    ? 0 : m->mtp_target_hidden_pos;
     if (m->n_kv[m->mtp_layer] != need)
         return mtp_alignment_fail(m, "enable", m->n_kv[m->mtp_layer], need);
+    /* Counts alone are insufficient after an anticipatory proposal: MTP may
+     * have cached token A, been disabled, and then watched the target consume
+     * token B.  One target step makes the counts line up again while the row
+     * is still semantically wrong.  Retain and compare the token identities
+     * before allowing that state back into service. */
+    if (need > 0 &&
+        (m->mtp_last_pos != need - 1 ||
+         m->mtp_last_token != m->mtp_target_token))
+        return mtp_alignment_fail(m, "enable token", m->mtp_last_token,
+                                  m->mtp_target_token);
     m->mtp_active = 1;
     return 0;
 }
@@ -6973,7 +7063,7 @@ const float *waste_model_mtp_propose(waste_model *m, int next_token,
     }
     dump_pos0 = target_pos;
     const float *draft = mtp_step(m, next_token, target_pos,
-                                  m->mtp_target_hidden, routed);
+                                  m->mtp_target_hidden, NULL, routed);
     if (draft) m->mtp_shadow_argmax = mtp_argmax(draft, m->cfg.vocab);
     return draft;
 }
@@ -7003,10 +7093,366 @@ uint64_t waste_model_mtp_shadow_matches(const waste_model *m)
     return m ? m->mtp_shadow_matches : 0;
 }
 
+/* ---- serial depth-1 MTP verifier oracle -------------------------------
+ *
+ * The optimized verifier will eventually run two target positions
+ * layer-major.  This transaction deliberately does not: it evaluates the
+ * same two positions with the ordinary, already-qualified target path and
+ * supplies the exact state/result oracle that the optimized path must match.
+ * Only the state after token0 needs a checkpoint.  Rejecting draft token1
+ * restores it; accepting simply discards the checkpoint.
+ */
+
+struct waste_mtp_verify2_oracle {
+    waste_model *model;
+    int pos0, token0, token1;
+    int open;
+    int n_kv[WASTE_MAX_LAYERS];
+    int n_blockres, media_used, ctx_full;
+    int read_error, bad_layer, bad_expert;
+    int cuda_kda_state_dirty, cuda_kda_failed;
+    int mtp_active, mtp_target_hidden_pos, mtp_alignment_error;
+    int mtp_last_pos, mtp_last_token, mtp_target_token;
+    int mtp_shadow_argmax;
+    uint64_t mtp_steps, mtp_shadow_steps, mtp_shadow_matches;
+    double mtp_seconds;
+    size_t blockres_floats, state_floats;
+    float *state;
+    float *logits;                  /* [2][vocab] */
+    float *hidden;                  /* [2][hidden] */
+};
+
+static int mtp_oracle_add_floats(size_t *total, size_t count)
+{
+    if (*total > SIZE_MAX - count) return -1;
+    *total += count;
+    return 0;
+}
+
+/* Production accepts only the released GLM-5.3 geometry.  The one other
+ * accepted shape is the exact, named tiny GLM-5.3 fixture used by the
+ * integration suite; it preserves all 45 layers, the 3-KDA/1-MLA schedule,
+ * four mHC streams and the appended layer while scaling matrix widths. */
+static int mtp_oracle_geometry_ok(const waste_model *m)
+{
+    if (!m || !m->mtp_available || !m->mtp_active) return 0;
+    const waste_config *c = &m->cfg;
+    if (strcmp(c->arch, "Glm5NextForConditionalGeneration") ||
+        strcmp(c->model_type, "glm5_next_text") ||
+        c->attention_kind != WASTE_ATTN_LATENT || c->n_layers != 45 ||
+        !c->mhc || c->hc_mult != 4 || c->hc_sinkhorn_iters != 20 ||
+        fabsf(c->hc_eps - 1e-6f) > 1e-12f ||
+        c->mtp_layers != 1 || c->mtp_source_layer != 45 ||
+        m->mtp_layer != 45 || m->mtp_context_limit != 2048 ||
+        c->dsa_dense_context_limit != 2048 ||
+        c->max_position_embeddings != 2048 || c->qk_rope != 0 ||
+        !c->mla_nope || c->kda_layer_index_base != 0 ||
+        fabsf(c->kda_l2_eps - 1e-6f) > 1e-12f ||
+        c->conv_k != 4 || c->full_rank_gate ||
+        fabsf(c->gate_lower_bound + 5.0f) > 1e-6f ||
+        c->latent_dim != 0 || c->mla_output_gate || c->act_situ)
+        return 0;
+    for (int L = 0; L < c->n_layers; L++)
+        if (!!c->kda_layer[L] != (L % 4 != 3)) return 0;
+    if (waste_model_cuda_glm53_dense_compatible(m)) return 1;
+    return c->hidden == 128 && c->n_experts == 8 && c->top_k == 2 &&
+           c->moe_inter == 64 && c->dense_inter == 256 &&
+           c->n_shared == 1 && c->first_dense == 3 &&
+           c->n_heads == 4 && c->n_kv_heads == 4 &&
+           c->kv_lora == 32 && c->q_lora == 64 &&
+           c->qk_nope == 16 && c->v_head == 16 &&
+           c->kda_heads == 4 && c->kda_dim == 32 &&
+           m->expert_m[0] == 64 && m->expert_m[1] == 64 &&
+           m->expert_m[2] == 128 && m->expert_n[0] == 128 &&
+           m->expert_n[1] == 128 && m->expert_n[2] == 64;
+}
+
+static int mtp_oracle_base_cache_at(const waste_model *m, int rows)
+{
+    for (int L = 0; L < m->cfg.n_layers; L++)
+        if (!m->cfg.kda_layer[L] && m->n_kv[L] != rows) return 0;
+    return 1;
+}
+
+static void mtp_oracle_free(waste_mtp_verify2_oracle *o)
+{
+    if (!o) return;
+    free(o->state);
+    free(o->logits);
+    free(o->hidden);
+    free(o);
+}
+
+static waste_mtp_verify2_oracle *mtp_oracle_alloc(waste_model *m,
+                                                   int token0, int token1,
+                                                   int pos0)
+{
+    const waste_config *c = &m->cfg;
+    waste_mtp_verify2_oracle *o =
+        (waste_mtp_verify2_oracle *)calloc(1, sizeof *o);
+    if (!o) return NULL;
+    o->model = m; o->token0 = token0; o->token1 = token1; o->pos0 = pos0;
+
+    size_t nf = 0;
+    const size_t H = (size_t)c->kda_heads, D = (size_t)c->kda_dim;
+    const size_t C = H * D;
+    for (int L = 0; L < c->n_layers; L++) {
+        if (!c->kda_layer[L]) continue;
+        if (mtp_oracle_add_floats(&nf, H * D * D) ||
+            mtp_oracle_add_floats(
+                &nf, (size_t)3 * C * (size_t)(c->conv_k - 1)))
+            goto fail;
+    }
+    if (c->attn_res_block) {
+        o->blockres_floats =
+            (size_t)(c->n_layers / c->attn_res_block + 2) * c->hidden;
+    }
+    /* x, complete block-residual backing, target hidden, raw MTP residual,
+     * the embedding cached for that residual row, and MTP logits. Target
+     * logits are already retained as result row 0. */
+    if (mtp_oracle_add_floats(&nf, (size_t)c->hidden) ||
+        mtp_oracle_add_floats(&nf, o->blockres_floats) ||
+        mtp_oracle_add_floats(&nf, (size_t)3 * c->hidden) ||
+        mtp_oracle_add_floats(&nf, (size_t)c->vocab))
+        goto fail;
+    o->state_floats = nf;
+    if (nf > SIZE_MAX / sizeof(float)) goto fail;
+    o->state = (float *)malloc(nf * sizeof(float));
+    if ((size_t)c->vocab > SIZE_MAX / (2 * sizeof(float)) ||
+        (size_t)c->hidden > SIZE_MAX / (2 * sizeof(float)))
+        goto fail;
+    o->logits = (float *)malloc((size_t)2 * c->vocab * sizeof(float));
+    o->hidden = (float *)malloc((size_t)2 * c->hidden * sizeof(float));
+    if (!o->state || !o->logits || !o->hidden) goto fail;
+    return o;
+fail:
+    mtp_oracle_free(o);
+    return NULL;
+}
+
+static void mtp_oracle_capture_after_token0(waste_mtp_verify2_oracle *o)
+{
+    waste_model *m = o->model;
+    const waste_config *c = &m->cfg;
+    float *p = o->state;
+    const size_t H = (size_t)c->kda_heads, D = (size_t)c->kda_dim;
+    const size_t C = H * D;
+    memcpy(o->n_kv, m->n_kv, sizeof o->n_kv);
+    for (int L = 0; L < c->n_layers; L++) {
+        if (!c->kda_layer[L]) continue;
+        size_t n = H * D * D;
+        memcpy(p, m->S[L], n * sizeof(float)); p += n;
+        n = (size_t)3 * C * (size_t)(c->conv_k - 1);
+        memcpy(p, m->conv[L], n * sizeof(float)); p += n;
+    }
+    memcpy(p, m->x, (size_t)c->hidden * sizeof(float)); p += c->hidden;
+    if (o->blockres_floats) {
+        memcpy(p, m->blockres, o->blockres_floats * sizeof(float));
+        p += o->blockres_floats;
+    }
+    memcpy(p, m->mtp_target_hidden, (size_t)c->hidden * sizeof(float));
+    p += c->hidden;
+    memcpy(p, m->mtp_hidden, (size_t)c->hidden * sizeof(float));
+    p += c->hidden;
+    memcpy(p, m->mtp_input_embed, (size_t)c->hidden * sizeof(float));
+    p += c->hidden;
+    memcpy(p, m->mtp_logits, (size_t)c->vocab * sizeof(float)); p += c->vocab;
+
+    o->n_blockres = m->n_blockres; o->media_used = m->media_used;
+    o->ctx_full = m->ctx_full; o->read_error = m->read_error;
+    o->bad_layer = m->bad_layer; o->bad_expert = m->bad_expert;
+    o->cuda_kda_state_dirty = m->cuda_kda_state_dirty;
+    o->cuda_kda_failed = m->cuda_kda_failed;
+    o->mtp_active = m->mtp_active;
+    o->mtp_target_hidden_pos = m->mtp_target_hidden_pos;
+    o->mtp_alignment_error = m->mtp_alignment_error;
+    o->mtp_last_pos = m->mtp_last_pos; o->mtp_last_token = m->mtp_last_token;
+    o->mtp_target_token = m->mtp_target_token;
+    o->mtp_shadow_argmax = m->mtp_shadow_argmax;
+    o->mtp_steps = m->mtp_steps; o->mtp_shadow_steps = m->mtp_shadow_steps;
+    o->mtp_shadow_matches = m->mtp_shadow_matches;
+    o->mtp_seconds = m->mtp_seconds;
+    (void)p;
+}
+
+/* Restore semantic state only.  Expert-cache contents/usage and accelerator
+ * work counters intentionally describe the physical work that really ran.
+ * MLA bytes beyond the restored count are dead and may remain in place. */
+static void mtp_oracle_restore_after_token0(waste_mtp_verify2_oracle *o,
+                                             int preserve_failure)
+{
+    waste_model *m = o->model;
+    const waste_config *c = &m->cfg;
+    const int failed_read = m->read_error;
+    const int failed_layer = m->bad_layer, failed_expert = m->bad_expert;
+    const int failed_ctx = m->ctx_full;
+    const int failed_cuda = m->cuda_kda_failed;
+    const int failed_dirty = m->cuda_kda_state_dirty;
+    const int failed_alignment = m->mtp_alignment_error;
+    const size_t H = (size_t)c->kda_heads, D = (size_t)c->kda_dim;
+    const size_t C = H * D;
+    const float *p = o->state;
+
+    memcpy(m->n_kv, o->n_kv, sizeof o->n_kv);
+    for (int L = 0; L < c->n_layers; L++) {
+        if (!c->kda_layer[L]) continue;
+        size_t n = H * D * D;
+        memcpy(m->S[L], p, n * sizeof(float)); p += n;
+        n = (size_t)3 * C * (size_t)(c->conv_k - 1);
+        memcpy(m->conv[L], p, n * sizeof(float)); p += n;
+    }
+    memcpy(m->x, p, (size_t)c->hidden * sizeof(float)); p += c->hidden;
+    if (o->blockres_floats) {
+        memcpy(m->blockres, p, o->blockres_floats * sizeof(float));
+        p += o->blockres_floats;
+    }
+    memcpy(m->mtp_target_hidden, p, (size_t)c->hidden * sizeof(float));
+    p += c->hidden;
+    memcpy(m->mtp_hidden, p, (size_t)c->hidden * sizeof(float));
+    p += c->hidden;
+    memcpy(m->mtp_input_embed, p, (size_t)c->hidden * sizeof(float));
+    p += c->hidden;
+    memcpy(m->mtp_logits, p, (size_t)c->vocab * sizeof(float));
+    memcpy(m->logits, o->logits, (size_t)c->vocab * sizeof(float));
+
+    m->n_blockres = o->n_blockres; m->media_used = o->media_used;
+    m->ctx_full = o->ctx_full; m->read_error = o->read_error;
+    m->bad_layer = o->bad_layer; m->bad_expert = o->bad_expert;
+    m->cuda_kda_state_dirty = o->cuda_kda_state_dirty;
+    m->cuda_kda_failed = o->cuda_kda_failed;
+    m->mtp_active = o->mtp_active;
+    m->mtp_target_hidden_pos = o->mtp_target_hidden_pos;
+    m->mtp_alignment_error = o->mtp_alignment_error;
+    m->mtp_last_pos = o->mtp_last_pos; m->mtp_last_token = o->mtp_last_token;
+    m->mtp_target_token = o->mtp_target_token;
+    m->mtp_shadow_argmax = o->mtp_shadow_argmax;
+    m->mtp_steps = o->mtp_steps; m->mtp_shadow_steps = o->mtp_shadow_steps;
+    m->mtp_shadow_matches = o->mtp_shadow_matches;
+    m->mtp_seconds = o->mtp_seconds;
+
+    /* A verifier failure is not made valid merely because its mathematical
+     * state was recoverable.  Keep the sticky failure channel set. */
+    if (preserve_failure) {
+        if (failed_read) {
+            m->read_error = failed_read; m->bad_layer = failed_layer;
+            m->bad_expert = failed_expert;
+        }
+        if (failed_ctx) m->ctx_full = failed_ctx;
+        if (failed_cuda) m->cuda_kda_failed = failed_cuda;
+        if (failed_dirty) m->cuda_kda_state_dirty = failed_dirty;
+        if (failed_alignment) m->mtp_alignment_error = failed_alignment;
+    }
+}
+
+static int mtp_oracle_after_token1(const waste_mtp_verify2_oracle *o)
+{
+    const waste_model *m = o->model;
+    return m->mtp_active && !m->mtp_alignment_error && !m->read_error &&
+           !m->cuda_kda_state_dirty && m->mtp_target_hidden_pos == o->pos0 + 1 &&
+           m->mtp_target_token == o->token1 &&
+           m->n_kv[m->mtp_layer] == o->pos0 + 1 &&
+           m->mtp_last_pos == o->pos0 && m->mtp_last_token == o->token1 &&
+           m->mtp_shadow_argmax == -1 &&
+           mtp_oracle_base_cache_at(m, o->pos0 + 2);
+}
+
+int waste_model_mtp_verify2_oracle_begin(
+    waste_model *m, int token0, int draft_token1, int pos0,
+    int *routed0, int *routed1, waste_mtp_verify2_oracle **out)
+{
+    if (out) *out = NULL;
+    if (!out || !mtp_oracle_geometry_ok(m) || m->mtp_oracle_open ||
+        token0 < 0 || token0 >= m->cfg.vocab || draft_token1 < 0 ||
+        draft_token1 >= m->cfg.vocab || pos0 <= 0 || pos0 >= INT_MAX ||
+        pos0 + 1 >= m->kv_cap || pos0 + 1 >= m->mtp_context_limit ||
+        m->read_error || m->ctx_full || m->cuda_kda_state_dirty ||
+        m->cuda_kda_failed || m->mtp_alignment_error ||
+        m->mtp_target_hidden_pos != pos0 - 1 ||
+        m->n_kv[m->mtp_layer] != pos0 ||
+        m->mtp_last_pos != pos0 - 1 || m->mtp_last_token != token0 ||
+        m->mtp_shadow_argmax < 0 || !mtp_oracle_base_cache_at(m, pos0))
+        return -1;
+
+    waste_mtp_verify2_oracle *o =
+        mtp_oracle_alloc(m, token0, draft_token1, pos0);
+    if (!o) return -1;              /* no target state changed yet */
+    m->mtp_oracle_open = 1;
+    o->open = 1;
+
+    const float *logits = waste_model_step(m, token0, pos0, routed0);
+    if (!logits || m->mtp_target_hidden_pos != pos0 ||
+        m->mtp_target_token != token0 ||
+        m->n_kv[m->mtp_layer] != pos0 ||
+        m->mtp_last_pos != pos0 - 1 || m->mtp_last_token != token0 ||
+        m->mtp_shadow_argmax != -1 ||
+        !mtp_oracle_base_cache_at(m, pos0 + 1))
+        goto fail_first;
+    memcpy(o->logits, logits, (size_t)m->cfg.vocab * sizeof(float));
+    memcpy(o->hidden, m->mtp_target_hidden,
+           (size_t)m->cfg.hidden * sizeof(float));
+    mtp_oracle_capture_after_token0(o);
+
+    logits = waste_model_step(m, draft_token1, pos0 + 1, routed1);
+    if (!logits || !mtp_oracle_after_token1(o)) {
+        mtp_oracle_restore_after_token0(o, 1);
+        goto fail_closed;
+    }
+    memcpy(o->logits + m->cfg.vocab, logits,
+           (size_t)m->cfg.vocab * sizeof(float));
+    memcpy(o->hidden + m->cfg.hidden, m->mtp_target_hidden,
+           (size_t)m->cfg.hidden * sizeof(float));
+    *out = o;
+    return 0;
+
+fail_first:
+    /* A failed first target step may already have changed recurrent state.
+     * waste_model_step marks active MTP alignment bad, and read/CUDA errors
+     * are sticky; keep that failure visible instead of inventing a state for
+     * which no after-token0 checkpoint exists. */
+fail_closed:
+    m->mtp_oracle_open = 0;
+    o->open = 0;
+    mtp_oracle_free(o);
+    return -1;
+}
+
+const float *waste_model_mtp_verify2_oracle_logits(
+    const waste_mtp_verify2_oracle *o, int token_index)
+{
+    if (!o || !o->open || (token_index != 0 && token_index != 1)) return NULL;
+    return o->logits + (size_t)token_index * o->model->cfg.vocab;
+}
+
+const float *waste_model_mtp_verify2_oracle_hidden(
+    const waste_mtp_verify2_oracle *o, int token_index)
+{
+    if (!o || !o->open || (token_index != 0 && token_index != 1)) return NULL;
+    return o->hidden + (size_t)token_index * o->model->cfg.hidden;
+}
+
+int waste_model_mtp_verify2_oracle_finish(waste_mtp_verify2_oracle *o,
+                                           int accept_draft)
+{
+    if (!o || !o->open || (accept_draft != 0 && accept_draft != 1)) return -1;
+    waste_model *m = o->model;
+    int rc = 0;
+    if (!mtp_oracle_after_token1(o)) {
+        mtp_oracle_restore_after_token0(o, 1);
+        rc = -1;
+    } else if (!accept_draft) {
+        mtp_oracle_restore_after_token0(o, 0);
+    }
+    m->mtp_oracle_open = 0;
+    o->open = 0;
+    mtp_oracle_free(o);
+    return rc;
+}
+
 /* Advance the MTP history before the target consumes a known token.  A
  * proposal may already have filled exactly this row; record and require the
  * token identity so a rejected/deviating path never reuses the wrong cache. */
-static int mtp_before_target_step(waste_model *m, int token, int pos)
+static int mtp_before_target_step(waste_model *m, int token, int pos,
+                                  const float *input_embedding)
 {
     if (!m->mtp_active) return 0;
     if (m->mtp_alignment_error) return -1;
@@ -7031,7 +7477,8 @@ static int mtp_before_target_step(waste_model *m, int token, int pos)
         return mtp_alignment_fail(m, "bootstrap cache", m->n_kv[L], pos - 1);
     dump_pos0 = pos - 1;
     const float *draft = mtp_step(m, token, pos - 1,
-                                  m->mtp_target_hidden, NULL);
+                                  m->mtp_target_hidden,
+                                  input_embedding, NULL);
     if (!draft) return -1;
     m->mtp_shadow_argmax = mtp_argmax(draft, m->cfg.vocab);
     return 0;
@@ -7502,14 +7949,17 @@ const float *waste_model_step(waste_model *m, int token, int pos, int *routed)
         ((m->cuda_kda_mode || m->cuda_dense_scope || m->cuda_gqa_proj ||
           m->cuda_vq_mode) &&
          m->cuda_kda_failed)) return NULL;
+    if (m->mtp_active && m->media) {
+        if (!m->mtp_alignment_error)
+            fprintf(stderr,
+                    "waste: active GLM MTP cannot consume media embeddings\n");
+        m->mtp_alignment_error = 1;
+        return NULL;
+    }
     {   /* see waste_model_prefill */
         const int cm = waste_model_ctx_max(m);
         if (cm && (pos < 0 || pos >= cm)) { m->ctx_full = 1; return NULL; }
     }
-    if (mtp_before_target_step(m, token, pos)) return NULL;
-    /* The MTP bootstrap step reports its own pair position.  Restore the
-     * target position before route/hidden diagnostics run. */
-    dump_pos0 = pos;
     /* one embedding row; the table may be kept quantized */
     /* Same splice as the prefill: a chunked prompt whose last chunk is a
      * single token comes through here, and if that token is a media
@@ -7517,13 +7967,24 @@ const float *waste_model_step(waste_model *m, int token, int pos, int *routed)
      * this the bug only appears when an image lands at the very end of a
      * prompt or its token count divides badly — which is to say, rarely
      * and confusingly. */
-    if (m->media && m->media_used < m->media_n && token == m->cfg_media_token) {
+    const int cached_mtp_embedding =
+        m->mtp_active && pos > 0 &&
+        m->n_kv[m->mtp_layer] == pos && m->mtp_last_pos == pos - 1 &&
+        m->mtp_last_token == clamp_token(m, token);
+    if (cached_mtp_embedding) {
+        memcpy(m->x, m->mtp_input_embed, (size_t)hid * sizeof(float));
+    } else if (m->media && m->media_used < m->media_n &&
+               token == m->cfg_media_token) {
         memcpy(m->x, m->media + (size_t)m->media_used * hid,
                (size_t)hid * sizeof(float));
         m->media_used++;
     } else {
-        waste_embed_row(m, token, m->x);
+        if (waste_embed_row(m, token, m->x)) return NULL;
     }
+    if (mtp_before_target_step(m, token, pos, m->x)) return NULL;
+    /* The MTP bootstrap step reports its own pair position.  Restore the
+     * target position before route/hidden diagnostics run. */
+    dump_pos0 = pos;
 
     if (c->mhc) {
         const float *target = model_step_mhc(m, pos, routed);
@@ -7531,6 +7992,7 @@ const float *waste_model_step(waste_model *m, int token, int pos, int *routed)
             if (m->mtp_active) m->mtp_alignment_error = 1;
             return NULL;
         }
+        if (m->mtp_available) m->mtp_target_token = clamp_token(m, token);
         mtp_after_target_step(m, target);
         return target;
     }
@@ -7659,6 +8121,7 @@ const float *waste_model_step(waste_model *m, int token, int pos, int *routed)
     if (target_ok && m->mtp_available) {
         memcpy(m->mtp_target_hidden, norm, (size_t)hid * sizeof(float));
         m->mtp_target_hidden_pos = pos;
+        m->mtp_target_token = clamp_token(m, token);
     }
     free(resid);
     free(norm);

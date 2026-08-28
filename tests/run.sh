@@ -1593,6 +1593,7 @@ elif ! python3 - "$GLM53_MTP" "$TMP" <<'PY_GLM53_MTP_BAD'
 import json
 from pathlib import Path
 import shutil
+import struct
 import sys
 
 source, temp = map(Path, sys.argv[1:])
@@ -1614,6 +1615,17 @@ rewrite(clone("nonrecurrent"),
 rewrite(clone("missing-config"), lambda m: m["config"].pop("mtp_layers"))
 rewrite(clone("bank-bytes"),
         lambda m: m["mtp"]["bank"].__setitem__("bytes", 1))
+rewrite(clone("bank-bytes-overflow"),
+        lambda m: m["mtp"]["bank"].__setitem__(
+            "bytes", 9223372036854775808))
+wrong_codebook = clone("record-codebook")
+wrong_manifest = json.loads((wrong_codebook / "manifest.json").read_text())
+wrong_bank = wrong_manifest["mtp"]["bank"]
+record_bytes = wrong_bank["bytes"] // wrong_bank["experts"]
+with (wrong_codebook / wrong_bank["file"]).open("r+b") as stream:
+    for expert in range(wrong_bank["experts"]):
+        stream.seek(expert * record_bytes + 10)  # waste_expert_hdr.codebook_id
+        stream.write(struct.pack("<H", wrong_bank["codebook_base"] + 1))
 missing = clone("missing-bank")
 (missing / "experts-L45.bin").unlink()
 PY_GLM53_MTP_BAD

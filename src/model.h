@@ -225,8 +225,11 @@ typedef struct {
      * calibration step cannot perturb generation. */
     int    mtp_available, mtp_active, mtp_layer, mtp_context_limit;
     int    mtp_target_hidden_pos, mtp_alignment_error;
-    int    mtp_last_pos, mtp_last_token, mtp_shadow_argmax;
-    float *mtp_target_hidden, *mtp_hidden, *mtp_logits, *mtp_work;
+    int    mtp_last_pos, mtp_last_token, mtp_target_token;
+    int    mtp_shadow_argmax;
+    int    mtp_oracle_open;
+    float *mtp_target_hidden, *mtp_hidden, *mtp_input_embed;
+    float *mtp_logits, *mtp_work;
     uint64_t mtp_steps, mtp_shadow_steps, mtp_shadow_matches;
     double mtp_seconds;
     /* 1 when at least one layer owns per-token attention state (MLA or
@@ -401,6 +404,24 @@ uint64_t    waste_model_mtp_steps(const waste_model *m);
 double      waste_model_mtp_seconds(const waste_model *m);
 uint64_t    waste_model_mtp_shadow_steps(const waste_model *m);
 uint64_t    waste_model_mtp_shadow_matches(const waste_model *m);
+
+/* Internal serial oracle for a depth-1 speculative verifier.  The caller
+ * must already have proposed draft_token1 from token0.  begin then runs the
+ * target on token0 and draft_token1 and retains both target logits and both
+ * post-final-norm target hiddens.  finish(1) commits the two-token state;
+ * finish(0) rolls every semantic target/MTP state field back to immediately
+ * after token0.  This is a reference/transaction layer, not a public
+ * generation scheduler or a performance path. */
+typedef struct waste_mtp_verify2_oracle waste_mtp_verify2_oracle;
+int waste_model_mtp_verify2_oracle_begin(
+    waste_model *m, int token0, int draft_token1, int pos0,
+    int *routed0, int *routed1, waste_mtp_verify2_oracle **out);
+const float *waste_model_mtp_verify2_oracle_logits(
+    const waste_mtp_verify2_oracle *oracle, int token_index);
+const float *waste_model_mtp_verify2_oracle_hidden(
+    const waste_mtp_verify2_oracle *oracle, int token_index);
+int waste_model_mtp_verify2_oracle_finish(
+    waste_mtp_verify2_oracle *oracle, int accept_draft);
 
 /* Why the last read failed, and where. NULL when nothing has. The string
  * is static; `layer` and `expert` name the record. Sticky, so a caller
