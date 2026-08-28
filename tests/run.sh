@@ -1653,26 +1653,117 @@ elif WASTE_CACHE_MB=8 WASTE_IO_THREADS=1 WASTE_IO_DEPTH=1 \
         WASTE_MTP_SPEC_CHECK=1 WASTE_MTP_VERIFY2=serial WASTE_MTP_VQ2=0 \
         ./mtp_spec "$GLM53_MTP" 3,7,11,5 7 \
         >"$TMP/glm53-mtp-spec-serial.log" 2>&1 &&
+     WASTE_CACHE_MB=8 WASTE_IO_THREADS=1 WASTE_IO_DEPTH=1 \
+        WASTE_MTP_SPEC_CHECK=1 WASTE_MTP_VERIFY2=gated WASTE_MTP_VQ2=0 \
+        ./mtp_spec "$GLM53_MTP" 3,7,11,5 7 \
+        >"$TMP/glm53-mtp-spec-gated.log" 2>&1 &&
+     WASTE_CACHE_MB=8 WASTE_IO_THREADS=1 WASTE_IO_DEPTH=1 \
+        WASTE_MTP_SPEC_CHECK=1 WASTE_MTP_VERIFY2=gated WASTE_MTP_VQ2=0 \
+        ./mtp_spec "$GLM53_MTP" 38 3 \
+        >"$TMP/glm53-mtp-spec-gated-accepted.log" 2>&1 &&
+     WASTE_CACHE_MB=8 WASTE_IO_THREADS=1 WASTE_IO_DEPTH=1 \
+        WASTE_MTP_SPEC_CHECK=1 WASTE_MTP_VERIFY2=gated WASTE_MTP_VQ2=0 \
+        ./mtp_spec "$GLM53_MTP" 38 2 \
+        >"$TMP/glm53-mtp-spec-gated-budget.log" 2>&1 &&
      ! WASTE_MTP_VERIFY2=invalid \
         ./mtp_spec "$GLM53_MTP" 3,7,11,5 1 \
         >"$TMP/glm53-mtp-spec-invalid.log" 2>&1 &&
-     grep -q 'WASTE_MTP_VERIFY2 must be fast or serial' \
+     grep -q 'WASTE_MTP_VERIFY2 must be fast, serial, or gated' \
         "$TMP/glm53-mtp-spec-invalid.log" &&
      grep -q ' verifier=fast vq2=0 ' "$TMP/glm53-mtp-spec.log" &&
      grep -q ' verifier=serial_oracle vq2=0 ' \
         "$TMP/glm53-mtp-spec-serial.log" &&
+     grep -q ' verifier=gated vq2=0 ' \
+        "$TMP/glm53-mtp-spec-gated.log" &&
      grep -q '^stream_check=pass target_stream_fnv1a64=' \
         "$TMP/glm53-mtp-spec.log" &&
+     grep -q '^stream_check=pass target_stream_fnv1a64=' \
+        "$TMP/glm53-mtp-spec-gated.log" &&
+     grep -q '^stream_check=pass target_stream_fnv1a64=' \
+        "$TMP/glm53-mtp-spec-gated-accepted.log" &&
+     grep -q '^stream_check=pass target_stream_fnv1a64=' \
+        "$TMP/glm53-mtp-spec-gated-budget.log" &&
      test "$(sed -n 's/^stream_fnv1a64=//p' \
         "$TMP/glm53-mtp-spec.log")" = \
           "$(sed -n 's/^stream_fnv1a64=//p' \
         "$TMP/glm53-mtp-spec-serial.log")" &&
+     test "$(sed -n 's/^stream_fnv1a64=//p' \
+        "$TMP/glm53-mtp-spec.log")" = \
+          "$(sed -n 's/^stream_fnv1a64=//p' \
+        "$TMP/glm53-mtp-spec-gated.log")" &&
+     awk '
+       /^summary / {
+         for (i = 1; i <= NF; i++) {
+           split($i, pair, "=")
+           if (pair[1] == "cycles") cycles = pair[2] + 0
+           if (pair[1] == "committed") committed = pair[2] + 0
+           if (pair[1] == "verified_target_positions") positions = pair[2] + 0
+           if (pair[1] == "gated_row1_calls") row1 = pair[2] + 0
+         }
+       }
+       END { exit !(positions == cycles + committed && row1 == committed) }
+     ' "$TMP/glm53-mtp-spec-gated.log" &&
+     awk '
+       /^summary / {
+         for (i = 1; i <= NF; i++) {
+           split($i, pair, "=")
+           if (pair[1] == "cycles") cycles = pair[2] + 0
+           if (pair[1] == "accepted") accepted = pair[2] + 0
+           if (pair[1] == "committed") committed = pair[2] + 0
+           if (pair[1] == "verified_target_positions") positions = pair[2] + 0
+           if (pair[1] == "gated_row1_calls") row1 = pair[2] + 0
+         }
+       }
+       END {
+         exit !(cycles == 1 && accepted == 1 && committed == 1 &&
+                positions == 2 && row1 == 1)
+       }
+     ' "$TMP/glm53-mtp-spec-gated-accepted.log" &&
+     awk '
+       /^summary / {
+         for (i = 1; i <= NF; i++) {
+           split($i, pair, "=")
+           if (pair[1] == "cycles") cycles = pair[2] + 0
+           if (pair[1] == "accepted") accepted = pair[2] + 0
+           if (pair[1] == "committed") committed = pair[2] + 0
+           if (pair[1] == "verified_target_positions") positions = pair[2] + 0
+           if (pair[1] == "gated_row1_calls") row1 = pair[2] + 0
+         }
+       }
+       END {
+         exit !(cycles == 1 && accepted == 1 && committed == 0 &&
+                positions == 1 && row1 == 0)
+       }
+     ' "$TMP/glm53-mtp-spec-gated-budget.log" &&
      grep -q '^summary generated=7 .*accepted=.* rejected=' \
         "$TMP/glm53-mtp-spec.log"; then
-    ok "fast and serial depth-1 MTP schedulers match ordinary generation"
+    ok "fast, serial and rejection-gated depth-1 MTP schedulers match ordinary generation"
 else
     no "greedy depth-1 MTP scheduler"
-    sed -n '1,24p' "$TMP/glm53-mtp-spec.log" 2>/dev/null
+    sed -n '1,24p' "$TMP/glm53-mtp-spec.log" \
+        "$TMP/glm53-mtp-spec-gated-accepted.log" \
+        "$TMP/glm53-mtp-spec-gated-budget.log" 2>/dev/null
+fi
+
+# A one-step tail under a registered depth-three chain is deliberately
+# right-censored when its only available draft matches.  It contributes to
+# the per-position observation but must not be reported as an exact prefix-1
+# rejection in the complete-cycle histogram.
+if [ ! -d "$GLM53_MTP" ]; then
+    sk "recursive MTP censored-tail accounting" "MTP container not built"
+elif WASTE_CACHE_MB=8 WASTE_IO_THREADS=1 WASTE_IO_DEPTH=1 \
+        ./mtp_shadow "$GLM53_MTP" 38 1 3 \
+        >"$TMP/glm53-mtp-shadow-censored.log" 2>&1 &&
+     grep -q '^stream_check=pass stream_fnv1a64=' \
+        "$TMP/glm53-mtp-shadow-censored.log" &&
+     grep -q '^position=1 reached=1 matched=1 conditional_pct=100.000 ' \
+        "$TMP/glm53-mtp-shadow-censored.log" &&
+     grep -q '^prefix_hist complete_cycles=0 censored_cycles=1 ' \
+        "$TMP/glm53-mtp-shadow-censored.log"; then
+    ok "recursive MTP shadow reports a matched short tail as censored"
+else
+    no "recursive MTP censored-tail accounting"
+    sed -n '1,24p' "$TMP/glm53-mtp-shadow-censored.log" 2>/dev/null
 fi
 
 # Flash names three terminal turn markers.  A valid bounded set must load;

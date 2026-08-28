@@ -6,7 +6,9 @@
  *
  * The default fast verifier evaluates the two target rows layer-major while
  * retaining rejection-safe target authority.  Set WASTE_MTP_VERIFY2=serial
- * to use the slower serial oracle as a matched reference:
+ * to use the slower serial oracle as a matched reference, or `gated` to run
+ * row zero through the ordinary target first and evaluate row one only after
+ * the draft matches and the output budget has room for its bonus:
  *
  *   mtp_spec CONTAINER ids[,..] n_gen
  *
@@ -48,8 +50,19 @@ typedef struct {
 
 typedef enum {
     VERIFY_FAST,
-    VERIFY_SERIAL
+    VERIFY_SERIAL,
+    VERIFY_GATED
 } verify_kind;
+
+static const char *verify_name(verify_kind verifier)
+{
+    switch (verifier) {
+    case VERIFY_FAST:   return "fast";
+    case VERIFY_SERIAL: return "serial_oracle";
+    case VERIFY_GATED:  return "gated";
+    }
+    return "invalid";
+}
 
 static double now(void)
 {
@@ -254,6 +267,7 @@ int main(int argc, char **argv)
     int n_prompt = 0, n_gen = 0, loaded = 0;
     int emitted = 0, current = -1, pos0 = -1, n_records = 0;
     uint64_t accepted = 0, committed = 0, rejected = 0, bonuses = 0;
+    uint64_t verified_target_positions = 0, gated_row1_calls = 0;
     double draft_seconds = 0.0, verify_begin_seconds = 0.0;
     double finish_seconds = 0.0;
     double spec_prof[16] = {0};
@@ -307,8 +321,11 @@ int main(int argc, char **argv)
             verifier = VERIFY_FAST;
         else if (!strcmp(verify_env, "serial"))
             verifier = VERIFY_SERIAL;
+        else if (!strcmp(verify_env, "gated"))
+            verifier = VERIFY_GATED;
         else {
-            fprintf(stderr, "WASTE_MTP_VERIFY2 must be fast or serial\n");
+            fprintf(stderr,
+                    "WASTE_MTP_VERIFY2 must be fast, serial, or gated\n");
             goto usage_fail;
         }
     }
@@ -391,52 +408,93 @@ int main(int argc, char **argv)
 
         waste_mtp_verify2 *verify = NULL;
         waste_mtp_verify2_oracle *oracle = NULL;
-        const double verify_start = now();
-        const int begin_rc = verifier == VERIFY_FAST
-            ? waste_model_mtp_verify2_begin(
-                  &model, current, rec->draft, pos0, NULL, NULL, &verify)
-            : waste_model_mtp_verify2_oracle_begin(
-                  &model, current, rec->draft, pos0, NULL, NULL, &oracle);
-        rec->verify_begin_seconds = now() - verify_start;
-        verify_begin_seconds += rec->verify_begin_seconds;
-        if (begin_rc || (verifier == VERIFY_FAST ? !verify : !oracle)) {
-            report_failure(&model, verifier == VERIFY_FAST
-                ? "fast verify2 begin" : "serial verify2 begin");
-            goto fail;
-        }
-        const float *logits0 = verifier == VERIFY_FAST
-            ? waste_model_mtp_verify2_logits(verify, 0)
-            : waste_model_mtp_verify2_oracle_logits(oracle, 0);
-        const float *logits1 = verifier == VERIFY_FAST
-            ? waste_model_mtp_verify2_logits(verify, 1)
-            : waste_model_mtp_verify2_oracle_logits(oracle, 1);
-        if (!logits0 || !logits1) {
-            if (verifier == VERIFY_FAST)
-                waste_model_mtp_verify2_finish(verify, 0);
-            else
-                waste_model_mtp_verify2_oracle_finish(oracle, 0);
-            fprintf(stderr, "%s verify2 did not retain both logits rows\n",
-                    verifier == VERIFY_FAST ? "fast" : "serial");
-            goto fail;
-        }
-        rec->target1 = argmax(logits0, model.cfg.vocab);
-        rec->bonus = argmax(logits1, model.cfg.vocab);
-        rec->accepted = rec->draft == rec->target1;
-        /* Accepting row one is useful only when its bonus can also become
-         * public.  At the exact budget edge, roll back to row zero so a
-         * later continuation starts from the last emitted token. */
-        rec->committed = rec->accepted && emitted + 1 < n_gen;
+        if (verifier == VERIFY_GATED) {
+            /* The proposal has already advanced the MTP cache for `current`.
+             * The ordinary target consumes and validates that exact row.  A
+             * rejection therefore leaves a complete committed row-zero state
+             * and needs neither a checkpoint nor a rollback. */
+            const double row0_start = now();
+            const float *logits0 = waste_model_step(
+                &model, current, pos0, NULL);
+            rec->verify_begin_seconds = now() - row0_start;
+            verify_begin_seconds += rec->verify_begin_seconds;
+            if (!logits0) {
+                report_failure(&model, "gated target row zero");
+                goto fail;
+            }
+            verified_target_positions++;
+            rec->target1 = argmax(logits0, model.cfg.vocab);
+            rec->accepted = rec->draft == rec->target1;
+            /* Row one is useful only when its accepted draft and bonus can
+             * both become public.  At the exact budget edge, row zero is
+             * already the resumable committed state. */
+            rec->committed = rec->accepted && emitted + 1 < n_gen;
+            rec->bonus = -1;
+            if (rec->committed) {
+                const double row1_start = now();
+                const float *logits1 = waste_model_step(
+                    &model, rec->draft, pos0 + 1, NULL);
+                rec->finish_seconds = now() - row1_start;
+                finish_seconds += rec->finish_seconds;
+                if (!logits1) {
+                    report_failure(&model, "gated target row one");
+                    goto fail;
+                }
+                verified_target_positions++;
+                gated_row1_calls++;
+                rec->bonus = argmax(logits1, model.cfg.vocab);
+            }
+        } else {
+            const double verify_start = now();
+            const int begin_rc = verifier == VERIFY_FAST
+                ? waste_model_mtp_verify2_begin(
+                      &model, current, rec->draft, pos0, NULL, NULL, &verify)
+                : waste_model_mtp_verify2_oracle_begin(
+                      &model, current, rec->draft, pos0, NULL, NULL, &oracle);
+            rec->verify_begin_seconds = now() - verify_start;
+            verify_begin_seconds += rec->verify_begin_seconds;
+            if (begin_rc || (verifier == VERIFY_FAST ? !verify : !oracle)) {
+                report_failure(&model, verifier == VERIFY_FAST
+                    ? "fast verify2 begin" : "serial verify2 begin");
+                goto fail;
+            }
+            const float *logits0 = verifier == VERIFY_FAST
+                ? waste_model_mtp_verify2_logits(verify, 0)
+                : waste_model_mtp_verify2_oracle_logits(oracle, 0);
+            const float *logits1 = verifier == VERIFY_FAST
+                ? waste_model_mtp_verify2_logits(verify, 1)
+                : waste_model_mtp_verify2_oracle_logits(oracle, 1);
+            if (!logits0 || !logits1) {
+                if (verifier == VERIFY_FAST)
+                    waste_model_mtp_verify2_finish(verify, 0);
+                else
+                    waste_model_mtp_verify2_oracle_finish(oracle, 0);
+                fprintf(stderr,
+                        "%s verify2 did not retain both logits rows\n",
+                        verifier == VERIFY_FAST ? "fast" : "serial");
+                goto fail;
+            }
+            rec->target1 = argmax(logits0, model.cfg.vocab);
+            rec->bonus = argmax(logits1, model.cfg.vocab);
+            rec->accepted = rec->draft == rec->target1;
+            /* Accepting row one is useful only when its bonus can also become
+             * public.  At the exact budget edge, roll back to row zero so a
+             * later continuation starts from the last emitted token. */
+            rec->committed = rec->accepted && emitted + 1 < n_gen;
 
-        const double finish_start = now();
-        const int finish_rc = verifier == VERIFY_FAST
-            ? waste_model_mtp_verify2_finish(verify, rec->committed)
-            : waste_model_mtp_verify2_oracle_finish(oracle, rec->committed);
-        rec->finish_seconds = now() - finish_start;
-        finish_seconds += rec->finish_seconds;
-        if (finish_rc) {
-            report_failure(&model, verifier == VERIFY_FAST
-                ? "fast verify2 finish" : "serial verify2 finish");
-            goto fail;
+            const double finish_start = now();
+            const int finish_rc = verifier == VERIFY_FAST
+                ? waste_model_mtp_verify2_finish(verify, rec->committed)
+                : waste_model_mtp_verify2_oracle_finish(
+                      oracle, rec->committed);
+            rec->finish_seconds = now() - finish_start;
+            finish_seconds += rec->finish_seconds;
+            if (finish_rc) {
+                report_failure(&model, verifier == VERIFY_FAST
+                    ? "fast verify2 finish" : "serial verify2 finish");
+                goto fail;
+            }
+            verified_target_positions += 2;
         }
 
         const int verdict = append_verdict(
@@ -504,7 +562,7 @@ int main(int argc, char **argv)
 
     printf("mtp_spec model=%s verifier=%s vq2=%d prompt=%d generate=%d "
            "load_s=%.6f prefill_s=%.6f prefill_tok_s=%.6f\n",
-           argv[1], verifier == VERIFY_FAST ? "fast" : "serial_oracle",
+           argv[1], verify_name(verifier),
            waste_model_mtp_verify2_get_vq2(&model),
            n_prompt, n_gen, load_seconds, prefill_seconds,
            prefill_seconds > 0.0 ? n_prompt / prefill_seconds : 0.0);
@@ -543,8 +601,11 @@ int main(int argc, char **argv)
            "draft_call_s=%.6f draft_call_s_per_cycle=%.6f "
            "verify_transaction_s=%.6f verify_transaction_s_per_cycle=%.6f "
            "verify_begin_call_s=%.6f finish_call_s=%.6f "
+           "verify_s_per_target_position=%.6f "
            "scheduler_residual_s=%.6f "
-           "verified_target_positions=%d cache_pos=%d hidden_pos=%d\n",
+           "verified_target_positions=%" PRIu64 " "
+           "gated_row1_calls=%" PRIu64 " "
+           "gated_row1_skips=%" PRIu64 " cache_pos=%d hidden_pos=%d\n",
            n_gen, measured, n_records, accepted, rejected,
            n_records ? 100.0 * accepted / n_records : 0.0, committed,
            n_records ? 100.0 * committed / n_records : 0.0, bonuses,
@@ -552,8 +613,12 @@ int main(int argc, char **argv)
            decode_seconds, draft_seconds,
            n_records ? draft_seconds / n_records : 0.0,
            verify_seconds, n_records ? verify_seconds / n_records : 0.0,
-           verify_begin_seconds, finish_seconds, scheduler_residual,
-           2 * n_records,
+           verify_begin_seconds, finish_seconds,
+           verified_target_positions
+               ? verify_seconds / (double)verified_target_positions : 0.0,
+           scheduler_residual, verified_target_positions, gated_row1_calls,
+           verifier == VERIFY_GATED
+               ? (uint64_t)n_records - gated_row1_calls : 0,
            final_cache_pos, final_hidden_pos);
     if (profile) {
         puts("profile_schema p0=lut_build p1=kda p2=mla p3=route_moe "
@@ -561,7 +626,7 @@ int main(int argc, char **argv)
              "p8=dense_mm p9=kda_recurrent p10=kda_qkv p11=kda_conv "
              "p12=kda_aux p13=kda_gate p14=kda_norm p15=kda_out");
         printf("profile verifier=%s vq2=%d",
-               verifier == VERIFY_FAST ? "fast" : "serial_oracle",
+               verify_name(verifier),
                waste_model_mtp_verify2_get_vq2(&model));
         for (int pidx = 0; pidx < 16; pidx++)
             printf(" p%d=%.9f n%d=%" PRIu64,
