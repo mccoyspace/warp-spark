@@ -374,7 +374,8 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         "weight_gib": round(total_size / (1024 ** 3), 2),
         "architecture": config.get("architectures"),
         "model_type": config.get("model_type"),
-        "scope": "text-only, context <= 2048; MTP and vision omitted",
+        "scope": ("text-only, context <= 2048; MTP optional in a separate "
+                  "opt-in container; vision omitted"),
     }
     if args.headers:
         result["header_gate"] = remote_header_gate(

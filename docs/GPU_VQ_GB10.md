@@ -185,6 +185,13 @@ least 5% over group 1. Group sizes are tested in ascending order and the work
 stops once larger groups reduce I/O/compute overlap or no longer improve the
 median. One tok/s remains the stretch target rather than an acceptance waiver.
 
+A later GLM-5.3 follow-up adds a distinct, opt-in task-major selector:
+`WASTE_CUDA_VQ_FUSED=4`, `8`, or `16`. Unlike `WASTE_CUDA_VQ_GROUP`, it puts
+multiple independent expert tasks into each physical kernel launch. It is
+load-static, requires mode 2/group 1, and is off by default. Group 4 passed an
+exact matched GLM-5.3 bracket at +7.22%; no K2 or K3 promotion follows without
+its own model-specific qualification. See [GLM53_GB10.md](GLM53_GB10.md).
+
 ## Measured result
 
 The strict CUDA kernel passed. On 16 distinct real K3 expert records, the

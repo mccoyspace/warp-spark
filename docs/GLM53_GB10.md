@@ -25,9 +25,11 @@ The first WARP profile is deliberately bounded to text generation and an
 exact 2,048-token context. At that length the DSA top-2,048 selection contains
 the complete causal history, so dense NoPE MLA is equivalent to the sparse
 path. Four-stream mHC, GLM-5.3's KDA schedule and normalization, and its
-clamped SwiGLU are implemented. DSA indexer tensors, the appended MTP layer,
-and the separate image/video tower are omitted explicitly. The runtime
-refuses contexts above the proven bound.
+clamped SwiGLU are implemented. DSA indexer tensors and the separate
+image/video tower are omitted explicitly. The base container omits the
+appended MTP layer; a separate opt-in research container includes it under
+the exact recurrent contract described below. The runtime refuses contexts
+above the proven bound.
 
 ## Conversion and source verification
 
@@ -80,16 +82,71 @@ Two resident-model, fresh-engine-cache TTFT captures for the seven-token
 prompt were 3.847 and 3.538 seconds (3.693-second mean). Model opening was a
 separate roughly 1.7 seconds and is not included in those TTFT figures.
 
+## MTP and task-major VQ follow-up
+
+The released checkpoint has one recurrent MTP layer. An opt-in conversion
+now preserves that layer, its distinct expert bank, normalization, embedding,
+and output head. The runtime can recursively propose one to three tokens using
+the released recurrence, restore exact target state after rejected proposals,
+and verify depth-one proposals with either a serial oracle or an exact
+layer-major scheduler. Ordinary conversion and generation remain unchanged
+when MTP is not requested.
+
+A 64-target-token shadow run first measured whether a wider verifier was worth
+building. Every depth replayed to the same ordinary token hash:
+
+| Proposal depth | Position-1 match | Later conditional matches | Observed output / complete cycle | Verifier time allowed for a 5% win |
+| ---: | ---: | ---: | ---: | ---: |
+| 1 | 77.8% | — | 1.778 | 0.452 s |
+| 2 | 75.9% | 59.1% | 2.250 | 0.564 s |
+| 3 | 77.8% | 52.4%, then 45.5% | 2.423 | 0.585 s |
+
+The depth-three chain accepted all three proposals in only 18.5% of complete
+cycles. A four-row target verifier would therefore need roughly a 47% target-
+work discount to clear the registered 5% end-to-end promotion bar. The
+measured kernel opportunity was much smaller, so depth-three target fusion was
+stopped before it became a larger engineering project.
+
+Profiling did expose a useful general optimization: ordinary decode launched
+one VQ kernel per selected expert. A new opt-in task-major CUDA path instead
+batches four, eight, or sixteen independent expert tasks while preserving the
+router-ordered fp32 accumulation contract. A clean 16-token bracket selected
+group 4:
+
+| Arm | Decode rate | Change vs control mean |
+| --- | ---: | ---: |
+| Control, before | 3.5841 tok/s | — |
+| Control, after | 3.5994 tok/s | — |
+| Task-major group 4 | **3.8512 tok/s** | **+7.22%** |
+| Task-major group 8 | 3.7528 tok/s | +4.48% |
+
+All four arms produced identical token, logit, and route hashes, and all
+registered dispatch, launch, synchronization, and fallback counters passed.
+Group 8 reduced launches further, but its profiled expert-acquisition bucket
+grew; that is consistent with its larger barrier giving some of the gain back.
+The selected model-specific setting is
+`WASTE_CUDA_VQ_FUSED=4`; it is load-static, requires CUDA VQ mode 2 with the
+legacy group-1 path, and remains off for other models until qualified there.
+
+Enabling the paired CUDA VQ2 verifier under fused group 8 improved the MTP arm
+from 3.3593 to 3.6106 tok/s (+7.48%) on a favorable short trace with 87.5%
+proposal acceptance. That was still 6.25% slower than ordinary group-4 decode.
+Depth-one target verification is consequently retained as exact experimental
+support and a measurement tool, but it is off by default. The practical
+promotion from this work is task-major VQ batching, not speculative decoding.
+
 ## Interpretation and limits
 
 - This establishes a source-backed, runnable 320B-total/18B-active hybrid
   model on one 128 GiB coherent-memory system, bounded to 2,048 tokens.
-- The 3.51 tok/s result is a short, warm-cache decode row. It is not a
+- The original 3.51 tok/s result and the later 3.85 tok/s fused result are
+  short, warm-cache decode rows. They are not
   sustained studio-workload, long-run stability, semantic-quality, or
   concurrency result.
 - The installed chat profile is fixed-Max, one-shot, plain text. Generated
   reasoning and answer text currently share one content stream and should not
   be replayed as history.
-- Sparse DSA beyond 2,048 tokens, MTP, image/video input, tools, dynamic
-  reasoning control, response-channel splitting, and stateful chat formatting
-  remain unsupported or fail closed.
+- Sparse DSA beyond 2,048 tokens, image/video input, tools, dynamic reasoning
+  control, response-channel splitting, and stateful chat formatting remain
+  unsupported or fail closed. MTP is supported only by the separate opt-in
+  research container and is not a promoted speed profile.
