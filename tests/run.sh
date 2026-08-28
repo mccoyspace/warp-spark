@@ -1646,14 +1646,30 @@ if ! ./mtp_spec --self-test 2>/dev/null | grep -q "^MTP SPEC SCHEDULER OK$"; the
 elif [ ! -d "$GLM53_MTP" ]; then
     sk "greedy depth-1 MTP scheduler" "MTP container not built"
 elif WASTE_CACHE_MB=8 WASTE_IO_THREADS=1 WASTE_IO_DEPTH=1 \
-        WASTE_MTP_SPEC_CHECK=1 \
+        WASTE_MTP_SPEC_CHECK=1 WASTE_MTP_VERIFY2=fast WASTE_MTP_VQ2=0 \
         ./mtp_spec "$GLM53_MTP" 3,7,11,5 7 \
         >"$TMP/glm53-mtp-spec.log" 2>&1 &&
+     WASTE_CACHE_MB=8 WASTE_IO_THREADS=1 WASTE_IO_DEPTH=1 \
+        WASTE_MTP_SPEC_CHECK=1 WASTE_MTP_VERIFY2=serial WASTE_MTP_VQ2=0 \
+        ./mtp_spec "$GLM53_MTP" 3,7,11,5 7 \
+        >"$TMP/glm53-mtp-spec-serial.log" 2>&1 &&
+     ! WASTE_MTP_VERIFY2=invalid \
+        ./mtp_spec "$GLM53_MTP" 3,7,11,5 1 \
+        >"$TMP/glm53-mtp-spec-invalid.log" 2>&1 &&
+     grep -q 'WASTE_MTP_VERIFY2 must be fast or serial' \
+        "$TMP/glm53-mtp-spec-invalid.log" &&
+     grep -q ' verifier=fast vq2=0 ' "$TMP/glm53-mtp-spec.log" &&
+     grep -q ' verifier=serial_oracle vq2=0 ' \
+        "$TMP/glm53-mtp-spec-serial.log" &&
      grep -q '^stream_check=pass target_stream_fnv1a64=' \
         "$TMP/glm53-mtp-spec.log" &&
+     test "$(sed -n 's/^stream_fnv1a64=//p' \
+        "$TMP/glm53-mtp-spec.log")" = \
+          "$(sed -n 's/^stream_fnv1a64=//p' \
+        "$TMP/glm53-mtp-spec-serial.log")" &&
      grep -q '^summary generated=7 .*accepted=.* rejected=' \
         "$TMP/glm53-mtp-spec.log"; then
-    ok "greedy depth-1 MTP scheduler matches ordinary generation"
+    ok "fast and serial depth-1 MTP schedulers match ordinary generation"
 else
     no "greedy depth-1 MTP scheduler"
     sed -n '1,24p' "$TMP/glm53-mtp-spec.log" 2>/dev/null

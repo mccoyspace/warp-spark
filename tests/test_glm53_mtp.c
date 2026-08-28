@@ -93,6 +93,36 @@ static int malformed_rejected(const char *path)
     return 0;
 }
 
+static int invalid_vq2_env_rejected(const char *path)
+{
+    const char *prior = getenv("WASTE_MTP_VQ2");
+    char *saved = NULL;
+    waste_load_opts opts;
+    waste_model model;
+    int loaded = 0;
+
+    if (prior) {
+        const size_t n = strlen(prior) + 1;
+        saved = (char *)malloc(n);
+        if (!saved) return -1;
+        memcpy(saved, prior, n);
+    }
+    load_opts(&opts);
+    if (setenv("WASTE_MTP_VQ2", "2", 1)) {
+        free(saved);
+        return -1;
+    }
+    loaded = waste_model_load(&model, path, 8, &opts) == 0;
+    if (saved) setenv("WASTE_MTP_VQ2", saved, 1);
+    else unsetenv("WASTE_MTP_VQ2");
+    free(saved);
+    if (loaded) {
+        waste_model_free(&model);
+        return -1;
+    }
+    return 0;
+}
+
 static int corrupt_record_rejected(const char *path)
 {
     static const int tokens[] = {3, 7};
@@ -365,6 +395,159 @@ fail:
     return -1;
 }
 
+static int run_fast_verify2_contract(const char *path)
+{
+    static const int prompt[] = {3, 7, 11, 5};
+    enum { N_PROMPT = 4, N_MODELS = 4 };
+    const int token0 = 9, pos0 = N_PROMPT;
+    waste_model model[N_MODELS];
+    int loaded = 0, draft_token1 = -1;
+    float *serial_logits = NULL, *serial_hidden = NULL;
+    int *serial_routes = NULL, *fast_routes = NULL;
+    waste_mtp_verify2 *verify = NULL;
+
+    memset(model, 0, sizeof model);
+    for (int i = 0; i < N_MODELS; i++) {
+        int draft = -1;
+        if (prepare_oracle_model(&model[i], path, prompt, N_PROMPT,
+                                 token0, &draft))
+            goto fail;
+        loaded++;
+        if (i == 0) draft_token1 = draft;
+        else if (draft != draft_token1) goto fail;
+        if (waste_model_mtp_verify2_get_vq2(&model[i]) != 0 ||
+            waste_model_mtp_verify2_set_vq2(&model[i], -1) == 0 ||
+            waste_model_mtp_verify2_set_vq2(&model[i], 2) == 0 ||
+            waste_model_mtp_verify2_set_vq2(&model[i], 1) == 0 ||
+            waste_model_mtp_verify2_get_vq2(&model[i]) != 0 ||
+            waste_model_mtp_verify2_set_vq2(&model[i], 0) != 0)
+            goto fail;
+    }
+    const int vocab = model[0].cfg.vocab, hidden = model[0].cfg.hidden;
+    const size_t route_n = (size_t)model[0].cfg.n_layers *
+                           model[0].cfg.top_k;
+    serial_logits = (float *)malloc((size_t)2 * vocab * sizeof(float));
+    serial_hidden = (float *)malloc((size_t)2 * hidden * sizeof(float));
+    serial_routes = (int *)malloc((size_t)2 * route_n * sizeof(int));
+    fast_routes = (int *)malloc((size_t)2 * route_n * sizeof(int));
+    if (!serial_logits || !serial_hidden || !serial_routes || !fast_routes)
+        goto fail;
+    memset(serial_routes, 0xa5, (size_t)2 * route_n * sizeof(int));
+    memset(fast_routes, 0xa5, (size_t)2 * route_n * sizeof(int));
+
+    /* Accepted fast state, both exposed rows, and one further continuation
+     * must be byte-identical to the ordinary serial target. */
+    const float *p = waste_model_step(
+        &model[1], token0, pos0, serial_routes);
+    if (!p) goto fail;
+    memcpy(serial_logits, p, (size_t)vocab * sizeof(float));
+    memcpy(serial_hidden, model[1].mtp_target_hidden,
+           (size_t)hidden * sizeof(float));
+    p = waste_model_step(
+        &model[1], draft_token1, pos0 + 1, serial_routes + route_n);
+    if (!p) goto fail;
+    memcpy(serial_logits + vocab, p, (size_t)vocab * sizeof(float));
+    memcpy(serial_hidden + hidden, model[1].mtp_target_hidden,
+           (size_t)hidden * sizeof(float));
+
+    if (waste_model_mtp_verify2_begin(
+            &model[0], token0, draft_token1, pos0,
+            fast_routes, fast_routes + route_n, &verify) || !verify ||
+        !waste_model_mtp_verify2_logits(verify, 0) ||
+        !waste_model_mtp_verify2_logits(verify, 1) ||
+        waste_model_mtp_verify2_logits(verify, 2) ||
+        !waste_model_mtp_verify2_hidden(verify, 0) ||
+        !waste_model_mtp_verify2_hidden(verify, 1) ||
+        waste_model_mtp_verify2_hidden(verify, -1) ||
+        memcmp(waste_model_mtp_verify2_logits(verify, 0),
+               serial_logits, (size_t)2 * vocab * sizeof(float)) ||
+        memcmp(waste_model_mtp_verify2_hidden(verify, 0),
+               serial_hidden, (size_t)2 * hidden * sizeof(float)) ||
+        memcmp(fast_routes, serial_routes,
+               (size_t)2 * route_n * sizeof(int)))
+        goto fail;
+    /* The result views live in model-owned persistent scratch.  While they
+     * are open, every semantic mutator and model free must fail/no-op; the
+     * transaction must remain finishable and unchanged afterward. */
+    size_t snapshot_bytes = 0;
+    const int held_nkv = model[0].n_kv[0];
+    const uint64_t held_steps = model[0].mtp_steps;
+    const int held_target_pos = model[0].mtp_target_hidden_pos;
+    waste_model_reset(&model[0]);
+    waste_model_clear_read_error(&model[0]);
+    waste_model_free(&model[0]);
+    const int blocked_token = 31;
+    if (waste_model_step(&model[0], blocked_token, pos0 + 2, NULL) ||
+        waste_model_prefill(&model[0], &blocked_token, 1, pos0 + 2) ||
+        waste_model_mtp_set_enabled(&model[0], 0) == 0 ||
+        waste_model_mtp_propose(&model[0], blocked_token,
+                                pos0 + 1, NULL) ||
+        waste_model_state_size(&model[0], pos0 + 2, &snapshot_bytes) == 0 ||
+        waste_model_set_cuda_kda(&model[0], 0) == 0 ||
+        waste_model_mtp_verify2_set_vq2(&model[0], 0) == 0 ||
+        model[0].n_kv[0] != held_nkv ||
+        model[0].mtp_steps != held_steps ||
+        model[0].mtp_target_hidden_pos != held_target_pos ||
+        memcmp(waste_model_mtp_verify2_logits(verify, 0),
+               serial_logits, (size_t)2 * vocab * sizeof(float)) ||
+        memcmp(waste_model_mtp_verify2_hidden(verify, 0),
+               serial_hidden, (size_t)2 * hidden * sizeof(float)) ||
+        waste_model_mtp_verify2_finish(verify, 2) == 0)
+        goto fail;
+    if (waste_model_mtp_verify2_finish(verify, 1)) goto fail;
+    verify = NULL;
+    if (!same_oracle_state(&model[0], &model[1])) goto fail;
+    const int token2 = draft_token1 == 17 ? 18 : 17;
+    const float *a = waste_model_step(&model[0], token2, pos0 + 2, NULL);
+    const float *b = waste_model_step(&model[1], token2, pos0 + 2, NULL);
+    if (!a || !b || memcmp(a, b, (size_t)vocab * sizeof(float)) ||
+        !same_oracle_state(&model[0], &model[1]))
+        goto fail;
+
+    /* Rejection is exactly the state after token0, including every KDA
+     * ring/state matrix and the predictor's anticipatory proposal row. */
+    b = waste_model_step(&model[3], token0, pos0, NULL);
+    if (!b) goto fail;
+    memcpy(serial_logits, b, (size_t)vocab * sizeof(float));
+    memcpy(serial_hidden, model[3].mtp_target_hidden,
+           (size_t)hidden * sizeof(float));
+    const double mtp_seconds = model[2].mtp_seconds;
+    if (waste_model_mtp_verify2_begin(
+            &model[2], token0, draft_token1, pos0,
+            NULL, NULL, &verify) || !verify ||
+        memcmp(waste_model_mtp_verify2_logits(verify, 0),
+               serial_logits, (size_t)vocab * sizeof(float)) ||
+        memcmp(waste_model_mtp_verify2_hidden(verify, 0),
+               serial_hidden, (size_t)hidden * sizeof(float)) ||
+        waste_model_mtp_verify2_finish(verify, 0))
+        goto fail;
+    verify = NULL;
+    if (model[2].mtp_seconds != mtp_seconds ||
+        !same_oracle_state(&model[2], &model[3]))
+        goto fail;
+    const int replacement = draft_token1 == 23 ? 24 : 23;
+    a = waste_model_step(&model[2], replacement, pos0 + 1, NULL);
+    b = waste_model_step(&model[3], replacement, pos0 + 1, NULL);
+    if (!a || !b || memcmp(a, b, (size_t)vocab * sizeof(float)) ||
+        !same_oracle_state(&model[2], &model[3]))
+        goto fail;
+
+    for (int i = 0; i < loaded; i++) waste_model_free(&model[i]);
+    free(serial_logits);
+    free(serial_hidden);
+    free(serial_routes);
+    free(fast_routes);
+    return 0;
+fail:
+    if (verify) waste_model_mtp_verify2_finish(verify, 0);
+    for (int i = 0; i < loaded; i++) waste_model_free(&model[i]);
+    free(serial_logits);
+    free(serial_hidden);
+    free(serial_routes);
+    free(fast_routes);
+    return -1;
+}
+
 int main(int argc, char **argv)
 {
     static const int tokens[] = {3, 7, 11, 5, 9};
@@ -380,6 +563,7 @@ int main(int argc, char **argv)
         fprintf(stderr, "usage: %s BASE MTP [MALFORMED ...]\n", argv[0]);
         return 2;
     }
+    if (invalid_vq2_env_rejected(argv[2])) goto fail;
     if (run_control(argv[1], tokens, N_PROMPT, &control_prompt,
                     &control_next, &vocab))
         goto fail;
@@ -522,6 +706,7 @@ int main(int argc, char **argv)
     loaded = 0;
     REQUIRE(embedding_failure_is_sticky(argv[2]) == 0);
     REQUIRE(run_oracle_contract(argv[2]) == 0);
+    REQUIRE(run_fast_verify2_contract(argv[2]) == 0);
     for (int i = 3; i < argc; i++) {
         const int rejected = strstr(argv[i], "record-codebook")
             ? corrupt_record_rejected(argv[i])

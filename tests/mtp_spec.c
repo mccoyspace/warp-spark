@@ -2,10 +2,11 @@
  * Copyright 2026 SQLite Cloud, Inc.
  */
 /*
- * mtp_spec.c -- greedy depth-1 MTP scheduler and serial-verifier baseline.
+ * mtp_spec.c -- greedy depth-1 MTP scheduler.
  *
- * This is a measurement tool, not the optimized verify2 path.  It uses the
- * rejection-safe serial oracle to make the target model authoritative:
+ * The default fast verifier evaluates the two target rows layer-major while
+ * retaining rejection-safe target authority.  Set WASTE_MTP_VERIFY2=serial
+ * to use the slower serial oracle as a matched reference:
  *
  *   mtp_spec CONTAINER ids[,..] n_gen
  *
@@ -37,10 +38,15 @@
 #include "../src/model.h"
 
 typedef struct {
-    int cycle, pos0, current, draft, target1, accepted;
+    int cycle, pos0, current, draft, target1, accepted, committed;
     int bonus, bonus_emitted, emitted;
     double draft_seconds, verify_begin_seconds, finish_seconds;
 } spec_record;
+
+typedef enum {
+    VERIFY_FAST,
+    VERIFY_SERIAL
+} verify_kind;
 
 static double now(void)
 {
@@ -127,8 +133,9 @@ static uint64_t hash_stream(const int *stream, int n)
     return hash;
 }
 
-/* Append exactly what greedy target generation makes public.  Returning the
- * verdict lets the caller make the matching oracle commit/rollback choice.
+/* Append exactly what greedy target generation makes public.  The caller
+ * separately budget-gates the two-row commit before this helper; returning
+ * the predictor verdict checks that the public stream used the same choice.
  * This helper is deliberately independent of model state so both budget
  * boundaries are covered by the deterministic --self-test. */
 static int append_verdict(int draft, int target1, int bonus,
@@ -144,8 +151,12 @@ static int append_verdict(int draft, int target1, int bonus,
     if (accepted && *emitted < cap) {
         stream[(*emitted)++] = bonus;
         *bonus_emitted = 1;
+        *current = bonus;
+    } else {
+        /* Keep the resumable invariant: current is the last public token
+         * and has not yet been consumed by the committed target state. */
+        *current = target1;
     }
-    *current = accepted ? bonus : target1;
     return accepted;
 }
 
@@ -166,7 +177,7 @@ static int scheduler_self_test(void)
         return 1;
     if (append_verdict(40, 40, 41, stream, 5, &emitted, &current,
                        &bonus_emitted) != 1 ||
-        emitted != 5 || current != 41 || bonus_emitted != 0 ||
+        emitted != 5 || current != 40 || bonus_emitted != 0 ||
         stream[4] != 40 ||
         append_verdict(50, 50, 51, stream, 5, &emitted, &current,
                        &bonus_emitted) != -1)
@@ -207,6 +218,10 @@ static int ordinary_stream_check(waste_model *m, const int *prompt,
                                  uint64_t *hash_out, double *decode_seconds)
 {
     waste_model_reset(m);
+    /* The speculative arm began from a freshly opened cache. Replaying on
+     * its warmed records would make the correctness control look faster for
+     * an order-dependent reason, so rebuild the same post-prefill state. */
+    waste_ecache_clear(&m->cache);
     if (waste_model_mtp_set_enabled(m, 0)) return -1;
     const float *logits = prefill(m, prompt, n_prompt);
     if (!logits) return -1;
@@ -235,7 +250,7 @@ int main(int argc, char **argv)
     spec_record *records = NULL;
     int n_prompt = 0, n_gen = 0, loaded = 0;
     int emitted = 0, current = -1, pos0 = -1, n_records = 0;
-    uint64_t accepted = 0, rejected = 0, bonuses = 0;
+    uint64_t accepted = 0, committed = 0, rejected = 0, bonuses = 0;
     double draft_seconds = 0.0, verify_begin_seconds = 0.0;
     double finish_seconds = 0.0;
 
@@ -279,6 +294,18 @@ int main(int argc, char **argv)
                   (stream_check != 0 && stream_check != 1))) {
         fprintf(stderr, "WASTE_MTP_SPEC_CHECK must be 0 or 1\n");
         goto usage_fail;
+    }
+    verify_kind verifier = VERIFY_FAST;
+    const char *verify_env = getenv("WASTE_MTP_VERIFY2");
+    if (verify_env && *verify_env) {
+        if (!strcmp(verify_env, "fast"))
+            verifier = VERIFY_FAST;
+        else if (!strcmp(verify_env, "serial"))
+            verifier = VERIFY_SERIAL;
+        else {
+            fprintf(stderr, "WASTE_MTP_VERIFY2 must be fast or serial\n");
+            goto usage_fail;
+        }
     }
     opts.cache_bytes = (size_t)cache << 20;
     opts.direct_io = 1;
@@ -352,53 +379,72 @@ int main(int argc, char **argv)
         }
         rec->draft = argmax(draft_logits, model.cfg.vocab);
 
+        waste_mtp_verify2 *verify = NULL;
         waste_mtp_verify2_oracle *oracle = NULL;
         const double verify_start = now();
-        const int begin_rc = waste_model_mtp_verify2_oracle_begin(
-            &model, current, rec->draft, pos0, NULL, NULL, &oracle);
+        const int begin_rc = verifier == VERIFY_FAST
+            ? waste_model_mtp_verify2_begin(
+                  &model, current, rec->draft, pos0, NULL, NULL, &verify)
+            : waste_model_mtp_verify2_oracle_begin(
+                  &model, current, rec->draft, pos0, NULL, NULL, &oracle);
         rec->verify_begin_seconds = now() - verify_start;
         verify_begin_seconds += rec->verify_begin_seconds;
-        if (begin_rc || !oracle) {
-            report_failure(&model, "serial verify2 begin");
+        if (begin_rc || (verifier == VERIFY_FAST ? !verify : !oracle)) {
+            report_failure(&model, verifier == VERIFY_FAST
+                ? "fast verify2 begin" : "serial verify2 begin");
             goto fail;
         }
-        const float *logits0 =
-            waste_model_mtp_verify2_oracle_logits(oracle, 0);
-        const float *logits1 =
-            waste_model_mtp_verify2_oracle_logits(oracle, 1);
+        const float *logits0 = verifier == VERIFY_FAST
+            ? waste_model_mtp_verify2_logits(verify, 0)
+            : waste_model_mtp_verify2_oracle_logits(oracle, 0);
+        const float *logits1 = verifier == VERIFY_FAST
+            ? waste_model_mtp_verify2_logits(verify, 1)
+            : waste_model_mtp_verify2_oracle_logits(oracle, 1);
         if (!logits0 || !logits1) {
-            waste_model_mtp_verify2_oracle_finish(oracle, 0);
-            fprintf(stderr, "serial verify2 did not retain both logits rows\n");
+            if (verifier == VERIFY_FAST)
+                waste_model_mtp_verify2_finish(verify, 0);
+            else
+                waste_model_mtp_verify2_oracle_finish(oracle, 0);
+            fprintf(stderr, "%s verify2 did not retain both logits rows\n",
+                    verifier == VERIFY_FAST ? "fast" : "serial");
             goto fail;
         }
         rec->target1 = argmax(logits0, model.cfg.vocab);
         rec->bonus = argmax(logits1, model.cfg.vocab);
         rec->accepted = rec->draft == rec->target1;
+        /* Accepting row one is useful only when its bonus can also become
+         * public.  At the exact budget edge, roll back to row zero so a
+         * later continuation starts from the last emitted token. */
+        rec->committed = rec->accepted && emitted + 1 < n_gen;
 
         const double finish_start = now();
-        const int finish_rc = waste_model_mtp_verify2_oracle_finish(
-            oracle, rec->accepted);
+        const int finish_rc = verifier == VERIFY_FAST
+            ? waste_model_mtp_verify2_finish(verify, rec->committed)
+            : waste_model_mtp_verify2_oracle_finish(oracle, rec->committed);
         rec->finish_seconds = now() - finish_start;
         finish_seconds += rec->finish_seconds;
         if (finish_rc) {
-            report_failure(&model, "serial verify2 finish");
+            report_failure(&model, verifier == VERIFY_FAST
+                ? "fast verify2 finish" : "serial verify2 finish");
             goto fail;
         }
 
         const int verdict = append_verdict(
             rec->draft, rec->target1, rec->bonus, stream, n_gen, &emitted,
             &current, &rec->bonus_emitted);
-        if (verdict != rec->accepted) {
+        if (verdict != rec->accepted ||
+            rec->bonus_emitted != rec->committed) {
             fprintf(stderr, "internal speculative scheduler failure\n");
             goto fail;
         }
         rec->emitted = emitted;
-        if (rec->accepted) {
-            accepted++;
+        if (rec->accepted) accepted++;
+        else rejected++;
+        if (rec->committed) {
+            committed++;
             bonuses += (uint64_t)rec->bonus_emitted;
             pos0 += 2;
         } else {
-            rejected++;
             pos0++;
         }
         n_records++;
@@ -412,6 +458,10 @@ int main(int argc, char **argv)
                     waste_model_mtp_cache_pos(&model), pos0 - 1);
             goto fail;
         }
+    }
+    if (pos0 != n_prompt + n_gen - 1) {
+        fprintf(stderr, "speculative position accounting failure\n");
+        goto fail;
     }
     waste_ecache_drain(&model.cache);
     const double decode_seconds = now() - decode_start;
@@ -438,17 +488,19 @@ int main(int argc, char **argv)
         }
     }
 
-    printf("mtp_spec model=%s verifier=serial_oracle prompt=%d generate=%d "
+    printf("mtp_spec model=%s verifier=%s vq2=%d prompt=%d generate=%d "
            "load_s=%.6f prefill_s=%.6f prefill_tok_s=%.6f\n",
-           argv[1], n_prompt, n_gen, load_seconds, prefill_seconds,
+           argv[1], verifier == VERIFY_FAST ? "fast" : "serial_oracle",
+           waste_model_mtp_verify2_get_vq2(&model),
+           n_prompt, n_gen, load_seconds, prefill_seconds,
            prefill_seconds > 0.0 ? n_prompt / prefill_seconds : 0.0);
-    printf("# cycle pos0 current draft target1 accepted bonus "
+    printf("# cycle pos0 current draft target1 matched committed bonus "
            "bonus_emitted emitted draft_s verify_begin_s finish_s\n");
     for (int i = 0; i < n_records; i++) {
         const spec_record *rec = &records[i];
-        printf("%d %d %d %d %d %d %d %d %d %.6f %.6f %.6f\n",
+        printf("%d %d %d %d %d %d %d %d %d %d %.6f %.6f %.6f\n",
                rec->cycle, rec->pos0, rec->current, rec->draft,
-               rec->target1, rec->accepted, rec->bonus,
+               rec->target1, rec->accepted, rec->committed, rec->bonus,
                rec->bonus_emitted, rec->emitted, rec->draft_seconds,
                rec->verify_begin_seconds, rec->finish_seconds);
     }
@@ -467,21 +519,27 @@ int main(int argc, char **argv)
 
     const int measured = n_gen - 1;
     const double verify_seconds = verify_begin_seconds + finish_seconds;
+    const double scheduler_residual =
+        decode_seconds - draft_seconds - verify_seconds;
     printf("summary generated=%d bootstrap=1 measured_emitted=%d cycles=%d "
            "accepted=%" PRIu64 " rejected=%" PRIu64
-           " acceptance_pct=%.3f accepted_bonuses=%" PRIu64
+           " acceptance_pct=%.3f committed=%" PRIu64
+           " commit_pct=%.3f accepted_bonuses=%" PRIu64
            " emitted_tok_s=%.6f decode_wall_s=%.6f "
-           "draft_s=%.6f draft_s_per_cycle=%.6f "
-           "verify_s=%.6f verify_s_per_cycle=%.6f "
-           "verify_begin_s=%.6f finish_s=%.6f "
-           "target_positions=%d cache_pos=%d hidden_pos=%d\n",
+           "draft_call_s=%.6f draft_call_s_per_cycle=%.6f "
+           "verify_transaction_s=%.6f verify_transaction_s_per_cycle=%.6f "
+           "verify_begin_call_s=%.6f finish_call_s=%.6f "
+           "scheduler_residual_s=%.6f "
+           "verified_target_positions=%d cache_pos=%d hidden_pos=%d\n",
            n_gen, measured, n_records, accepted, rejected,
-           n_records ? 100.0 * accepted / n_records : 0.0, bonuses,
+           n_records ? 100.0 * accepted / n_records : 0.0, committed,
+           n_records ? 100.0 * committed / n_records : 0.0, bonuses,
            decode_seconds > 0.0 ? measured / decode_seconds : 0.0,
            decode_seconds, draft_seconds,
            n_records ? draft_seconds / n_records : 0.0,
            verify_seconds, n_records ? verify_seconds / n_records : 0.0,
-           verify_begin_seconds, finish_seconds, 2 * n_records,
+           verify_begin_seconds, finish_seconds, scheduler_residual,
+           2 * n_records,
            final_cache_pos, final_hidden_pos);
 
     waste_model_free(&model);

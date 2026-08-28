@@ -228,8 +228,16 @@ typedef struct {
     int    mtp_last_pos, mtp_last_token, mtp_target_token;
     int    mtp_shadow_argmax;
     int    mtp_oracle_open;
+    int    mtp_verify2_vq2;          /* opt-in 16-task dual-row VQ schedule */
     float *mtp_target_hidden, *mtp_hidden, *mtp_input_embed;
     float *mtp_logits, *mtp_work;
+    /* Lazily allocated, persistent two-position verifier workspace.  The
+     * backing is deliberately opaque to callers: it contains the paired
+     * mHC streams and the after-row-zero KDA checkpoint used to make a
+     * rejected draft an exact transaction.  Keeping it on the model avoids
+     * a roughly 150 MiB allocation/free cycle on every speculative step. */
+    float *mtp_verify2_scratch;
+    size_t mtp_verify2_scratch_floats;
     uint64_t mtp_steps, mtp_shadow_steps, mtp_shadow_matches;
     double mtp_seconds;
     /* 1 when at least one layer owns per-token attention state (MLA or
@@ -380,6 +388,9 @@ typedef struct {
 
 int  waste_model_load(waste_model *m, const char *dir, int kv_cap,
                       const waste_load_opts *opt);
+/* No-ops (with a diagnostic) while either MTP verifier transaction is open;
+ * finish the verifier first because its result views live in model-owned
+ * persistent scratch. */
 void waste_model_free(waste_model *m);
 /* Runs one token; returns logits (vocab floats, owned by the model), or
  * NULL when an expert record failed to read or failed verification —
@@ -422,6 +433,25 @@ const float *waste_model_mtp_verify2_oracle_hidden(
     const waste_mtp_verify2_oracle *oracle, int token_index);
 int waste_model_mtp_verify2_oracle_finish(
     waste_mtp_verify2_oracle *oracle, int accept_draft);
+
+/* Exact layer-major depth-1 verifier.  It has the same transaction contract
+ * as the serial oracle above, but evaluates the two target rows together so
+ * adjacent expert records stay hot and eligible CUDA Q4 projections can use
+ * their two-row kernel.  Production entry is intentionally restricted to
+ * the qualified GLM-5.3 CUDA tuple; the named tiny fixture is admitted on
+ * CPU for differential testing. */
+typedef struct waste_mtp_verify2 waste_mtp_verify2;
+int waste_model_mtp_verify2_begin(
+    waste_model *m, int token0, int draft_token1, int pos0,
+    int *routed0, int *routed1, waste_mtp_verify2 **out);
+const float *waste_model_mtp_verify2_logits(
+    const waste_mtp_verify2 *verify, int token_index);
+const float *waste_model_mtp_verify2_hidden(
+    const waste_mtp_verify2 *verify, int token_index);
+int waste_model_mtp_verify2_finish(
+    waste_mtp_verify2 *verify, int accept_draft);
+int waste_model_mtp_verify2_set_vq2(waste_model *m, int enabled);
+int waste_model_mtp_verify2_get_vq2(const waste_model *m);
 
 /* Why the last read failed, and where. NULL when nothing has. The string
  * is static; `layer` and `expert` name the record. Sticky, so a caller

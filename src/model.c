@@ -41,10 +41,19 @@ static void vq_build_lut(waste_model *m, float *lut, int cb_base,
 int  waste_cuda_q4_matvec(waste_model *m, float *y,
                           const waste_tensor *tensor, const float *x,
                           int out, int in, int mode);
+int  waste_cuda_q4_matvec2(waste_model *m, float *y0, float *y1,
+                           const waste_tensor *tensor,
+                           const float *x0, const float *x1,
+                           int out, int in, int mode);
+int  waste_cuda_q4_matvec2_eligible(const waste_tensor *tensor,
+                                    int out, int in, int mode);
 int  waste_cuda_vq_init(waste_model *m);
 int  waste_cuda_vq_prepare_pair(waste_model *m, int mode, const float *x,
                                 const float *gate_lut, const float *up_lut,
                                 int cb_base, int cols);
+int  waste_cuda_vq_prepare_pair2(waste_model *m,
+                                 const float *x0, const float *x1,
+                                 int cb_base, int cols);
 int  waste_cuda_vq_apply_pair(waste_model *m, float *gate_y, float *up_y,
                               const uint8_t *gate_idx,
                               const uint8_t *up_idx,
@@ -55,6 +64,9 @@ int  waste_cuda_vq_apply_down(waste_model *m, int mode, float *y,
                               int cb_base, int rows, int cols);
 int  waste_cuda_vq_group_pair_enqueue(
         waste_model *m, int slot, const uint8_t *gate_idx,
+        const uint8_t *up_idx, const uint16_t *scale, int rows, int cols);
+int  waste_cuda_vq_group_pair2_enqueue(
+        waste_model *m, int slot, int row, const uint8_t *gate_idx,
         const uint8_t *up_idx, const uint16_t *scale, int rows, int cols);
 int  waste_cuda_vq_group_pair_finish(
         waste_model *m, int count, const float **host_outputs);
@@ -98,6 +110,16 @@ static double pnow(void)
 #define PROF_END(b)   do { if (prof_on) { pthread_mutex_lock(&prof_mu); \
     waste_prof[b] += pnow() - _t##b; waste_prof_n[b]++; \
     pthread_mutex_unlock(&prof_mu); } } while (0)
+#if defined(WASTE_ENABLE_CUDA)
+static void prof_interval_end(int phase, double start)
+{
+    if (!prof_on) return;
+    pthread_mutex_lock(&prof_mu);
+    waste_prof[phase] += pnow() - start;
+    waste_prof_n[phase]++;
+    pthread_mutex_unlock(&prof_mu);
+}
+#endif
 /* The prefill trace needs the same read_expert wall interval as P_EDEQ.
  * Share its two existing gates so an unset trace adds no inner-loop branch. */
 #define PROF_ACC_START(b, acc) \
@@ -564,6 +586,67 @@ static int dense_matvec_t(waste_model *m, float *y, const waste_tensor *t,
                                 m->cuda_kda_mode);
 }
 
+/* Two target rows against one Q4 projection.  The CUDA entry owns a narrow
+ * shape allowlist: a false eligibility result is an ordinary two-launch
+ * path, while a failed eligible launch is sticky and may never silently
+ * fall back after a speculative transaction has begun.  CPU builds call the
+ * same single-row primitive twice, which is the differential-test oracle for
+ * all layer-major state handling. */
+static int q4_matvec2_t(waste_model *m, float *y0, float *y1,
+                        const waste_tensor *t, const float *x0,
+                        const float *x1, int out, int in, int cuda_mode,
+                        int dense)
+{
+#if defined(WASTE_ENABLE_CUDA)
+    if (cuda_mode && waste_cuda_q4_matvec2_eligible(t, out, in, cuda_mode)) {
+        if (m->cuda_kda_failed) return -1;
+        if (waste_cuda_q4_matvec2(m, y0, y1, t, x0, x1,
+                                  out, in, cuda_mode) == 0) {
+            if (dense) {
+                m->cuda_dense_effective = m->cuda_dense_scope;
+                m->cuda_dense_calls += 2;
+            } else {
+                m->cuda_kda_effective = cuda_mode;
+                m->cuda_kda_calls += 2;
+            }
+            return 0;
+        }
+        return cuda_projection_failed(m, dense ? "dense pair" : "KDA pair");
+    }
+#else
+    (void)cuda_mode;
+    (void)dense;
+#endif
+    if (cuda_q4_matvec_t(m, y0, t, x0, out, in, cuda_mode, dense)) return -1;
+    return cuda_q4_matvec_t(m, y1, t, x1, out, in, cuda_mode, dense);
+}
+
+static int kda_matvec2_t(waste_model *m, float *y0, float *y1,
+                         const waste_tensor *t, const float *x0,
+                         const float *x1, int out, int in, int cuda_mode)
+{
+    return q4_matvec2_t(m, y0, y1, t, x0, x1,
+                        out, in, cuda_mode, 0);
+}
+
+static int dense_matvec2_scope_t(waste_model *m, float *y0, float *y1,
+                                 const waste_tensor *t, const float *x0,
+                                 const float *x1, int out, int in,
+                                 int scope, int min_scope, int kernel_mode)
+{
+    const int mode = scope >= min_scope ? kernel_mode : 0;
+    return q4_matvec2_t(m, y0, y1, t, x0, x1, out, in, mode, 1);
+}
+
+static int dense_matvec2_t(waste_model *m, float *y0, float *y1,
+                           const waste_tensor *t, const float *x0,
+                           const float *x1, int out, int in, int min_scope)
+{
+    return dense_matvec2_scope_t(m, y0, y1, t, x0, x1, out, in,
+                                 m->cuda_dense_scope, min_scope,
+                                 m->cuda_kda_mode);
+}
+
 int waste_model_cuda_k2_dense_compatible(const waste_model *m)
 {
     if (!m) return 0;
@@ -785,6 +868,28 @@ int waste_model_cuda_glm53_profile_compatible(const waste_model *m,
         return 0;
     if (!vq_mode) return 1;
     return vq_mode == 2 && waste_model_cuda_glm53_vq3r_compatible(m);
+}
+
+/* The paired routed-expert schedule is a qualification switch, not a new
+ * generic meaning for CUDA VQ mode 2. It owns sixteen cache holds at once
+ * and depends on every proof made by the released GLM-5.3 CUDA profile. */
+static int mtp_verify2_vq2_compatible(const waste_model *m)
+{
+#if defined(WASTE_ENABLE_CUDA)
+    return m && m->mtp_available && m->cfg.top_k == 8 &&
+           m->cache.n_slots >= 2 * m->cfg.top_k &&
+           waste_model_cuda_glm53_profile_compatible(
+               m, m->cuda_kda_mode, m->cuda_dense_scope,
+               m->cuda_vq_mode, m->cuda_vq_group) &&
+           m->cuda_kda_mode == 1 && m->cuda_dense_scope == 3 &&
+           m->cuda_dense_preflight_scope == 3 &&
+           m->cuda_vq_mode == 2 && m->cuda_vq_group == 1 &&
+           (m->cuda_vq_preflight_modes & (1 << 2)) &&
+           !m->cuda_kda_failed && !m->cuda_kda_state_dirty;
+#else
+    (void)m;
+    return 0;
+#endif
 }
 
 /* The first hardware pilot deliberately qualifies one selector tuple, plus
@@ -2805,6 +2910,21 @@ int waste_model_load(waste_model *m, const char *dir, int kv_cap,
         }
         m->gqa_chunk_prefill = e && !strcmp(e, "1");
     }
+    {
+        const char *e = getenv("WASTE_MTP_VQ2");
+        if (e && strcmp(e, "0") && strcmp(e, "1")) {
+            fprintf(stderr, "waste: WASTE_MTP_VQ2 must be 0 or 1\n");
+            return -1;
+        }
+        m->mtp_verify2_vq2 = e && !strcmp(e, "1");
+#if !defined(WASTE_ENABLE_CUDA)
+        if (m->mtp_verify2_vq2) {
+            fprintf(stderr,
+                    "waste: WASTE_MTP_VQ2=1 requires a CUDA build\n");
+            return -1;
+        }
+#endif
+    }
 #if defined(WASTE_ENABLE_CUDA)
     {
         const char *e = getenv("WASTE_CUDA_KDA");
@@ -3511,11 +3631,26 @@ int waste_model_load(waste_model *m, const char *dir, int kv_cap,
                 "waste: WASTE_XPAR ignored while CUDA VQ owns routed-expert "
                 "scheduling\n");
 #endif
+    if (m->mtp_verify2_vq2 && !mtp_verify2_vq2_compatible(m)) {
+        fprintf(stderr,
+                "waste: WASTE_MTP_VQ2=1 requires the preflighted GLM-5.3 "
+                "KDA1/dense3/VQ2/group1 profile and 16 cache slots\n");
+        return -1;
+    }
     return 0;
 }
 
 void waste_model_free(waste_model *m)
 {
+    /* An open verifier returns views into model-owned persistent scratch.
+     * Free is void, so the only fail-closed policy is to leave the model
+     * intact until its owner finishes the transaction and calls again. */
+    if (!m) return;
+    if (m->mtp_oracle_open) {
+        fprintf(stderr,
+                "waste: model free refused while an MTP verifier is open\n");
+        return;
+    }
     /* Before anything else: the reader threads pread on the bank fds, and
      * those are closed further down. Stopping them here rather than in
      * waste_ecache_free — which runs last — is the difference between a
@@ -3551,7 +3686,7 @@ void waste_model_free(waste_model *m)
     free(m->x); free(m->h); free(m->tmp); free(m->att); free(m->logits);
     free(m->mtp_target_hidden); free(m->mtp_hidden);
     free(m->mtp_input_embed);
-    free(m->mtp_logits); free(m->mtp_work);
+    free(m->mtp_logits); free(m->mtp_work); free(m->mtp_verify2_scratch);
     free(m->ff); free(m->e_gate); free(m->e_up); free(m->e_down); free(m->lut);
     free(m->lut8); free(m->lut8_scale);
     free(m->xga); free(m->xub); free(m->xacc);
@@ -3858,6 +3993,7 @@ const char *waste_model_read_error(const waste_model *m, int *layer, int *expert
 
 void waste_model_clear_read_error(waste_model *m)
 {
+    if (!m || m->mtp_oracle_open) return;
     m->read_error = 0;
     m->ctx_full = 0;
 }
@@ -4553,6 +4689,162 @@ static int kda_layer(waste_model *m, int L, const float *in, float *out,
     return failed ? -1 : 0;
 }
 
+/* Two causal KDA rows, with every recurrent mutation kept in the same order
+ * as two ordinary decode calls.  Projection pairs are independent and may
+ * share a CUDA launch; convolution and delta-rule recurrence are row-zero
+ * then row-one.  `checkpoint` receives the complete state immediately after
+ * row zero (S followed by all three convolution rings). */
+static int kda_layer2(waste_model *m, int L,
+                      const float *in0, const float *in1,
+                      float *out0, float *out1, int cuda_mode,
+                      float *aux, float *checkpoint)
+{
+    const waste_config *c = &m->cfg;
+    const int H = c->kda_heads, D = c->kda_dim, C = H * D, hid = c->hidden;
+    float *q = aux;
+    float *k = q + (size_t)2 * C;
+    float *v = k + (size_t)2 * C;
+    float *g = v + (size_t)2 * C;
+    float *o = g + (size_t)2 * C;
+    float *beta = o + (size_t)2 * C;
+    float *lo = beta + (size_t)2 * H;
+    float *gate = lo + (size_t)2 * C;
+    float *vec[3] = { q, k, v };
+    const char *nm[3] = { "q", "k", "v" };
+
+    for (int i = 0; i < 3; i++) {
+        const waste_tensor *t = waste_find(m, tname(
+            "%smodel.layers.%d.self_attn.%s_proj.weight",
+            c->prefix, L, nm[i]));
+        PROF_START(P_KDA_QKV);
+        const int failed = kda_matvec2_t(
+            m, vec[i], vec[i] + C, t, in0, in1, C, hid, cuda_mode);
+        PROF_END(P_KDA_QKV);
+        if (failed) return -1;
+    }
+
+    /* All three row-zero rings must be checkpointed at the same logical
+     * midpoint.  Interleaving q0,q1,k0,k1 would make that state impossible
+     * to recover without another full copy. */
+    for (int row = 0; row < 2; row++) {
+        for (int i = 0; i < 3; i++) {
+            const waste_tensor *cw = waste_find(m, tname(
+                "%smodel.layers.%d.self_attn.%s_conv1d.weight",
+                c->prefix, L, nm[i]));
+            PROF_START(P_KDA_CONV);
+            waste_k.short_conv_step(
+                C, c->conv_k, cw->data, NULL,
+                m->conv[L] + (size_t)i * C * (c->conv_k - 1),
+                vec[i] + (size_t)row * C,
+                vec[i] + (size_t)row * C);
+            PROF_END(P_KDA_CONV);
+        }
+        if (row == 0) {
+            const size_t sn = (size_t)H * D * D;
+            const size_t cn = (size_t)3 * C * (c->conv_k - 1);
+            /* S is filled below; reserve its prefix now and capture rings. */
+            memcpy(checkpoint + sn, m->conv[L], cn * sizeof(float));
+        }
+    }
+
+    PROF_START(P_KDA_AUX);
+    int failed = kda_matvec2_t(
+        m, lo, lo + C,
+        waste_find(m, tname(
+            "%smodel.layers.%d.self_attn.f_a_proj.weight", c->prefix, L)),
+        in0, in1, D, hid, cuda_mode);
+    if (!failed)
+        failed = kda_matvec2_t(
+            m, g, g + C,
+            waste_find(m, tname(
+                "%smodel.layers.%d.self_attn.f_b_proj.weight", c->prefix, L)),
+            lo, lo + C, C, D, cuda_mode);
+    if (!failed)
+        failed = kda_matvec2_t(
+            m, beta, beta + H,
+            waste_find(m, tname(
+                "%smodel.layers.%d.self_attn.b_proj.weight", c->prefix, L)),
+            in0, in1, H, hid, cuda_mode);
+    if (failed) {
+        PROF_END(P_KDA_AUX);
+        return -1;
+    }
+    const waste_tensor *At = waste_find(m, tname(
+        "%smodel.layers.%d.self_attn.A_log", c->prefix, L));
+    const float *dt = T(m, "%smodel.layers.%d.self_attn.dt_bias",
+                        c->prefix, L);
+    for (int row = 0; row < 2; row++) {
+        waste_kda_decay_gate_ex(g + (size_t)row * C, At->data, dt,
+                                H, D, c->gate_lower_bound, 0);
+        for (int h = 0; h < H; h++) {
+            float *b = beta + (size_t)row * H + h;
+            *b = 1.0f / (1.0f + expf(-*b));
+        }
+    }
+    PROF_END(P_KDA_AUX);
+
+    for (int row = 0; row < 2; row++) {
+        kda_par a = { D, D, c->kda_l2_eps,
+                      q + (size_t)row * C,
+                      k + (size_t)row * C,
+                      v + (size_t)row * C,
+                      g + (size_t)row * C,
+                      beta + (size_t)row * H,
+                      m->S[L], o + (size_t)row * C, m->att };
+        PROF_START(P_KDA_REC);
+        waste_parallel_for(H, 1, kda_step_range, &a);
+        PROF_END(P_KDA_REC);
+        if (row == 0)
+            memcpy(checkpoint, m->S[L],
+                   (size_t)H * D * D * sizeof(float));
+    }
+
+    PROF_START(P_KDA_GATE);
+    if (c->full_rank_gate) {
+        failed = kda_matvec2_t(
+            m, gate, gate + C,
+            waste_find(m, tname(
+                "%smodel.layers.%d.self_attn.g_proj.weight", c->prefix, L)),
+            in0, in1, C, hid, cuda_mode);
+    } else {
+        failed = kda_matvec2_t(
+            m, lo, lo + C,
+            waste_find(m, tname(
+                "%smodel.layers.%d.self_attn.g_a_proj.weight", c->prefix, L)),
+            in0, in1, D, hid, cuda_mode);
+        if (!failed)
+            failed = kda_matvec2_t(
+                m, gate, gate + C,
+                waste_find(m, tname(
+                    "%smodel.layers.%d.self_attn.g_b_proj.weight",
+                    c->prefix, L)),
+                lo, lo + C, C, D, cuda_mode);
+    }
+    PROF_END(P_KDA_GATE);
+    if (failed) return -1;
+
+    const float *onw = T(m, "%smodel.layers.%d.self_attn.o_norm.weight",
+                         c->prefix, L);
+    PROF_START(P_KDA_NORM);
+    for (int row = 0; row < 2; row++)
+        for (int h = 0; h < H; h++)
+            waste_k.rmsnorm_gated(
+                D, o + (size_t)row * C + (size_t)h * D,
+                gate + (size_t)row * C + (size_t)h * D,
+                onw, c->eps,
+                o + (size_t)row * C + (size_t)h * D);
+    PROF_END(P_KDA_NORM);
+
+    PROF_START(P_KDA_OUT);
+    failed = kda_matvec2_t(
+        m, out0, out1,
+        waste_find(m, tname(
+            "%smodel.layers.%d.self_attn.o_proj.weight", c->prefix, L)),
+        o, o + C, hid, C, cuda_mode);
+    PROF_END(P_KDA_OUT);
+    return failed ? -1 : 0;
+}
+
 /* MLA with kv_b_proj absorbed into the query and the output.
  *
  * The cache holds only what MLA is designed to cache: the kv_lora-wide
@@ -4903,6 +5195,134 @@ static int mla_layer(waste_model *m, int L, const float *in, float *out,
     return 0;
 }
 
+/* Two independent projection rows followed by the required causal cache
+ * order.  The absorbed-attention arithmetic remains the ordinary per-row
+ * implementation, so row one sees row zero's latent exactly as it would in
+ * two successive decode calls. */
+static int mla_layer2(waste_model *m, int L,
+                      const float *in0, const float *in1,
+                      float *out0, float *out1, int pos,
+                      int cuda_scope, int cuda_mode, float *aux)
+{
+    const waste_config *c = &m->cfg;
+    const int nh = c->n_heads, qd = c->qk_nope + c->qk_rope;
+    const int vh = c->v_head, hid = c->hidden;
+    const int qn = nh * qd, on = nh * vh;
+    const int latd = c->kv_lora + c->qk_rope;
+    float *q = aux;
+    float *ckv = q + (size_t)2 * qn;
+    float *o = ckv + (size_t)2 * latd;
+    float *qa = o + (size_t)2 * on;
+
+    if (c->q_lora) {
+        if (dense_matvec2_scope_t(
+                m, qa, qa + c->q_lora,
+                waste_find(m, tname(
+                    "%smodel.layers.%d.self_attn.q_a_proj.weight",
+                    c->prefix, L)),
+                in0, in1, c->q_lora, hid,
+                cuda_scope, 2, cuda_mode))
+            return -1;
+        for (int row = 0; row < 2; row++)
+            waste_rmsnorm(
+                qa + (size_t)row * c->q_lora,
+                qa + (size_t)row * c->q_lora,
+                T(m, "%smodel.layers.%d.self_attn.q_a_layernorm.weight",
+                  c->prefix, L),
+                c->q_lora, c->mla_rms_norm_eps);
+        if (dense_matvec2_scope_t(
+                m, q, q + qn,
+                waste_find(m, tname(
+                    "%smodel.layers.%d.self_attn.q_b_proj.weight",
+                    c->prefix, L)),
+                qa, qa + c->q_lora, qn, c->q_lora,
+                cuda_scope, 2, cuda_mode))
+            return -1;
+    } else if (dense_matvec2_scope_t(
+                   m, q, q + qn,
+                   waste_find(m, tname(
+                       "%smodel.layers.%d.self_attn.q_proj.weight",
+                       c->prefix, L)),
+                   in0, in1, qn, hid, cuda_scope, 2, cuda_mode)) {
+        return -1;
+    }
+    if (dense_matvec2_scope_t(
+            m, ckv, ckv + latd,
+            waste_find(m, tname(
+                "%smodel.layers.%d.self_attn.kv_a_proj_with_mqa.weight",
+                c->prefix, L)),
+            in0, in1, latd, hid, cuda_scope, 2, cuda_mode))
+        return -1;
+    for (int row = 0; row < 2; row++)
+        waste_rmsnorm(ckv + (size_t)row * latd,
+                      ckv + (size_t)row * latd,
+                      T(m, "%smodel.layers.%d.self_attn.kv_a_layernorm.weight",
+                        c->prefix, L),
+                      c->kv_lora, c->mla_rms_norm_eps);
+
+    for (int row = 0; row < 2; row++) {
+        float *qr = q + (size_t)row * qn;
+        float *lr = ckv + (size_t)row * latd;
+        if (!c->mla_nope) {
+            float cs[WASTE_MAX_ROPE_HALF], sn[WASTE_MAX_ROPE_HALF];
+            rope_tables(c, pos + row, cs, sn);
+            const int half = c->qk_rope / 2;
+            for (int h = 0; h < nh; h++)
+                rope_apply(half, qr + (size_t)h * qd + c->qk_nope,
+                           cs, sn);
+            rope_apply(half, lr + c->kv_lora, cs, sn);
+        }
+        memcpy(m->latcache[L] + (size_t)(pos + row) * latd,
+               lr, (size_t)latd * sizeof(float));
+        const char *dump_latent = getenv("WASTE_DUMP_LATENT");
+        if (dump_latent) {
+            FILE *df = fopen(dump_latent, "ab");
+            if (df) {
+                fwrite(lr, sizeof(float), (size_t)latd, df);
+                fclose(df);
+            }
+        }
+        m->n_kv[L] = pos + row + 1;
+
+        mla_par a;
+        a.m = m;
+        a.kvb = waste_find(m, tname(
+            "%smodel.layers.%d.self_attn.kv_b_proj.weight", c->prefix, L));
+        a.q = qr;
+        a.lat = m->latcache[L];
+        a.o = o + (size_t)row * on;
+        a.S = m->n_kv[L];
+        a.qd = qd;
+        a.qk_nope = c->qk_nope;
+        a.qk_rope = c->qk_rope;
+        a.vh = vh;
+        a.kv_lora = c->kv_lora;
+        a.latd = latd;
+        a.scale = c->att_mul / sqrtf((float)qd);
+        waste_parallel_for(nh, 1, mla_head_range, &a);
+    }
+
+    if (c->mla_output_gate) {
+        float *gate = qa + (size_t)2 * (c->q_lora ? c->q_lora : 1);
+        if (dense_matvec2_scope_t(
+                m, gate, gate + on,
+                waste_find(m, tname(
+                    "%smodel.layers.%d.self_attn.g_proj.weight",
+                    c->prefix, L)),
+                in0, in1, on, hid, cuda_scope, 2, cuda_mode))
+            return -1;
+        for (int row = 0; row < 2; row++)
+            for (int i = 0; i < on; i++)
+                o[(size_t)row * on + i] *=
+                    1.0f / (1.0f + expf(-gate[(size_t)row * on + i]));
+    }
+    return dense_matvec2_scope_t(
+        m, out0, out1,
+        waste_find(m, tname(
+            "%smodel.layers.%d.self_attn.o_proj.weight", c->prefix, L)),
+        o, o + on, hid, on, cuda_scope, 2, cuda_mode);
+}
+
 static int ffn(waste_model *m, const waste_tensor *W1, const waste_tensor *W3,
                const waste_tensor *W2, const float *in, float *out,
                int inter, int hid, float w, int accum, int cuda_scope)
@@ -4920,6 +5340,35 @@ static int ffn(waste_model *m, const waste_tensor *W1, const waste_tensor *W3,
     if (dense_matvec_t(m, dst, W2, a, hid, inter, cuda_scope)) return -1;
     if (accum) for (int i = 0; i < hid; i++) out[i] += w * dst[i];
     return 0;
+}
+
+static int ffn2(waste_model *m, const waste_tensor *W1,
+                const waste_tensor *W3, const waste_tensor *W2,
+                const float *in0, const float *in1,
+                float *out0, float *out1, int inter, int hid,
+                int cuda_scope, float *aux)
+{
+    float *a = aux;
+    float *b = a + (size_t)2 * inter;
+    if (dense_matvec2_t(m, a, a + inter, W1, in0, in1,
+                        inter, hid, cuda_scope) ||
+        dense_matvec2_t(m, b, b + inter, W3, in0, in1,
+                        inter, hid, cuda_scope))
+        return -1;
+    for (int row = 0; row < 2; row++) {
+        float *ar = a + (size_t)row * inter;
+        const float *br = b + (size_t)row * inter;
+        if (m->cfg.act_situ)
+            for (int i = 0; i < inter; i++)
+                ar[i] = waste_situ_pair(ar[i], br[i],
+                                        m->cfg.situ_beta,
+                                        m->cfg.situ_linear_beta);
+        else
+            for (int i = 0; i < inter; i++)
+                ar[i] = swiglu_pair(&m->cfg, ar[i], br[i]);
+    }
+    return dense_matvec2_t(m, out0, out1, W2, a, a + inter,
+                           hid, inter, cuda_scope);
 }
 
 /* What layer L+1's router says about layer L's hidden state.
@@ -5181,30 +5630,34 @@ static int moe_vq_grouped(waste_model *m, int L, const int *idx,
 }
 #endif
 
-static int moe_layer(waste_model *m, int L, const float *in, float *out, int *routed)
+/* Router-only half of a MoE layer.  Keeping it shared between single-row
+ * decode and verify2 is important: top-k tie handling, renormalization and
+ * router order are part of the exact contract, not scheduling details. */
+static void moe_route_row(waste_model *m, int L, const float *in,
+                          int *idx, float *w, int *routed, int emit_hint)
 {
     const waste_config *c = &m->cfg;
     const int E = c->n_experts, K = c->top_k, hid = c->hidden;
-    /* K3's Stable LatentMoE: experts run on a narrower projection of the
-     * hidden state. `in` still drives the router and the shared experts. */
-    const int lat = c->latent_dim ? c->latent_dim : hid;
     float *sc = m->att + WASTE_ATT_ROUTER_OFF;
-    matvec_t(m, sc, waste_find(m, tname("%smodel.layers.%d.block_sparse_moe.gate.weight", c->prefix, L)), in, E, hid);
-    const float *bias = T(m, "%smodel.layers.%d.block_sparse_moe.gate.e_score_correction_bias", c->prefix, L);
+    matvec_t(m, sc, waste_find(m, tname(
+        "%smodel.layers.%d.block_sparse_moe.gate.weight", c->prefix, L)),
+        in, E, hid);
+    const float *bias = T(m,
+        "%smodel.layers.%d.block_sparse_moe.gate.e_score_correction_bias",
+        c->prefix, L);
     float *score = sc + E;
-    for (int e = 0; e < E; e++) score[e] = 1.0f / (1.0f + expf(-sc[e]));
-
-    int idx[64];
-    float w[64];
+    for (int e = 0; e < E; e++)
+        score[e] = 1.0f / (1.0f + expf(-sc[e]));
     for (int j = 0; j < K; j++) {
         int best = -1;
         float bv = -1e30f;
         for (int e = 0; e < E; e++) {
             int taken = 0;
-            for (int p = 0; p < j; p++) if (idx[p] == e) { taken = 1; break; }
+            for (int p = 0; p < j; p++)
+                if (idx[p] == e) { taken = 1; break; }
             if (taken) continue;
-            const float v = score[e] + (bias ? bias[e] : 0.0f);
-            if (v > bv) { bv = v; best = e; }
+            const float value = score[e] + (bias ? bias[e] : 0.0f);
+            if (value > bv) { bv = value; best = e; }
         }
         idx[j] = best;
         w[j] = score[best];
@@ -5214,32 +5667,15 @@ static int moe_layer(waste_model *m, int L, const float *in, float *out, int *ro
     route_margin_row('D', dump_pos0, L, attention, in, hid,
                      sc, score, bias, E, idx, K);
     if (c->renorm && K > 1) {
-        float s = 0;
-        for (int j = 0; j < K; j++) s += w[j];
-        for (int j = 0; j < K; j++) w[j] /= (s + 1e-20f);
+        float sum = 0.0f;
+        for (int j = 0; j < K; j++) sum += w[j];
+        for (int j = 0; j < K; j++) w[j] /= (sum + 1e-20f);
     }
     for (int j = 0; j < K; j++) w[j] *= c->routed_scale;
-    if (routed) for (int j = 0; j < K; j++) routed[j] = idx[j];
+    if (routed)
+        for (int j = 0; j < K; j++) routed[j] = idx[j];
 
-    /* WASTE_DUMP_ROUTE=path appends one line per (token, layer):
-     *
-     *     L  id0..idK-1  w0..wK-1
-     *
-     * the layer, the top-K expert ids in selection order, then their
-     * renormalized weights. The weights gated lever C of
-     * docs/EFFICIENCY.md; the ids gate the cross-layer prefetcher whose
-     * next_layer_top field docs/FORMAT.md has reserved since the skeleton.
-     * Both questions are "is the signal there", and both are cheaper to
-     * answer from a trace than from a build. */
     if (dump_route) {
-        /* Third group on the line: what the *next* layer's router says about
-         * *this* layer's hidden state. That is the predictor deltafin calls
-         * "router lookahead", and it is a different and much stronger one
-         * than the co-occurrence over expert ids that LEARNED §29 refuted —
-         * it asks the real router rather than a statistic about its past
-         * answers. Whether the hidden state has moved too far between here
-         * and there is exactly what wants measuring. -1 when there is no
-         * next MoE layer to ask. */
         int look[64];
         const int nlook = predict_next_moe(m, L, in, look, K);
         FILE *df = fopen(dump_route, "a");
@@ -5247,16 +5683,25 @@ static int moe_layer(waste_model *m, int L, const float *in, float *out, int *ro
             fprintf(df, "%d %d", dump_pos0, L);
             for (int j = 0; j < K; j++) fprintf(df, " %d", idx[j]);
             for (int j = 0; j < K; j++) fprintf(df, " %.6g", w[j]);
-            for (int j = 0; j < K; j++) fprintf(df, " %d", j < nlook ? look[j] : -1);
+            for (int j = 0; j < K; j++)
+                fprintf(df, " %d", j < nlook ? look[j] : -1);
             fputc('\n', df);
             fclose(df);
         }
     }
+    if (emit_hint) waste_ecache_hint(&m->cache, L, idx, K);
+}
 
-    /* Every id this layer will read is known here, before the first read.
-     * Handing them over lets the cache keep reads in flight while the
-     * matmuls below run; without read-ahead it does nothing. */
-    waste_ecache_hint(&m->cache, L, idx, K);
+static int moe_layer(waste_model *m, int L, const float *in, float *out, int *routed)
+{
+    const waste_config *c = &m->cfg;
+    const int K = c->top_k, hid = c->hidden;
+    /* K3's Stable LatentMoE: experts run on a narrower projection of the
+     * hidden state. `in` still drives the router and the shared experts. */
+    const int lat = c->latent_dim ? c->latent_dim : hid;
+    int idx[64];
+    float w[64];
+    moe_route_row(m, L, in, idx, w, routed, 1);
 
     const int inter = c->moe_inter;
     float *ga = m->ff, *ub = ga + inter, *acc = m->e_gate;
@@ -5508,6 +5953,250 @@ moe_done:
     return 0;
 }
 
+#if defined(WASTE_ENABLE_CUDA)
+/* One bounded GLM-5.3 verifier layer: 2 rows x top-8 experts.  Gate/up LUTs
+ * are built for both rows before a single 16-task apply sync; down then uses
+ * the established grouped handoff.  The final two sums still consume each
+ * row's experts in router order, so batching changes only scheduling. */
+static int moe_layer2_vq(waste_model *m, int L,
+                         const float *in0, const float *in1,
+                         float *out0, float *out1,
+                         int *routed0, int *routed1, float *aux)
+{
+    const waste_config *c = &m->cfg;
+    const int K = c->top_k, hid = c->hidden, inter = c->moe_inter;
+    const int count = 2 * K;
+    int idx[2][64];
+    float weight[2][64];
+    const float *in[2] = { in0, in1 };
+    float *out[2] = { out0, out1 };
+    int *routed[2] = { routed0, routed1 };
+    const uint8_t *rec[16] = { 0 };
+    const waste_expert_hdr *hdr[16] = { 0 };
+    waste_ecache_hold hold[16];
+    const float *pair_out[16] = { 0 };
+    const float *down_out[16] = { 0 };
+    int acquired = 0;
+    int emm_open = 0;
+    double emm_start = 0.0;
+
+    if (c->latent_dim || K < 1 || K > 8 || count > 16 ||
+        m->cuda_vq_mode != 2 || m->cuda_vq_group != 1 ||
+        m->cache.n_slots < count)
+        return 1;                   /* clean request for the serial fallback */
+    for (int i = 0; i < 16; i++)
+        hold[i] = (waste_ecache_hold)WASTE_ECACHE_HOLD_INIT;
+    for (int row = 0; row < 2; row++) {
+        dump_pos0 += row;
+        moe_route_row(m, L, in[row], idx[row], weight[row], routed[row], 0);
+        dump_pos0 -= row;
+    }
+    /* A hint is a replaceable demand window. Hinting row one by itself
+     * would discard row zero's cold reads before its first acquire, so name
+     * the stable, router-ordered union consumed by this paired schedule. */
+    {
+        int hint[16], n_hint = 0;
+        for (int row = 0; row < 2; row++)
+            for (int j = 0; j < K; j++) {
+                const int id = idx[row][j];
+                int seen = 0;
+                for (int i = 0; i < n_hint; i++)
+                    if (hint[i] == id) { seen = 1; break; }
+                if (!seen) hint[n_hint++] = id;
+            }
+        waste_ecache_hint(&m->cache, L, hint, n_hint);
+    }
+
+    PROF_START(P_EDEQ);
+    for (int row = 0; row < 2; row++) {
+        for (int j = 0; j < K; j++) {
+            const int slot = row * K + j;
+            rec[slot] = read_expert_hold(
+                m, L, idx[row][j], &hold[slot]);
+            if (!rec[slot]) goto fail_read;
+            acquired++;
+            hdr[slot] = (const waste_expert_hdr *)rec[slot];
+            if (hdr[slot]->fmt != WQ_VQ3R) goto fail_record;
+        }
+    }
+    PROF_END(P_EDEQ);
+    emm_start = prof_on ? pnow() : 0.0;
+    emm_open = 1;
+
+    if (waste_cuda_vq_prepare_pair2(
+            m, in0, in1, hdr[0]->codebook_id, hid))
+        goto fail_prepare;
+    m->cuda_vq_lut_builds += 4;
+    m->cuda_vq_launches += 2;
+    for (int row = 0; row < 2; row++) {
+        for (int j = 0; j < K; j++) {
+            const int slot = row * K + j;
+            const uint16_t *scale = (const uint16_t *)(
+                rec[slot] + hdr[slot]->chan_corr_off);
+            PROF_START(P_LUTA);
+            const int failed = waste_cuda_vq_group_pair2_enqueue(
+                m, slot, row,
+                rec[slot] + hdr[slot]->gate_off,
+                rec[slot] + hdr[slot]->up_off,
+                scale, inter, hid);
+            PROF_END(P_LUTA);
+            if (failed) goto fail_pair_enqueue;
+            m->cuda_vq_launches++;
+        }
+    }
+    {
+        PROF_START(P_LUTA);
+        const int failed = waste_cuda_vq_group_pair_finish(
+            m, count, pair_out);
+        PROF_END(P_LUTA);
+        if (failed) goto fail_pair_finish;
+    }
+    m->cuda_vq_syncs++;
+
+    for (int slot = 0; slot < count; slot++) {
+        float *gate = (float *)pair_out[slot];
+        const float *up = pair_out[slot] + inter;
+        if (c->act_situ)
+            for (int i = 0; i < inter; i++)
+                gate[i] = waste_situ_pair(
+                    gate[i], up[i], c->situ_beta, c->situ_linear_beta);
+        else
+            for (int i = 0; i < inter; i++)
+                gate[i] = swiglu_pair(c, gate[i], up[i]);
+        const uint16_t *scale = (const uint16_t *)(
+            rec[slot] + hdr[slot]->chan_corr_off);
+        PROF_START(P_LUTA);
+        const int failed = waste_cuda_vq_group_down_enqueue(
+            m, slot, rec[slot] + hdr[slot]->down_off,
+            scale + 2 * inter, gate,
+            hdr[slot]->codebook_id + 2 * m->stages,
+            hid, inter);
+        PROF_END(P_LUTA);
+        if (failed) goto fail_down_enqueue;
+        m->cuda_vq_lut_builds++;
+        m->cuda_vq_launches += 2;
+    }
+    {
+        PROF_START(P_LUTA);
+        const int failed = waste_cuda_vq_group_down_finish(
+            m, count, down_out);
+        PROF_END(P_LUTA);
+        if (failed) goto fail_down_finish;
+    }
+    m->cuda_vq_syncs++;
+
+    memset(out0, 0, (size_t)hid * sizeof(float));
+    memset(out1, 0, (size_t)hid * sizeof(float));
+    for (int row = 0; row < 2; row++) {
+        for (int j = 0; j < K; j++) {
+            const int slot = row * K + j;
+            const float w = weight[row][j];
+            for (int i = 0; i < hid; i++)
+                out[row][i] += w * down_out[slot][i];
+            m->cuda_vq_experts++;
+            m->cuda_vq_applies += 3;
+        }
+    }
+    m->cuda_vq_effective = 2;
+    prof_interval_end(P_EMM, emm_start);
+    emm_open = 0;
+    release_expert_holds(m, hold, acquired);
+
+    /* Shared expert is independent between rows.  Keep its outputs outside
+     * the gate/up workspace and use the same pair projection selector as the
+     * dense verifier path. */
+    float *shared = aux;
+    float *ffaux = shared + (size_t)2 * hid;
+    if (ffn2(m,
+             waste_find(m, tname(
+                "%smodel.layers.%d.block_sparse_moe.shared_experts.gate_proj.weight",
+                c->prefix, L)),
+             waste_find(m, tname(
+                "%smodel.layers.%d.block_sparse_moe.shared_experts.up_proj.weight",
+                c->prefix, L)),
+             waste_find(m, tname(
+                "%smodel.layers.%d.block_sparse_moe.shared_experts.down_proj.weight",
+                c->prefix, L)),
+             in0, in1, shared, shared + hid,
+             inter * (c->n_shared ? c->n_shared : 1), hid, 1, ffaux))
+        return -1;
+    for (int row = 0; row < 2; row++)
+        for (int i = 0; i < hid; i++)
+            out[row][i] += shared[(size_t)row * hid + i];
+
+    if (lookahead_n) {
+        int next[WASTE_PF_MAX];
+        int n = predict_next_moe(m, L, in0, next, lookahead_n);
+        if (n) waste_ecache_prefetch(&m->cache, L + 1, next, n);
+        n = predict_next_moe(m, L, in1, next, lookahead_n);
+        if (n) waste_ecache_prefetch(&m->cache, L + 1, next, n);
+    }
+    return 0;
+
+fail_read:
+    PROF_END(P_EDEQ);
+    if (waste_cuda_vq_group_drain(m))
+        cuda_projection_failed(m, "verify2 VQ read drain");
+    release_expert_holds(m, hold, acquired);
+    return -1;
+fail_record:
+    PROF_END(P_EDEQ);
+    waste_cuda_vq_group_drain(m);
+    release_expert_holds(m, hold, acquired);
+    return cuda_projection_failed(m, "verify2 VQ3R record validation");
+fail_prepare:
+    if (emm_open) prof_interval_end(P_EMM, emm_start);
+    waste_cuda_vq_group_drain(m);
+    release_expert_holds(m, hold, acquired);
+    return cuda_projection_failed(m, "verify2 VQ prepare");
+fail_pair_enqueue:
+    if (emm_open) prof_interval_end(P_EMM, emm_start);
+    waste_cuda_vq_group_drain(m);
+    release_expert_holds(m, hold, acquired);
+    return cuda_projection_failed(m, "verify2 VQ pair enqueue");
+fail_pair_finish:
+    if (emm_open) prof_interval_end(P_EMM, emm_start);
+    waste_cuda_vq_group_drain(m);
+    release_expert_holds(m, hold, acquired);
+    return cuda_projection_failed(m, "verify2 VQ pair finish");
+fail_down_enqueue:
+    if (emm_open) prof_interval_end(P_EMM, emm_start);
+    waste_cuda_vq_group_drain(m);
+    release_expert_holds(m, hold, acquired);
+    return cuda_projection_failed(m, "verify2 VQ down enqueue");
+fail_down_finish:
+    if (emm_open) prof_interval_end(P_EMM, emm_start);
+    waste_cuda_vq_group_drain(m);
+    release_expert_holds(m, hold, acquired);
+    return cuda_projection_failed(m, "verify2 VQ down finish");
+}
+#endif
+
+/* Verify2 scheduling seam.  The semantic fallback deliberately remains two
+ * ordinary router-ordered rows; the CUDA mode-2 implementation plugs in
+ * here once the dual-row LUT/group primitive is available. */
+static int moe_layer2(waste_model *m, int L,
+                      const float *in0, const float *in1,
+                      float *out0, float *out1,
+                      int *routed0, int *routed1, float *aux)
+{
+#if defined(WASTE_ENABLE_CUDA)
+    if (m->mtp_verify2_vq2 && m->cuda_vq_mode == 2) {
+        const int rc = moe_layer2_vq(
+            m, L, in0, in1, out0, out1, routed0, routed1, aux);
+        if (rc <= 0) return rc;      /* success or sticky failure */
+    }
+#else
+    (void)aux;
+#endif
+    const int pos = dump_pos0;
+    if (moe_layer(m, L, in0, out0, routed0)) return -1;
+    dump_pos0 = pos + 1;
+    const int failed = moe_layer(m, L, in1, out1, routed1);
+    dump_pos0 = pos;
+    return failed;
+}
+
 /* ---- Attention Residuals (K3) ------------------------------------------
  * Every layer mixes its running sum with a history of block residuals via a
  * learned softmax attention over that history; every attn_res_block_size
@@ -5603,6 +6292,7 @@ static int state_add_bytes(uint64_t *total, uint64_t count, uint64_t width)
 int waste_model_state_size(const waste_model *m, int pos, size_t *bytes)
 {
     if (!m || !bytes) return -1;
+    if (m->mtp_oracle_open) return -1;
     /* v1 has no appended MTP cache/hidden representation.  Availability by
      * itself is harmless and preserves old snapshots; refuse only while the
      * caller has explicitly activated experimental MTP state. */
@@ -5698,6 +6388,7 @@ int waste_model_state_import(waste_model *m, const void *src, size_t bytes,
                              int *pos)
 {
     if (!m || !src || bytes < sizeof(waste_state_hdr)) return -2;
+    if (m->mtp_oracle_open) return -2;
     if (m->mtp_active) return -2;
     if (m->cfg.attention_kind == WASTE_ATTN_GQA) return -2;
     const waste_config *c = &m->cfg;
@@ -5789,6 +6480,7 @@ int waste_model_state_import(waste_model *m, const void *src, size_t bytes,
  * directly can start each arm from the same place the last one did. */
 void waste_model_reset(waste_model *m)
 {
+    if (!m || m->mtp_oracle_open) return;
     const waste_config *c = &m->cfg;
     for (int L = 0; L < c->n_layers; L++) {
         if (m->S[L])
@@ -5864,7 +6556,7 @@ int  waste_model_get_lookahead(void)  { return lookahead_n; }
 
 int waste_model_set_cuda_kda(waste_model *m, int mode)
 {
-    if (!m || mode < 0 || mode > 2) return -1;
+    if (!m || m->mtp_oracle_open || mode < 0 || mode > 2) return -1;
 #if defined(WASTE_ENABLE_CUDA)
     const char *backend = getenv("WASTE_BACKEND");
     if (mode && backend && !strcmp(backend, "cpu")) return -1;
@@ -5909,7 +6601,7 @@ uint64_t waste_model_cuda_kda_calls(const waste_model *m)
 
 int waste_model_set_cuda_dense(waste_model *m, int scope)
 {
-    if (!m || scope < 0 || scope > 3) return -1;
+    if (!m || m->mtp_oracle_open || scope < 0 || scope > 3) return -1;
 #if defined(WASTE_ENABLE_CUDA)
     const int clear_prefill_dense = m->cuda_prefill_dense && scope == 0;
     const char *backend = getenv("WASTE_BACKEND");
@@ -5960,7 +6652,7 @@ uint64_t waste_model_cuda_dense_calls(const waste_model *m)
 
 int waste_model_set_cuda_gqa_proj(waste_model *m, int enabled)
 {
-    if (!m || enabled < 0 || enabled > 1) return -1;
+    if (!m || m->mtp_oracle_open || enabled < 0 || enabled > 1) return -1;
 #if defined(WASTE_ENABLE_CUDA)
     const char *backend = getenv("WASTE_BACKEND");
     if (enabled && backend && !strcmp(backend, "cpu")) return -1;
@@ -6004,7 +6696,7 @@ uint64_t waste_model_cuda_gqa_proj_calls(const waste_model *m)
 
 int waste_model_set_cuda_vq(waste_model *m, int mode)
 {
-    if (!m || mode < 0 || mode > 2) return -1;
+    if (!m || m->mtp_oracle_open || mode < 0 || mode > 2) return -1;
 #if defined(WASTE_ENABLE_CUDA)
     const int clear_prefill_vq = m->cuda_prefill_vq && mode == 0;
     const int clear_gqa_chunk = m->gqa_chunk_prefill &&
@@ -6114,6 +6806,7 @@ static void start_readers(waste_model *m)
  * the budget would have made it. */
 int waste_model_resize_cache(waste_model *m, size_t cache_bytes)
 {
+    if (!m || m->mtp_oracle_open) return -1;
     const int policy = m->cache.policy;
     int64_t rec = 0;
     const int end = m->mtp_available ? m->mtp_layer + 1 : m->cfg.n_layers;
@@ -6174,6 +6867,7 @@ int waste_model_state_save(const waste_model *m, const char *path, int pos)
 
 int waste_model_state_load(waste_model *m, const char *path, int *pos)
 {
+    if (!m || m->mtp_oracle_open) return -2;
     const waste_config *c = &m->cfg;
     if (m->mtp_active) return -2;
     if (c->attention_kind == WASTE_ATTN_GQA) return -2;
@@ -6999,7 +7693,8 @@ int waste_model_mtp_available(const waste_model *m)
 
 int waste_model_mtp_set_enabled(waste_model *m, int enabled)
 {
-    if (!m || (enabled != 0 && enabled != 1)) return -1;
+    if (!m || m->mtp_oracle_open ||
+        (enabled != 0 && enabled != 1)) return -1;
     if (!enabled) {
         m->mtp_active = 0;
         /* A pending comparison belongs to the target step that the caller
@@ -7055,7 +7750,8 @@ const float *waste_model_mtp_target_hidden(const waste_model *m, int *pos)
 const float *waste_model_mtp_propose(waste_model *m, int next_token,
                                      int target_pos, int *routed)
 {
-    if (!m || !m->mtp_active || target_pos != m->mtp_target_hidden_pos)
+    if (!m || m->mtp_oracle_open || !m->mtp_active ||
+        target_pos != m->mtp_target_hidden_pos)
         return NULL;
     if (m->n_kv[m->mtp_layer] != target_pos) {
         mtp_alignment_fail(m, "proposal", m->n_kv[m->mtp_layer], target_pos);
@@ -7376,7 +8072,6 @@ int waste_model_mtp_verify2_oracle_begin(
     waste_mtp_verify2_oracle *o =
         mtp_oracle_alloc(m, token0, draft_token1, pos0);
     if (!o) return -1;              /* no target state changed yet */
-    m->mtp_oracle_open = 1;
     o->open = 1;
 
     const float *logits = waste_model_step(m, token0, pos0, routed0);
@@ -7401,6 +8096,7 @@ int waste_model_mtp_verify2_oracle_begin(
            (size_t)m->cfg.vocab * sizeof(float));
     memcpy(o->hidden + m->cfg.hidden, m->mtp_target_hidden,
            (size_t)m->cfg.hidden * sizeof(float));
+    m->mtp_oracle_open = 1;
     *out = o;
     return 0;
 
@@ -7493,9 +8189,552 @@ static void mtp_after_target_step(waste_model *m, const float *target_logits)
     m->mtp_shadow_argmax = -1;
 }
 
+/* ---- exact layer-major depth-1 MTP verifier --------------------------- */
+
+struct waste_mtp_verify2 {
+    waste_model *model;
+    int pos0, token0, token1, open;
+    int n_kv[WASTE_MAX_LAYERS];
+    int n_blockres, media_used, ctx_full;
+    int read_error, bad_layer, bad_expert;
+    int cuda_kda_state_dirty, cuda_kda_failed;
+    int mtp_active, mtp_target_hidden_pos, mtp_alignment_error;
+    int mtp_last_pos, mtp_last_token, mtp_target_token;
+    int mtp_shadow_argmax;
+    uint64_t mtp_steps, mtp_shadow_steps, mtp_shadow_matches;
+    double mtp_seconds;
+    float *kda_checkpoint;
+    float *streams[2][2];
+    float *map_scratch, *post, *comb, *collapsed, *sub;
+    float *embedding, *row_x, *pair_aux, *logits, *hidden;
+    float *after_x, *after_target_hidden, *after_mtp_hidden;
+    float *after_mtp_input, *after_mtp_logits;
+};
+
+static int mtp_verify2_is_tiny_fixture(const waste_model *m)
+{
+    const waste_config *c = &m->cfg;
+    return c->hidden == 128 && c->n_experts == 8 && c->top_k == 2 &&
+           c->moe_inter == 64 && c->dense_inter == 256 &&
+           c->n_shared == 1 && c->first_dense == 3 &&
+           c->n_heads == 4 && c->n_kv_heads == 4 &&
+           c->kv_lora == 32 && c->q_lora == 64 &&
+           c->qk_nope == 16 && c->v_head == 16 &&
+           c->kda_heads == 4 && c->kda_dim == 32 &&
+           m->expert_m[0] == 64 && m->expert_m[1] == 64 &&
+           m->expert_m[2] == 128 && m->expert_n[0] == 128 &&
+           m->expert_n[1] == 128 && m->expert_n[2] == 64;
+}
+
+static int mtp_verify2_geometry_ok(const waste_model *m)
+{
+    if (!mtp_oracle_geometry_ok(m) || m->media ||
+        getenv("WASTE_DUMP_HIDDEN") || getenv("WASTE_DUMP_LATENT") ||
+        getenv("WASTE_DUMP_ROUTE"))
+        return 0;
+    if (mtp_verify2_is_tiny_fixture(m))
+        return !m->cuda_kda_mode && !m->cuda_dense_scope &&
+               !m->cuda_vq_mode && !m->cuda_gqa_proj &&
+               !m->mtp_verify2_vq2;
+    if (m->mtp_verify2_vq2 && !mtp_verify2_vq2_compatible(m)) return 0;
+    return waste_model_cuda_glm53_profile_compatible(
+               m, m->cuda_kda_mode, m->cuda_dense_scope,
+               m->cuda_vq_mode, m->cuda_vq_group) &&
+           m->cuda_kda_mode == 1 && m->cuda_dense_scope == 3 &&
+           m->cuda_dense_preflight_scope == 3 &&
+           m->cuda_vq_mode == 2 && m->cuda_vq_group == 1 &&
+           (m->cuda_vq_preflight_modes & (1 << 2)) &&
+           !m->cuda_kda_failed && !m->cuda_kda_state_dirty;
+}
+
+int waste_model_mtp_verify2_set_vq2(waste_model *m, int enabled)
+{
+    if (!m || m->mtp_oracle_open || (enabled != 0 && enabled != 1))
+        return -1;
+    if (enabled && !mtp_verify2_vq2_compatible(m)) return -1;
+    m->mtp_verify2_vq2 = enabled;
+    return 0;
+}
+
+int waste_model_mtp_verify2_get_vq2(const waste_model *m)
+{
+    return m ? m->mtp_verify2_vq2 : 0;
+}
+
+static int mtp_verify2_add(size_t *total, size_t n)
+{
+    if (*total > SIZE_MAX - n) return -1;
+    *total += n;
+    return 0;
+}
+
+static int mtp_verify2_layout(waste_mtp_verify2 *v, size_t *need)
+{
+    waste_model *m = v->model;
+    const waste_config *c = &m->cfg;
+    const size_t H = (size_t)c->hidden;
+    const size_t hc = (size_t)c->hc_mult;
+    const size_t streamn = hc * H;
+    const size_t mixn = (size_t)(2 + c->hc_mult) * c->hc_mult;
+    const size_t C = (size_t)c->kda_heads * c->kda_dim;
+    size_t maxdim = H;
+    const size_t dims[] = {
+        C, (size_t)c->dense_inter, (size_t)c->moe_inter,
+        (size_t)c->n_heads * (size_t)(c->qk_nope + c->qk_rope),
+        (size_t)c->n_heads * (size_t)c->v_head,
+        (size_t)(c->q_lora ? c->q_lora : 1),
+        (size_t)(c->kv_lora + c->qk_rope)
+    };
+    for (size_t i = 0; i < sizeof dims / sizeof dims[0]; i++)
+        if (dims[i] > maxdim) maxdim = dims[i];
+    if (maxdim > (SIZE_MAX - 1024) / 32) return -1;
+    const size_t auxn = 32 * maxdim + 1024;
+    size_t nf = 0, kdan = 0;
+    for (int L = 0; L < c->n_layers; L++) {
+        if (!c->kda_layer[L]) continue;
+        if (mtp_verify2_add(&kdan,
+                (size_t)c->kda_heads * c->kda_dim * c->kda_dim) ||
+            mtp_verify2_add(&kdan,
+                (size_t)3 * C * (size_t)(c->conv_k - 1)))
+            return -1;
+    }
+    if (mtp_verify2_add(&nf, kdan) ||
+        mtp_verify2_add(&nf, 4 * streamn) ||
+        mtp_verify2_add(&nf, streamn + mixn) ||
+        mtp_verify2_add(&nf, 2 * hc) ||
+        mtp_verify2_add(&nf, 2 * hc * hc) ||
+        mtp_verify2_add(&nf, 2 * H) ||       /* collapsed */
+        mtp_verify2_add(&nf, 2 * H) ||       /* sublayer */
+        mtp_verify2_add(&nf, 2 * H) ||       /* embeddings */
+        mtp_verify2_add(&nf, 2 * H) ||       /* final raw rows */
+        mtp_verify2_add(&nf, auxn) ||
+        mtp_verify2_add(&nf, (size_t)2 * c->vocab) ||
+        mtp_verify2_add(&nf, 2 * H) ||       /* final normalized rows */
+        mtp_verify2_add(&nf, 4 * H) ||       /* after-row0 vectors */
+        mtp_verify2_add(&nf, (size_t)c->vocab))
+        return -1;
+    *need = nf;
+    if (!m->mtp_verify2_scratch || m->mtp_verify2_scratch_floats < nf)
+        return 0;
+
+    float *p = m->mtp_verify2_scratch;
+    v->kda_checkpoint = p; p += kdan;
+    for (int row = 0; row < 2; row++)
+        for (int bank = 0; bank < 2; bank++) {
+            v->streams[row][bank] = p;
+            p += streamn;
+        }
+    v->map_scratch = p; p += streamn + mixn;
+    v->post = p; p += 2 * hc;
+    v->comb = p; p += 2 * hc * hc;
+    v->collapsed = p; p += 2 * H;
+    v->sub = p; p += 2 * H;
+    v->embedding = p; p += 2 * H;
+    v->row_x = p; p += 2 * H;
+    v->pair_aux = p; p += auxn;
+    v->logits = p; p += (size_t)2 * c->vocab;
+    v->hidden = p; p += 2 * H;
+    v->after_x = p; p += H;
+    v->after_target_hidden = p; p += H;
+    v->after_mtp_hidden = p; p += H;
+    v->after_mtp_input = p; p += H;
+    v->after_mtp_logits = p;
+    return 0;
+}
+
+static int mtp_verify2_ensure_scratch(waste_mtp_verify2 *v)
+{
+    size_t need = 0;
+    if (mtp_verify2_layout(v, &need)) return -1;
+    waste_model *m = v->model;
+    if (!m->mtp_verify2_scratch || m->mtp_verify2_scratch_floats < need) {
+        if (need > SIZE_MAX / sizeof(float)) return -1;
+        float *p = (float *)calloc(need, sizeof(float));
+        if (!p) return -1;
+        free(m->mtp_verify2_scratch);
+        m->mtp_verify2_scratch = p;
+        m->mtp_verify2_scratch_floats = need;
+    }
+    return mtp_verify2_layout(v, &need);
+}
+
+static int model_step_mhc2(waste_mtp_verify2 *v,
+                           int *routed0, int *routed1)
+{
+    waste_model *m = v->model;
+    const waste_config *c = &m->cfg;
+    const int hc = c->hc_mult, hid = c->hidden;
+    for (int row = 0; row < 2; row++)
+        for (int s = 0; s < hc; s++)
+            memcpy(v->streams[row][0] + (size_t)s * hid,
+                   v->embedding + (size_t)row * hid,
+                   (size_t)hid * sizeof(float));
+
+    float *kcp = v->kda_checkpoint;
+    int cur = 0;
+    m->n_blockres = 0;
+    for (int L = 0; L < c->n_layers; L++) {
+        if (m->read_error || m->cuda_kda_failed || m->cuda_kda_state_dirty)
+            return -1;
+
+        for (int row = 0; row < 2; row++) {
+            float *post = v->post + (size_t)row * hc;
+            float *comb = v->comb + (size_t)row * hc * hc;
+            float *collapsed = v->collapsed + (size_t)row * hid;
+            mhc_model_map(m, L, "attn", v->streams[row][cur],
+                          post, comb, collapsed, v->map_scratch);
+            waste_rmsnorm(
+                collapsed, collapsed,
+                T(m, "%smodel.layers.%d.input_layernorm.weight",
+                  c->prefix, L),
+                hid, c->eps);
+        }
+        if (c->kda_layer[L]) {
+            PROF_START(P_KDA);
+            const int failed = kda_layer2(
+                m, L, v->collapsed, v->collapsed + hid,
+                v->sub, v->sub + hid, m->cuda_kda_mode,
+                v->pair_aux, kcp);
+            PROF_END(P_KDA);
+            if (failed) return -1;
+            kcp += (size_t)c->kda_heads * c->kda_dim * c->kda_dim;
+            kcp += (size_t)3 * c->kda_heads * c->kda_dim *
+                   (size_t)(c->conv_k - 1);
+        } else {
+            PROF_START(P_MLA);
+            const int failed = mla_layer2(
+                m, L, v->collapsed, v->collapsed + hid,
+                v->sub, v->sub + hid, v->pos0,
+                m->cuda_dense_scope, m->cuda_kda_mode, v->pair_aux);
+            PROF_END(P_MLA);
+            if (failed) return -1;
+        }
+        for (int row = 0; row < 2; row++)
+            waste_mhc_merge(
+                hc, hid, v->streams[row][cur],
+                v->sub + (size_t)row * hid,
+                v->post + (size_t)row * hc,
+                v->comb + (size_t)row * hc * hc,
+                v->streams[row][1 - cur]);
+        cur = 1 - cur;
+
+        for (int row = 0; row < 2; row++) {
+            float *post = v->post + (size_t)row * hc;
+            float *comb = v->comb + (size_t)row * hc * hc;
+            float *collapsed = v->collapsed + (size_t)row * hid;
+            mhc_model_map(m, L, "ffn", v->streams[row][cur],
+                          post, comb, collapsed, v->map_scratch);
+            waste_rmsnorm(
+                collapsed, collapsed,
+                T(m, "%smodel.layers.%d.post_attention_layernorm.weight",
+                  c->prefix, L),
+                hid, c->eps);
+        }
+        if (waste_find(m, tname(
+                "%smodel.layers.%d.block_sparse_moe.gate.weight",
+                c->prefix, L))) {
+            dump_pos0 = v->pos0;
+            PROF_START(P_ROUTE);
+            const int failed = moe_layer2(
+                m, L, v->collapsed, v->collapsed + hid,
+                v->sub, v->sub + hid,
+                routed0 ? routed0 + (size_t)L * c->top_k : NULL,
+                routed1 ? routed1 + (size_t)L * c->top_k : NULL,
+                v->pair_aux);
+            PROF_END(P_ROUTE);
+            if (failed) return -1;
+        } else if (ffn2(
+                       m,
+                       waste_find(m, tname(
+                           "%smodel.layers.%d.mlp.gate_proj.weight",
+                           c->prefix, L)),
+                       waste_find(m, tname(
+                           "%smodel.layers.%d.mlp.up_proj.weight",
+                           c->prefix, L)),
+                       waste_find(m, tname(
+                           "%smodel.layers.%d.mlp.down_proj.weight",
+                           c->prefix, L)),
+                       v->collapsed, v->collapsed + hid,
+                       v->sub, v->sub + hid,
+                       c->dense_inter, hid, 3, v->pair_aux)) {
+            return -1;
+        }
+        for (int row = 0; row < 2; row++)
+            waste_mhc_merge(
+                hc, hid, v->streams[row][cur],
+                v->sub + (size_t)row * hid,
+                v->post + (size_t)row * hc,
+                v->comb + (size_t)row * hc * hc,
+                v->streams[row][1 - cur]);
+        cur = 1 - cur;
+    }
+
+    if (m->read_error || m->cuda_kda_failed || m->cuda_kda_state_dirty)
+        return -1;
+    for (int row = 0; row < 2; row++) {
+        const float *streams = v->streams[row][cur];
+        float *raw = v->row_x + (size_t)row * hid;
+        float *hidden = v->hidden + (size_t)row * hid;
+        for (int d = 0; d < hid; d++) {
+            float s = 0.0f;
+            for (int h = 0; h < hc; h++)
+                s += streams[(size_t)h * hid + d];
+            raw[d] = s / (float)hc;
+        }
+        waste_rmsnorm(hidden, raw,
+                      T(m, "%smodel.norm.weight", c->prefix),
+                      hid, c->eps);
+        PROF_START(P_HEAD);
+        matvec_t(m, v->logits + (size_t)row * c->vocab,
+                 waste_find(m, tname("%slm_head.weight", c->prefix)),
+                 hidden, c->vocab, hid);
+        PROF_END(P_HEAD);
+    }
+    return 0;
+}
+
+static void mtp_verify2_capture_after_row0(waste_mtp_verify2 *v)
+{
+    waste_model *m = v->model;
+    const waste_config *c = &m->cfg;
+    memcpy(v->n_kv, m->n_kv, sizeof v->n_kv);
+    /* The paired target has already appended row one.  Counts are the only
+     * live MLA boundary; bytes at and after the restored count are dead. */
+    for (int L = 0; L < c->n_layers; L++)
+        if (!c->kda_layer[L]) v->n_kv[L] = v->pos0 + 1;
+    v->n_kv[m->mtp_layer] = v->pos0;
+    memcpy(v->after_x, v->row_x, (size_t)c->hidden * sizeof(float));
+    memcpy(v->after_target_hidden, m->mtp_target_hidden,
+           (size_t)c->hidden * sizeof(float));
+    memcpy(v->after_mtp_hidden, m->mtp_hidden,
+           (size_t)c->hidden * sizeof(float));
+    memcpy(v->after_mtp_input, m->mtp_input_embed,
+           (size_t)c->hidden * sizeof(float));
+    memcpy(v->after_mtp_logits, m->mtp_logits,
+           (size_t)c->vocab * sizeof(float));
+    v->n_blockres = m->n_blockres;
+    v->media_used = m->media_used;
+    v->ctx_full = m->ctx_full;
+    v->read_error = m->read_error;
+    v->bad_layer = m->bad_layer;
+    v->bad_expert = m->bad_expert;
+    v->cuda_kda_state_dirty = m->cuda_kda_state_dirty;
+    v->cuda_kda_failed = m->cuda_kda_failed;
+    v->mtp_active = m->mtp_active;
+    v->mtp_target_hidden_pos = m->mtp_target_hidden_pos;
+    v->mtp_alignment_error = m->mtp_alignment_error;
+    v->mtp_last_pos = m->mtp_last_pos;
+    v->mtp_last_token = m->mtp_last_token;
+    v->mtp_target_token = m->mtp_target_token;
+    v->mtp_shadow_argmax = m->mtp_shadow_argmax;
+    v->mtp_steps = m->mtp_steps;
+    v->mtp_shadow_steps = m->mtp_shadow_steps;
+    v->mtp_shadow_matches = m->mtp_shadow_matches;
+    v->mtp_seconds = m->mtp_seconds;
+}
+
+static void mtp_verify2_restore_after_row0(waste_mtp_verify2 *v,
+                                            int preserve_failure)
+{
+    waste_model *m = v->model;
+    const waste_config *c = &m->cfg;
+    const int failed_read = m->read_error;
+    const int failed_layer = m->bad_layer, failed_expert = m->bad_expert;
+    const int failed_ctx = m->ctx_full;
+    const int failed_cuda = m->cuda_kda_failed;
+    const int failed_dirty = m->cuda_kda_state_dirty;
+    const int failed_alignment = m->mtp_alignment_error;
+    memcpy(m->n_kv, v->n_kv, sizeof v->n_kv);
+    const float *p = v->kda_checkpoint;
+    for (int L = 0; L < c->n_layers; L++) {
+        if (!c->kda_layer[L]) continue;
+        size_t n = (size_t)c->kda_heads * c->kda_dim * c->kda_dim;
+        memcpy(m->S[L], p, n * sizeof(float)); p += n;
+        n = (size_t)3 * c->kda_heads * c->kda_dim *
+            (size_t)(c->conv_k - 1);
+        memcpy(m->conv[L], p, n * sizeof(float)); p += n;
+    }
+    memcpy(m->x, v->after_x, (size_t)c->hidden * sizeof(float));
+    memcpy(m->logits, v->logits, (size_t)c->vocab * sizeof(float));
+    memcpy(m->mtp_target_hidden, v->after_target_hidden,
+           (size_t)c->hidden * sizeof(float));
+    memcpy(m->mtp_hidden, v->after_mtp_hidden,
+           (size_t)c->hidden * sizeof(float));
+    memcpy(m->mtp_input_embed, v->after_mtp_input,
+           (size_t)c->hidden * sizeof(float));
+    memcpy(m->mtp_logits, v->after_mtp_logits,
+           (size_t)c->vocab * sizeof(float));
+    m->n_blockres = v->n_blockres;
+    m->media_used = v->media_used;
+    m->ctx_full = v->ctx_full;
+    m->read_error = v->read_error;
+    m->bad_layer = v->bad_layer;
+    m->bad_expert = v->bad_expert;
+    m->cuda_kda_state_dirty = v->cuda_kda_state_dirty;
+    m->cuda_kda_failed = v->cuda_kda_failed;
+    m->mtp_active = v->mtp_active;
+    m->mtp_target_hidden_pos = v->mtp_target_hidden_pos;
+    m->mtp_alignment_error = v->mtp_alignment_error;
+    m->mtp_last_pos = v->mtp_last_pos;
+    m->mtp_last_token = v->mtp_last_token;
+    m->mtp_target_token = v->mtp_target_token;
+    m->mtp_shadow_argmax = v->mtp_shadow_argmax;
+    m->mtp_steps = v->mtp_steps;
+    m->mtp_shadow_steps = v->mtp_shadow_steps;
+    m->mtp_shadow_matches = v->mtp_shadow_matches;
+    m->mtp_seconds = v->mtp_seconds;
+    if (preserve_failure) {
+        if (failed_read) {
+            m->read_error = failed_read;
+            m->bad_layer = failed_layer;
+            m->bad_expert = failed_expert;
+        }
+        if (failed_ctx) m->ctx_full = failed_ctx;
+        if (failed_cuda) m->cuda_kda_failed = failed_cuda;
+        if (failed_dirty) m->cuda_kda_state_dirty = failed_dirty;
+        if (failed_alignment) m->mtp_alignment_error = failed_alignment;
+    }
+}
+
+static int mtp_verify2_final_ok(const waste_mtp_verify2 *v)
+{
+    const waste_model *m = v->model;
+    return m->mtp_active && !m->mtp_alignment_error && !m->read_error &&
+           !m->ctx_full && !m->cuda_kda_state_dirty && !m->cuda_kda_failed &&
+           m->mtp_target_hidden_pos == v->pos0 + 1 &&
+           m->mtp_target_token == v->token1 &&
+           m->n_kv[m->mtp_layer] == v->pos0 + 1 &&
+           m->mtp_last_pos == v->pos0 && m->mtp_last_token == v->token1 &&
+           m->mtp_shadow_argmax == -1 &&
+           mtp_oracle_base_cache_at(m, v->pos0 + 2);
+}
+
+int waste_model_mtp_verify2_begin(
+    waste_model *m, int token0, int draft_token1, int pos0,
+    int *routed0, int *routed1, waste_mtp_verify2 **out)
+{
+    if (out) *out = NULL;
+    if (!out || !mtp_verify2_geometry_ok(m) || m->mtp_oracle_open ||
+        token0 < 0 || token0 >= m->cfg.vocab || draft_token1 < 0 ||
+        draft_token1 >= m->cfg.vocab || pos0 <= 0 || pos0 >= INT_MAX ||
+        pos0 + 1 >= m->kv_cap || pos0 + 1 >= m->mtp_context_limit ||
+        m->read_error || m->ctx_full || m->cuda_kda_state_dirty ||
+        m->cuda_kda_failed || m->mtp_alignment_error ||
+        m->mtp_target_hidden_pos != pos0 - 1 ||
+        m->n_kv[m->mtp_layer] != pos0 ||
+        m->mtp_last_pos != pos0 - 1 || m->mtp_last_token != token0 ||
+        m->mtp_shadow_argmax < 0 || !mtp_oracle_base_cache_at(m, pos0))
+        return -1;
+
+    waste_mtp_verify2 *v = (waste_mtp_verify2 *)calloc(1, sizeof *v);
+    if (!v) return -1;
+    v->model = m;
+    v->token0 = token0;
+    v->token1 = draft_token1;
+    v->pos0 = pos0;
+    if (mtp_verify2_ensure_scratch(v)) {
+        free(v);
+        return -1;
+    }
+    m->mtp_oracle_open = 1;
+    v->open = 1;
+
+    const int hid = m->cfg.hidden;
+    /* token0's row was cached by the proposal itself.  Loading it again is
+     * both wasted trunk I/O and a chance for the two sides of the proposal
+     * contract to observe different bytes after an I/O error. */
+    memcpy(v->embedding, m->mtp_input_embed,
+           (size_t)hid * sizeof(float));
+    if (waste_embed_row(m, draft_token1, v->embedding + hid))
+        goto fail_before_checkpoint;
+    dump_pos0 = pos0;
+    if (model_step_mhc2(v, routed0, routed1))
+        goto fail_before_checkpoint;
+
+    /* Materialize the committed row-zero surface before advancing the
+     * appended predictor for row one. */
+    memcpy(m->x, v->row_x, (size_t)hid * sizeof(float));
+    memcpy(m->logits, v->logits,
+           (size_t)m->cfg.vocab * sizeof(float));
+    memcpy(m->mtp_target_hidden, v->hidden,
+           (size_t)hid * sizeof(float));
+    m->mtp_target_hidden_pos = pos0;
+    m->mtp_target_token = token0;
+    mtp_after_target_step(m, v->logits);
+    mtp_verify2_capture_after_row0(v);
+
+    dump_pos0 = pos0;
+    const float *draft = mtp_step(
+        m, draft_token1, pos0, v->hidden,
+        v->embedding + hid, NULL);
+    if (!draft) goto fail_after_checkpoint;
+    m->mtp_shadow_argmax = mtp_argmax(draft, m->cfg.vocab);
+
+    memcpy(m->x, v->row_x + hid, (size_t)hid * sizeof(float));
+    memcpy(m->logits, v->logits + m->cfg.vocab,
+           (size_t)m->cfg.vocab * sizeof(float));
+    memcpy(m->mtp_target_hidden, v->hidden + hid,
+           (size_t)hid * sizeof(float));
+    m->mtp_target_hidden_pos = pos0 + 1;
+    m->mtp_target_token = draft_token1;
+    mtp_after_target_step(m, v->logits + m->cfg.vocab);
+    if (!mtp_verify2_final_ok(v)) goto fail_after_checkpoint;
+    *out = v;
+    return 0;
+
+fail_after_checkpoint:
+    mtp_verify2_restore_after_row0(v, 1);
+    m->mtp_oracle_open = 0;
+    v->open = 0;
+    free(v);
+    return -1;
+
+fail_before_checkpoint:
+    /* The paired path may already have mutated some recurrent layers.  No
+     * complete row-zero checkpoint exists until all 45 layers finish, so
+     * poison the mixed state instead of pretending it can be resumed. */
+    m->mtp_alignment_error = 1;
+    m->mtp_oracle_open = 0;
+    v->open = 0;
+    free(v);
+    return -1;
+}
+
+const float *waste_model_mtp_verify2_logits(
+    const waste_mtp_verify2 *v, int token_index)
+{
+    if (!v || !v->open || (token_index != 0 && token_index != 1)) return NULL;
+    return v->logits + (size_t)token_index * v->model->cfg.vocab;
+}
+
+const float *waste_model_mtp_verify2_hidden(
+    const waste_mtp_verify2 *v, int token_index)
+{
+    if (!v || !v->open || (token_index != 0 && token_index != 1)) return NULL;
+    return v->hidden + (size_t)token_index * v->model->cfg.hidden;
+}
+
+int waste_model_mtp_verify2_finish(waste_mtp_verify2 *v, int accept_draft)
+{
+    if (!v || !v->open || (accept_draft != 0 && accept_draft != 1)) return -1;
+    waste_model *m = v->model;
+    int rc = 0;
+    if (!mtp_verify2_final_ok(v)) {
+        mtp_verify2_restore_after_row0(v, 1);
+        rc = -1;
+    } else if (!accept_draft) {
+        mtp_verify2_restore_after_row0(v, 0);
+    }
+    m->mtp_oracle_open = 0;
+    v->open = 0;
+    free(v);
+    return rc;
+}
+
 const float *waste_model_prefill(waste_model *m, const int *tokens, int n,
                                  int pos0)
 {
+    if (!m || m->mtp_oracle_open) return NULL;
     const waste_config *c = &m->cfg;
     const int hid = c->hidden;
     if (m->cuda_kda_state_dirty ||
@@ -7942,6 +9181,7 @@ static const float *model_step_mhc(waste_model *m, int pos, int *routed)
 
 const float *waste_model_step(waste_model *m, int token, int pos, int *routed)
 {
+    if (!m || m->mtp_oracle_open) return NULL;
     dump_pos0 = pos;
     const waste_config *c = &m->cfg;
     const int hid = c->hidden;
