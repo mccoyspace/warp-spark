@@ -410,6 +410,19 @@ int         waste_model_mtp_enabled(const waste_model *m);
 const float *waste_model_mtp_target_hidden(const waste_model *m, int *pos);
 const float *waste_model_mtp_propose(waste_model *m, int next_token,
                                      int target_pos, int *routed);
+/* Measurement-only greedy recursive drafting.  `depth` is deliberately
+ * bounded to 1..3.  The returned ids follow the released/vLLM recurrence:
+ * row zero pairs the target's post-final-norm hidden with `next_token`, and
+ * later rows pair the preceding draft token with the preceding MTP row's
+ * post-shared-head-norm hidden.  On success the model is left in exactly the
+ * same live semantic state as one ordinary waste_model_mtp_propose call;
+ * deeper MLA cache rows are rolled behind n_kv and therefore dead.  This is
+ * a shadow qualification hook, not a multi-row target verifier.
+ * `model_seconds`, when non-NULL, receives time spent in all MTP rows (the
+ * snapshot/unwind harness cost is excluded). */
+int         waste_model_mtp_propose_greedy_chain(
+                waste_model *m, int next_token, int target_pos, int depth,
+                int *draft_tokens, double *model_seconds);
 int         waste_model_mtp_cache_pos(const waste_model *m);
 uint64_t    waste_model_mtp_steps(const waste_model *m);
 double      waste_model_mtp_seconds(const waste_model *m);

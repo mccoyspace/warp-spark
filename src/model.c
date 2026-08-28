@@ -7764,6 +7764,102 @@ const float *waste_model_mtp_propose(waste_model *m, int next_token,
     return draft;
 }
 
+int waste_model_mtp_propose_greedy_chain(
+    waste_model *m, int next_token, int target_pos, int depth,
+    int *draft_tokens, double *model_seconds)
+{
+    if (model_seconds) *model_seconds = 0.0;
+    if (!m || !draft_tokens || depth < 1 || depth > 3 ||
+        next_token < 0 || next_token >= m->cfg.vocab || target_pos < 0 ||
+        target_pos > INT_MAX - (depth - 1) || m->mtp_oracle_open ||
+        !m->mtp_active || target_pos != m->mtp_target_hidden_pos ||
+        m->n_kv[m->mtp_layer] != target_pos || m->mtp_alignment_error)
+        return -1;
+
+    /* Preflight the complete chain before row zero mutates the cache.  A
+     * caller asking for an unavailable deeper row must not be left with a
+     * valid-looking one-row proposal as a partial result. */
+    const int last_pos = target_pos + depth - 1;
+    if (last_pos >= m->kv_cap || last_pos >= m->mtp_context_limit)
+        return -1;
+
+    const size_t H = (size_t)m->cfg.hidden;
+    const size_t V = (size_t)m->cfg.vocab;
+    size_t save_floats = 0;
+    float *save = NULL;
+    if (depth > 1) {
+        if (H > (SIZE_MAX - V) / 2) return -1;
+        save_floats = 2 * H + V;
+        if (save_floats > SIZE_MAX / sizeof(float)) return -1;
+        save = (float *)malloc(save_floats * sizeof(float));
+        if (!save) return -1;
+    }
+
+    const double seconds_before = m->mtp_seconds;
+    const float *logits = waste_model_mtp_propose(
+        m, next_token, target_pos, NULL);
+    if (!logits) {
+        free(save);
+        return -1;
+    }
+    draft_tokens[0] = mtp_argmax(logits, m->cfg.vocab);
+    if (depth == 1) {
+        if (model_seconds) *model_seconds = m->mtp_seconds - seconds_before;
+        return 0;
+    }
+
+    /* State after row zero is the one the target will consume.  Recursive
+     * rows are useful only as candidates: their hidden is predictor-derived,
+     * while the target must later rebuild the same positions from its own
+     * hidden.  Preserve the row-zero semantic state and retain only the
+     * physical cache heat from the deeper work. */
+    const int L = m->mtp_layer;
+    const int first_n_kv = m->n_kv[L];
+    const int first_last_pos = m->mtp_last_pos;
+    const int first_last_token = m->mtp_last_token;
+    const int first_shadow_argmax = m->mtp_shadow_argmax;
+    const uint64_t first_steps = m->mtp_steps;
+    const double first_seconds = m->mtp_seconds;
+    float *p = save;
+    memcpy(p, m->mtp_hidden, H * sizeof(float)); p += H;
+    memcpy(p, m->mtp_input_embed, H * sizeof(float)); p += H;
+    memcpy(p, m->mtp_logits, V * sizeof(float));
+
+    int rc = 0;
+    /* mtp_step leaves the shared-head-normalized row at norm, the fourth H
+     * slice of mtp_work.  Passing that same address to the next call is safe:
+     * its hnorm destination is the second slice, and norm is overwritten only
+     * after the projection has consumed the previous row. */
+    const float *chain_hidden = m->mtp_work + (size_t)3 * H;
+    for (int row = 1; row < depth; row++) {
+        dump_pos0 = target_pos + row;
+        logits = mtp_step(m, draft_tokens[row - 1], target_pos + row,
+                          chain_hidden, NULL, NULL);
+        if (!logits) {
+            rc = -1;
+            break;
+        }
+        draft_tokens[row] = mtp_argmax(logits, m->cfg.vocab);
+    }
+    const double all_rows_seconds = m->mtp_seconds - seconds_before;
+
+    m->n_kv[L] = first_n_kv;
+    m->mtp_last_pos = first_last_pos;
+    m->mtp_last_token = first_last_token;
+    m->mtp_shadow_argmax = first_shadow_argmax;
+    m->mtp_steps = first_steps;
+    m->mtp_seconds = first_seconds;
+    p = save;
+    memcpy(m->mtp_hidden, p, H * sizeof(float)); p += H;
+    memcpy(m->mtp_input_embed, p, H * sizeof(float)); p += H;
+    memcpy(m->mtp_logits, p, V * sizeof(float));
+    dump_pos0 = target_pos;
+    free(save);
+
+    if (!rc && model_seconds) *model_seconds = all_rows_seconds;
+    return rc;
+}
+
 int waste_model_mtp_cache_pos(const waste_model *m)
 {
     return m && m->mtp_available ? m->n_kv[m->mtp_layer] : -1;
