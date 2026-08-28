@@ -1641,6 +1641,24 @@ else
         "$TMP/glm53-mtp-runtime.log" 2>/dev/null
 fi
 
+if ! ./mtp_spec --self-test 2>/dev/null | grep -q "^MTP SPEC SCHEDULER OK$"; then
+    no "greedy depth-1 MTP scheduler"
+elif [ ! -d "$GLM53_MTP" ]; then
+    sk "greedy depth-1 MTP scheduler" "MTP container not built"
+elif WASTE_CACHE_MB=8 WASTE_IO_THREADS=1 WASTE_IO_DEPTH=1 \
+        WASTE_MTP_SPEC_CHECK=1 \
+        ./mtp_spec "$GLM53_MTP" 3,7,11,5 7 \
+        >"$TMP/glm53-mtp-spec.log" 2>&1 &&
+     grep -q '^stream_check=pass target_stream_fnv1a64=' \
+        "$TMP/glm53-mtp-spec.log" &&
+     grep -q '^summary generated=7 .*accepted=.* rejected=' \
+        "$TMP/glm53-mtp-spec.log"; then
+    ok "greedy depth-1 MTP scheduler matches ordinary generation"
+else
+    no "greedy depth-1 MTP scheduler"
+    sed -n '1,24p' "$TMP/glm53-mtp-spec.log" 2>/dev/null
+fi
+
 # Flash names three terminal turn markers.  A valid bounded set must load;
 # malformed sets must fail with a format error before generation.  Scalar-only
 # Kimi manifests keep the old tokenizer path and are exercised everywhere else
