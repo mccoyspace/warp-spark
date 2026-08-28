@@ -23,10 +23,11 @@ What that buys, and what it does not:
   list, or a result turn. K3's encoder needs 647 lines for that, and the
   markup Kimi-Linear's tokenizer carries for it is not transcribed anywhere
   in this repo. Refused, by name, rather than half-rendered.
-- **No reasoning channel.** There is no think markup in these containers'
-  specials at all, so a request that asks for one is refused rather than
-  answered without it — a server that silently drops `reasoning_effort`
-  reports a different amount of reasoning than it did.
+- **No selectable or parsed reasoning channel.** A declarative profile may
+  carry fixed think markup, but four role strings cannot implement a
+  per-request reasoning policy and PlainParser cannot split reasoning from
+  the answer. A request that asks for reasoning, or a historical turn that
+  carries it separately, is refused rather than silently dropped.
 - **No images.** The media block is K3's, and its shape is part of the
   vision tower's contract, not something chat.json can place.
 
@@ -99,6 +100,7 @@ class ChatFormat:
     stop_ids: tuple[int, ...]
     preamble: str = ""
     strip_roles: frozenset[str] = frozenset()
+    fixed_reasoning_effort: Optional[str] = None
 
     @property
     def stop_marker(self) -> str:
@@ -178,6 +180,13 @@ class ChatFormat:
                 'chat.json "strip_roles" must not repeat a role')
         strip_roles = frozenset(raw_strip_roles)
 
+        fixed_reasoning_effort = raw.get("fixed_reasoning_effort")
+        if (fixed_reasoning_effort is not None and
+                fixed_reasoning_effort not in ("low", "high", "max")):
+            raise ChatFormatError(
+                'chat.json "fixed_reasoning_effort" must be one of '
+                '"low", "high", or "max"')
+
         # Legacy templates derive their one stop from the assistant suffix.
         # New templates may name a list independently: GLM ends a reply on
         # any of three role/EOS tokens and has an empty assistant suffix.
@@ -226,7 +235,8 @@ class ChatFormat:
 
         return cls(roles=roles, opening=opening,
                    stop_markers=stop_markers, stop_ids=stop_ids,
-                   preamble=preamble, strip_roles=strip_roles)
+                   preamble=preamble, strip_roles=strip_roles,
+                   fixed_reasoning_effort=fixed_reasoning_effort)
 
     # ---- rendering ------------------------------------------------------
 
@@ -259,11 +269,17 @@ class ChatFormat:
                 raise ChatFormatError(
                     f"this container is served from its chat.json, which "
                     f"cannot express '{name}'", param=name)
+        reasoning_control = kwargs.get("reasoning_control")
+        if self.fixed_reasoning_effort is not None and reasoning_control:
+            raise ChatFormatError(
+                "this chat profile fixes reasoning effort at "
+                f"{self.fixed_reasoning_effort}; omit explicit reasoning "
+                "controls", param=str(reasoning_control))
         if thinking:
             raise ChatFormatError(
-                "this container has no reasoning channel in its tokenizer, "
-                "so it cannot think on request; pass reasoning_effort "
-                "'none' or thinking false", param="reasoning_effort")
+                "this container's chat.json has no reasoning channel the "
+                "server can select or parse; omit reasoning_effort or pass "
+                "thinking false", param="reasoning_effort")
         if image_prompts:
             raise ChatFormatError(
                 "this container is served from its chat.json, which cannot "
@@ -277,6 +293,14 @@ class ChatFormat:
         for i, message in enumerate(messages):
             role = message.get("role")
             role = _ROLE_ALIASES.get(role, role)
+            if role == "assistant":
+                for field in ("reasoning_content", "reasoning"):
+                    if message.get(field) not in (None, ""):
+                        raise ChatFormatError(
+                            "this container's chat.json cannot replay "
+                            "historical reasoning; provide answer-only "
+                            "assistant content",
+                            param=f"messages[{i}].{field}")
             if role == "tool" or message.get("tool_calls"):
                 raise ChatFormatError(
                     "this container is served from its chat.json, which "

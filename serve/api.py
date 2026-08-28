@@ -336,6 +336,16 @@ def build_prompt(engine: Engine, body: dict, *, default_thinking: bool,
     messages = validate_messages(_require(body, "messages"))
     thinking, effort = resolve_thinking(body, default_thinking)
 
+    # Presence is distinct from the resolved value. In particular,
+    # reasoning_effort="none" resolves to thinking=False; a fixed-reasoning
+    # declarative profile must still see that the caller tried to override
+    # its contract instead of silently prompting the model with something
+    # else. Complete formats ignore this metadata.
+    reasoning_control = next(
+        (name for name in ("reasoning_effort", "thinking_effort",
+                           "reasoning", "thinking") if name in body),
+        None)
+
     tools = body.get("tools")
     if tools is not None and not isinstance(tools, list):
         raise APIError("'tools' must be an array", param="tools")
@@ -396,6 +406,8 @@ def build_prompt(engine: Engine, body: dict, *, default_thinking: bool,
                 pass
 
     kwargs: dict[str, Any] = {}
+    if reasoning_control is not None:
+        kwargs["reasoning_control"] = reasoning_control
     if effort is not None:
         kwargs["thinking_effort"] = effort
     if tool_choice is not None:

@@ -39,8 +39,8 @@ from serve.prefix_cache import CONTROLLER_OVERHEAD_BYTES    # noqa: E402
 from serve.qos import QosError, QosLease                     # noqa: E402
 from serve.server import serve                              # noqa: E402
 from tests.serve.fake_engine import (FakeEngine, GLM_MARKERS,    # noqa: E402
-                                     LINEAR_MARKERS, reply_plain,
-                                     reply_tool_call)
+                                     GLM53_MARKERS, LINEAR_MARKERS,
+                                     reply_plain, reply_tool_call)
 
 
 class ServerTestCase(unittest.TestCase):
@@ -1410,6 +1410,65 @@ class TestGlmChatFromChatJson(ServerTestCase):
         controls = [token for token in prompt if token in GLM_MARKERS]
         self.assertEqual(controls,
                          [154822, 154824, 154827, 154828, 154842])
+
+
+class TestGlm53ChatFromChatJson(ServerTestCase):
+    """The bounded fixed-Max profile reaches HTTP without implying more."""
+
+    def setUp(self):
+        self.dir = tempfile.mkdtemp(prefix="serve-glm53-chatjson-")
+        self.addCleanup(shutil.rmtree, self.dir, True)
+        shutil.copyfile(REPO / "examples" / "chat-glm53-flash.json",
+                        Path(self.dir) / "chat.json")
+        self.engine_kwargs = {"no_markers": True, "model_path": self.dir,
+                              "markers": dict(GLM53_MARKERS)}
+        super().setUp()
+
+    def test_fixed_max_prompt_and_all_stops_reach_the_engine(self):
+        self.engine.reply = "thought</think>answer<|endoftext|>ignored"
+        status, body = self.chat()
+        self.assertEqual(status, 200, body)
+        # PlainParser deliberately does not claim to separate these yet.
+        self.assertEqual(body["choices"][0]["message"]["content"],
+                         "thoughtanswer")
+        self.assertEqual(self.engine.calls[-1]["stop_tokens"],
+                         [154820, 154827, 154829])
+        controls = [token for token in self.engine.prompts[-1]
+                    if token in GLM53_MARKERS]
+        self.assertEqual(controls, [
+            154822, 154824, 154826, 154827, 154828, 154841,
+        ])
+
+    def test_every_reasoning_override_is_refused_not_misreported(self):
+        cases = (
+            {"reasoning_effort": "high"},
+            {"reasoning_effort": "none"},
+            {"reasoning_effort": "minimal"},
+            {"reasoning_effort": "off"},
+            {"thinking_effort": "low"},
+            {"reasoning": {"effort": "none"}},
+            {"thinking": False},
+            {"thinking": True},
+        )
+        for override in cases:
+            with self.subTest(override=override):
+                status, body = self.chat(**override)
+                self.assertEqual(status, 400, body)
+                self.assertIn("fixes reasoning effort at max",
+                              body["error"]["message"])
+
+    def test_reasoning_history_is_refused_not_silently_dropped(self):
+        status, body = self.chat(messages=[
+            {"role": "user", "content": "One?"},
+            {"role": "assistant", "content": "First.",
+             "reasoning_content": "private reasoning"},
+            {"role": "user", "content": "Two?"},
+        ])
+        self.assertEqual(status, 400)
+        self.assertEqual(body["error"]["param"],
+                         "messages[1].reasoning_content")
+        self.assertIn("answer-only assistant content",
+                      body["error"]["message"])
 
 
 class TestAuth(ServerTestCase):

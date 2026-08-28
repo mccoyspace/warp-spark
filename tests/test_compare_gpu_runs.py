@@ -64,7 +64,9 @@ def base_steps():
     ]
 
 
-def write_capture(directory, name, logits, steps, *, greedy=True, arm=None):
+def write_capture(
+    directory, name, logits, steps, *, greedy=True, arm=None, top_k=TOP_K
+):
     raw_name = name + ".logits.f32"
     raw_path = os.path.join(directory, raw_name)
     with open(raw_path, "wb") as stream:
@@ -77,7 +79,7 @@ def write_capture(directory, name, logits, steps, *, greedy=True, arm=None):
         "dtype": COMPARE.DTYPE,
         "logits_file": raw_name,
         "vocab": VOCAB,
-        "top_k": TOP_K,
+        "top_k": top_k,
         "greedy": greedy,
         "steps": steps,
     }
@@ -102,6 +104,7 @@ class CompareGpuRunsTest(unittest.TestCase):
         gpu_steps=None,
         cpu_arm=DEFAULT_ARM,
         gpu_arm=DEFAULT_ARM,
+        top_k=TOP_K,
     ):
         cpu_logits = copy.deepcopy(cpu_logits if cpu_logits is not None else base_logits())
         gpu_logits = copy.deepcopy(gpu_logits if gpu_logits is not None else base_logits())
@@ -110,10 +113,12 @@ class CompareGpuRunsTest(unittest.TestCase):
         if cpu_arm is DEFAULT_ARM and gpu_arm is DEFAULT_ARM:
             cpu_arm, gpu_arm = self.arms()
         cpu = write_capture(
-            self.temp.name, "cpu", cpu_logits, cpu_steps, arm=cpu_arm
+            self.temp.name, "cpu", cpu_logits, cpu_steps, arm=cpu_arm,
+            top_k=top_k,
         )
         gpu = write_capture(
-            self.temp.name, "gpu", gpu_logits, gpu_steps, arm=gpu_arm
+            self.temp.name, "gpu", gpu_logits, gpu_steps, arm=gpu_arm,
+            top_k=top_k,
         )
         return COMPARE.compare_captures(cpu, gpu)
 
@@ -205,6 +210,76 @@ class CompareGpuRunsTest(unittest.TestCase):
             "vq_expected_syncs": 2 * layer_runs * ((2 + group - 1) // group),
         }
         return control, candidate
+
+    @staticmethod
+    def glm53_vq_arms(decode_steps=2):
+        kda_calls = 306 * decode_steps
+        dense_calls = 179 * decode_steps
+        layer_runs = 42 * decode_steps
+        experts = 8 * layer_runs
+        base = {
+            "key": "cuda_vq",
+            "fallbacks": 0,
+            "kda_mode": 1,
+            "kda_effective": 1,
+            "kda_calls": kda_calls,
+            "kda_expected_calls": kda_calls,
+            "dense_scope": 3,
+            "dense_effective": 3,
+            "dense_calls": dense_calls,
+            "dense_expected_calls": dense_calls,
+            "vq_group": 1,
+        }
+        zero = {
+            "vq_experts": 0,
+            "vq_expected_experts": 0,
+            "vq_applies": 0,
+            "vq_expected_applies": 0,
+            "vq_lut_builds": 0,
+            "vq_expected_lut_builds": 0,
+            "vq_launches": 0,
+            "vq_expected_launches": 0,
+            "vq_syncs": 0,
+            "vq_expected_syncs": 0,
+        }
+        control = {
+            **base, **zero,
+            "value": 0, "effective": 0,
+            "calls": 0, "expected_calls": 0,
+            "vq_mode": 0, "vq_effective": 0,
+        }
+        lut_builds = experts + 2 * layer_runs
+        launches = 3 * experts + layer_runs
+        syncs = 2 * experts
+        candidate = {
+            **base,
+            "value": 2, "effective": 2,
+            "calls": launches, "expected_calls": launches,
+            "vq_mode": 2, "vq_effective": 2,
+            "vq_experts": experts,
+            "vq_expected_experts": experts,
+            "vq_applies": 3 * experts,
+            "vq_expected_applies": 3 * experts,
+            "vq_lut_builds": lut_builds,
+            "vq_expected_lut_builds": lut_builds,
+            "vq_launches": launches,
+            "vq_expected_launches": launches,
+            "vq_syncs": syncs,
+            "vq_expected_syncs": syncs,
+        }
+        return control, candidate
+
+    @staticmethod
+    def glm53_steps():
+        steps = base_steps()
+        steps[0]["routes"] = []
+        for step in steps[1:]:
+            step["routes"] = [
+                {"layer": layer,
+                 "experts": [layer * 8 + expert for expert in range(8)]}
+                for layer in range(3, 45)
+            ]
+        return steps
 
     @staticmethod
     def gqa_arms():
@@ -430,6 +505,46 @@ class CompareGpuRunsTest(unittest.TestCase):
         control, candidate = self.vq_arms(2, dense_scope=3)
         with self.assertRaises(COMPARE.CaptureError):
             self.compare(cpu_arm=control, gpu_arm=candidate)
+
+    def test_vq_accepts_exact_glm53_hybrid_scope_three_base(self):
+        control, candidate = self.glm53_vq_arms()
+        steps = self.glm53_steps()
+        result = self.compare(
+            cpu_steps=steps, gpu_steps=steps,
+            cpu_arm=control, gpu_arm=candidate, top_k=8,
+        )
+        self.assertEqual(result["arms"]["gpu"]["kda_calls"], 612)
+        self.assertEqual(result["arms"]["gpu"]["dense_calls"], 358)
+        self.assertEqual(result["arms"]["gpu"]["vq_experts"], 672)
+        self.assertEqual(result["routes"]["compared_rows"], 84)
+        self.assertEqual(result["routes"]["selected_slots"], 672)
+
+    def test_vq_glm53_scope_three_rejects_near_match_contracts(self):
+        control, candidate = self.glm53_vq_arms()
+        steps = self.glm53_steps()
+        cases = []
+
+        bad_kda = copy.deepcopy(candidate)
+        bad_kda["kda_calls"] = bad_kda["kda_expected_calls"] = 611
+        cases.append(("kda-work", steps, control, bad_kda, 8))
+
+        bad_dense = copy.deepcopy(candidate)
+        bad_dense["dense_calls"] = bad_dense["dense_expected_calls"] = 357
+        cases.append(("dense-work", steps, control, bad_dense, 8))
+
+        wrong_layers = copy.deepcopy(steps)
+        for step in wrong_layers[1:]:
+            for row in step["routes"]:
+                row["layer"] -= 1
+        cases.append(("moe-schedule", wrong_layers, control, candidate, 8))
+
+        for name, bad_steps, cpu_arm, gpu_arm, top_k in cases:
+            with self.subTest(name=name):
+                with self.assertRaises(COMPARE.CaptureError):
+                    self.compare(
+                        cpu_steps=bad_steps, gpu_steps=bad_steps,
+                        cpu_arm=cpu_arm, gpu_arm=gpu_arm, top_k=top_k,
+                    )
 
     def test_zero_kda_base_rejects_false_effective_mode(self):
         control, candidate = self.dense_arms(zero_kda=True)

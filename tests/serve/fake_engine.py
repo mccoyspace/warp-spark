@@ -45,6 +45,10 @@ GLM_MARKERS = {154820: "<|endoftext|>", 154822: "[gMASK]",
                154827: "<|user|>", 154828: "<|assistant|>",
                154829: "<|observation|>", 154842: "</think>"}
 
+# GLM-5.3-Flash opens, rather than suppresses, the reasoning block. Its
+# released tokenizer adds both tags as one-token controls.
+GLM53_MARKERS = {**GLM_MARKERS, 154841: "<think>"}
+
 # Ordinary text starts here, so no piece of content can collide with a
 # marker id — the same separation the real container gets from its
 # reserved block.

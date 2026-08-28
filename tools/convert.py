@@ -343,6 +343,13 @@ GLM53_ARCH = "Glm5NextForConditionalGeneration"
 GLM53_TEXT_TYPE = "glm5_next_text"
 GLM53_DENSE_CONTEXT = 2048
 
+CHAT_TEMPLATE_FILES = {
+    "kimi-k3": "chat-k3.json",
+    "kimi-linear": "chat-kimi-linear.json",
+    "glm47-flash": "chat-glm47-flash.json",
+    "glm53-flash": "chat-glm53-flash.json",
+}
+
 
 def hf_architecture(cfg):
     """The release architecture, including K3's outer text wrapper."""
@@ -412,6 +419,7 @@ def chat_profile(cfg):
     arch = hf_architecture(cfg)
     return ("kimi-k3" if "KimiK3" in arch else
             "kimi-linear" if "KimiLinear" in arch else
+            "glm53-flash" if is_glm53(cfg) else
             "glm47-flash" if (arch == GLM47_FULL_ARCH or
                                "Glm4MoeLite" in arch) else "")
 
@@ -2287,7 +2295,9 @@ def main():
     # be finished by hand is a container that will be used unfinished. GLM's
     # plain no-thinking subset is transcribed from its released Jinja. Copied
     # from examples/ rather than embedded here, so there is one copy of each
-    # template and not two that drift.
+    # template and not two that drift. GLM-5.3's profile is likewise an
+    # exact, deliberately narrower transcription: fixed-Max text with
+    # answer-only history, not its tool/media or dynamic-reasoning branches.
     #
     # Only for an architecture we actually have: for anything else the CLI
     # keeps saying so and falling back, which is better than a guessed
@@ -2299,12 +2309,9 @@ def main():
     # markers are absent from the tokenizer, so they encode as ordinary text
     # and the model reads its own turn structure as prose. That is what the
     # marker check below refuses, and it also catches a renamed release.
-    _tmpl_for = {"kimi-k3": "chat-k3.json",
-                 "kimi-linear": "chat-kimi-linear.json",
-                 "glm47-flash": "chat-glm47-flash.json"}
     _arch0 = chat_profile(cfg)
     _dst = os.path.join(args.out, "chat.json")
-    _name = _tmpl_for.get(_arch0)
+    _name = CHAT_TEMPLATE_FILES.get(_arch0)
     if _name and not os.path.exists(_dst):
         _src_tmpl = os.path.join(os.path.dirname(os.path.dirname(
             os.path.abspath(__file__))), "examples", _name)

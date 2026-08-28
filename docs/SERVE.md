@@ -132,8 +132,11 @@ startup the server asks for the richer format first and falls back:
 2. **The container's own `chat.json`**, otherwise. Role prefix/suffix
    strings are the legacy subset; stateless HTTP additionally understands
    an optional one-time `preamble`, explicit `stop` token list, and narrow
-   per-role whitespace normalization through `strip_roles`.
-   Kimi-Linear uses the legacy subset and GLM-4.7-Flash uses the extension.
+   per-role whitespace normalization through `strip_roles`. A literal
+   fixed-reasoning profile may declare `fixed_reasoning_effort`; that makes
+   every explicit request-side reasoning control an error.
+   Kimi-Linear uses the legacy subset. GLM-4.7-Flash and the bounded
+   GLM-5.3-Flash text profile use the extension.
 
 ```
 chat     from ~/models/kimi-linear.waste/chat.json — plain conversation only,
@@ -141,6 +144,9 @@ chat     from ~/models/kimi-linear.waste/chat.json — plain conversation only,
 
 chat     from a GLM-4.7-Flash container — exact plain no-thinking histories,
          including [gMASK]<sop> and all three released terminal token ids
+
+chat     from a GLM-5.3-Flash container — fixed-Max, answer-only prompt
+         rendering; generated reasoning is not yet split from answer content
 ```
 
 Plain means plain: system / user / assistant turns, blocking and streaming.
@@ -150,6 +156,18 @@ express is refused with a 400 that
 names the field — `tools`, `reasoning_effort`, an image part, a tool result
 turn. None of it is silently dropped; a server that ignores
 `reasoning_effort` reports a different amount of reasoning than it did.
+GLM-5.3's declarative profile therefore hardcodes the released default,
+`Reasoning Effort: Max`, and rejects every explicit reasoning request,
+including `none`, `minimal`, `off`, and `thinking:false`. It also
+refuses historical `reasoning_content`: only answer text can be represented
+exactly by role prefix/suffix strings.
+
+That exactness currently ends at the generated prompt. `PlainParser` consumes
+GLM-5.3's `</think>` marker without using it as a channel boundary, so
+reasoning and answer are concatenated in `content`. Do not replay that
+combined value as assistant history. The profile is qualified for one-shot
+text requests until a think-aware parser is added; tools, media, and the
+stateful CLI remain out of scope.
 
 `chat.json` is validated more strictly here than the legacy CLI subset.
 Serving needs an `open`, a `user` turn, and either an explicit non-empty stop

@@ -460,6 +460,36 @@ def _valid_kda_base(arm: Arm, modes: tuple[int, ...]) -> bool:
     return arm.kda_calls > 0 and arm.kda_effective == arm.kda_mode
 
 
+def _valid_glm53_vq_base(capture: Capture, arm: Arm) -> bool:
+    """Recognize the one qualified hybrid KDA+dense/VQ scope-3 base.
+
+    Older scope-3 profiles are all-MLA and therefore have zero KDA calls.
+    GLM-5.3 is the first hybrid admitted to that scope: 34 nine-projection
+    KDA layers, 11 four-projection MLA layers, three dense FFNs, and 42
+    shared-expert FFNs.  Capture v1 does not carry an architecture string,
+    so require the complete independently observable shape and work count;
+    accepting merely ``dense_scope == 3`` would reopen every near-match the
+    CUDA geometry guards deliberately reject.
+    """
+    decode_steps = len(capture.steps) - 1
+    if decode_steps <= 0 or capture.top_k != 8:
+        return False
+    moe_layers = tuple(range(3, 45))
+    if any(tuple(row.layer for row in step.routes) != moe_layers
+           for step in capture.steps[1:]):
+        return False
+    return (
+        arm.kda_mode == 1
+        and arm.kda_effective == 1
+        and arm.kda_calls == 306 * decode_steps
+        and arm.kda_expected_calls == 306 * decode_steps
+        and arm.dense_scope == 3
+        and arm.dense_effective == 3
+        and arm.dense_calls == 179 * decode_steps
+        and arm.dense_expected_calls == 179 * decode_steps
+    )
+
+
 def _validate_cuda_arms(cpu: Capture, gpu: Capture) -> dict[str, Any] | None:
     if cpu.arm is None or gpu.arm is None:
         raise CaptureError("both captures must have arm metadata")
@@ -551,21 +581,23 @@ def _validate_cuda_arms(cpu: Capture, gpu: Capture) -> dict[str, Any] | None:
 
     if cpu.arm.key == "cuda_vq":
         counter_names = ("experts", "applies", "lut_builds", "launches", "syncs")
-        for label, arm in (("control", cpu.arm), ("candidate", gpu.arm)):
+        for label, capture in (("control", cpu), ("candidate", gpu)):
+            arm = capture.arm
+            assert arm is not None
             if not _valid_kda_base(arm, (1,)):
                 raise CaptureError(
                     f"CUDA VQ {label} has invalid KDA/Q4=1 base metadata"
                 )
             dense_scope_ok = arm.dense_scope == 2 or (
                 arm.dense_scope == 3 and arm.kda_expected_calls == 0
-            )
+            ) or _valid_glm53_vq_base(capture, arm)
             if (not dense_scope_ok or arm.dense_effective != arm.dense_scope or
                     arm.dense_calls is None or
                     arm.dense_expected_calls is None or
                     arm.dense_calls != arm.dense_expected_calls or
                     arm.dense_calls == 0):
                 raise CaptureError(
-                    f"CUDA VQ {label} has invalid dense=2 base metadata"
+                    f"CUDA VQ {label} has invalid dense base metadata"
                 )
             if arm.fallbacks != 0:
                 raise CaptureError(

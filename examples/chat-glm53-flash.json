@@ -1,0 +1,10 @@
+{
+ "preamble": "[gMASK]<sop><|system|>Reasoning Effort: Max",
+ "system": ["<|system|>", ""],
+ "user": ["<|user|>", ""],
+ "assistant": ["<|assistant|><think></think>", ""],
+ "strip_roles": ["assistant"],
+ "fixed_reasoning_effort": "max",
+ "open": "<|assistant|><think>",
+ "stop": ["<|endoftext|>", "<|user|>", "<|observation|>"]
+}

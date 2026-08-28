@@ -73,5 +73,8 @@ but it is only a hypothesis until the source-backed correctness gates pass.
    the measured boundary and unsupported features are stated alongside them.
 
 The chat template includes reasoning controls, XML tools, and image/video
-markers. Raw token inference comes first; a distilled text/tool harness
-profile is a separate frontend qualification after model logits are sound.
+markers. The container installs only the separately tested, declarative
+plain-text subset: fixed `Reasoning Effort: Max`, answer-only history, and
+stateless HTTP. Tools, media, dynamic reasoning effort, historical reasoning,
+stateful CLI formatting, and reasoning/answer response splitting remain
+fail-closed or explicitly unsupported until their own frontend gates exist.

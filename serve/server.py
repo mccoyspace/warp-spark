@@ -189,9 +189,10 @@ class ChatServer(ThreadingHTTPServer):
                 self.chat_format = fmt
                 self.chat_error = None
                 self.stop_tokens = list(fmt.stop_ids)
-                # No think markup in such a container, so the channel does
-                # not exist to default on. A request that asks for it is
-                # refused by the renderer rather than answered without it.
+                # chat.json has no selectable, parsed think channel, even
+                # when a fixed profile contains think markers. A request
+                # that asks for one is refused by the renderer rather than
+                # silently changing the profile's contract.
                 self.default_thinking = False
 
         self.prefix_cache_identity = _prefix_identity(

@@ -46,6 +46,7 @@ KL_MARKERS = ["<|im_system|>", "<|im_user|>", "<|im_assistant|>",
 GLM_MARKERS = ["[gMASK]", "<sop>", "<|system|>", "<|user|>",
                "<|assistant|>", "</think>", "<|endoftext|>",
                "<|observation|>"]
+GLM53_MARKERS = GLM_MARKERS + ["<think>"]
 # Intentionally broader than convert.py's accepted spellings, so a new
 # bracketed control cannot disappear from both implementation and test.
 CONTROL_RE = re.compile(r"<[^>]+>|\[[A-Za-z]+MASK\]")
@@ -108,6 +109,10 @@ def main():
            "chat-kimi-linear.json uses only markup Kimi-Linear carries")
         ck(uses_only("chat-glm47-flash.json", GLM_MARKERS),
            "chat-glm47-flash.json uses only markup GLM-4.7-Flash carries")
+        ck(uses_only("chat-glm53-flash.json", GLM53_MARKERS),
+           "chat-glm53-flash.json uses only markup GLM-5.3-Flash carries")
+        ck(not uses_only("chat-glm53-flash.json", GLM_MARKERS),
+           "GLM-5.3 reasoning-open profile requires its <think> token")
 
         print("each architecture gets its own")
         ck(build(tmp, "kl", "KimiLinearForCausalLM", KL_MARKERS)
@@ -122,6 +127,19 @@ def main():
         ck(H.CONV.chat_profile({
                "architectures": ["Glm4MoeForCausalLM"]}) == "glm47-flash",
            "full Glm4Moe selects the same qualified GLM chat metadata")
+        glm53 = {
+            "model_type": "glm5_next_text",
+            "_outer": {"architectures": [
+                "Glm5NextForConditionalGeneration"]},
+        }
+        ck(H.CONV.chat_profile(glm53) == "glm53-flash",
+           "GLM-5.3's exact nested architecture selects its own profile")
+        ck(H.CONV.CHAT_TEMPLATE_FILES.get(
+               H.CONV.chat_profile(glm53)) == "chat-glm53-flash.json",
+           "GLM-5.3 profile maps to the shipped declarative template")
+        ck(H.CONV.chat_profile({
+               **glm53, "model_type": "glm5_next"}) == "",
+           "outer-only GLM-5.3 claims do not select text chat metadata")
 
         print("and never one the tokenizer cannot spell")
         ck(build(tmp, "cross", "KimiLinearForCausalLM", K3_MARKERS) is None,

@@ -213,6 +213,7 @@ accepts an optional one-time `preamble`, an explicit `stop` token list, and
  "user":      ["<prefix>", "<suffix>"],
  "assistant": ["<prefix>", "<suffix>"],
  "strip_roles":["assistant"],
+ "fixed_reasoning_effort":"max",
  "open":      "<what starts the model's turn>",
  "stop":      ["<token that ends generation>"]}
 ```
@@ -222,6 +223,11 @@ the assistant suffix, preserving the original format exactly. The stateful
 `waste run` and `waste chat` commands currently refuse the extended fields
 instead of silently ignoring them; use `waste serve` for such a container,
 or `--raw` only when raw continuation is intentional.
+
+`fixed_reasoning_effort` is only for a profile whose literal preamble and
+opening already select that effort. When present, HTTP rejects every explicit
+reasoning control — including `none`, `minimal`, `off`, and `thinking:false`
+— because accepting one would report a setting different from the prompt.
 
 `\n` and `\t` are the escapes the reader understands. Whatever markup you
 put in these strings has to exist in the tokenizer as a *single* token, or
@@ -278,6 +284,33 @@ Jinja does; user and system text is not.
 The deliberately narrow scope is ordinary system, user, and prior assistant
 text over stateless HTTP. Tools and thinking remain refused by name; the
 Jinja template's structured branches have not been approximated.
+
+## chat-glm53-flash.json — GLM-5.3-Flash fixed-Max text
+
+[chat-glm53-flash.json](chat-glm53-flash.json) is the smallest exact text
+subset of GLM-5.3-Flash's released Jinja template. The converter installs it
+only for the release's nested `Glm5NextForConditionalGeneration` /
+`glm5_next_text` pair. It emits the exact
+`[gMASK]<sop><|system|>Reasoning Effort: Max` preamble, preserves system and
+user text, represents answer-only assistant history as
+`<|assistant|><think></think>…`, and opens generation with
+`<|assistant|><think>`.
+
+The scope is intentionally strict:
+
+- reasoning effort is fixed at **Max**; a request cannot override it;
+- historical assistant turns must contain answer text only. A separate
+  `reasoning_content` field is refused instead of silently discarded;
+- tools and media are refused by name; and
+- this is an extended, stateless-HTTP profile. `waste run` and `waste chat`
+  refuse it rather than ignoring its one-time preamble or three stop tokens.
+
+The current plain reply parser does not yet split GLM's generated reasoning
+from its answer. It consumes the `</think>` marker and concatenates both
+regions in `content`. This makes the profile useful for one-shot correctness
+and performance work, but a client must not feed that combined output back
+as assistant history. A think-aware response parser is separate work; until
+it lands, use raw generation if a client must split the regions itself.
 
 ## chat-k3.json — Kimi K3
 

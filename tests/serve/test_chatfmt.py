@@ -35,10 +35,11 @@ sys.path.insert(0, str(REPO))
 from serve.chatfmt import (ChatFormat, ChatFormatError,   # noqa: E402
                            PlainParser)
 from tests.serve.fake_engine import (FakeEngine, GLM_MARKERS,   # noqa: E402
-                                     LINEAR_MARKERS)
+                                     GLM53_MARKERS, LINEAR_MARKERS)
 
 SHIPPED = REPO / "examples" / "chat-kimi-linear.json"
 GLM_SHIPPED = REPO / "examples" / "chat-glm47-flash.json"
+GLM53_SHIPPED = REPO / "examples" / "chat-glm53-flash.json"
 CHATML = REPO / "examples" / "chat.json"
 
 
@@ -52,6 +53,7 @@ class GlmOracleEngine(FakeEngine):
     """
 
     _TEXT_IDS = {
+        "Reasoning Effort: Max": [25062, 287, 29905, 371, 25, 7487],
         "Say OK.": [45494, 10397, 13],
         "Be brief.": [3430, 9809, 13],
         "One?": [3966, 30],
@@ -61,6 +63,10 @@ class GlmOracleEngine(FakeEngine):
 
     def tokenize(self, text, *, markup=False, add_bos=False):
         if markup:
+            if text == ("[gMASK]<sop><|system|>"
+                        "Reasoning Effort: Max"):
+                return [154822, 154824, 154826] + list(
+                    self._TEXT_IDS["Reasoning Effort: Max"])
             return super().tokenize(text, markup=True, add_bos=add_bos)
         if text not in self._TEXT_IDS:
             raise AssertionError(f"no official GLM token fixture for {text!r}")
@@ -115,6 +121,25 @@ class TestLoad(Base):
             "<|endoftext|>", "<|user|>", "<|observation|>"))
         self.assertEqual(fmt.stop_ids, (154820, 154827, 154829))
         self.assertEqual(fmt.strip_roles, frozenset({"assistant"}))
+
+    def test_the_glm53_template_fixes_max_reasoning_and_opens_think(self):
+        fmt = self.load(GLM53_SHIPPED, markers=GLM53_MARKERS)
+        self.assertEqual(
+            fmt.preamble,
+            "[gMASK]<sop><|system|>Reasoning Effort: Max")
+        self.assertEqual(fmt.roles["assistant"],
+                         ("<|assistant|><think></think>", ""))
+        self.assertEqual(fmt.opening, "<|assistant|><think>")
+        self.assertEqual(fmt.stop_ids, (154820, 154827, 154829))
+        self.assertEqual(fmt.strip_roles, frozenset({"assistant"}))
+        self.assertEqual(fmt.fixed_reasoning_effort, "max")
+
+    def test_a_fixed_reasoning_effort_is_narrowly_validated(self):
+        raw = json.loads(GLM53_SHIPPED.read_text())
+        raw["fixed_reasoning_effort"] = "medium"
+        with self.assertRaises(ChatFormatError) as cm:
+            self.load(raw, markers=GLM53_MARKERS)
+        self.assertIn("fixed_reasoning_effort", str(cm.exception))
 
     def test_markup_the_tokenizer_lacks_is_refused_at_load(self):
         """examples/chat.json is ChatML, and <|im_start|> is not in this
@@ -238,6 +263,14 @@ class TestRender(Base):
     def test_thinking(self):
         self.refuses("no reasoning channel", thinking=True)
 
+    def test_historical_reasoning_is_refused_instead_of_dropped(self):
+        with self.assertRaises(ChatFormatError) as cm:
+            self.render([{"role": "assistant", "content": "answer",
+                          "reasoning_content": "private reasoning"}])
+        self.assertIn("answer-only assistant content", str(cm.exception))
+        self.assertEqual(cm.exception.param,
+                         "messages[0].reasoning_content")
+
     def test_response_format(self):
         self.refuses("response_format",
                      response_format={"type": "json_object"})
@@ -325,6 +358,98 @@ class TestGlmOfficialDifferential(Base):
                     {"type": "text", "text": "First."}]}
             ], thinking=False)
         self.assertIn("must be a string", str(cm.exception))
+
+
+class TestGlm53OfficialDifferential(Base):
+    """Fixed-Max, answer-only rendering equals the pinned release Jinja."""
+
+    def setUp(self):
+        super().setUp()
+        shutil.copyfile(GLM53_SHIPPED, os.path.join(self.dir, "chat.json"))
+        self.engine = GlmOracleEngine(
+            no_markers=True, model_path=self.dir,
+            markers=dict(GLM53_MARKERS))
+        self.fmt = ChatFormat.load(self.engine)
+
+    def ids(self, messages, *, add_generation_prompt=True):
+        segments = self.fmt.build_chat_segments(
+            messages, thinking=False,
+            add_generation_prompt=add_generation_prompt)
+        return self.engine.tokenize_segments(segments), "".join(
+            segment.text for segment in segments)
+
+    def test_single_user_matches_official_jinja_text_and_ids(self):
+        ids, text = self.ids([{"role": "user", "content": "Say OK."}])
+        self.assertEqual(
+            text,
+            "[gMASK]<sop><|system|>Reasoning Effort: Max"
+            "<|user|>Say OK.<|assistant|><think>")
+        self.assertEqual(ids, [
+            154822, 154824, 154826,
+            25062, 287, 29905, 371, 25, 7487,
+            154827, 45494, 10397, 13, 154828, 154841,
+        ])
+
+    def test_plain_answer_only_history_matches_official_jinja(self):
+        ids, text = self.ids([
+            {"role": "system", "content": "Be brief."},
+            {"role": "user", "content": "One?"},
+            {"role": "assistant", "content": " \n First. \n "},
+            {"role": "user", "content": "Two?"},
+        ])
+        self.assertEqual(
+            text,
+            "[gMASK]<sop><|system|>Reasoning Effort: Max"
+            "<|system|>Be brief.<|user|>One?"
+            "<|assistant|><think></think>First.<|user|>Two?"
+            "<|assistant|><think>")
+        self.assertEqual(ids, [
+            154822, 154824, 154826,
+            25062, 287, 29905, 371, 25, 7487,
+            154826, 3430, 9809, 13, 154827, 3966, 30,
+            154828, 154841, 154842, 5338, 13,
+            154827, 11608, 30, 154828, 154841,
+        ])
+
+    def test_no_generation_prompt_matches_official_jinja(self):
+        ids, text = self.ids(
+            [{"role": "user", "content": "One?"}],
+            add_generation_prompt=False)
+        self.assertEqual(
+            text,
+            "[gMASK]<sop><|system|>Reasoning Effort: Max<|user|>One?")
+        self.assertEqual(ids, [
+            154822, 154824, 154826,
+            25062, 287, 29905, 371, 25, 7487,
+            154827, 3966, 30,
+        ])
+
+    def test_dynamic_reasoning_and_non_text_modes_fail_closed(self):
+        messages = [{"role": "user", "content": "Say OK."}]
+        cases = (
+            ({"thinking": True}, "no reasoning channel"),
+            ({"tools": [{"type": "function", "function": {
+                "name": "f", "parameters": {}}}]}, "tool definitions"),
+            ({"image_prompts": ["<image>"]}, "cannot place an image"),
+        )
+        for kwargs, expected in cases:
+            with self.subTest(kwargs=kwargs):
+                kwargs.setdefault("thinking", False)
+                with self.assertRaises(ChatFormatError) as cm:
+                    self.fmt.build_chat_segments(messages, **kwargs)
+                self.assertIn(expected, str(cm.exception))
+
+    def test_any_explicit_reasoning_control_is_refused(self):
+        messages = [{"role": "user", "content": "Say OK."}]
+        for param in ("reasoning_effort", "thinking_effort", "reasoning",
+                      "thinking"):
+            with self.subTest(param=param):
+                with self.assertRaises(ChatFormatError) as cm:
+                    self.fmt.build_chat_segments(
+                        messages, thinking=False, reasoning_control=param)
+                self.assertEqual(cm.exception.param, param)
+                self.assertIn("fixes reasoning effort at max",
+                              str(cm.exception))
 
 
 class TestPlainParser(unittest.TestCase):

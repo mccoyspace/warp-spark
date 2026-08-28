@@ -33,10 +33,18 @@ KINDS = (("gate", "w1"), ("up", "w3"), ("down", "w2"))
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from mxfp4 import ST                                              # noqa: E402
 from convert import (ShardReader, is_omitted_source_tensor,
-                     is_source_only_layer, moe_layout,
-                     source_layer_index, unsupported_source_features,
+                     is_source_only_layer, moe_layout_at,
+                     source_layer_index, source_model_prefix,
+                     unsupported_source_features,
                      validate_glm47_full_source,
-                     validate_glm52_source)                       # noqa: E402
+                     validate_glm52_source,
+                     validate_glm53_source)                       # noqa: E402
+
+
+def source_moe_layout(source, cfg, runtime_prefix, layer):
+    """Resolve a manifest prefix back to the published expert namespace."""
+    model_prefix = source_model_prefix(cfg, runtime_prefix)
+    return (model_prefix, *moe_layout_at(source, model_prefix, layer))
 
 
 def load_codebooks(path):
@@ -107,6 +115,8 @@ def main():
                                man.get("tensor_prefix", ""))
     validate_glm52_source(cfg, source_index,
                           man.get("tensor_prefix", ""))
+    validate_glm53_source(cfg, source_index,
+                          man.get("tensor_prefix", ""))
     n_layers = cfg["num_hidden_layers"]
     source_only = sorted({
         layer for name in source_index.names()
@@ -140,12 +150,13 @@ def main():
         L = int(lstr)
         bank = open(os.path.join(args.container, meta["file"]), "rb").read()
         assert len(bank) == meta["bytes"]
-        layout, segment, source_kinds = moe_layout(sr, prefix, L)
+        model_prefix, layout, segment, source_kinds = source_moe_layout(
+            sr, cfg, prefix, L)
         assert layout is not None, f"no supported source expert layout at layer {L}"
         shapes = []
         for _kind, tag in source_kinds:
             t = sr.tensor(
-                f"{prefix}model.layers.{L}.{segment}.experts.0.{tag}.weight")
+                f"{model_prefix}layers.{L}.{segment}.experts.0.{tag}.weight")
             shapes.append(tuple(t.shape))
 
         off, checked = 0, 0
@@ -156,7 +167,7 @@ def main():
             assert off % ALIGN == 0, f"record {eid} not 4 KiB aligned"
             for i, (kind, tag) in enumerate(source_kinds):
                 W = sr.tensor(
-                    f"{prefix}model.layers.{L}.{segment}.experts.{eid}.{tag}.weight")
+                    f"{model_prefix}layers.{L}.{segment}.experts.{eid}.{tag}.weight")
                 err = (W - rec[kind]).norm() / W.norm()
                 flag = "ok " if err < 0.30 else "BAD"
                 if err >= 0.30:
