@@ -114,7 +114,8 @@ __global__ static void q4_fast(const uint8_t *weights,
  * not turn the qualified mode-1 target into a different numerical kernel. */
 __global__ static void q4_fast2(const uint8_t *weights,
                                 const uint16_t *scales,
-                                const float *x, float *y,
+                                const float *x0, const float *x1,
+                                float *y0, float *y1,
                                 int out, int in, size_t rowbytes)
 {
     const int row_index = (int)blockIdx.x;
@@ -123,8 +124,6 @@ __global__ static void q4_fast2(const uint8_t *weights,
     const int groups = (in + Q4_GROUP - 1) / Q4_GROUP;
     const uint8_t *row = weights + (size_t)row_index * rowbytes;
     const uint16_t *row_scales = scales + (size_t)row_index * groups;
-    const float *x0 = x;
-    const float *x1 = x + in;
     float sum0 = 0.0f, sum1 = 0.0f;
     for (int i = lane; i < in; i += Q4_THREADS) {
         const float w = q4_half(row_scales[i / Q4_GROUP]) *
@@ -144,8 +143,8 @@ __global__ static void q4_fast2(const uint8_t *weights,
         __syncthreads();
     }
     if (lane == 0) {
-        y[row_index] = partial[0][0];
-        y[(size_t)out + row_index] = partial[1][0];
+        y0[row_index] = partial[0][0];
+        y1[row_index] = partial[1][0];
     }
 }
 
@@ -436,18 +435,55 @@ extern "C" int waste_cuda_q4_matvec(waste_model *m, float *y,
     return 0;
 }
 
-/* Additive two-row entry point for the bounded MTP verifier. Only the
- * qualified mode-1 arithmetic is implemented: accepting another selector
- * here would silently give the target a prefill-specific numerical meaning.
- * X is [2][in] and Y is [2][out], both row-major. */
-extern "C" int waste_cuda_q4_matvec2(waste_model *m, float *y,
-                                      const waste_tensor *tensor,
-                                      const float *x, int out, int in,
-                                      int mode)
+/* The two-row kernel is not automatically faster.  These are the shapes
+ * whose bracketed GB10 screen beat two qualified mode-1 launches.  Keep this
+ * an exact allowlist: small auxiliaries and wide-to-hidden projections remain
+ * sequential until they produce their own positive measurements.  In
+ * particular, every out=4096, in>4096 projection is excluded; both measured
+ * examples regressed (4096x8192 and 4096x12288).
+ *
+ * The three entries not used by the released GLM-5.3 projection set remain
+ * here because they were independently measured positive and make the
+ * primitive reusable without turning this into a heuristic threshold. */
+static int q4_fast2_shape_eligible(int out, int in)
 {
-    if (!m || !tensor || !tensor->q || !tensor->qs || !x || !y ||
+    if (out == 4096 && in > 4096) return 0;
+    return (out == 8192  && in == 4096) ||
+           (out == 1536  && in == 4096) ||
+           (out == 4096  && in == 1536) ||
+           (out == 4096  && in == 4096) ||
+           (out == 12288 && in == 4096) ||
+           (out == 12288 && in == 1536);
+}
+
+/* Public, side-effect-free dispatch predicate.  A zero is an ordinary
+ * verifier fallback, not a CUDA failure.  Requiring the declared tensor
+ * geometry here prevents an allowlisted pair of integers from being applied
+ * to a differently shaped record. */
+extern "C" int waste_cuda_q4_matvec2_eligible(
+    const waste_tensor *tensor, int out, int in, int mode)
+{
+    if (!tensor || !tensor->q || !tensor->qs ||
         tensor->bits != 4 || tensor->group != Q4_GROUP || mode != 1 ||
-        out < 1 || in < 1 || (size_t)out > (size_t)INT32_MAX)
+        tensor->ndim != 2 || tensor->shape[0] != out ||
+        tensor->shape[1] != in || out < 1 || in < 1 ||
+        tensor->rowbytes < ((size_t)in + 1) / 2)
+        return 0;
+    return q4_fast2_shape_eligible(out, in);
+}
+
+static int q4_matvec2_run(waste_model *m, float *y0, float *y1,
+                          const waste_tensor *tensor,
+                          const float *x0, const float *x1,
+                          int out, int in, int mode, int require_allowlist)
+{
+    if (!m || !tensor || !tensor->q || !tensor->qs ||
+        !x0 || !x1 || !y0 || !y1 ||
+        tensor->bits != 4 || tensor->group != Q4_GROUP || mode != 1 ||
+        tensor->ndim != 2 || tensor->shape[0] != out ||
+        tensor->shape[1] != in || out < 1 || in < 1 ||
+        tensor->rowbytes < ((size_t)in + 1) / 2 ||
+        (require_allowlist && !q4_fast2_shape_eligible(out, in)))
         return -1;
     waste_cuda_kda *ctx = (waste_cuda_kda *)m->cuda_kda_ctx;
     if (!ctx) {
@@ -457,19 +493,52 @@ extern "C" int waste_cuda_q4_matvec2(waste_model *m, float *y,
     }
     if ((size_t)in > ctx->capacity || (size_t)out > ctx->capacity)
         return -1;
-    memcpy(ctx->host_x, x, (size_t)2 * in * sizeof(float));
+    memcpy(ctx->host_x, x0, (size_t)in * sizeof(float));
+    memcpy(ctx->host_x + ctx->capacity, x1,
+           (size_t)in * sizeof(float));
     q4_fast2<<<out, Q4_THREADS, 0, ctx->stream>>>(
         (const uint8_t *)tensor->q, tensor->qs,
-        ctx->device_x, ctx->device_y, out, in, tensor->rowbytes);
+        ctx->device_x, ctx->device_x + ctx->capacity,
+        ctx->device_y, ctx->device_y + ctx->capacity,
+        out, in, tensor->rowbytes);
     cudaError_t status = cudaGetLastError();
     if (status == cudaSuccess) status = cudaStreamSynchronize(ctx->stream);
     if (status != cudaSuccess) {
         cuda_problem("two-row projection", status);
         return -1;
     }
-    memcpy(y, ctx->host_y, (size_t)2 * out * sizeof(float));
+    memcpy(y0, ctx->host_y, (size_t)out * sizeof(float));
+    memcpy(y1, ctx->host_y + ctx->capacity,
+           (size_t)out * sizeof(float));
     return 0;
 }
+
+/* Additive two-row entry point for the bounded MTP verifier. Only the
+ * qualified mode-1 arithmetic is implemented: accepting another selector
+ * here would silently give the target a prefill-specific numerical meaning.
+ * Inputs and outputs are separate because verifier rows live in distinct
+ * per-position workspaces.  Call waste_cuda_q4_matvec2_eligible first; this
+ * entry also enforces the allowlist so bypassing the predicate fails closed. */
+extern "C" int waste_cuda_q4_matvec2(
+    waste_model *m, float *y0, float *y1, const waste_tensor *tensor,
+    const float *x0, const float *x1, int out, int in, int mode)
+{
+    return q4_matvec2_run(m, y0, y1, tensor, x0, x1,
+                          out, in, mode, 1);
+}
+
+#if defined(WASTE_CUDA_Q4_MATVEC2_TEST)
+/* The standalone gate exercises arithmetic on every released GLM-5.3 Q4
+ * geometry, including shapes that production deliberately routes to two
+ * scalar launches.  It is absent from ordinary builds. */
+extern "C" int waste_cuda_q4_matvec2_test_only(
+    waste_model *m, float *y0, float *y1, const waste_tensor *tensor,
+    const float *x0, const float *x1, int out, int in, int mode)
+{
+    return q4_matvec2_run(m, y0, y1, tensor, x0, x1,
+                          out, in, mode, 0);
+}
+#endif
 
 static void cuda_vq_release(waste_cuda_kda *ctx)
 {
